@@ -143,11 +143,12 @@ The first bytes of `CL Wolf Creek_Data` after its `u32` version are `FE FE 80 ..
 1. The format is a package container rather than a single raw map image: the libraries include dedicated package readers and writers, an index table, and a collection of entries.
 2. The container has a versioned header and an index layout confirmed above. The supplied corpus contains multiple versions, so a Rust reader should preserve and explicitly validate the version number.
 3. `ColossalFramework.Importers.Image` exposes `isCompressed`, `Compress`, and `Uncompress`, but this pass has not connected those methods to package-level compression. `Package.Save` copies asset payload bytes into the package; there is currently no evidence that the container applies a generic compression layer.
-4. The code separates container handling (reader, writer, index, entries) from game-object serialization (`PackageSerializer`, `DataSerializer`). The type `100` metadata uses the reflected-object path; type `52` uses `DataSerializer` object framing, while the game-specific `IDataContainer` payloads remain to be mapped.
+4. Entry checksums are lowercase hexadecimal MD5 hashes of the raw asset payload. `SecurityHelper.CalculateChecksum` computes MD5 and formats it as lowercase hex; the `Package.Asset` constructors call the byte-array or file overload. Recomputing hashes for all 469 entries across the 105 supplied maps matched every stored checksum.
+5. The code separates container handling (reader, writer, index, entries) from game-object serialization (`PackageSerializer`, `DataSerializer`). The type `100` metadata uses the reflected-object path; type `52` uses `DataSerializer` object framing, while the game-specific `IDataContainer` payloads remain to be mapped.
 
 ## Open questions
 
-- The checksum algorithm and any version-specific changes to index fields.
+- Any version-specific changes to index fields.
 - Whether data offsets and entry sizes require additional handling for all package implementation types.
 - Whether image compression or other compression is used inside asset payloads, and how payloads are serialized.
 - Semantic differences between versions 4–10.
@@ -156,7 +157,7 @@ The first bytes of `CL Wolf Creek_Data` after its `u32` version are `FE FE 80 ..
 
 1. Trace which `IDataContainer.Serialize` implementation produces the type `52` map payload and how its versions are selected.
 2. Check for compression within that data path and identify version-specific payload differences across map samples.
-3. Inspect checksum generation/validation, then build a compatibility table for versions 4–10 before defining the public Rust API.
+3. Inspect checksum validation behavior and build a compatibility table for versions 4–10 before defining the public Rust API.
 
 ## Limitations of this pass
 
