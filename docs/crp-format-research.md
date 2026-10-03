@@ -134,7 +134,7 @@ Across the corpus, the reflected metadata headers group as follows:
 
 The type-107 sample is an observed mismatch: the DLL's `UserAssetType` constants label 107 as `MapThemeMapMetaData`, but the entry payload advertises `SystemMapMetaData`. Preserve the outer type and inner runtime type independently when reading.
 
-All 237 type-3 texture entries in the map corpus begin with the reflected runtime type `ColossalFramework.Importers.Image` and contain a PNG signature (`89 50 4E 47 0D 0A 1A 0A`). The PNG starts at a variable offset after the wrapper header (offset 129–166 in this corpus). The wrapper's pre-PNG fields remain to be decoded; the PNG itself accounts for image-level compression, not a package-wide compression layer.
+Type-3 texture entries use a dedicated texture reader rather than the generic reflected field-count form. The entry stores the non-null marker and runtime type string, then the texture name, a `linear` boolean, an `i32 anisoLevel` for outer package versions 6 and newer (older versions default it to 1), an `i32` byte count, and that many image bytes. The `CL Wolf Creek` textures have `linear=false`, `anisoLevel=1`, and PNG image data. This sequence was checked across all 237 type-3 entries: every byte count exactly matches the remaining payload, and every image buffer starts with the PNG signature `89 50 4E 47 0D 0A 1A 0A`.
 
 ## Type-52 map data payloads
 
@@ -175,7 +175,7 @@ For `UShort`, control `0x00`–`0x3F` means the next `control+1` big-endian `u16
 
 1. The format is a package container rather than a single raw map image: the libraries include dedicated package readers and writers, an index table, and a collection of entries.
 2. The container has a versioned header and an index layout confirmed above. The supplied corpus contains multiple versions, so a Rust reader should preserve and explicitly validate the version number.
-3. `Package.Save` copies asset payload bytes into the package; no generic compression layer was found in the container writer. Type-3 assets contain PNGs, and specific DataSerializer array fields use delta/RLE encoding, while other per-field encodings remain possible.
+3. `Package.Save` copies asset payload bytes into the package; no generic compression layer was found in the container writer. Type-3 assets contain PNGs, and specific DataSerializer array fields use delta/RLE encoding; other fields may have their own encodings.
 4. Entry checksums are lowercase hexadecimal MD5 hashes of the raw asset payload. `SecurityHelper.CalculateChecksum` computes MD5 and formats it as lowercase hex; the `Package.Asset` constructors call the byte-array or file overload. Recomputing hashes for all 469 entries across the 105 supplied maps matched every stored checksum.
 5. The code separates container handling (reader, writer, index, entries) from game-object serialization (`PackageSerializer`, `DataSerializer`). The type `100` metadata uses the reflected-object path; type `52` uses `DataSerializer` object framing, while the game-specific `IDataContainer` payloads remain to be mapped.
 
@@ -183,15 +183,15 @@ For `UShort`, control `0x00`–`0x3F` means the next `control+1` big-endian `u16
 
 - Any version-specific changes to index fields.
 - Whether data offsets and entry sizes require additional handling for all package implementation types.
-- The type-3 image wrapper fields and the remaining manager-specific data field sequences.
+- The remaining manager-specific data field sequences.
 - Semantic differences between versions 4–10.
 
 ## Next research steps
 
 1. Decode the remaining manager-specific `IDataContainer` payloads, beginning with network, building, and citizen data.
-2. Decode the type-3 image wrapper and confirm the shared format rules on non-map package families.
+2. Confirm the shared format rules on non-map package families.
 3. Compare field-level behavior across the observed inner serializer versions before defining the public Rust API.
 
 ## Limitations of this pass
 
-No high-level .NET decompiler (`monodis`, `ilspycmd`, or `ildasm`) was found, so reader, writer, and serializer methods were decoded from CIL bodies and metadata with a small inspection script. The outer container, MD5 checksums, reflected metadata headers, texture PNG signatures, and second DataSerializer root headers were cross-checked against all 105 map files. A full field-level decoder for every simulation manager and other package implementation types remains outside the current findings.
+No high-level .NET decompiler (`monodis`, `ilspycmd`, or `ildasm`) was found, so reader, writer, and serializer methods were decoded from CIL bodies and metadata with a small inspection script. The outer container, MD5 checksums, reflected metadata headers, complete type-3 texture framing, and second DataSerializer root headers were cross-checked against all 105 map files. A full field-level decoder for every simulation manager and other package implementation types remains outside the current findings.
