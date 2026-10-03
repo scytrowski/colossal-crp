@@ -78,29 +78,63 @@ This layout matches `CL Wolf Creek.crp` exactly. Its header values are version `
 | `Wolf Creek_Data` | 52 | 388,266 | 4,215,002 |
 | `CL Wolf Creek` | 100 | 4,603,268 | 2,908 |
 
-The index ends at offset `0x151`, matching the base data offset. The final entry ends exactly at the file size (4,606,513 bytes). Asset type numeric meanings and whether offsets are identical in other package implementations remain to be checked.
+The index ends at offset `0x151`, matching the base data offset. The final entry ends exactly at the file size (4,606,513 bytes).
+
+## Writer corroboration and asset types
+
+`Package.Save` in `ColossalManaged.dll` writes the same header and index fields in the same order as `ReadIndexTable`. It writes asset payloads after the index, copying from a disk path, in-memory byte array, or an existing asset stream. For a non-empty package author it encrypts the author string with `SimpleAES`; an empty author is written as-is. A reader should expect the author string to be empty/plaintext or encrypted, depending on the file.
+
+Before writing the index, `CalculateDataStartOffset` computes the payload start from the stream's current position, adds eight bytes for the base-offset field, then adds each record's encoded name and checksum string lengths plus 4 bytes for type, 8 for relative offset, and 8 for size. In `Save`, record offsets are cumulative payload lengths. This agrees with the sample's index ending exactly where payload data begins.
+
+The static initialization of `.AssetType` in `ColossalManaged.dll` defines these built-in numeric values. `Assembly-CSharp.dll` extends `User` with the listed metadata subtypes:
+
+| Value | Asset type |
+| ---: | --- |
+| 0 | Unknown |
+| 1 | Object |
+| 2 | Material |
+| 3 | Texture |
+| 4 | StaticMesh |
+| 50 | Text |
+| 51 | Assembly |
+| 52 | Data |
+| 53 | Package |
+| 80 | Locale |
+| 81 | LocaleOverride |
+| 100 | User / MapMetaData |
+| 101 | User / SaveGameMetaData |
+| 102 | User / SystemMapMetaData |
+| 103 | User / CustomAssetMetaData |
+| 104 | User / ColorCorrection |
+| 105 | User / DistrictStyleMetaData |
+| 106 | User / MapThemeMetaData |
+| 107 | User / MapThemeMapMetaData |
+| 108 | User / ScenarioMetaData |
+
+The map corpus contains entry types 3, 52, 100, 102, 105, and 107. Across 105 files the occurrence counts are 237, 110, 104, 5, 12, and 1 respectively. Thus type 3 is used by preview/snapshot assets, type 52 by map data, and type 100 by map metadata in the inspected sample.
+
+The decoded reader layout was applied to all 105 map files. Every index parsed, every index ended at its declared base data offset, and every asset range fit within its file. This confirms the shared container layout across the observed format versions 4–10; it does not yet prove that all other `.crp` package families use the same implementation or payload encoding.
 
 ## Findings from the DLLs
 
 1. The format is a package container rather than a single raw map image: the libraries include dedicated package readers and writers, an index table, and a collection of entries.
 2. The container has a versioned header and an index layout confirmed above. The supplied corpus contains multiple versions, so a Rust reader should preserve and explicitly validate the version number.
-3. The package code includes the concept of compressed data (`isCompressed`, `Compress`, `Uncompress`). The flag layout, algorithm, compression scope, and length encoding still need confirmation from IL or by correlating multiple samples.
+3. `ColossalFramework.Importers.Image` exposes `isCompressed`, `Compress`, and `Uncompress`, but this pass has not connected those methods to package-level compression. `Package.Save` copies asset payload bytes into the package; there is currently no evidence that the container applies a generic compression layer.
 4. The class names suggest a separation between container handling (reader, writer, index, entries) and game-object serialization (`PackageSerializer`, `DataSerializer`). It is useful to investigate these layers separately: first extract entries, then decode map resources.
 
 ## Open questions
 
-- The meanings of asset type values, checksum algorithm, and any version-specific changes to index fields.
+- The checksum algorithm and any version-specific changes to index fields.
 - Whether data offsets and entry sizes require additional handling for all package implementation types.
-- Compression details and payload type serialization.
+- Whether image compression or other compression is used inside asset payloads, and how payloads are serialized.
 - Semantic differences between versions 4–10.
 
 ## Next research steps
 
-1. Decode `PackageWriter` and compare its field and entry order to the reader implementation.
-2. Map asset type values and inspect the serializer used by type `52` (the map data entry in this sample).
-3. Decode headers and indexes from files of several versions; validate offsets by checking payload signatures (such as PNG) and file boundaries.
-4. Inspect compression and payload serialization, then build a compatibility table for versions 4–10 before defining the public Rust API.
+1. Inspect how type `52` (the map data entry) is serialized and whether its opaque payload contains independently compressed sections; also inspect metadata type `100`.
+2. Decode payload boundaries in files of several versions and identify any version-specific differences.
+3. Inspect checksum generation/validation, then build a compatibility table for versions 4–10 before defining the public Rust API.
 
 ## Limitations of this pass
 
-No high-level .NET decompiler (`monodis`, `ilspycmd`, or `ildasm`) was found, so the index method was decoded from its CIL body and metadata with a small inspection script rather than rendered as decompiled source. The listed field order and offset calculation are confirmed by the method body and were cross-checked against one sample. Other package versions and the writer path still need verification.
+No high-level .NET decompiler (`monodis`, `ilspycmd`, or `ildasm`) was found, so the reader and writer methods were decoded from their CIL bodies and metadata with a small inspection script rather than rendered as decompiled source. The layout was cross-checked against all 105 map files. Payload formats and behavior of other package implementation types still need verification.
