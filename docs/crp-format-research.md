@@ -2,6 +2,10 @@
 
 Status as of 2026-10-04. These notes are based on the game DLLs and samples in `data/maps/`. They record current observations, not a complete implementation specification.
 
+## Rust implementation status
+
+The crate currently has an initial outer-container reader. `Package::read_from` reads package versions 4–10 using the base implementation's zero data offset; `Package::read_from_with_data_offset` accepts an implementation-specific offset. It retains index order, checksum strings, unknown numeric asset types, and raw payload bytes. The reader does not yet validate checksums, decrypt non-empty author fields, decode asset payloads, or write packages. The reader has compiled, but this increment has not yet been validated against the full map corpus.
+
 ## Materials examined
 
 - `data/maps/`: 105 map files.
