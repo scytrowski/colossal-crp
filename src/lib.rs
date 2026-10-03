@@ -591,3 +591,151 @@ fn md5_compress(state: &mut [u32; 4], block: &[u8], shifts: &[u32; 64], constant
     state[2] = state[2].wrapping_add(c);
     state[3] = state[3].wrapping_add(d);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    fn sample_package() -> Package {
+        Package {
+            format_version: 6,
+            name: "Test Map".to_owned(),
+            author_field: String::new(),
+            package_version: 3,
+            main_asset_name: "Test Map".to_owned(),
+            data_start_offset: 0,
+            assets: vec![
+                Asset {
+                    name: "preview".to_owned(),
+                    checksum: "stale checksum is replaced".to_owned(),
+                    asset_type: 3,
+                    relative_offset: 900,
+                    data: b"first payload".to_vec(),
+                },
+                Asset {
+                    name: "future asset".to_owned(),
+                    checksum: String::new(),
+                    asset_type: 712,
+                    relative_offset: 0,
+                    data: vec![0, 1, 2, 255],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn md5_matches_standard_vectors() {
+        assert_eq!(checksum_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(checksum_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            checksum_hex(b"message digest"),
+            "f96b697d7cb7938d525a2f31aaf161d0"
+        );
+    }
+
+    #[test]
+    fn compact_writer_round_trips_metadata_and_unknown_assets() -> Result<(), CrpError> {
+        let package = sample_package();
+        let mut encoded = Vec::new();
+        package.write_compact_to(&mut encoded)?;
+
+        let mut cursor = Cursor::new(encoded);
+        let decoded = Package::read_from(&mut cursor)?;
+
+        assert_eq!(decoded.format_version, package.format_version);
+        assert_eq!(decoded.name, package.name);
+        assert_eq!(decoded.author_field, package.author_field);
+        assert_eq!(decoded.package_version, package.package_version);
+        assert_eq!(decoded.main_asset_name, package.main_asset_name);
+        assert_eq!(decoded.assets.len(), 2);
+        assert_eq!(decoded.assets[0].relative_offset, 0);
+        assert_eq!(decoded.assets[0].data, b"first payload");
+        assert_eq!(
+            decoded.assets[0].checksum,
+            "c027f85a8c79a1c936c3fd3119b1e0da"
+        );
+        assert_eq!(decoded.assets[1].asset_type, 712);
+        assert_eq!(decoded.assets[1].data, [0, 1, 2, 255]);
+        assert_eq!(decoded.assets[1].relative_offset, 13);
+        Ok(())
+    }
+
+    #[test]
+    fn reader_rejects_asset_ranges_past_end_of_file() -> Result<(), CrpError> {
+        let mut encoded = Vec::new();
+        sample_package().write_compact_to(&mut encoded)?;
+
+        let mut cursor = Cursor::new(encoded.as_slice());
+        cursor.seek(SeekFrom::Start(6))?;
+        read_binary_string(&mut cursor)?;
+        read_binary_string(&mut cursor)?;
+        read_u32_le(&mut cursor)?;
+        read_binary_string(&mut cursor)?;
+        read_i32_le(&mut cursor)?;
+        read_u64_le(&mut cursor)?;
+        read_binary_string(&mut cursor)?;
+        read_binary_string(&mut cursor)?;
+        read_i32_le(&mut cursor)?;
+        read_i64_le(&mut cursor)?;
+        let size_offset = cursor.position() as usize;
+        encoded[size_offset..size_offset + 8].copy_from_slice(&i64::MAX.to_le_bytes());
+
+        let mut cursor = Cursor::new(encoded);
+        assert!(matches!(
+            Package::read_from(&mut cursor),
+            Err(CrpError::AssetOutOfBounds { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wolf_creek_round_trips_with_matching_payload_checksums() -> Result<(), CrpError> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
+        let mut source = File::open(path)?;
+        let original = Package::read_from(&mut source)?;
+
+        let mut encoded = Vec::new();
+        original.write_compact_to(&mut encoded)?;
+        let mut cursor = Cursor::new(encoded);
+        let rewritten = Package::read_from(&mut cursor)?;
+
+        assert_eq!(rewritten.name, original.name);
+        assert_eq!(rewritten.main_asset_name, original.main_asset_name);
+        assert_eq!(rewritten.assets.len(), original.assets.len());
+        for (before, after) in original.assets.iter().zip(&rewritten.assets) {
+            assert_eq!(before.name, after.name);
+            assert_eq!(before.asset_type, after.asset_type);
+            assert_eq!(before.data, after.data);
+            assert_eq!(before.checksum, after.checksum);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reads_all_supplied_map_containers() -> Result<(), CrpError> {
+        let maps_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps");
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(maps_dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|extension| extension == "crp") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        assert_eq!(paths.len(), 105, "unexpected supplied map corpus size");
+
+        for path in paths {
+            let mut file = File::open(&path)?;
+            let package = Package::read_from(&mut file)?;
+            assert!(
+                !package.assets.is_empty(),
+                "{} has no assets",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+}
