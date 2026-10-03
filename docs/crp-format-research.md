@@ -115,12 +115,22 @@ The map corpus contains entry types 3, 52, 100, 102, 105, and 107. Across 105 fi
 
 The decoded reader layout was applied to all 105 map files. Every index parsed, every index ended at its declared base data offset, and every asset range fit within its file. This confirms the shared container layout across the observed format versions 4–10; it does not yet prove that all other `.crp` package families use the same implementation or payload encoding.
 
+## Payload serialization leads
+
+The type `100` main asset in `CL Wolf Creek.crp` begins with a `false` null marker, followed by the assembly-qualified type name `MapMetaData, Assembly-CSharp, ...`. This matches the generic object header path in `AssetSerializer.DeserializeHeader` and `PackageDeserializer.DeserializeObject`; metadata therefore appears to use the framework's reflected object serialization.
+
+The type `52` data payload does not begin with that reflected type-name header. IL inspection traces its source: `LoadingManager.SaveSimulationData` writes a temporary file by calling `DataSerializer.Serialize` first for `m_metaData`, then for a new `.Data` object. The map packaging callback passes that temporary file to `Package.AddFileAsset` as the `_Data` entry with type `Data` (52). Thus the type `52` payload contains two sequential DataSerializer streams.
+
+Each `DataSerializer.Serialize` call writes a 32-bit format version before serializing its object. `DataSerializer.WriteUInt32` emits bytes most-significant first, and `Deserialize` reads two big-endian `u16` values to recover its version. This is a different byte order from the little-endian package header/index. The beginning of `CL Wolf Creek_Data` is `00 01 B5 84`, which is the big-endian word `0x0001B584`; `ND Island Hopping_Data` begins `00 00 01 3C`, or `0x0000013C`.
+
+The internal DataSerializer versions vary independently of the outer package version. Across the corpus, the ranges are: package v4, `0xF4`–`0x140` (5 distinct values); v5, `0x1A9CE` (1); v6, `0x1A9D3`–`0x1B96F` (7); v7, `0x1B972` (1); v8, `0x1BD57`–`0x1C14F` (6); v9, `0x1C52A`–`0x1C534` (4); and v10, `0xC2`–`0x1CCFB` (5). A reader must track these two version fields separately. The serializer path is now identified, but the internal `.Data` object layout and any compression within either stream remain to be decoded.
+
 ## Findings from the DLLs
 
 1. The format is a package container rather than a single raw map image: the libraries include dedicated package readers and writers, an index table, and a collection of entries.
 2. The container has a versioned header and an index layout confirmed above. The supplied corpus contains multiple versions, so a Rust reader should preserve and explicitly validate the version number.
 3. `ColossalFramework.Importers.Image` exposes `isCompressed`, `Compress`, and `Uncompress`, but this pass has not connected those methods to package-level compression. `Package.Save` copies asset payload bytes into the package; there is currently no evidence that the container applies a generic compression layer.
-4. The class names suggest a separation between container handling (reader, writer, index, entries) and game-object serialization (`PackageSerializer`, `DataSerializer`). It is useful to investigate these layers separately: first extract entries, then decode map resources.
+4. The code separates container handling (reader, writer, index, entries) from game-object serialization (`PackageSerializer`, `DataSerializer`). The type `100` metadata uses the reflected-object path; type `52` appears to use a separate game data path that remains to be mapped.
 
 ## Open questions
 
@@ -131,10 +141,10 @@ The decoded reader layout was applied to all 105 map files. Every index parsed, 
 
 ## Next research steps
 
-1. Inspect how type `52` (the map data entry) is serialized and whether its opaque payload contains independently compressed sections; also inspect metadata type `100`.
-2. Decode payload boundaries in files of several versions and identify any version-specific differences.
+1. Trace which `IDataContainer.Serialize` implementation produces the type `52` map payload and how its versions are selected.
+2. Check for compression within that data path and identify version-specific payload differences across map samples.
 3. Inspect checksum generation/validation, then build a compatibility table for versions 4–10 before defining the public Rust API.
 
 ## Limitations of this pass
 
-No high-level .NET decompiler (`monodis`, `ilspycmd`, or `ildasm`) was found, so the reader and writer methods were decoded from their CIL bodies and metadata with a small inspection script rather than rendered as decompiled source. The layout was cross-checked against all 105 map files. Payload formats and behavior of other package implementation types still need verification.
+No high-level .NET decompiler (`monodis`, `ilspycmd`, or `ildasm`) was found, so the reader, writer, and serializer methods were decoded from their CIL bodies and metadata with a small inspection script rather than rendered as decompiled source. The container layout was cross-checked against all 105 map files. The type `52` payload path and behavior of other package implementation types still need verification.
