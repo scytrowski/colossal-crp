@@ -34,6 +34,18 @@ Build a Rust library for reading and writing City: Skylines (2015) `.crp` files.
 - Keep dependencies minimal; explain the need before adding a dependency for core parsing or serialization.
 - Follow the crate's existing style and edition (`2024`). Do not add unrelated features or reorganize files without a project need.
 
+### Code quality
+
+- Prefer clear, direct Rust over clever or overly generic abstractions. Introduce abstractions when they remove real duplication or make format invariants easier to enforce.
+- Keep parsing and serialization logic explicit about byte order, field order, version conditions, and length limits. Avoid scattered magic numbers; name format constants and explain non-obvious values.
+- Return descriptive errors for malformed input, unsupported versions, truncation, invalid checksums, and write failures. Include useful context such as the asset name, field, or byte offset when available.
+- Do not use `unwrap`, `expect`, or panic-based control flow on data read from a `.crp` file. Validate before indexing, converting, allocating, or seeking.
+- Avoid `unsafe`. If it is necessary, keep the unsafe block small and document the invariant that makes it sound.
+- Use precise integer types for on-disk values and checked conversions between file values and platform sizes. Do not silently truncate, wrap, or saturate values.
+- Keep functions focused and names descriptive. Comments should explain format constraints or non-obvious decisions rather than restate the code.
+- Document public types and methods, including supported versions, failure behavior, and whether read/write operations preserve unknown data.
+- Keep code formatted and free of avoidable compiler warnings. Prefer fixing the underlying issue over suppressing a warning.
+
 ## Changes and reporting
 
 - Keep changes focused and update relevant English documentation alongside code when format behavior changes.
