@@ -1,6 +1,6 @@
 # Preliminary research on the `.crp` format
 
-Status as of 2026-10-03. These notes are based on the game DLLs and samples in `data/maps/`. They record current observations, not a complete implementation specification.
+Status as of 2026-10-04. These notes are based on the game DLLs and samples in `data/maps/`. They record current observations, not a complete implementation specification.
 
 ## Materials examined
 
@@ -67,7 +67,7 @@ i64      asset size
 
 For each entry the reader computes its stream offset as the record's relative offset plus the base data offset plus `PackageImplementation.dataOffset`. The base `PackageImplementation` returns zero for `dataOffset`; a packaged implementation has a separate override. The read size is converted to `i32` when the in-memory asset is constructed, despite being stored as `i64` in the index.
 
-The record's second string is passed to the `Asset` constructor as its checksum. The sample uses 32-character hexadecimal values; their specific checksum algorithm has not yet been verified.
+The record's second string is passed to the `Asset` constructor as its checksum. The sample uses 32-character lowercase hexadecimal MD5 values; the algorithm and corpus-wide match are confirmed below.
 
 This layout matches `CL Wolf Creek.crp` exactly. Its header values are version `6`, package name `CL Wolf Creek`, empty author, package version `0`, main asset `CL Wolf Creek`, four records, and base data offset `337` (`0x151`). The four records are:
 
@@ -115,15 +115,34 @@ The map corpus contains entry types 3, 52, 100, 102, 105, and 107. Across 105 fi
 
 The decoded reader layout was applied to all 105 map files. Every index parsed, every index ended at its declared base data offset, and every asset range fit within its file. This confirms the shared container layout across the observed format versions 4–10; it does not yet prove that all other `.crp` package families use the same implementation or payload encoding.
 
-## Payload serialization leads
+## Reflected metadata payloads
 
-The type `100` main asset in `CL Wolf Creek.crp` begins with a `false` null marker, followed by the assembly-qualified type name `MapMetaData, Assembly-CSharp, ...`. This matches the generic object header path in `AssetSerializer.DeserializeHeader` and `PackageDeserializer.DeserializeObject`; metadata therefore appears to use the framework's reflected object serialization.
+The type `100` main asset in `CL Wolf Creek.crp` uses the framework's reflected object serializer. Its header is `bool isNull`, assembly-qualified runtime type string, object-name string, and little-endian `i32` field count. In this sample the values are `false`, `MapMetaData, Assembly-CSharp, ...`, `CL Wolf Creek`, and `25`.
 
-The type `52` data payload does not begin with that reflected type-name header. IL inspection traces its source: `LoadingManager.SaveSimulationData` writes a temporary file by calling `DataSerializer.Serialize` first for `m_metaData`, then for a new `.Data` object. The map packaging callback passes that temporary file to `Package.AddFileAsset` as the `_Data` entry with type `Data` (52). Thus the type `52` payload contains two sequential DataSerializer streams.
+Each reflected field begins with a null marker. A non-null field then stores its runtime type name and field name as .NET `BinaryWriter` strings, followed by its value. Null fields store only the marker; their identity comes from the reflected field order. Arrays store a little-endian `i32` length and then each item. DateTime values are round-trip strings (`DateTime.ToString("O")`). `PackageWriter.WriteUnityType` handles supported Unity/framework types and `PackageDeserializer.DeserializeObject` reads the corresponding field records.
 
-Each `DataSerializer.Serialize` call writes a 32-bit format version before serializing its object. `DataSerializer.WriteUInt32` emits bytes most-significant first, and `Deserialize` reads two big-endian `u16` values to recover its version. This is a different byte order from the little-endian package header/index. The beginning of `CL Wolf Creek_Data` is `00 01 B5 84`, which is the big-endian word `0x0001B584`; `ND Island Hopping_Data` begins `00 00 01 3C`, or `0x0000013C`.
+The 25 `MapMetaData` fields in `CL Wolf Creek` were parsed to the end of the 2,908-byte entry. Values include `builtin=true`, `environment="North"`, `mapThemeRef=null`, `mapName="Wolf Creek"`, timestamp `2019-01-30T13:02:49.7692598+02:00`, image and preview checksums `1419a823a786f548fac710b6bde981b5` and `f52b6e1764cf54d1ed79295494e8ed0f`, `mods=[]`, and the inherited `assetRef` checksum `3bb3661184961300c39107046eea3e0d` (the `_Data` entry). Remaining fields are the published hash, buildable area, resource quantities, and route counts.
 
-The internal DataSerializer versions vary independently of the outer package version. Across the corpus, the ranges are: package v4, `0xF4`–`0x140` (5 distinct values); v5, `0x1A9CE` (1); v6, `0x1A9D3`–`0x1B96F` (7); v7, `0x1B972` (1); v8, `0x1BD57`–`0x1C14F` (6); v9, `0x1C52A`–`0x1C534` (4); and v10, `0xC2`–`0x1CCFB` (5). A reader must track these two version fields separately. The object framing is also partly recovered below; the payload fields and container-specific serialization remain to be decoded.
+Across the corpus, the reflected metadata headers group as follows:
+
+| Outer type | Count | Runtime type | Top-level field count |
+| ---: | ---: | --- | ---: |
+| 100 | 104 | `MapMetaData` | 25 |
+| 102 | 5 | `SystemMapMetaData` | 4 |
+| 105 | 12 | `DistrictStyleMetaData` | 8 |
+| 107 | 1 | `SystemMapMetaData` | 4 |
+
+The type-107 sample is an observed mismatch: the DLL's `UserAssetType` constants label 107 as `MapThemeMapMetaData`, but the entry payload advertises `SystemMapMetaData`. Preserve the outer type and inner runtime type independently when reading.
+
+All 237 type-3 texture entries in the map corpus begin with the reflected runtime type `ColossalFramework.Importers.Image` and contain a PNG signature (`89 50 4E 47 0D 0A 1A 0A`). The PNG starts at a variable offset after the wrapper header (offset 129–166 in this corpus). The wrapper's pre-PNG fields remain to be decoded; the PNG itself accounts for image-level compression, not a package-wide compression layer.
+
+## Type-52 map data payloads
+
+The type-52 data payload does not use this reflected header. IL inspection traces its source: `LoadingManager.SaveSimulationData` writes a temporary file by calling `DataSerializer.Serialize` first for `m_metaData`, then for a new `SimulationManager+Data` object. The map packaging callback adds this file as the `_Data` entry with type `Data` (52). Each call writes a 32-bit format version before its root object, so the payload contains two sequential DataSerializer streams.
+
+Each DataSerializer stream starts with a big-endian `u32` format version. `DataSerializer.WriteUInt32` emits bytes most-significant first, and `Deserialize` reads two big-endian `u16` values to recover its version. This differs from the little-endian package header/index. The beginning of `CL Wolf Creek_Data` is `00 01 B5 84` (`0x0001B584`); `ND Island Hopping_Data` begins `00 00 01 3C` (`0x0000013C`).
+
+The internal DataSerializer versions vary independently of the outer package version. Across the corpus, the ranges are: package v4, `0xF4`–`0x140` (5 distinct values); v5, `0x1A9CE` (1); v6, `0x1A9D3`–`0x1B96F` (7); v7, `0x1B972` (1); v8, `0x1BD57`–`0x1C14F` (6); v9, `0x1C52A`–`0x1C534` (4); and v10, `0xC2`–`0x1CCFB` (5). A reader must track these two version fields separately. The object framing and selected manager schemas are recovered below; most manager-specific payload fields remain to be mapped.
 
 `DataSerializer` also uses its own primitive encoding, distinct from both the package header and .NET `BinaryWriter` strings. IL confirms that `WriteUInt16` and `WriteUInt32` emit most-significant bytes first. `WriteUniqueString` writes `0xFF` for null; otherwise it writes a big-endian 24-bit character count. If every character fits in one byte, bit `0x800000` marks the count and each character is delta-encoded from an initial value of 128 into one byte. Strings containing wider characters use unflagged length and big-endian 16-bit deltas.
 
@@ -136,13 +155,27 @@ Object framing from `WriteObject` and `WriteSharedType` is:
 
 The first bytes of `CL Wolf Creek_Data` after its `u32` version are `FE FE 80 ...`. This matches a new root object, a new shared type, and the flagged compact-string form. Decoding that string yields `SimulationMetaData, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null`. The next fields also match `SimulationMetaData.Serialize`: the game-instance identifier is `7a8bf7ba-d1dc-45ed-b96b-93e75f9c7130`, the environment is `North`, and the scenario asset/name are null. Continuing with the field sequence from IL parses the complete metadata object through byte 192. A second big-endian version word `0x0001B584` begins at payload offset 193, immediately followed by another `FE FE 80 ...` object/type header. This identifies the boundary between the two Serialize calls in this sample and confirms the second call uses the same version. Its root type is `SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null`.
 
-`SimulationManager+Data.Serialize` reveals the beginning of the second block's structure. It writes current tick, frame, and build indices as `u32`, a randomizer seed as `u64`, a day-time offset as `u32`, then the build-index history. It next writes an object array assembled from every registered `ISimulationManager.GetData()` result. Finally, it writes a count followed by key/byte-array pairs from `m_serializableDataStorage`. Each manager-specific object has its own `IDataContainer.Serialize` implementation, so this array is the main remaining source of game-specific field layouts.
+`SimulationManager+Data.Serialize` reveals the second block's structure. It writes current tick, frame, and build indices as `u32`, a randomizer seed as `u64`, a day-time offset as `u32`, then the build-index history. It next writes an object array assembled from registered `ISimulationManager.GetData()` results. Finally, it writes a count followed by key/byte-array pairs from `m_serializableDataStorage`.
+
+The matching `Deserialize` method exposes compatibility gates on the internal format version: versions below 37 are rejected; current tick appears at 84, frame at 5, build index at 13, randomizer seed at 10, day-time offset at 212, build-index history at 164, manager data as an object array at 41, and mod serializable-data storage at 186. For older versions the reader supplies defaults or uses a legacy sequence of manager objects. All observed map payload versions are at least `0xC2` (194), so they use the object-array, history, and serializable-storage paths; versions below 212 use a derived day-time offset.
+
+The DLL contains `IDataContainer.Serialize` implementations for manager data types such as `GameAreaManager+Data`, `TerrainManager+Data`, `NetManager+Data`, `BuildingManager+Data`, `CitizenManager+Data`, `PropManager+Data`, `VehicleManager+Data`, and `ZoneManager+Data`, plus other simulation managers. Each has its own field sequence and version gates. The complete simulation graph is therefore much larger than the two root headers; this pass has identified its dispatch and compatibility structure, but has not decoded every manager's fields.
+
+Two map-critical manager schemas are now mapped at the IL level. `GameAreaManager+Data.Serialize` writes `m_areaCount` (`u8`), `m_startTile` (`u8`), the known-length `m_areaGrid` through `EncodedArray.Byte`, `m_areaNotUnlocked` as a DataSerializer object, four buildable-area floats, and a serialized `SavedCameraView`. Its reader gates are: start tile at version 137 (otherwise defaults to 12), `m_areaNotUnlocked` at 87 (otherwise null), the four area floats at 199 (otherwise all default to -1), and saved camera view at 112032 (otherwise its mode defaults to -1).
+
+`TerrainManager+Data.Serialize` writes the known-length raw-height array through `EncodedArray.UShort`, then a second `EncodedArray.UShort` for nonzero block-height differences (`m_blockHeights - m_blockHeights2`) at positions whose raw height is nonzero. It then writes `m_dirtBuffer` (`i32`) and three DataSerializer objects for the terrain-tool / dirt-warning state. The reader always loads raw heights; it loads the block-height deltas from version 96 (otherwise zeroes them), `m_dirtBuffer` from 243 (otherwise defaults to 524288), and the three objects from 244 (otherwise null).
+
+`EncodedArray.Byte` and `EncodedArray.UShort` are inner array codecs, not package-wide compressors. They emit control blocks with up to 128 values; the decoder gets the total element count from the manager's preallocated array.
+
+For `Byte`, control `0x00`–`0x7F` means the next `control+1` bytes are literal values. Control `0x80`–`0xFF` repeats the previous signed byte delta `control-0x7F` times; each result is previous value plus that delta modulo 256.
+
+For `UShort`, control `0x00`–`0x3F` means the next `control+1` big-endian `u16` values are literals. Control `0x40`–`0x7F` means `control-0x3F` signed-byte adjustments to the previous delta; each adjusted delta is added to the previous value. Control `0x80`–`0xFF` repeats the previous signed 16-bit delta `control-0x7F` times. Reconstructed values wrap to 16 bits. Both codecs initialize the previous value and delta to zero. The DLL defines corresponding encoded-array helpers for signed/unsigned integers, floats, booleans, and 64-bit values; their exact codecs have not been analyzed here.
 
 ## Findings from the DLLs
 
 1. The format is a package container rather than a single raw map image: the libraries include dedicated package readers and writers, an index table, and a collection of entries.
 2. The container has a versioned header and an index layout confirmed above. The supplied corpus contains multiple versions, so a Rust reader should preserve and explicitly validate the version number.
-3. `ColossalFramework.Importers.Image` exposes `isCompressed`, `Compress`, and `Uncompress`, but this pass has not connected those methods to package-level compression. `Package.Save` copies asset payload bytes into the package; there is currently no evidence that the container applies a generic compression layer.
+3. `Package.Save` copies asset payload bytes into the package; no generic compression layer was found in the container writer. Type-3 assets contain PNGs, and specific DataSerializer array fields use delta/RLE encoding, while other per-field encodings remain possible.
 4. Entry checksums are lowercase hexadecimal MD5 hashes of the raw asset payload. `SecurityHelper.CalculateChecksum` computes MD5 and formats it as lowercase hex; the `Package.Asset` constructors call the byte-array or file overload. Recomputing hashes for all 469 entries across the 105 supplied maps matched every stored checksum.
 5. The code separates container handling (reader, writer, index, entries) from game-object serialization (`PackageSerializer`, `DataSerializer`). The type `100` metadata uses the reflected-object path; type `52` uses `DataSerializer` object framing, while the game-specific `IDataContainer` payloads remain to be mapped.
 
@@ -150,15 +183,15 @@ The first bytes of `CL Wolf Creek_Data` after its `u32` version are `FE FE 80 ..
 
 - Any version-specific changes to index fields.
 - Whether data offsets and entry sizes require additional handling for all package implementation types.
-- Whether image compression or other compression is used inside asset payloads, and how payloads are serialized.
+- The type-3 image wrapper fields and the remaining manager-specific data field sequences.
 - Semantic differences between versions 4–10.
 
 ## Next research steps
 
-1. Trace which `IDataContainer.Serialize` implementation produces the type `52` map payload and how its versions are selected.
-2. Check for compression within that data path and identify version-specific payload differences across map samples.
-3. Inspect checksum validation behavior and build a compatibility table for versions 4–10 before defining the public Rust API.
+1. Decode the remaining manager-specific `IDataContainer` payloads, beginning with network, building, and citizen data.
+2. Decode the type-3 image wrapper and confirm the shared format rules on non-map package families.
+3. Compare field-level behavior across the observed inner serializer versions before defining the public Rust API.
 
 ## Limitations of this pass
 
-No high-level .NET decompiler (`monodis`, `ilspycmd`, or `ildasm`) was found, so the reader, writer, and serializer methods were decoded from their CIL bodies and metadata with a small inspection script rather than rendered as decompiled source. The container layout was cross-checked against all 105 map files. The type `52` payload path and behavior of other package implementation types still need verification.
+No high-level .NET decompiler (`monodis`, `ilspycmd`, or `ildasm`) was found, so reader, writer, and serializer methods were decoded from CIL bodies and metadata with a small inspection script. The outer container, MD5 checksums, reflected metadata headers, texture PNG signatures, and second DataSerializer root headers were cross-checked against all 105 map files. A full field-level decoder for every simulation manager and other package implementation types remains outside the current findings.
