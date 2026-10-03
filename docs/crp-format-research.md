@@ -4,7 +4,7 @@ Status as of 2026-10-04. These notes are based on the game DLLs and samples in `
 
 ## Rust implementation status
 
-The crate currently has an initial outer-container reader. `Package::read_from` reads package versions 4–10 using the base implementation's zero data offset; `Package::read_from_with_data_offset` accepts an implementation-specific offset. It retains index order, checksum strings, unknown numeric asset types, and raw payload bytes. The reader does not yet validate checksums, decrypt non-empty author fields, decode asset payloads, or write packages. The reader has compiled, but this increment has not yet been validated against the full map corpus.
+The crate currently has an initial outer-container reader and compact writer. `Package::read_from` reads package versions 4–10 using the base implementation's zero data offset; `Package::read_from_with_data_offset` accepts an implementation-specific offset. The reader retains index order, checksum strings, unknown numeric asset types, and raw payload bytes. `Package::write_compact_to` emits assets in index order with recalculated contiguous offsets and MD5 checksums. It preserves the stored author field without decrypting or encrypting it. Asset payload decoding and checksum validation during reads are not implemented yet. The reader and writer compile, but this increment has not yet been validated against the full map corpus.
 
 ## Materials examined
 

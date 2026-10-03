@@ -4,7 +4,7 @@
 //! versions 4 through 10. Asset payloads are returned as raw bytes.
 
 use std::fmt;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 const MAGIC: &[u8; 4] = b"CRAP";
 const MIN_SUPPORTED_VERSION: u16 = 4;
@@ -264,6 +264,67 @@ impl Package {
             assets,
         })
     }
+
+    /// Writes a compact package, recalculating offsets and payload checksums.
+    ///
+    /// Assets are emitted in index order with contiguous payload ranges. The
+    /// package's format version and stored author field are preserved. This
+    /// method does not encrypt or decrypt non-empty author fields; a field read
+    /// from a package is written back as stored.
+    pub fn write_compact_to<W: Write>(&self, writer: &mut W) -> Result<(), CrpError> {
+        if !(MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&self.format_version) {
+            return Err(CrpError::UnsupportedVersion(self.format_version));
+        }
+        let asset_count =
+            i32::try_from(self.assets.len()).map_err(|_| CrpError::InvalidAssetCount)?;
+
+        let mut header = Vec::new();
+        header.write_all(MAGIC)?;
+        write_u16_le(&mut header, self.format_version)?;
+        write_binary_string(&mut header, &self.name)?;
+        write_binary_string(&mut header, &self.author_field)?;
+        write_u32_le(&mut header, self.package_version)?;
+        write_binary_string(&mut header, &self.main_asset_name)?;
+        write_i32_le(&mut header, asset_count)?;
+
+        let mut index = Vec::new();
+        let mut relative_offset = 0_u64;
+        for asset in &self.assets {
+            write_binary_string(&mut index, &asset.name)?;
+            write_binary_string(&mut index, &checksum_hex(&asset.data))?;
+            write_i32_le(&mut index, asset.asset_type)?;
+            write_i64_le(
+                &mut index,
+                i64::try_from(relative_offset)
+                    .map_err(|_| CrpError::ArithmeticOverflow("asset relative offset"))?,
+            )?;
+            write_i64_le(
+                &mut index,
+                i64::try_from(asset.data.len())
+                    .map_err(|_| CrpError::ArithmeticOverflow("asset size"))?,
+            )?;
+            relative_offset = relative_offset
+                .checked_add(
+                    u64::try_from(asset.data.len())
+                        .map_err(|_| CrpError::ArithmeticOverflow("asset size"))?,
+                )
+                .ok_or(CrpError::ArithmeticOverflow("asset relative offset"))?;
+        }
+
+        let data_start_offset = u64::try_from(header.len())
+            .ok()
+            .and_then(|header_size| header_size.checked_add(8))
+            .and_then(|header_size| header_size.checked_add(u64::try_from(index.len()).ok()?))
+            .ok_or(CrpError::ArithmeticOverflow("package data start offset"))?;
+        write_u64_le(&mut header, data_start_offset)?;
+
+        writer.write_all(&header)?;
+        writer.write_all(&index)?;
+        for asset in &self.assets {
+            writer.write_all(&asset.data)?;
+        }
+        Ok(())
+    }
 }
 
 fn read_binary_string<R: Read>(reader: &mut R) -> Result<String, CrpError> {
@@ -342,4 +403,191 @@ fn read_u64_le<R: Read>(reader: &mut R) -> Result<u64, CrpError> {
     let mut bytes = [0; 8];
     reader.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+fn write_binary_string<W: Write>(writer: &mut W, value: &str) -> Result<(), CrpError> {
+    let bytes = value.as_bytes();
+    let byte_len = u32::try_from(bytes.len())
+        .map_err(|_| CrpError::ArithmeticOverflow("string byte length"))?;
+    write_7bit_encoded_u32(writer, byte_len)?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
+fn write_7bit_encoded_u32<W: Write>(writer: &mut W, mut value: u32) -> Result<(), CrpError> {
+    while value >= 0x80 {
+        writer.write_all(&[((value as u8) & 0x7F) | 0x80])?;
+        value >>= 7;
+    }
+    writer.write_all(&[value as u8])?;
+    Ok(())
+}
+
+fn write_u16_le<W: Write>(writer: &mut W, value: u16) -> Result<(), CrpError> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_u32_le<W: Write>(writer: &mut W, value: u32) -> Result<(), CrpError> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_i32_le<W: Write>(writer: &mut W, value: i32) -> Result<(), CrpError> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_i64_le<W: Write>(writer: &mut W, value: i64) -> Result<(), CrpError> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_u64_le<W: Write>(writer: &mut W, value: u64) -> Result<(), CrpError> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn checksum_hex(data: &[u8]) -> String {
+    let digest = md5_digest(data);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(32);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0F)]));
+    }
+    output
+}
+
+fn md5_digest(data: &[u8]) -> [u8; 16] {
+    const SHIFTS: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const CONSTANTS: [u32; 64] = [
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
+        0xeb86_d391,
+    ];
+
+    let mut state = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+    let chunks = data.chunks_exact(64);
+    for chunk in chunks.clone() {
+        md5_compress(&mut state, chunk, &SHIFTS, &CONSTANTS);
+    }
+
+    let remainder = chunks.remainder();
+    let mut final_blocks = [0_u8; 128];
+    final_blocks[..remainder.len()].copy_from_slice(remainder);
+    final_blocks[remainder.len()] = 0x80;
+    let bit_length = (data.len() as u64).wrapping_mul(8).to_le_bytes();
+
+    if remainder.len() >= 56 {
+        final_blocks[120..128].copy_from_slice(&bit_length);
+        md5_compress(&mut state, &final_blocks[..64], &SHIFTS, &CONSTANTS);
+        md5_compress(&mut state, &final_blocks[64..], &SHIFTS, &CONSTANTS);
+    } else {
+        final_blocks[56..64].copy_from_slice(&bit_length);
+        md5_compress(&mut state, &final_blocks[..64], &SHIFTS, &CONSTANTS);
+    }
+
+    let mut digest = [0_u8; 16];
+    for (index, word) in state.into_iter().enumerate() {
+        let start = index * 4;
+        digest[start..start + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    digest
+}
+
+fn md5_compress(state: &mut [u32; 4], block: &[u8], shifts: &[u32; 64], constants: &[u32; 64]) {
+    let mut words = [0_u32; 16];
+    for (index, chunk) in block.chunks_exact(4).enumerate() {
+        words[index] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+
+    let [mut a, mut b, mut c, mut d] = *state;
+    for index in 0..64 {
+        let (function, word_index) = match index {
+            0..=15 => ((b & c) | (!b & d), index),
+            16..=31 => ((d & b) | (!d & c), (5 * index + 1) % 16),
+            32..=47 => (b ^ c ^ d, (3 * index + 5) % 16),
+            _ => (c ^ (b | !d), (7 * index) % 16),
+        };
+        let sum = a
+            .wrapping_add(function)
+            .wrapping_add(constants[index])
+            .wrapping_add(words[word_index]);
+        let next_b = b.wrapping_add(sum.rotate_left(shifts[index]));
+        a = d;
+        d = c;
+        c = b;
+        b = next_b;
+    }
+
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
 }
