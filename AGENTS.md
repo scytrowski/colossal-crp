@@ -53,8 +53,9 @@ Build a Rust library for reading and writing City: Skylines (2015) `.crp` files.
 - Use expected bytes, field values, and checksums derived independently from the implementation, such as game-produced samples, DLL behavior, or established algorithm test vectors.
 - For the reader, cover every supported package version and relevant version gate, valid boundary cases, unknown asset types, truncated input, invalid strings, negative values, arithmetic overflow, and out-of-bounds index or payload ranges. Malformed input tests must confirm the parser returns an error without panicking.
 - For the writer, verify exact index field order and endianness, offsets, lengths, checksums, empty and non-empty payloads, unknown asset preservation, and documented compacting behavior. Include read/write round-trips for supported versions and payload families, while also checking each side against independent expected values.
-- Keep regression fixtures for discovered format behaviors and bugs. Parse every supplied map in `data/maps/` in the corpus integration tests; when checksum logic changes, verify stored checksums against raw payloads across the corpus.
-- Keep tests deterministic and offline. Never modify the research inputs in `data/maps/` or `data/dlls/`; write generated files only to temporary locations.
+- Keep small regression fixtures cut from representative game-produced maps and spanning supported package versions. Do not commit full map files or make the default test suite depend on the local, ignored `data/maps/` directory.
+- Parse every committed CRP fixture in the default suite. When checksum logic changes, verify stored checksums against raw payloads across all committed fixtures; provide an opt-in test for a full external corpus when one is available.
+- Keep tests deterministic and offline. Never modify the research inputs in `data/maps/` or `data/dlls/`; write generated files only to temporary locations or the designated fixture directory.
 - Run `cargo test --offline` and `cargo fmt --check` before committing code changes. Report any untested behavior or unavailable coverage explicitly rather than treating a compile check as test coverage.
 
 ## Changes and reporting

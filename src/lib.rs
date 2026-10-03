@@ -638,28 +638,53 @@ mod tests {
 
     #[test]
     fn compact_writer_round_trips_metadata_and_unknown_assets() -> Result<(), CrpError> {
-        let package = sample_package();
+        for version in MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION {
+            let mut package = sample_package();
+            package.format_version = version;
+            let mut encoded = Vec::new();
+            package.write_compact_to(&mut encoded)?;
+
+            let mut cursor = Cursor::new(encoded);
+            let decoded = Package::read_from(&mut cursor)?;
+
+            assert_eq!(decoded.format_version, package.format_version);
+            assert_eq!(decoded.name, package.name);
+            assert_eq!(decoded.author_field, package.author_field);
+            assert_eq!(decoded.package_version, package.package_version);
+            assert_eq!(decoded.main_asset_name, package.main_asset_name);
+            assert_eq!(decoded.assets.len(), 2);
+            assert_eq!(decoded.assets[0].relative_offset, 0);
+            assert_eq!(decoded.assets[0].data, b"first payload");
+            assert_eq!(
+                decoded.assets[0].checksum,
+                "c027f85a8c79a1c936c3fd3119b1e0da"
+            );
+            assert_eq!(decoded.assets[1].asset_type, 712);
+            assert_eq!(decoded.assets[1].data, [0, 1, 2, 255]);
+            assert_eq!(decoded.assets[1].relative_offset, 13);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn writer_emits_expected_little_endian_index_layout() -> Result<(), CrpError> {
         let mut encoded = Vec::new();
-        package.write_compact_to(&mut encoded)?;
+        sample_package().write_compact_to(&mut encoded)?;
 
-        let mut cursor = Cursor::new(encoded);
-        let decoded = Package::read_from(&mut cursor)?;
-
-        assert_eq!(decoded.format_version, package.format_version);
-        assert_eq!(decoded.name, package.name);
-        assert_eq!(decoded.author_field, package.author_field);
-        assert_eq!(decoded.package_version, package.package_version);
-        assert_eq!(decoded.main_asset_name, package.main_asset_name);
-        assert_eq!(decoded.assets.len(), 2);
-        assert_eq!(decoded.assets[0].relative_offset, 0);
-        assert_eq!(decoded.assets[0].data, b"first payload");
-        assert_eq!(
-            decoded.assets[0].checksum,
-            "c027f85a8c79a1c936c3fd3119b1e0da"
-        );
-        assert_eq!(decoded.assets[1].asset_type, 712);
-        assert_eq!(decoded.assets[1].data, [0, 1, 2, 255]);
-        assert_eq!(decoded.assets[1].relative_offset, 13);
+        assert_eq!(&encoded[..4], b"CRAP");
+        assert_eq!(&encoded[4..6], &[6, 0]);
+        assert_eq!(&encoded[33..41], &168_u64.to_le_bytes());
+        assert_eq!(&encoded[41..49], b"\x07preview");
+        assert_eq!(&encoded[49..82], b"\x20c027f85a8c79a1c936c3fd3119b1e0da");
+        assert_eq!(&encoded[82..86], &3_i32.to_le_bytes());
+        assert_eq!(&encoded[86..94], &0_i64.to_le_bytes());
+        assert_eq!(&encoded[94..102], &13_i64.to_le_bytes());
+        assert_eq!(&encoded[102..115], b"\x0cfuture asset");
+        assert_eq!(&encoded[115..148], b"\x200416dab819887333af831f8c765ac2ae");
+        assert_eq!(&encoded[148..152], &712_i32.to_le_bytes());
+        assert_eq!(&encoded[152..160], &13_i64.to_le_bytes());
+        assert_eq!(&encoded[160..168], &4_i64.to_le_bytes());
+        assert_eq!(&encoded[168..], b"first payload\x00\x01\x02\xff");
         Ok(())
     }
 
@@ -692,31 +717,60 @@ mod tests {
     }
 
     #[test]
-    fn wolf_creek_round_trips_with_matching_payload_checksums() -> Result<(), CrpError> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
-        let mut source = File::open(path)?;
-        let original = Package::read_from(&mut source)?;
+    fn committed_map_fixtures_cover_versions_4_and_10() -> Result<(), CrpError> {
+        let fixtures = [
+            (
+                "metadata-v4.crp",
+                4,
+                "ND Island Hopping",
+                "3b51f60cc678c6d4a9608cab2c885c9a",
+            ),
+            (
+                "metadata-v10.crp",
+                10,
+                "MM Shifting Sands",
+                "ea1f16657409f0c1349488925597d5d3",
+            ),
+        ];
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
 
-        let mut encoded = Vec::new();
-        original.write_compact_to(&mut encoded)?;
-        let mut cursor = Cursor::new(encoded);
-        let rewritten = Package::read_from(&mut cursor)?;
+        for (filename, expected_version, expected_name, expected_checksum) in fixtures {
+            let path = fixture_dir.join(filename);
+            let mut source = File::open(path)?;
+            let original = Package::read_from(&mut source)?;
+            assert_eq!(original.format_version, expected_version);
+            assert_eq!(original.name, expected_name);
+            assert_eq!(original.main_asset_name, expected_name);
+            assert_eq!(original.assets.len(), 1);
+            assert_eq!(original.assets[0].asset_type, 100);
+            assert_eq!(original.assets[0].checksum, expected_checksum);
+            assert_eq!(checksum_hex(&original.assets[0].data), expected_checksum);
 
-        assert_eq!(rewritten.name, original.name);
-        assert_eq!(rewritten.main_asset_name, original.main_asset_name);
-        assert_eq!(rewritten.assets.len(), original.assets.len());
-        for (before, after) in original.assets.iter().zip(&rewritten.assets) {
-            assert_eq!(before.name, after.name);
-            assert_eq!(before.asset_type, after.asset_type);
-            assert_eq!(before.data, after.data);
-            assert_eq!(before.checksum, after.checksum);
+            let mut encoded = Vec::new();
+            original.write_compact_to(&mut encoded)?;
+            let mut cursor = Cursor::new(encoded);
+            let rewritten = Package::read_from(&mut cursor)?;
+            assert_eq!(rewritten.format_version, original.format_version);
+            assert_eq!(rewritten.name, original.name);
+            assert_eq!(rewritten.main_asset_name, original.main_asset_name);
+            assert_eq!(rewritten.assets.len(), original.assets.len());
+            assert_eq!(rewritten.assets[0].name, original.assets[0].name);
+            assert_eq!(
+                rewritten.assets[0].asset_type,
+                original.assets[0].asset_type
+            );
+            assert_eq!(rewritten.assets[0].data, original.assets[0].data);
+            assert_eq!(rewritten.assets[0].checksum, expected_checksum);
         }
         Ok(())
     }
 
     #[test]
-    fn reads_all_supplied_map_containers() -> Result<(), CrpError> {
-        let maps_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps");
+    #[ignore = "set CRP_CORPUS_DIR and run explicitly to check a local full corpus"]
+    fn validates_optional_external_map_corpus() -> Result<(), Box<dyn std::error::Error>> {
+        let maps_dir = std::env::var_os("CRP_CORPUS_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| std::io::Error::other("CRP_CORPUS_DIR is not set"))?;
         let mut paths = Vec::new();
         for entry in fs::read_dir(maps_dir)? {
             let path = entry?.path();
@@ -725,7 +779,7 @@ mod tests {
             }
         }
         paths.sort();
-        assert_eq!(paths.len(), 105, "unexpected supplied map corpus size");
+        assert!(!paths.is_empty(), "external corpus contains no .crp files");
 
         for path in paths {
             let mut file = File::open(&path)?;
