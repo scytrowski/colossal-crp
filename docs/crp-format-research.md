@@ -38,30 +38,69 @@ offset  size     observation
 
 For this name, the length prefix at byte `0x06` is `0x0d` (13 bytes). This encoding matches .NET `BinaryWriter.Write(string)`. The same kind of prefix appears for map names of different lengths; for example, `AP Asanu Beach` starts with `0x0e`.
 
-Additional fields and text-readable names or identifiers follow the package name, but their boundaries and meanings have not yet been confirmed. Strings in the sample include `Wolf Creek_SteamPreview`, `Wolf Creek_Snapshot`, and `Wolf Creek_Data`; .NET type names and PNG data also appear later. These strings should not yet be treated as a complete entry listing, or as proof that every file contains the same set of entries.
+Additional fields and text-readable names or identifiers follow the package name. Their container layout is now confirmed from IL below. Strings in the sample include `Wolf Creek_SteamPreview`, `Wolf Creek_Snapshot`, and `Wolf Creek_Data`; .NET type names and PNG data also appear later. These strings should not yet be treated as a complete entry listing, or as proof that every file contains the same set of entries.
+
+## Container index confirmed from IL
+
+The IL for `ColossalFramework.Packaging.Package.ReadIndexTable` was decoded. It confirms this read order:
+
+```text
+char[4]  package ID (`CRAP`)
+u16      package format version
+string   package name
+string   package author
+u32      package version
+string   main asset name
+i32      asset count
+i64      base data offset
+```
+
+Each index record is then read as:
+
+```text
+string   asset name
+string   asset checksum
+i32      asset type
+i64      asset offset, relative to the package data area
+i64      asset size
+```
+
+For each entry the reader computes its stream offset as the record's relative offset plus the base data offset plus `PackageImplementation.dataOffset`. The base `PackageImplementation` returns zero for `dataOffset`; a packaged implementation has a separate override. The read size is converted to `i32` when the in-memory asset is constructed, despite being stored as `i64` in the index.
+
+The record's second string is passed to the `Asset` constructor as its checksum. The sample uses 32-character hexadecimal values; their specific checksum algorithm has not yet been verified.
+
+This layout matches `CL Wolf Creek.crp` exactly. Its header values are version `6`, package name `CL Wolf Creek`, empty author, package version `0`, main asset `CL Wolf Creek`, four records, and base data offset `337` (`0x151`). The four records are:
+
+| Asset name | Type value | Relative offset | Size |
+| --- | ---: | ---: | ---: |
+| `Wolf Creek_SteamPreview` | 3 | 0 | 286,048 |
+| `Wolf Creek_Snapshot` | 3 | 286,048 | 102,218 |
+| `Wolf Creek_Data` | 52 | 388,266 | 4,215,002 |
+| `CL Wolf Creek` | 100 | 4,603,268 | 2,908 |
+
+The index ends at offset `0x151`, matching the base data offset. The final entry ends exactly at the file size (4,606,513 bytes). Asset type numeric meanings and whether offsets are identical in other package implementations remain to be checked.
 
 ## Findings from the DLLs
 
 1. The format is a package container rather than a single raw map image: the libraries include dedicated package readers and writers, an index table, and a collection of entries.
-2. The container has a versioned header. The supplied corpus contains multiple versions, so a Rust reader should preserve and explicitly validate the version number.
+2. The container has a versioned header and an index layout confirmed above. The supplied corpus contains multiple versions, so a Rust reader should preserve and explicitly validate the version number.
 3. The package code includes the concept of compressed data (`isCompressed`, `Compress`, `Uncompress`). The flag layout, algorithm, compression scope, and length encoding still need confirmation from IL or by correlating multiple samples.
 4. The class names suggest a separation between container handling (reader, writer, index, entries) and game-object serialization (`PackageSerializer`, `DataSerializer`). It is useful to investigate these layers separately: first extract entries, then decode map resources.
 
 ## Open questions
 
-- The complete order and types of header fields after the package name.
-- The index entry structure: name or path, type, offset, compressed and uncompressed lengths, flags, and any checksum.
-- The location of the index table (beginning, end, or elsewhere) and whether there can be multiple tables.
+- The meanings of asset type values, checksum algorithm, and any version-specific changes to index fields.
+- Whether data offsets and entry sizes require additional handling for all package implementation types.
 - Compression details and payload type serialization.
 - Semantic differences between versions 4–10.
 
 ## Next research steps
 
-1. Inspect the IL for `PackageReader`, `PackageWriter`, and `ReadIndexTable` in `ColossalManaged.dll`, including class fields and method signatures.
-2. Trace related call paths in `Assembly-CSharp.dll` to distinguish container writing from map serialization.
+1. Decode `PackageWriter` and compare its field and entry order to the reader implementation.
+2. Map asset type values and inspect the serializer used by type `52` (the map data entry in this sample).
 3. Decode headers and indexes from files of several versions; validate offsets by checking payload signatures (such as PNG) and file boundaries.
-4. Build a compatibility table for versions 4–10 before defining the public Rust API.
+4. Inspect compression and payload serialization, then build a compatibility table for versions 4–10 before defining the public Rust API.
 
 ## Limitations of this pass
 
-The environment provided the DLLs and tools for reading strings from binaries, but no local .NET decompiler (`monodis`, `ilspycmd`, or `ildasm`) was found. CLI metadata inspection can identify classes and methods, but it does not replace IL analysis. The file-prefix observations above were checked directly against samples; the remaining structural claims are hypotheses for further verification.
+No high-level .NET decompiler (`monodis`, `ilspycmd`, or `ildasm`) was found, so the index method was decoded from its CIL body and metadata with a small inspection script rather than rendered as decompiled source. The listed field order and offset calculation are confirmed by the method body and were cross-checked against one sample. Other package versions and the writer path still need verification.
