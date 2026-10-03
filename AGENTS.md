@@ -46,6 +46,17 @@ Build a Rust library for reading and writing City: Skylines (2015) `.crp` files.
 - Document public types and methods, including supported versions, failure behavior, and whether read/write operations preserve unknown data.
 - Keep code formatted and free of avoidable compiler warnings. Prefer fixing the underlying issue over suppressing a warning.
 
+## Testing
+
+- Treat tests as a required part of implementation, not optional follow-up work. Every code change must add or update tests for the changed behavior. Every bug fix must include a regression test that fails before the fix and passes after it.
+- Test reader and writer behavior independently as well as together. A round-trip alone is insufficient because the reader and writer can share the same mistake.
+- Use expected bytes, field values, and checksums derived independently from the implementation, such as game-produced samples, DLL behavior, or established algorithm test vectors.
+- For the reader, cover every supported package version and relevant version gate, valid boundary cases, unknown asset types, truncated input, invalid strings, negative values, arithmetic overflow, and out-of-bounds index or payload ranges. Malformed input tests must confirm the parser returns an error without panicking.
+- For the writer, verify exact index field order and endianness, offsets, lengths, checksums, empty and non-empty payloads, unknown asset preservation, and documented compacting behavior. Include read/write round-trips for supported versions and payload families, while also checking each side against independent expected values.
+- Keep regression fixtures for discovered format behaviors and bugs. Parse every supplied map in `data/maps/` in the corpus integration tests; when checksum logic changes, verify stored checksums against raw payloads across the corpus.
+- Keep tests deterministic and offline. Never modify the research inputs in `data/maps/` or `data/dlls/`; write generated files only to temporary locations.
+- Run `cargo test --offline` and `cargo fmt --check` before committing code changes. Report any untested behavior or unavailable coverage explicitly rather than treating a compile check as test coverage.
+
 ## Changes and reporting
 
 - Keep changes focused and update relevant English documentation alongside code when format behavior changes.

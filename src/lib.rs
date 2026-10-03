@@ -735,6 +735,15 @@ mod tests {
                 "{} has no assets",
                 path.display()
             );
+            for asset in &package.assets {
+                assert_eq!(
+                    checksum_hex(&asset.data),
+                    asset.checksum,
+                    "checksum mismatch for asset {:?} in {}",
+                    asset.name,
+                    path.display()
+                );
+            }
         }
         Ok(())
     }
