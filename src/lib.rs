@@ -6,6 +6,13 @@
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
+mod asset_io;
+mod metadata;
+mod texture;
+
+pub use metadata::{MapMetaData, ModInfo};
+pub use texture::TextureAsset;
+
 const MAGIC: &[u8; 4] = b"CRAP";
 const MIN_SUPPORTED_VERSION: u16 = 4;
 const MAX_SUPPORTED_VERSION: u16 = 10;
@@ -85,6 +92,18 @@ pub enum CrpError {
         expected: String,
         actual: String,
     },
+    /// An asset-specific decoder was called for a different asset type.
+    AssetTypeMismatch {
+        name: String,
+        expected: i32,
+        actual: i32,
+    },
+    /// An asset payload is malformed or uses an unsupported field schema.
+    InvalidAssetPayload {
+        name: String,
+        offset: usize,
+        reason: String,
+    },
     /// An offset or size calculation overflowed.
     ArithmeticOverflow(&'static str),
     /// An index count cannot fit in the remaining declared index area.
@@ -124,8 +143,7 @@ impl fmt::Display for CrpError {
                 file_size,
             } => write!(
                 f,
-                "asset {name:?} range {offset}..{} exceeds file size {file_size}",
-                offset.saturating_add(*size)
+                "asset {name:?} range starts at {offset} with size {size}, beyond file size {file_size}"
             ),
             Self::ChecksumMismatch {
                 name,
@@ -134,6 +152,22 @@ impl fmt::Display for CrpError {
             } => write!(
                 f,
                 "asset {name:?} checksum mismatch: index has {expected}, payload has {actual}"
+            ),
+            Self::AssetTypeMismatch {
+                name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "asset {name:?} has type {actual}; decoder requires type {expected}"
+            ),
+            Self::InvalidAssetPayload {
+                name,
+                offset,
+                reason,
+            } => write!(
+                f,
+                "asset {name:?} has an invalid payload at byte {offset}: {reason}"
             ),
             Self::ArithmeticOverflow(context) => {
                 write!(f, "integer overflow while calculating {context}")
@@ -213,7 +247,7 @@ impl Package {
                 data_start: data_start_offset,
             });
         }
-        let index_bytes_available = data_start_offset.saturating_sub(index_start);
+        let index_bytes_available = data_start_offset - index_start;
         let asset_count =
             usize::try_from(asset_count_signed).map_err(|_| CrpError::InvalidAssetCount)?;
         let min_index_bytes = u64::try_from(asset_count)
@@ -466,10 +500,14 @@ fn write_binary_string<W: Write>(writer: &mut W, value: &str) -> Result<(), CrpE
 
 fn write_7bit_encoded_u32<W: Write>(writer: &mut W, mut value: u32) -> Result<(), CrpError> {
     while value >= 0x80 {
-        writer.write_all(&[((value as u8) & 0x7F) | 0x80])?;
+        let low_bits = u8::try_from(value & 0x7f)
+            .map_err(|_| CrpError::ArithmeticOverflow("string length encoding"))?;
+        writer.write_all(&[low_bits | 0x80])?;
         value >>= 7;
     }
-    writer.write_all(&[value as u8])?;
+    let final_byte =
+        u8::try_from(value).map_err(|_| CrpError::ArithmeticOverflow("string length encoding"))?;
+    writer.write_all(&[final_byte])?;
     Ok(())
 }
 
@@ -592,6 +630,8 @@ fn md5_digest(data: &[u8]) -> [u8; 16] {
     let mut final_blocks = [0_u8; 128];
     final_blocks[..remainder.len()].copy_from_slice(remainder);
     final_blocks[remainder.len()] = 0x80;
+    // Rust targets supported by this crate have usize no wider than u64; MD5
+    // defines its bit length modulo 2^64.
     let bit_length = (data.len() as u64).wrapping_mul(8).to_le_bytes();
 
     if remainder.len() >= 56 {
@@ -755,7 +795,8 @@ mod tests {
         read_binary_string(&mut cursor)?;
         read_i32_le(&mut cursor)?;
         read_i64_le(&mut cursor)?;
-        let size_offset = cursor.position() as usize;
+        let size_offset = usize::try_from(cursor.position())
+            .map_err(|_| CrpError::ArithmeticOverflow("test cursor position"))?;
         encoded[size_offset..size_offset + 8].copy_from_slice(&i64::MAX.to_le_bytes());
 
         let mut cursor = Cursor::new(encoded);
@@ -937,6 +978,137 @@ mod tests {
     }
 
     #[test]
+    fn map_metadata_fixtures_decode_and_reencode_exactly() -> Result<(), CrpError> {
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let cases = [
+            (
+                "metadata-v4.crp",
+                "ND Island Hopping",
+                "The Archipelago",
+                Some(("UnlimitedMoney", -1)),
+                1153,
+            ),
+            (
+                "metadata-v10.crp",
+                "MM Shifting Sands",
+                "Shifting Sands",
+                None,
+                0,
+            ),
+        ];
+
+        for (filename, object_name, map_name, expected_mod, trailing_len) in cases {
+            let mut file = File::open(fixture_dir.join(filename))?;
+            let package = Package::read_from(&mut file)?;
+            let asset = &package.assets[0];
+            let metadata = MapMetaData::decode(asset)?;
+
+            assert_eq!(metadata.object_name, object_name);
+            assert_eq!(metadata.builtin, Some(true));
+            assert_eq!(metadata.environment.as_deref(), Some("Tropical"));
+            assert_eq!(metadata.map_theme_ref, None);
+            assert_eq!(metadata.map_name.as_deref(), Some(map_name));
+            assert_eq!(
+                metadata.mods.as_ref().map(Vec::len),
+                Some(usize::from(expected_mod.is_some()))
+            );
+            if let Some((mod_name, file_id)) = expected_mod {
+                let mods = metadata
+                    .mods
+                    .as_ref()
+                    .ok_or_else(|| CrpError::InvalidAssetPayload {
+                        name: asset.name.clone(),
+                        offset: 0,
+                        reason: "expected mod array was absent".to_owned(),
+                    })?;
+                assert_eq!(mods[0].name, mod_name);
+                assert_eq!(mods[0].published_file_id, file_id);
+            }
+            assert_eq!(metadata.trailing_bytes.len(), trailing_len);
+            assert_eq!(metadata.encode()?, asset.data);
+
+            if filename == "metadata-v10.crp" {
+                let mut edited = metadata.clone();
+                edited.map_name = Some("Edited Map Name".to_owned());
+                let mut edited_asset = asset.clone();
+                edited_asset.data = edited.encode()?;
+                let decoded_edit = MapMetaData::decode(&edited_asset)?;
+                assert_eq!(decoded_edit.map_name.as_deref(), Some("Edited Map Name"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_decoder_rejects_truncated_field_data() -> Result<(), CrpError> {
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut file = File::open(fixture_dir.join("metadata-v10.crp"))?;
+        let package = Package::read_from(&mut file)?;
+        let mut asset = package.assets[0].clone();
+        asset.data.pop();
+
+        assert!(matches!(
+            MapMetaData::decode(&asset),
+            Err(CrpError::InvalidAssetPayload { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn texture_fixture_decodes_and_round_trips_across_version_gate() -> Result<(), CrpError> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/texture-v6.crp");
+        let mut file = File::open(path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = &package.assets[0];
+        let texture = TextureAsset::decode(asset, package.format_version)?;
+
+        assert_eq!(texture.name, "Wolf Creek_Snapshot");
+        assert!(!texture.linear);
+        assert_eq!(texture.aniso_level, 1);
+        assert!(texture.image_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(texture.encode(6)?, asset.data);
+
+        let mut edited = texture.clone();
+        edited.name = "Edited Texture".to_owned();
+        edited.linear = true;
+        edited.aniso_level = 4;
+        let mut edited_asset = asset.clone();
+        edited_asset.data = edited.encode(6)?;
+        let decoded_edit = TextureAsset::decode(&edited_asset, 6)?;
+        assert_eq!(decoded_edit.name, "Edited Texture");
+        assert!(decoded_edit.linear);
+        assert_eq!(decoded_edit.aniso_level, 4);
+
+        let legacy_payload = texture.encode(5)?;
+        let mut legacy_asset = asset.clone();
+        legacy_asset.data = legacy_payload;
+        let legacy_texture = TextureAsset::decode(&legacy_asset, 5)?;
+        assert_eq!(legacy_texture.aniso_level, 1);
+        assert_eq!(legacy_texture.image_bytes, texture.image_bytes);
+        assert_eq!(legacy_texture.encode(5)?, legacy_asset.data);
+        Ok(())
+    }
+
+    #[test]
+    fn texture_decoder_rejects_incorrect_image_length() -> Result<(), CrpError> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/texture-v6.crp");
+        let mut file = File::open(path)?;
+        let package = Package::read_from(&mut file)?;
+        let original = &package.assets[0];
+        let texture = TextureAsset::decode(original, package.format_version)?;
+        let mut malformed = original.clone();
+        malformed.data = texture.encode(package.format_version)?;
+        let length_offset = malformed.data.len() - texture.image_bytes.len() - 4;
+        malformed.data[length_offset..length_offset + 4].copy_from_slice(&i32::MAX.to_le_bytes());
+
+        assert!(matches!(
+            TextureAsset::decode(&malformed, package.format_version),
+            Err(CrpError::InvalidAssetPayload { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "set CRP_CORPUS_DIR and run explicitly to check a local full corpus"]
     fn validates_optional_external_map_corpus() -> Result<(), Box<dyn std::error::Error>> {
         let maps_dir = std::env::var_os("CRP_CORPUS_DIR")
@@ -968,6 +1140,29 @@ mod tests {
                     asset.name,
                     path.display()
                 );
+                match asset.asset_type {
+                    3 => {
+                        let texture = TextureAsset::decode(asset, package.format_version)?;
+                        assert_eq!(
+                            texture.encode(package.format_version)?,
+                            asset.data,
+                            "texture round-trip mismatch for {:?} in {}",
+                            asset.name,
+                            path.display()
+                        );
+                    }
+                    100 => {
+                        let metadata = MapMetaData::decode(asset)?;
+                        assert_eq!(
+                            metadata.encode()?,
+                            asset.data,
+                            "metadata round-trip mismatch for {:?} in {}",
+                            asset.name,
+                            path.display()
+                        );
+                    }
+                    _ => {}
+                }
             }
         }
         Ok(())

@@ -4,7 +4,11 @@ Status as of 2026-10-04. These notes are based on the game DLLs and samples in `
 
 ## Rust implementation status
 
-The crate currently has an initial outer-container reader and compact writer. `Package::read_from` reads package versions 4–10 using the base implementation's zero data offset; `Package::read_from_with_data_offset` accepts an implementation-specific offset. The reader retains index order, checksum strings, unknown numeric asset types, and raw payload bytes, and rejects payloads whose MD5 does not match the index. `Package::write_compact_to` emits assets in index order with recalculated contiguous offsets and MD5 checksums. It preserves the stored author field without decrypting or encrypting it. Asset payload decoding is not implemented yet. The default `cargo test --offline` suite uses two small committed metadata-asset fixtures cut from game maps (package versions 4 and 10). It covers known MD5 vectors, synthetic round-trips for versions 4–10, fixture round-trips and checksums, malformed strings, truncated files, negative counts/ranges, invalid data starts, offset overflow, checksum mismatch, and the writer's expected byte-level index layout. An ignored test can validate every package and stored asset checksum in a full external corpus when `CRP_CORPUS_DIR` is set; full map files are not required by or included in the default test suite.
+The crate has an outer-container reader and compact writer. `Package::read_from` reads package versions 4–10 using the base implementation's zero data offset; `Package::read_from_with_data_offset` accepts an implementation-specific offset. The reader retains index order, checksum strings, unknown numeric asset types, and raw payload bytes, and rejects payloads whose MD5 does not match the index. `Package::write_compact_to` emits assets in index order with recalculated contiguous offsets and MD5 checksums. It preserves the stored author field without decrypting or encrypting it.
+
+`MapMetaData::decode` and `encode` support the 25-field reflected type-100 `MapMetaData` schema, including mod entries and trailing bytes. Other reflected metadata runtime types remain raw. `TextureAsset::decode` and `encode` support type-3 image wrappers, including the outer-version-6 anisotropic-level gate. Image bytes remain opaque and are preserved.
+
+The default `cargo test --offline` suite uses small committed fixtures cut from game maps, covering metadata from package versions 4 and 10 and a texture from version 6. It includes MD5 vectors, synthetic round-trips for outer versions 4–10, malformed inputs, typed metadata and texture round-trips, and exact writer index bytes. An ignored test can be run with `CRP_CORPUS_DIR` to parse and checksum a full external corpus and round-trip every type-3 texture and type-100 metadata asset. In the currently available 105-map corpus, that opt-in check passed for all 237 textures and 104 type-100 metadata assets. Full map files are not required by or included in the default test suite.
 
 ## Materials examined
 
@@ -127,6 +131,8 @@ Each reflected field begins with a null marker. A non-null field then stores its
 
 The 25 `MapMetaData` fields in `CL Wolf Creek` were parsed to the end of the 2,908-byte entry. Values include `builtin=true`, `environment="North"`, `mapThemeRef=null`, `mapName="Wolf Creek"`, timestamp `2019-01-30T13:02:49.7692598+02:00`, image and preview checksums `1419a823a786f548fac710b6bde981b5` and `f52b6e1764cf54d1ed79295494e8ed0f`, `mods=[]`, and the inherited `assetRef` checksum `3bb3661184961300c39107046eea3e0d` (the `_Data` entry). Remaining fields are the published hash, buildable area, resource quantities, and route counts.
 
+The implemented type-100 codec handles this field order: `builtin` (Boolean), `environment` (String), `mapThemeRef` (asset reference), `mapName` (String), `timeStamp` (DateTime round-trip string), `imageRef` and `steamPreviewRef` (asset references), `publishedHash` and `buildableArea` (`i32`), `maxResourceAmount` (`f32`), five resource amounts (`u32`), eight route counts (`i32`), `mods` (`ModInfo[]`), and inherited `assetRef` (asset reference). An asset reference's serialized value is its checksum string. `mods` is an `i32` count followed by each mod name as a BinaryWriter string and its published file ID as `i64`. Null fields retain their position in the 25-field layout and store only the null marker. Some version-4 metadata payloads have zero padding after the final field; the codec preserves trailing bytes so decode/encode reproduces those payloads exactly.
+
 Across the corpus, the reflected metadata headers group as follows:
 
 | Outer type | Count | Runtime type | Top-level field count |
@@ -139,6 +145,8 @@ Across the corpus, the reflected metadata headers group as follows:
 The type-107 sample is an observed mismatch: the DLL's `UserAssetType` constants label 107 as `MapThemeMapMetaData`, but the entry payload advertises `SystemMapMetaData`. Preserve the outer type and inner runtime type independently when reading.
 
 Type-3 texture entries use a dedicated texture reader rather than the generic reflected field-count form. The entry stores the non-null marker and runtime type string, then the texture name, a `linear` boolean, an `i32 anisoLevel` for outer package versions 6 and newer (older versions default it to 1), an `i32` byte count, and that many image bytes. The `CL Wolf Creek` textures have `linear=false`, `anisoLevel=1`, and PNG image data. This sequence was checked across all 237 type-3 entries: every byte count exactly matches the remaining payload, and every image buffer starts with the PNG signature `89 50 4E 47 0D 0A 1A 0A`.
+
+The Rust type-3 codec preserves the assembly-qualified runtime type and image bytes. Its encode/decode path was round-tripped against all 237 type-3 payloads in the external 105-map corpus, including the pre-version-6 `anisoLevel` gate.
 
 ## Type-52 map data payloads
 
