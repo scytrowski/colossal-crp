@@ -9,10 +9,12 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 mod asset_io;
 mod data_serializer;
 mod metadata;
+mod simulation_metadata;
 mod texture;
 
 pub use data_serializer::DataSerializerStream;
 pub use metadata::{MapMetaData, ModInfo};
+pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use texture::TextureAsset;
 
 const MAGIC: &[u8; 4] = b"CRAP";
@@ -735,9 +737,9 @@ mod tests {
             .join("tests/fixtures/simulation-metadata-v6.bin");
         let bytes = fs::read(fixture_path)?;
         let stream = DataSerializerStream::decode(&bytes)?;
-        assert_eq!(stream.format_version, 0x0001_b584);
+        assert_eq!(stream.format_version(), 0x0001_b584);
         assert_eq!(
-            stream.root_type,
+            stream.root_type(),
             "SimulationMetaData, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
         );
         assert_eq!(stream.encode(), bytes);
@@ -751,9 +753,9 @@ mod tests {
         assert_eq!(decoded_compact.root_type, "AB");
         assert_eq!(
             DataSerializerStream::from_parts(
-                decoded_compact.format_version,
-                decoded_compact.root_type,
-                decoded_compact.root_data,
+                decoded_compact.format_version(),
+                decoded_compact.root_type().to_owned(),
+                decoded_compact.root_data().to_vec(),
             )?
             .encode(),
             compact
@@ -780,6 +782,136 @@ mod tests {
         ] {
             assert!(DataSerializerStream::decode(bytes).is_err());
         }
+    }
+
+    #[test]
+    fn simulation_metadata_decodes_and_reencodes_game_stream_exactly() -> Result<(), CrpError> {
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/simulation-metadata-v6.bin");
+        let bytes = fs::read(fixture_path)?;
+        let (metadata, consumed) = SimulationMetaData::decode_from(&bytes)?;
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            metadata.game_instance_identifier.as_deref(),
+            Some("7a8bf7ba-d1dc-45ed-b96b-93e75f9c7130")
+        );
+        assert_eq!(metadata.environment.as_deref(), Some("North"));
+        assert_eq!(metadata.scenario_asset, None);
+        assert_eq!(metadata.scenario_name, None);
+        assert_eq!(metadata.encode()?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn simulation_metadata_reports_first_stream_boundary_in_combined_data() -> Result<(), CrpError>
+    {
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/simulation-metadata-v6.bin");
+        let metadata_stream = fs::read(fixture_path)?;
+        let mut combined = metadata_stream.clone();
+        combined.extend_from_slice(&[0, 1, 0xb5, 0x84, 0xfe, 0xfe]);
+        let (metadata, consumed) = SimulationMetaData::decode_from(&combined)?;
+        assert_eq!(consumed, metadata_stream.len());
+        assert_eq!(&combined[consumed..], &[0, 1, 0xb5, 0x84, 0xfe, 0xfe]);
+        assert_eq!(metadata.encode()?, metadata_stream);
+        Ok(())
+    }
+
+    #[test]
+    fn simulation_metadata_respects_legacy_version_gates() -> Result<(), CrpError> {
+        let version = 194;
+        let fields = [
+            0xff, 0xff, 0xa5, 0x5a, // nullable strings and raw boolean bytes
+            1, 2, 3, 4, 5, 6, 7, 8, // current DateTime ticks
+            0x11, 0x22, 0x33, 0x44, // save application version
+            0x55, 0x66, 0x77, 0x88, // data format version
+        ];
+        let stream = DataSerializerStream::from_parts(
+            version,
+            "SimulationMetaData, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null".to_owned(),
+            fields.to_vec(),
+        )?;
+        let encoded = stream.encode();
+        let (metadata, consumed) = SimulationMetaData::decode_from(&encoded)?;
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(metadata.game_instance_identifier, None);
+        assert_eq!(metadata.environment, None);
+        assert_eq!(metadata.scenario_asset, None);
+        assert_eq!(metadata.scenario_name, None);
+        assert_eq!(metadata.starting_datetime_ticks, None);
+        assert_eq!(metadata.invert_traffic, 0xa5);
+        assert_eq!(metadata.disable_achievements, Some(0x5a));
+        assert_eq!(metadata.current_datetime_ticks, Some(0x0102_0304_0506_0708));
+        assert_eq!(metadata.current_day_hour_bits, None);
+        assert_eq!(metadata.new_map_app_version, None);
+        assert_eq!(metadata.save_app_version, Some(0x1122_3344));
+        assert_eq!(metadata.data_format_version, 0x5566_7788);
+        assert_eq!(metadata.encode()?, encoded);
+        Ok(())
+    }
+
+    #[test]
+    fn simulation_metadata_handles_midrange_and_109000_gates() -> Result<(), CrpError> {
+        let fields = [
+            0xff, 0xff, 0xff, 0xff, // instance, environment, scenario asset, scenario name
+            0, 1, // scenario outcomes
+            0, 0, 0, 0, // empty mod override map
+            2, 3, // traffic and achievements flags
+            1, 2, 3, 4, 5, 6, 7, 8, // current DateTime ticks
+            0x41, 0x40, 0, 0, // day-hour 12.0
+            0, 0, 0, 9, // new-map app version
+            0, 0, 0, 10, // new-game app version
+            0, 0, 0, 11, // save app version
+            0, 0, 0, 12, // data format version
+        ];
+        for version in [300, 109_000] {
+            let stream = DataSerializerStream::from_parts(
+                version,
+                "SimulationMetaData, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null".to_owned(),
+                fields.to_vec(),
+            )?;
+            let encoded = stream.encode();
+            let (metadata, consumed) = SimulationMetaData::decode_from(&encoded)?;
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(metadata.scenario_asset, None);
+            assert_eq!(metadata.scenario_name, None);
+            assert_eq!(metadata.scenario_won, 0);
+            assert_eq!(metadata.scenario_failed, 1);
+            assert_eq!(metadata.starting_datetime_ticks, None);
+            assert_eq!(metadata.mod_override.len(), 0);
+            assert_eq!(metadata.current_day_hour_bits, Some(0x4140_0000));
+            assert_eq!(metadata.new_map_app_version, Some(9));
+            assert_eq!(metadata.save_app_version, Some(11));
+            assert_eq!(metadata.data_format_version, 12);
+            assert_eq!(metadata.encode()?, encoded);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn simulation_metadata_rejects_wrong_root_and_truncated_fields() -> Result<(), CrpError> {
+        let root = DataSerializerStream::from_parts(0x1_b584, "WrongRoot".to_owned(), vec![])?;
+        assert!(SimulationMetaData::decode_from(&root.encode()).is_err());
+
+        let truncated = DataSerializerStream::from_parts(
+            0x1_b584,
+            "SimulationMetaData, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null".to_owned(),
+            vec![0xff],
+        )?;
+        assert!(SimulationMetaData::decode_from(&truncated.encode()).is_err());
+
+        let mut malformed_fields = vec![0xff, 0xff, 0xff, 0xff];
+        malformed_fields.extend_from_slice(&[0, 0]);
+        malformed_fields.extend_from_slice(&[0; 8]);
+        malformed_fields.push(0xff);
+        malformed_fields.extend_from_slice(&(-1_i32).to_be_bytes());
+        let malformed = DataSerializerStream::from_parts(
+            0x1_b584,
+            "SimulationMetaData, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null".to_owned(),
+            malformed_fields,
+        )?;
+        assert!(SimulationMetaData::decode_from(&malformed.encode()).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1180,6 +1312,7 @@ mod tests {
         paths.sort();
         assert!(!paths.is_empty(), "external corpus contains no .crp files");
 
+        let mut simulation_metadata_count = 0;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -1217,10 +1350,22 @@ mod tests {
                             path.display()
                         );
                     }
+                    52 => {
+                        let (metadata, consumed) = SimulationMetaData::decode_from(&asset.data)?;
+                        assert_eq!(
+                            metadata.encode()?,
+                            asset.data[..consumed],
+                            "simulation metadata round-trip mismatch for {:?} in {}",
+                            asset.name,
+                            path.display()
+                        );
+                        simulation_metadata_count += 1;
+                    }
                     _ => {}
                 }
             }
         }
+        assert!(simulation_metadata_count > 0);
         Ok(())
     }
 }

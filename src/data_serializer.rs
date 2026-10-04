@@ -14,15 +14,37 @@ const MAX_STRING_CHARS: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataSerializerStream {
     /// The inner DataSerializer format version, independent of package version.
-    pub format_version: u32,
+    pub(crate) format_version: u32,
     /// Assembly-qualified type name of the root object.
-    pub root_type: String,
+    pub(crate) root_type: String,
     /// Opaque serialized fields following the root object's type header.
-    pub root_data: Vec<u8>,
+    pub(crate) root_data: Vec<u8>,
+    /// Byte length through the root type header.
+    pub(crate) header_len: usize,
     bytes: Vec<u8>,
 }
 
 impl DataSerializerStream {
+    /// Returns this stream's inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns the assembly-qualified type name of the root object.
+    pub fn root_type(&self) -> &str {
+        &self.root_type
+    }
+
+    /// Returns the opaque bytes following the root type header.
+    pub fn root_data(&self) -> &[u8] {
+        &self.root_data
+    }
+
+    /// Returns the byte length through the root type header.
+    pub fn header_len(&self) -> usize {
+        self.header_len
+    }
+
     /// Reads the version and new-root type header of one isolated stream.
     ///
     /// The remaining object graph is retained verbatim because manager and
@@ -45,6 +67,7 @@ impl DataSerializerStream {
             format_version,
             root_type,
             root_data,
+            header_len: reader.offset,
             bytes: bytes.to_vec(),
         })
     }
@@ -62,11 +85,13 @@ impl DataSerializerStream {
         let mut bytes = format_version.to_be_bytes().to_vec();
         bytes.extend_from_slice(&[NEW_OBJECT_MARKER, NEW_OBJECT_MARKER]);
         write_unique_string(&mut bytes, &root_type)?;
+        let header_len = bytes.len();
         bytes.extend_from_slice(&root_data);
         Ok(Self {
             format_version,
             root_type,
             root_data,
+            header_len,
             bytes,
         })
     }
@@ -77,17 +102,17 @@ impl DataSerializerStream {
     }
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     offset: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 
-    fn invalid(&self, reason: impl Into<String>) -> CrpError {
+    pub(crate) fn invalid(&self, reason: impl Into<String>) -> CrpError {
         CrpError::InvalidAssetPayload {
             name: "DataSerializer stream".to_owned(),
             offset: self.offset,
@@ -95,7 +120,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn read_bytes(&mut self, count: usize) -> Result<&'a [u8], CrpError> {
+    pub(crate) fn read_bytes(&mut self, count: usize) -> Result<&'a [u8], CrpError> {
         let end = self
             .offset
             .checked_add(count)
@@ -108,16 +133,21 @@ impl<'a> Reader<'a> {
         Ok(bytes)
     }
 
-    fn read_u8(&mut self) -> Result<u8, CrpError> {
+    pub(crate) fn read_u8(&mut self) -> Result<u8, CrpError> {
         Ok(self.read_bytes(1)?[0])
     }
 
-    fn read_u32_be(&mut self) -> Result<u32, CrpError> {
+    pub(crate) fn read_u32_be(&mut self) -> Result<u32, CrpError> {
         let bytes = self.read_bytes(4)?;
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    fn read_unique_string(&mut self) -> Result<Option<String>, CrpError> {
+    pub(crate) fn read_i32_be(&mut self) -> Result<i32, CrpError> {
+        let bytes = self.read_bytes(4)?;
+        Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    pub(crate) fn read_unique_string(&mut self) -> Result<Option<String>, CrpError> {
         let first = self.read_u8()?;
         if first == NULL_MARKER {
             return Ok(None);
@@ -157,9 +187,17 @@ impl<'a> Reader<'a> {
                 .map_err(|_| self.invalid("wide string contains invalid UTF-16"))
         }
     }
+
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
 }
 
-fn write_unique_string(output: &mut Vec<u8>, value: &str) -> Result<(), CrpError> {
+pub(crate) fn write_unique_string(output: &mut Vec<u8>, value: &str) -> Result<(), CrpError> {
     let compact = value.chars().all(|character| u32::from(character) < 256);
     let units = if compact {
         value
