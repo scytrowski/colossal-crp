@@ -137,6 +137,10 @@ impl<'a> Reader<'a> {
         Ok(self.read_bytes(1)?[0])
     }
 
+    pub(crate) fn peek_u8(&self) -> Option<u8> {
+        self.bytes.get(self.offset).copied()
+    }
+
     pub(crate) fn read_u32_be(&mut self) -> Result<u32, CrpError> {
         let bytes = self.read_bytes(4)?;
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
@@ -195,6 +199,14 @@ impl<'a> Reader<'a> {
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.offset
     }
+
+    pub(crate) fn consumed_bytes(&self) -> &'a [u8] {
+        &self.bytes[..self.offset]
+    }
+
+    pub(crate) fn remaining_bytes(&self) -> &'a [u8] {
+        &self.bytes[self.offset..]
+    }
 }
 
 pub(crate) fn write_unique_string(output: &mut Vec<u8>, value: &str) -> Result<(), CrpError> {
@@ -245,5 +257,20 @@ pub(crate) fn write_unique_string(output: &mut Vec<u8>, value: &str) -> Result<(
             previous = unit;
         }
     }
+    Ok(())
+}
+
+pub(crate) fn write_u24_be(output: &mut Vec<u8>, value: u32) -> Result<(), CrpError> {
+    if value >= 0xff_0000 {
+        return Err(CrpError::ArithmeticOverflow("DataSerializer 24-bit count"));
+    }
+    output.extend_from_slice(&[
+        u8::try_from(value >> 16)
+            .map_err(|_| CrpError::ArithmeticOverflow("DataSerializer 24-bit count"))?,
+        u8::try_from((value >> 8) & 0xff)
+            .map_err(|_| CrpError::ArithmeticOverflow("DataSerializer 24-bit count"))?,
+        u8::try_from(value & 0xff)
+            .map_err(|_| CrpError::ArithmeticOverflow("DataSerializer 24-bit count"))?,
+    ]);
     Ok(())
 }

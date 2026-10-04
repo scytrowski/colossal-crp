@@ -9,11 +9,15 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 mod asset_io;
 mod data_serializer;
 mod metadata;
+mod simulation_manager_data;
 mod simulation_metadata;
 mod texture;
 
 pub use data_serializer::DataSerializerStream;
 pub use metadata::{MapMetaData, ModInfo};
+pub use simulation_manager_data::{
+    ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
+};
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use texture::TextureAsset;
 
@@ -915,6 +919,54 @@ mod tests {
     }
 
     #[test]
+    fn simulation_manager_root_fixture_decodes_and_reencodes_exactly() -> Result<(), CrpError> {
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/simulation-manager-data-v6-root.bin");
+        let bytes = fs::read(fixture_path)?;
+        let manager = SimulationManagerData::decode(&bytes)?;
+        assert_eq!(manager.format_version(), 0x0001_b584);
+        assert_eq!(manager.current_tick_index, 0x0038_a2c2);
+        assert_eq!(manager.current_frame_index, 0x0199_d77b);
+        assert_eq!(manager.current_build_index, 0x0000_23ef);
+        assert_eq!(manager.randomizer_seed, 0x81c3_f923_d483_d023);
+        assert_eq!(manager.day_time_offset_frames, Some(0x0000_a885));
+        assert_eq!(manager.build_index_history.len(), 32);
+        assert_eq!(manager.leading_shared_type_names(), &["SimulationManager"]);
+        assert_eq!(manager.manager_objects().map_or(0, <[_]>::len), 29);
+        assert_eq!(
+            manager.serializable_data_storage.as_ref().map(Vec::len),
+            Some(0)
+        );
+        assert!(manager.serialized_object_graph().is_empty());
+        assert_eq!(manager.root_fields_len(), bytes.len());
+        assert_eq!(manager.encode()?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn simulation_manager_rejects_invalid_manager_type_reference() -> Result<(), CrpError> {
+        let mut root_data = vec![0xfe];
+        root_data.extend_from_slice(&[0x80, 0, 17]);
+        let mut previous = 128_u8;
+        for byte in b"SimulationManager" {
+            root_data.push(byte.wrapping_sub(previous));
+            previous = *byte;
+        }
+        root_data.extend_from_slice(&[0; 12]); // tick, frame, build
+        root_data.extend_from_slice(&[0; 8]); // randomizer seed
+        root_data.extend_from_slice(&[0; 4]); // day-time offset
+        root_data.extend_from_slice(&[0; 128]); // 32 history entries
+        root_data.extend_from_slice(&[0, 0, 1, 0xfe, 0xff, 0xff]); // invalid shared type ID
+        let stream = DataSerializerStream::from_parts(
+            212,
+            "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null".to_owned(),
+            root_data,
+        )?;
+        assert!(SimulationManagerData::decode(&stream.encode()).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn compact_writer_round_trips_metadata_and_unknown_assets() -> Result<(), CrpError> {
         for version in MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION {
             let mut package = sample_package();
@@ -1356,6 +1408,21 @@ mod tests {
                             metadata.encode()?,
                             asset.data[..consumed],
                             "simulation metadata round-trip mismatch for {:?} in {}",
+                            asset.name,
+                            path.display()
+                        );
+                        let manager_data = SimulationManagerData::decode(&asset.data[consumed..])?;
+                        assert_eq!(
+                            manager_data.encode()?,
+                            asset.data[consumed..],
+                            "simulation manager data round-trip mismatch for {:?} in {}",
+                            asset.name,
+                            path.display()
+                        );
+                        assert_eq!(
+                            manager_data.leading_shared_type_names(),
+                            &["SimulationManager"],
+                            "unexpected leading shared types for {:?} in {}",
                             asset.name,
                             path.display()
                         );
