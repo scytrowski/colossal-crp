@@ -7,9 +7,11 @@ use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 mod asset_io;
+mod data_serializer;
 mod metadata;
 mod texture;
 
+pub use data_serializer::DataSerializerStream;
 pub use metadata::{MapMetaData, ModInfo};
 pub use texture::TextureAsset;
 
@@ -724,6 +726,45 @@ mod tests {
             checksum_hex(b"message digest"),
             "f96b697d7cb7938d525a2f31aaf161d0"
         );
+    }
+
+    #[test]
+    fn data_serializer_stream_reads_root_header_and_preserves_opaque_bytes() -> Result<(), CrpError>
+    {
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/simulation-metadata-v6.bin");
+        let bytes = fs::read(fixture_path)?;
+        let stream = DataSerializerStream::decode(&bytes)?;
+        assert_eq!(stream.format_version, 0x0001_b584);
+        assert_eq!(
+            stream.root_type,
+            "SimulationMetaData, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+        );
+        assert_eq!(stream.encode(), bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn data_serializer_decodes_compact_and_wide_unique_strings() -> Result<(), CrpError> {
+        let compact = [0, 0, 0, 1, 0xfe, 0xfe, 0x80, 0, 2, 0xc1, 1];
+        assert_eq!(DataSerializerStream::decode(&compact)?.root_type, "AB");
+
+        let wide = [0, 0, 0, 1, 0xfe, 0xfe, 0, 0, 1, 0, 0x80];
+        assert_eq!(DataSerializerStream::decode(&wide)?.root_type, "Ā");
+        Ok(())
+    }
+
+    #[test]
+    fn data_serializer_rejects_invalid_root_headers_and_truncation() {
+        for bytes in [
+            &b""[..],
+            &[0, 0, 0, 1, 0xff],
+            &[0, 0, 0, 1, 0xfe, 0],
+            &[0, 0, 0, 1, 0xfe, 0xfe, 0xff],
+            &[0, 0, 0, 1, 0xfe, 0xfe, 0x80, 0, 1],
+        ] {
+            assert!(DataSerializerStream::decode(bytes).is_err());
+        }
     }
 
     #[test]
