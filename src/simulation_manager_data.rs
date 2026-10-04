@@ -1,4 +1,5 @@
 use crate::CrpError;
+use crate::GameAreaManagerData;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
@@ -174,6 +175,31 @@ impl SimulationManagerData {
     /// Returns the uninterpreted queued manager-object serialization bytes.
     pub fn serialized_object_graph(&self) -> &[u8] {
         &self.serialized_object_graph
+    }
+
+    /// Decodes the first queued manager object when it is `GameAreaManager+Data`.
+    ///
+    /// Returns the typed object and the number of bytes consumed from the opaque
+    /// graph. Remaining manager objects stay available through
+    /// [`serialized_object_graph`](Self::serialized_object_graph).
+    pub fn decode_game_area_prefix(&self) -> Result<(GameAreaManagerData, usize), CrpError> {
+        let Some(Some(first)) = self
+            .manager_objects
+            .as_ref()
+            .and_then(|objects| objects.first())
+        else {
+            return Err(invalid(0, "manager object array has no first object"));
+        };
+        if !first.type_name.starts_with("GameAreaManager+Data,") {
+            return Err(invalid(
+                0,
+                format!(
+                    "first manager object is {}, not GameAreaManager+Data",
+                    first.type_name
+                ),
+            ));
+        }
+        GameAreaManagerData::decode_prefix(self.format_version, &self.serialized_object_graph)
     }
 
     /// Encodes the typed root fields and copies the manager object graph raw.

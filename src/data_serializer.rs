@@ -146,6 +146,19 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
+    pub(crate) fn read_u16_be(&mut self) -> Result<u16, CrpError> {
+        let bytes = self.read_bytes(2)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    pub(crate) fn read_i16_be(&mut self) -> Result<i16, CrpError> {
+        Ok(self.read_u16_be()? as i16)
+    }
+
+    pub(crate) fn read_f32_be(&mut self) -> Result<f32, CrpError> {
+        Ok(f32::from_bits(self.read_u32_be()?))
+    }
+
     pub(crate) fn read_i32_be(&mut self) -> Result<i32, CrpError> {
         let bytes = self.read_bytes(4)?;
         Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))

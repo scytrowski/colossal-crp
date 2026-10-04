@@ -8,12 +8,14 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 mod asset_io;
 mod data_serializer;
+mod game_area_data;
 mod metadata;
 mod simulation_manager_data;
 mod simulation_metadata;
 mod texture;
 
 pub use data_serializer::DataSerializerStream;
+pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use metadata::{MapMetaData, ModInfo};
 pub use simulation_manager_data::{
     ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
@@ -944,6 +946,32 @@ mod tests {
     }
 
     #[test]
+    fn game_area_manager_fixture_decodes_fields_and_preserves_body() -> Result<(), CrpError> {
+        let bytes = include_bytes!("../tests/fixtures/game-area-manager-body-v112004.bin");
+        let (area, consumed) = GameAreaManagerData::decode_prefix(112_004, bytes)?;
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(area.area_count(), 0);
+        assert_eq!(area.start_tile(), 0);
+        assert_eq!(area.area_grid(), &[0; 25]);
+        assert_eq!(area.area_not_unlocked_reference(), &[0x80, 0x00, 0x0f]);
+        assert_eq!(
+            area.buildable_area().map(f32::to_bits),
+            [0xc71a_0cf8, 0xdc31_f3fc, 0xec14_0df3, 0x06fe_0d00,]
+        );
+        assert_eq!(area.saved_camera_view().mode, -1);
+        assert_eq!(area.encode(), bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn game_area_manager_rejects_truncated_or_overlong_grid_encoding() {
+        assert!(GameAreaManagerData::decode_prefix(199, &[0, 0, 0]).is_err());
+        let mut malformed = vec![0, 0, 0x19];
+        malformed.extend([0; 25]);
+        assert!(GameAreaManagerData::decode_prefix(199, &malformed).is_err());
+    }
+
+    #[test]
     fn simulation_manager_rejects_invalid_manager_type_reference() -> Result<(), CrpError> {
         let mut root_data = vec![0xfe];
         root_data.extend_from_slice(&[0x80, 0, 17]);
@@ -1426,6 +1454,10 @@ mod tests {
                             asset.name,
                             path.display()
                         );
+                        let (game_area, game_area_bytes) =
+                            manager_data.decode_game_area_prefix()?;
+                        assert_eq!(game_area.area_grid().len(), 25);
+                        assert!(game_area_bytes <= manager_data.serialized_object_graph().len());
                         simulation_metadata_count += 1;
                     }
                     _ => {}
