@@ -1,7 +1,7 @@
 //! Read the outer container structure of City: Skylines (2015) `.crp` files.
 //!
-//! This initial reader supports the common package index observed in format
-//! versions 4 through 10. Asset payloads are returned as raw bytes.
+//! This reader supports the common package index observed in format versions
+//! 4 through 10. It verifies each asset's stored MD5 and returns raw payloads.
 
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -64,6 +64,12 @@ pub enum CrpError {
     InvalidUtf8,
     /// The asset count was negative.
     NegativeAssetCount(i32),
+    /// An asset record has a negative relative offset or size.
+    InvalidAssetRange {
+        name: String,
+        relative_offset: i64,
+        size: i64,
+    },
     /// The package index exceeds the declared data start.
     IndexPastDataStart { index_end: u64, data_start: u64 },
     /// An asset's data range extends past the end of the input.
@@ -72,6 +78,12 @@ pub enum CrpError {
         offset: u64,
         size: u64,
         file_size: u64,
+    },
+    /// The payload's MD5 does not match the checksum stored in the index.
+    ChecksumMismatch {
+        name: String,
+        expected: String,
+        actual: String,
     },
     /// An offset or size calculation overflowed.
     ArithmeticOverflow(&'static str),
@@ -90,6 +102,14 @@ impl fmt::Display for CrpError {
             Self::InvalidStringLength => write!(f, "invalid or excessive package string length"),
             Self::InvalidUtf8 => write!(f, "package string is not valid UTF-8"),
             Self::NegativeAssetCount(count) => write!(f, "negative asset count {count}"),
+            Self::InvalidAssetRange {
+                name,
+                relative_offset,
+                size,
+            } => write!(
+                f,
+                "asset {name:?} has invalid relative offset {relative_offset} or size {size}"
+            ),
             Self::IndexPastDataStart {
                 index_end,
                 data_start,
@@ -106,6 +126,14 @@ impl fmt::Display for CrpError {
                 f,
                 "asset {name:?} range {offset}..{} exceeds file size {file_size}",
                 offset.saturating_add(*size)
+            ),
+            Self::ChecksumMismatch {
+                name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "asset {name:?} checksum mismatch: index has {expected}, payload has {actual}"
             ),
             Self::ArithmeticOverflow(context) => {
                 write!(f, "integer overflow while calculating {context}")
@@ -133,8 +161,9 @@ impl From<io::Error> for CrpError {
 impl Package {
     /// Reads a package using the base package implementation's zero data offset.
     ///
-    /// This covers the common map files currently examined. Other package
-    /// implementations may add a separate implementation-specific data offset.
+    /// This covers the common map files currently examined and rejects payloads
+    /// whose MD5 does not match the index. Other package implementations may add
+    /// a separate implementation-specific data offset.
     pub fn read_from<R: Read + Seek>(reader: &mut R) -> Result<Self, CrpError> {
         Self::read_from_with_data_offset(reader, 0)
     }
@@ -172,6 +201,12 @@ impl Package {
         let data_start_offset = read_u64_le(reader)?;
 
         let index_start = reader.stream_position()?;
+        if index_start > data_start_offset {
+            return Err(CrpError::IndexPastDataStart {
+                index_end: index_start,
+                data_start: data_start_offset,
+            });
+        }
         if data_start_offset > file_size {
             return Err(CrpError::IndexPastDataStart {
                 index_end: index_start,
@@ -206,6 +241,13 @@ impl Package {
             let asset_type = read_i32_le(reader)?;
             let relative_offset_signed = read_i64_le(reader)?;
             let size_signed = read_i64_le(reader)?;
+            if relative_offset_signed < 0 || size_signed < 0 {
+                return Err(CrpError::InvalidAssetRange {
+                    name: asset_name,
+                    relative_offset: relative_offset_signed,
+                    size: size_signed,
+                });
+            }
             let relative_offset = u64::try_from(relative_offset_signed)
                 .map_err(|_| CrpError::ArithmeticOverflow("asset relative offset"))?;
             let size = u64::try_from(size_signed)
@@ -244,6 +286,14 @@ impl Package {
             let mut data = vec![0; payload_size];
             reader.seek(SeekFrom::Start(payload_offset))?;
             reader.read_exact(&mut data)?;
+            let actual_checksum = checksum_hex(&data);
+            if checksum != actual_checksum {
+                return Err(CrpError::ChecksumMismatch {
+                    name: asset_name,
+                    expected: checksum,
+                    actual: actual_checksum,
+                });
+            }
 
             assets.push(Asset {
                 name: asset_name,
@@ -713,6 +763,127 @@ mod tests {
             Package::read_from(&mut cursor),
             Err(CrpError::AssetOutOfBounds { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn reader_rejects_payload_checksum_mismatch() -> Result<(), CrpError> {
+        let mut encoded = Vec::new();
+        sample_package().write_compact_to(&mut encoded)?;
+        encoded[50] = b'0';
+
+        let mut cursor = Cursor::new(encoded);
+        assert!(matches!(
+            Package::read_from(&mut cursor),
+            Err(CrpError::ChecksumMismatch { name, .. }) if name == "preview"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reader_rejects_truncated_input_and_invalid_strings() -> Result<(), CrpError> {
+        let mut invalid_magic = Cursor::new(b"NOPE\0\0".to_vec());
+        assert!(matches!(
+            Package::read_from(&mut invalid_magic),
+            Err(CrpError::InvalidMagic(_))
+        ));
+
+        let mut short_header = Cursor::new(&b"CRAP"[..]);
+        assert!(matches!(
+            Package::read_from(&mut short_header),
+            Err(CrpError::Io(_))
+        ));
+
+        let mut invalid_utf8 = Cursor::new([1, 0xff]);
+        assert!(matches!(
+            read_binary_string(&mut invalid_utf8),
+            Err(CrpError::InvalidUtf8)
+        ));
+
+        let mut invalid_length = Cursor::new([0x80; 5]);
+        assert!(matches!(
+            read_7bit_encoded_u32(&mut invalid_length),
+            Err(CrpError::InvalidStringLength)
+        ));
+
+        let mut truncated_payload = Vec::new();
+        sample_package().write_compact_to(&mut truncated_payload)?;
+        truncated_payload.pop();
+        let mut cursor = Cursor::new(truncated_payload);
+        assert!(matches!(
+            Package::read_from(&mut cursor),
+            Err(CrpError::AssetOutOfBounds { name, .. }) if name == "future asset"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reader_rejects_negative_counts_and_asset_ranges() -> Result<(), CrpError> {
+        let mut negative_count = Vec::new();
+        sample_package().write_compact_to(&mut negative_count)?;
+        negative_count[29..33].copy_from_slice(&(-1_i32).to_le_bytes());
+        let mut cursor = Cursor::new(negative_count);
+        assert!(matches!(
+            Package::read_from(&mut cursor),
+            Err(CrpError::NegativeAssetCount(-1))
+        ));
+
+        let mut negative_offset = Vec::new();
+        sample_package().write_compact_to(&mut negative_offset)?;
+        negative_offset[86..94].copy_from_slice(&(-1_i64).to_le_bytes());
+        let mut cursor = Cursor::new(negative_offset);
+        assert!(matches!(
+            Package::read_from(&mut cursor),
+            Err(CrpError::InvalidAssetRange { name, .. }) if name == "preview"
+        ));
+
+        let mut negative_size = Vec::new();
+        sample_package().write_compact_to(&mut negative_size)?;
+        negative_size[94..102].copy_from_slice(&(-1_i64).to_le_bytes());
+        let mut cursor = Cursor::new(negative_size);
+        assert!(matches!(
+            Package::read_from(&mut cursor),
+            Err(CrpError::InvalidAssetRange { name, .. }) if name == "preview"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reader_rejects_invalid_data_start_and_offset_overflow() -> Result<(), CrpError> {
+        let mut before_header = Vec::new();
+        sample_package().write_compact_to(&mut before_header)?;
+        before_header[33..41].copy_from_slice(&0_u64.to_le_bytes());
+        let mut cursor = Cursor::new(before_header);
+        assert!(matches!(
+            Package::read_from(&mut cursor),
+            Err(CrpError::IndexPastDataStart { .. })
+        ));
+
+        let mut encoded = Vec::new();
+        sample_package().write_compact_to(&mut encoded)?;
+        let mut cursor = Cursor::new(encoded);
+        assert!(matches!(
+            Package::read_from_with_data_offset(&mut cursor, u64::MAX),
+            Err(CrpError::ArithmeticOverflow("asset payload offset"))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn writer_handles_empty_payloads() -> Result<(), CrpError> {
+        let mut package = sample_package();
+        package.assets.truncate(1);
+        package.assets[0].data.clear();
+        let mut encoded = Vec::new();
+        package.write_compact_to(&mut encoded)?;
+
+        let mut cursor = Cursor::new(encoded);
+        let decoded = Package::read_from(&mut cursor)?;
+        assert!(decoded.assets[0].data.is_empty());
+        assert_eq!(
+            decoded.assets[0].checksum,
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
         Ok(())
     }
 
