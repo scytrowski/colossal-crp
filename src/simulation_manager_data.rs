@@ -1,5 +1,6 @@
 use crate::CrpError;
 use crate::GameAreaManagerData;
+use crate::TerrainManagerData;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
@@ -200,6 +201,40 @@ impl SimulationManagerData {
             ));
         }
         GameAreaManagerData::decode_prefix(self.format_version, &self.serialized_object_graph)
+    }
+
+    /// Decodes the queued `TerrainManager+Data` body after the game-area body.
+    ///
+    /// The returned byte length includes the preceding game-area object body
+    /// and the terrain body. Other queued manager objects remain opaque.
+    pub fn decode_terrain_prefix(&self) -> Result<(TerrainManagerData, usize), CrpError> {
+        let Some(Some(terrain)) = self
+            .manager_objects
+            .as_ref()
+            .and_then(|objects| objects.get(1))
+        else {
+            return Err(invalid(0, "manager object array has no second object"));
+        };
+        if !terrain.type_name.starts_with("TerrainManager+Data,") {
+            return Err(invalid(
+                0,
+                format!(
+                    "second manager object is {}, not TerrainManager+Data",
+                    terrain.type_name
+                ),
+            ));
+        }
+        let (_, area_length) = self.decode_game_area_prefix()?;
+        let remainder = self
+            .serialized_object_graph
+            .get(area_length..)
+            .ok_or_else(|| invalid(area_length, "game-area body extends past manager graph"))?;
+        let (terrain_data, terrain_length) =
+            TerrainManagerData::decode_prefix(self.format_version, remainder)?;
+        let consumed = area_length
+            .checked_add(terrain_length)
+            .ok_or(CrpError::ArithmeticOverflow("manager object prefix length"))?;
+        Ok((terrain_data, consumed))
     }
 
     /// Encodes the typed root fields and copies the manager object graph raw.

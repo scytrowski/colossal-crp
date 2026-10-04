@@ -43,10 +43,16 @@ impl GameAreaManagerData {
     pub fn decode_prefix(version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         let mut reader = Reader::new(bytes);
         let area_count = reader.read_u8()?;
-        let start_tile = reader.read_u8()?;
+        let start_tile = if version >= 137 {
+            reader.read_u8()?
+        } else {
+            12
+        };
         let area_grid = read_encoded_byte_array(&mut reader, AREA_GRID_LENGTH)?;
         let reference_start = reader.offset();
-        skip_object_reference(&mut reader)?;
+        if version >= 87 {
+            skip_object_reference(&mut reader)?;
+        }
         let area_not_unlocked_reference = reader.consumed_bytes()[reference_start..].to_vec();
         let buildable_area = if version >= 199 {
             [

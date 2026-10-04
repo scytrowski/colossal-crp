@@ -12,6 +12,7 @@ mod game_area_data;
 mod metadata;
 mod simulation_manager_data;
 mod simulation_metadata;
+mod terrain_manager_data;
 mod texture;
 
 pub use data_serializer::DataSerializerStream;
@@ -21,6 +22,7 @@ pub use simulation_manager_data::{
     ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
+pub use terrain_manager_data::TerrainManagerData;
 pub use texture::TextureAsset;
 
 const MAGIC: &[u8; 4] = b"CRAP";
@@ -972,6 +974,20 @@ mod tests {
     }
 
     #[test]
+    fn game_area_manager_applies_legacy_version_gates() -> Result<(), CrpError> {
+        let mut bytes = vec![7, 0x18];
+        bytes.extend([0; 25]);
+        let (area, consumed) = GameAreaManagerData::decode_prefix(86, &bytes)?;
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(area.area_count(), 7);
+        assert_eq!(area.start_tile(), 12);
+        assert!(area.area_not_unlocked_reference().is_empty());
+        assert_eq!(area.buildable_area(), [-1.0; 4]);
+        assert_eq!(area.saved_camera_view().mode, -1);
+        Ok(())
+    }
+
+    #[test]
     fn simulation_manager_rejects_invalid_manager_type_reference() -> Result<(), CrpError> {
         let mut root_data = vec![0xfe];
         root_data.extend_from_slice(&[0x80, 0, 17]);
@@ -1458,6 +1474,13 @@ mod tests {
                             manager_data.decode_game_area_prefix()?;
                         assert_eq!(game_area.area_grid().len(), 25);
                         assert!(game_area_bytes <= manager_data.serialized_object_graph().len());
+                        let (terrain, manager_prefix_bytes) =
+                            manager_data.decode_terrain_prefix()?;
+                        assert_eq!(terrain.raw_heights().len(), 1_168_561);
+                        assert_eq!(terrain.block_height_deltas().len(), 1_168_561);
+                        assert!(
+                            manager_prefix_bytes <= manager_data.serialized_object_graph().len()
+                        );
                         simulation_metadata_count += 1;
                     }
                     _ => {}
