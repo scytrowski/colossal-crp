@@ -17,6 +17,8 @@ pub struct DataSerializerStream {
     pub format_version: u32,
     /// Assembly-qualified type name of the root object.
     pub root_type: String,
+    /// Opaque serialized fields following the root object's type header.
+    pub root_data: Vec<u8>,
     bytes: Vec<u8>,
 }
 
@@ -38,10 +40,34 @@ impl DataSerializerStream {
         let root_type = reader
             .read_unique_string()?
             .ok_or_else(|| reader.invalid("root object's shared type name cannot be null"))?;
+        let root_data = bytes[reader.offset..].to_vec();
         Ok(Self {
             format_version,
             root_type,
+            root_data,
             bytes: bytes.to_vec(),
+        })
+    }
+
+    /// Builds a stream with a new root object and opaque serialized root data.
+    ///
+    /// The root type is emitted as a new shared type. Its name uses the
+    /// DataSerializer compact or wide unique-string form, and `root_data` is
+    /// copied without interpretation.
+    pub fn from_parts(
+        format_version: u32,
+        root_type: String,
+        root_data: Vec<u8>,
+    ) -> Result<Self, CrpError> {
+        let mut bytes = format_version.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[NEW_OBJECT_MARKER, NEW_OBJECT_MARKER]);
+        write_unique_string(&mut bytes, &root_type)?;
+        bytes.extend_from_slice(&root_data);
+        Ok(Self {
+            format_version,
+            root_type,
+            root_data,
+            bytes,
         })
     }
 
@@ -120,16 +146,66 @@ impl<'a> Reader<'a> {
                 .ok_or_else(|| self.invalid("wide string byte length overflow"))?;
             let deltas = self.read_bytes(byte_count)?;
             let mut previous = 128_u16;
-            let mut value = String::with_capacity(char_count);
+            let mut code_units = Vec::with_capacity(char_count);
             for pair in deltas.chunks_exact(2) {
                 let delta = u16::from_be_bytes([pair[0], pair[1]]);
                 previous = previous.wrapping_add(delta);
-                let character = char::from_u32(u32::from(previous)).ok_or_else(|| {
-                    self.invalid("wide string contains an invalid UTF-16 code unit")
-                })?;
-                value.push(character);
+                code_units.push(previous);
             }
-            Ok(Some(value))
+            String::from_utf16(&code_units)
+                .map(Some)
+                .map_err(|_| self.invalid("wide string contains invalid UTF-16"))
         }
     }
+}
+
+fn write_unique_string(output: &mut Vec<u8>, value: &str) -> Result<(), CrpError> {
+    let compact = value.chars().all(|character| u32::from(character) < 256);
+    let units = if compact {
+        value
+            .chars()
+            .map(|character| u32::from(character))
+            .collect::<Vec<_>>()
+    } else {
+        value.encode_utf16().map(u32::from).collect::<Vec<_>>()
+    };
+    if units.len() > MAX_STRING_CHARS {
+        return Err(CrpError::InvalidAssetPayload {
+            name: "DataSerializer stream".to_owned(),
+            offset: output.len(),
+            reason: "unique string exceeds the 16 Mi character limit".to_owned(),
+        });
+    }
+    let length = u32::try_from(units.len())
+        .map_err(|_| CrpError::ArithmeticOverflow("DataSerializer string length"))?;
+    let encoded_length = if compact {
+        length | COMPACT_STRING_FLAG
+    } else {
+        length
+    };
+    if encoded_length > 0xff_ffff {
+        return Err(CrpError::ArithmeticOverflow(
+            "DataSerializer 24-bit string length",
+        ));
+    }
+    output.extend_from_slice(&[
+        (encoded_length >> 16) as u8,
+        (encoded_length >> 8) as u8,
+        encoded_length as u8,
+    ]);
+    if compact {
+        let mut previous = 128_u32;
+        for unit in units {
+            output.push(unit.wrapping_sub(previous) as u8);
+            previous = unit;
+        }
+    } else {
+        let mut previous = 128_u32;
+        for unit in units {
+            let delta = unit.wrapping_sub(previous) as u16;
+            output.extend_from_slice(&delta.to_be_bytes());
+            previous = unit;
+        }
+    }
+    Ok(())
 }

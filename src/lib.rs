@@ -747,10 +747,25 @@ mod tests {
     #[test]
     fn data_serializer_decodes_compact_and_wide_unique_strings() -> Result<(), CrpError> {
         let compact = [0, 0, 0, 1, 0xfe, 0xfe, 0x80, 0, 2, 0xc1, 1];
-        assert_eq!(DataSerializerStream::decode(&compact)?.root_type, "AB");
+        let decoded_compact = DataSerializerStream::decode(&compact)?;
+        assert_eq!(decoded_compact.root_type, "AB");
+        assert_eq!(
+            DataSerializerStream::from_parts(
+                decoded_compact.format_version,
+                decoded_compact.root_type,
+                decoded_compact.root_data,
+            )?
+            .encode(),
+            compact
+        );
 
         let wide = [0, 0, 0, 1, 0xfe, 0xfe, 0, 0, 1, 0, 0x80];
         assert_eq!(DataSerializerStream::decode(&wide)?.root_type, "Ā");
+        let supplementary = DataSerializerStream::from_parts(1, "🚀".to_owned(), vec![])?;
+        assert_eq!(
+            DataSerializerStream::decode(&supplementary.encode())?.root_type,
+            "🚀"
+        );
         Ok(())
     }
 
