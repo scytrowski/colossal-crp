@@ -1,8 +1,13 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::{read_encoded_byte_array, read_encoded_ushort_array};
+use crate::encoded_array::{
+    read_encoded_byte_array, read_encoded_uint_array, read_encoded_ushort_array,
+};
 
 const LANE_COUNT: usize = 262_144;
+const NODE_COUNT: usize = 32_768;
+const TWO_NODE_FLAGS_VERSION: u32 = 115_018;
+const FULL_NODE_COUNT_VERSION: u32 = 202;
 
 /// One active lane's serialized flags, link, and reservation state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +37,27 @@ pub struct NetLanePrefix {
     format_version: u32,
     lane_flags: Vec<u16>,
     active_lanes: Vec<NetLane>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Serialized flags for one one-based `NetNode` buffer position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeFlag {
+    /// One-based node buffer index.
+    pub index: u16,
+    /// Primary node flags.
+    pub flags: u32,
+    /// Secondary node flags, zero before inner version 115018.
+    pub flags2: u32,
+}
+
+/// The encoded node-flag array immediately after NetManager's lane section.
+///
+/// Later node problem arrays and individual records remain opaque.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeFlagsPrefix {
+    format_version: u32,
+    node_flags: Vec<NetNodeFlag>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -115,6 +141,81 @@ impl NetLanePrefix {
     }
 
     /// Writes the original prefix bytes without changing encoded-array runs.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetNodeFlagsPrefix {
+    /// Decodes node flags for inner versions 164 and newer and returns bytes used.
+    /// Versions below 202 serialize only indices 1–16383; later indices are
+    /// filled with zero. Versions 115018+ serialize two flags per node.
+    pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 {
+            return Err(invalid(
+                0,
+                "NetManager node flags require inner version 164 or newer",
+            ));
+        }
+        let mut reader = Reader::new(bytes);
+        let node_count = if format_version < FULL_NODE_COUNT_VERSION {
+            16_383
+        } else {
+            NODE_COUNT - 1
+        };
+        let paired = format_version >= TWO_NODE_FLAGS_VERSION;
+        let encoded_count = if paired {
+            node_count
+                .checked_mul(2)
+                .ok_or(CrpError::ArithmeticOverflow("NetManager node flag count"))?
+        } else {
+            node_count
+        };
+        let encoded = read_encoded_uint_array(&mut reader, encoded_count)?;
+        let mut node_flags = Vec::with_capacity(NODE_COUNT - 1);
+        for index in 0..node_count {
+            let (flags, flags2) = if paired {
+                (encoded[index * 2], encoded[index * 2 + 1])
+            } else {
+                (encoded[index], 0)
+            };
+            node_flags.push(NetNodeFlag {
+                index: u16::try_from(index + 1)
+                    .map_err(|_| CrpError::ArithmeticOverflow("NetNode index"))?,
+                flags,
+                flags2,
+            });
+        }
+        for index in node_count..NODE_COUNT - 1 {
+            node_flags.push(NetNodeFlag {
+                index: u16::try_from(index + 1)
+                    .map_err(|_| CrpError::ArithmeticOverflow("NetNode index"))?,
+                flags: 0,
+                flags2: 0,
+            });
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                node_flags,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns flags for all 32,767 one-based node positions.
+    pub fn node_flags(&self) -> &[NetNodeFlag] {
+        &self.node_flags
+    }
+
+    /// Writes the original encoded node-flag bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }

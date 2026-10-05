@@ -78,6 +78,48 @@ pub(crate) fn read_encoded_ushort_array(
     Ok(values)
 }
 
+/// Decodes `EncodedArray.UInt`; its close-delta adjustment is a signed i16.
+pub(crate) fn read_encoded_uint_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<Vec<u32>, CrpError> {
+    let mut values = Vec::with_capacity(count);
+    let mut previous_value = 0_u32;
+    let mut previous_delta = 0_i32;
+    let mut full_count = 0_usize;
+    let mut close_count = 0_usize;
+    let mut same_count = 0_usize;
+
+    while values.len() < count {
+        if same_count > 0 {
+            previous_value = previous_value.wrapping_add(previous_delta as u32);
+            same_count -= 1;
+        } else if close_count > 0 {
+            let adjustment = i32::from(reader.read_i16_be()?);
+            previous_delta = previous_delta.wrapping_add(adjustment);
+            previous_value = previous_value.wrapping_add(previous_delta as u32);
+            close_count -= 1;
+        } else if full_count > 0 {
+            let value = reader.read_u32_be()?;
+            previous_delta = value.wrapping_sub(previous_value) as i32;
+            previous_value = value;
+            full_count -= 1;
+        } else {
+            let control = reader.read_u8()?;
+            if control >= 0x80 {
+                same_count = usize::from(control - 0x7f);
+            } else if control >= 0x40 {
+                close_count = usize::from(control - 0x3f);
+            } else {
+                full_count = usize::from(control) + 1;
+            }
+            continue;
+        }
+        values.push(previous_value);
+    }
+    Ok(values)
+}
+
 // Explicit canonical writer: literal blocks and repeated signed deltas.
 pub(crate) fn write_encoded_ushort_array(output: &mut Vec<u8>, values: &[u16]) {
     let mut index = 0;
@@ -126,7 +168,7 @@ fn repeated_delta_run(values: &[u16], start: usize, previous: u16, delta: i16) -
 
 #[cfg(test)]
 mod tests {
-    use super::read_encoded_ushort_array;
+    use super::{read_encoded_uint_array, read_encoded_ushort_array};
     use crate::data_serializer::Reader;
 
     #[test]
@@ -150,5 +192,22 @@ mod tests {
     fn ushort_array_rejects_truncated_literal_values() {
         let mut reader = Reader::new(&[0x01, 0x12]);
         assert!(read_encoded_ushort_array(&mut reader, 2).is_err());
+    }
+
+    #[test]
+    fn uint_array_decodes_literal_repeat_and_signed_close_delta() {
+        let bytes = [0, 0, 0, 0, 5, 0x81, 0x40, 0xff, 0xfe];
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            read_encoded_uint_array(&mut reader, 4).expect("valid UInt controls"),
+            [5, 10, 15, 18]
+        );
+        assert_eq!(reader.offset(), bytes.len());
+    }
+
+    #[test]
+    fn uint_array_rejects_truncated_close_delta() {
+        let mut reader = Reader::new(&[0, 0, 0, 0, 5, 0x40, 0]);
+        assert!(read_encoded_uint_array(&mut reader, 2).is_err());
     }
 }

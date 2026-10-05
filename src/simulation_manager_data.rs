@@ -2,12 +2,12 @@ use crate::CrpError;
 use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
 use crate::InstanceManagerEditor;
-use crate::NetLanePrefix;
 use crate::PathManagerData;
 use crate::TerrainManagerData;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
+use crate::{NetLanePrefix, NetNodeFlagsPrefix};
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
 const BUILD_INDEX_HISTORY_LENGTH: usize = 32;
@@ -409,6 +409,18 @@ impl SimulationManagerData {
         expect_profile_tag(&mut reader, &mut strings, "NetManager")?;
         let (data, body_length) =
             NetLanePrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes NetManager's node flags after its lane section. The returned
+    /// graph offset is before node problem arrays and other opaque fields.
+    pub fn decode_net_node_flags_prefix(&self) -> Result<(NetNodeFlagsPrefix, usize), CrpError> {
+        let (_, lane_end) = self.decode_net_lane_prefix()?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(lane_end)?;
+        let (data, body_length) =
+            NetNodeFlagsPrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
         reader.read_bytes(body_length)?;
         Ok((data, reader.offset()))
     }

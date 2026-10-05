@@ -24,7 +24,7 @@ pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{MapMetaData, ModInfo};
-pub use net_manager_data::{NetLane, NetLanePrefix};
+pub use net_manager_data::{NetLane, NetLanePrefix, NetNodeFlag, NetNodeFlagsPrefix};
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
     ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
@@ -1012,6 +1012,8 @@ mod tests {
         begin_tag(&mut graph, "NetManager")?;
         graph.extend(std::iter::repeat_n(0xff, 2047));
         graph.push(0xfe);
+        graph.extend(std::iter::repeat_n(0xff, 511));
+        graph.push(0xfd);
         graph.extend_from_slice(b"opaque next manager");
 
         let mut root_data = root.root_data().to_vec();
@@ -1096,6 +1098,13 @@ mod tests {
         );
         let (net_lanes, _) = manager.decode_net_lane_prefix()?;
         assert!(net_lanes.active_lanes().is_empty());
+        let (node_flags, _) = manager.decode_net_node_flags_prefix()?;
+        assert!(
+            node_flags
+                .node_flags()
+                .iter()
+                .all(|node| node.flags == 0 && node.flags2 == 0)
+        );
 
         let mut package = sample_package();
         let mut payload = include_bytes!("../tests/fixtures/simulation-metadata-v6.bin").to_vec();
@@ -1127,6 +1136,79 @@ mod tests {
         assert!(path.active_units().is_empty());
         let (net_lanes, _) = reread_manager.decode_net_lane_prefix()?;
         assert!(net_lanes.active_lanes().is_empty());
+        let (node_flags, _) = reread_manager.decode_net_node_flags_prefix()?;
+        assert_eq!(node_flags.node_flags().len(), 32_767);
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_flags_decode_versioned_arrays() -> Result<(), CrpError> {
+        for (version, full_controls, last_control, expected_len) in [
+            (194, 127, 0xfe, 128),
+            (202, 255, 0xfe, 256),
+            (115_018, 511, 0xfd, 512),
+        ] {
+            let mut bytes = vec![0xff; full_controls];
+            bytes.push(last_control);
+            let (nodes, used) = NetNodeFlagsPrefix::decode_prefix(version, &bytes)?;
+            assert_eq!(used, expected_len);
+            assert_eq!(nodes.node_flags().len(), 32_767);
+            assert_eq!(nodes.node_flags()[0].index, 1);
+            assert_eq!(nodes.node_flags()[32_766].index, 32_767);
+            assert_eq!(nodes.encode(), bytes);
+            assert!(NetNodeFlagsPrefix::decode_prefix(version, &bytes[..bytes.len() - 1]).is_err());
+        }
+        let mut bytes = vec![3];
+        for value in [5_u32, 2, 0, 0] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes.extend(std::iter::repeat_n(0xff, 511));
+        bytes.push(0xf9);
+        let (nodes, used) = NetNodeFlagsPrefix::decode_prefix(115_018, &bytes)?;
+        assert_eq!(used, bytes.len());
+        assert_eq!(
+            nodes.node_flags()[0],
+            NetNodeFlag {
+                index: 1,
+                flags: 5,
+                flags2: 2
+            }
+        );
+        assert_eq!(
+            nodes.node_flags()[1],
+            NetNodeFlag {
+                index: 2,
+                flags: 0,
+                flags2: 0
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_flags_game_fixture_preserves_real_values() -> Result<(), CrpError> {
+        let fixture = include_bytes!("../tests/fixtures/net-node-flags-v116020-desert.bin");
+        let (nodes, used) = NetNodeFlagsPrefix::decode_prefix(116_020, fixture)?;
+        assert_eq!(used, 27_596);
+        assert_eq!(nodes.node_flags().len(), 32_767);
+        assert_eq!(
+            nodes
+                .node_flags()
+                .iter()
+                .filter(|node| node.flags != 0 || node.flags2 != 0)
+                .count(),
+            2_082
+        );
+        assert_eq!(
+            nodes.node_flags()[10],
+            NetNodeFlag {
+                index: 11,
+                flags: 20_988_193,
+                flags2: 0,
+            }
+        );
+        assert_eq!(nodes.encode(), fixture);
+        assert!(NetNodeFlagsPrefix::decode_prefix(116_020, &fixture[..fixture.len() - 1]).is_err());
         Ok(())
     }
 
@@ -1778,6 +1860,7 @@ mod tests {
         let mut nonempty_wave_assets = 0;
         let mut active_net_lanes = 0_usize;
         let mut reserved_net_lanes = 0_usize;
+        let mut active_net_nodes = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -1906,6 +1989,15 @@ mod tests {
                                     || lane.last_reserve_id != 0
                             })
                             .count();
+                        let (net_nodes, net_node_end) =
+                            manager_data.decode_net_node_flags_prefix()?;
+                        assert_eq!(net_nodes.node_flags().len(), 32_767);
+                        assert!(net_node_end > net_prefix_end);
+                        active_net_nodes += net_nodes
+                            .node_flags()
+                            .iter()
+                            .filter(|node| node.flags != 0 || node.flags2 != 0)
+                            .count();
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -1943,7 +2035,7 @@ mod tests {
         }
         assert!(simulation_metadata_count > 0);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes"
         );
         Ok(())
     }
