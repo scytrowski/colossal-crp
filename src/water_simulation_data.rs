@@ -5,6 +5,8 @@ use crate::encoded_array::{read_encoded_ushort_array, write_encoded_ushort_array
 const GRID_SIDE: usize = 1081;
 const CELL_COUNT: usize = GRID_SIDE * GRID_SIDE;
 const WATER_SOURCE_RECORD_LENGTH: usize = 43;
+const WATER_WAVE_LEGACY_RECORD_LENGTH: usize = 23;
+const WATER_WAVE_RECORD_LENGTH: usize = 24;
 
 /// A water source in the version-184-and-newer layout.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +23,38 @@ pub struct WaterSource {
     pub parameters: [u32; 5],
 }
 
+/// One `WaterWave` record in a version-259-or-newer WaterSimulation body.
+///
+/// Versions 259–260 encode `wave_type` as a boolean byte and can represent
+/// only 0 or 1. Version 261 and newer encode it as a big-endian `u16`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaterWave {
+    /// Wave kind stored by the game.
+    pub wave_type: u16,
+    /// Minimum X coordinate of the affected cell rectangle.
+    pub min_x: u16,
+    /// Minimum Z coordinate of the affected cell rectangle.
+    pub min_z: u16,
+    /// Maximum X coordinate of the affected cell rectangle.
+    pub max_x: u16,
+    /// Maximum Z coordinate of the affected cell rectangle.
+    pub max_z: u16,
+    /// Original X coordinate.
+    pub origin_x: u16,
+    /// Original Z coordinate.
+    pub origin_z: u16,
+    /// Signed X direction.
+    pub direction_x: i16,
+    /// Signed Z direction.
+    pub direction_z: i16,
+    /// Signed wave height delta.
+    pub delta: i16,
+    /// Wave duration.
+    pub duration: u16,
+    /// Current wave time.
+    pub current_time: u16,
+}
+
 /// Decoded `WaterSimulation+Data` fields for inner serializer versions 184+.
 ///
 /// The original body is retained for byte-exact writing. Unknown record values
@@ -34,6 +68,7 @@ pub struct WaterSimulationData {
     velocity_z: Vec<i16>,
     sources: Vec<WaterSource>,
     wave_count: u16,
+    waves: Vec<WaterWave>,
     wave_records: Vec<u8>,
     sea_level: f32,
     pollution_rates: [i8; 2],
@@ -45,10 +80,65 @@ pub struct WaterSimulationData {
 ///
 /// Create this by consuming a decoded [`WaterSimulationData`] with
 /// [`into_editor`](WaterSimulationData::into_editor). Encoding writes fresh
-/// arrays, sources, and tail fields while copying wave records unchanged.
+/// arrays, sources, and tail fields. Unchanged wave records retain their
+/// original bytes; edited waves are written from typed fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaterSimulationEditor {
     data: WaterSimulationData,
+    original_waves: Vec<WaterWave>,
+}
+
+impl WaterWave {
+    fn read_from(version: u32, reader: &mut Reader<'_>) -> Result<Self, CrpError> {
+        let wave_type = if version >= 261 {
+            reader.read_u16_be()?
+        } else {
+            u16::from(reader.read_u8()? == 1)
+        };
+        Ok(Self {
+            wave_type,
+            min_x: reader.read_u16_be()?,
+            min_z: reader.read_u16_be()?,
+            max_x: reader.read_u16_be()?,
+            max_z: reader.read_u16_be()?,
+            origin_x: reader.read_u16_be()?,
+            origin_z: reader.read_u16_be()?,
+            direction_x: reader.read_i16_be()?,
+            direction_z: reader.read_i16_be()?,
+            delta: reader.read_i16_be()?,
+            duration: reader.read_u16_be()?,
+            current_time: reader.read_u16_be()?,
+        })
+    }
+
+    fn write_to(&self, version: u32, output: &mut Vec<u8>) -> Result<(), CrpError> {
+        if version >= 261 {
+            output.extend_from_slice(&self.wave_type.to_be_bytes());
+        } else if self.wave_type <= 1 {
+            output.push(self.wave_type as u8);
+        } else {
+            return Err(invalid(
+                output.len(),
+                "wave type exceeds the version-259 boolean layout",
+            ));
+        }
+        for coordinate in [
+            self.min_x,
+            self.min_z,
+            self.max_x,
+            self.max_z,
+            self.origin_x,
+            self.origin_z,
+        ] {
+            output.extend_from_slice(&coordinate.to_be_bytes());
+        }
+        for signed in [self.direction_x, self.direction_z, self.delta] {
+            output.extend_from_slice(&signed.to_be_bytes());
+        }
+        output.extend_from_slice(&self.duration.to_be_bytes());
+        output.extend_from_slice(&self.current_time.to_be_bytes());
+        Ok(())
+    }
 }
 
 impl WaterSimulationData {
@@ -152,16 +242,28 @@ impl WaterSimulationData {
                 parameters,
             });
         }
-        let (wave_count, wave_records) = if version >= 259 {
+        let (wave_count, waves, wave_records) = if version >= 259 {
             let count = reader.read_u16_be()?;
-            let record_length = if version >= 261 { 24 } else { 23 };
+            let record_length = if version >= 261 {
+                WATER_WAVE_RECORD_LENGTH
+            } else {
+                WATER_WAVE_LEGACY_RECORD_LENGTH
+            };
             let length = usize::from(count)
                 .checked_mul(record_length)
                 .ok_or(CrpError::ArithmeticOverflow("water wave table length"))?;
-            let records = reader.read_bytes(length)?.to_vec();
-            (count, records)
+            if length > reader.remaining() {
+                return Err(reader.invalid("water wave records exceed remaining bytes"));
+            }
+            let start = reader.offset();
+            let mut waves = Vec::with_capacity(usize::from(count));
+            for _ in 0..count {
+                waves.push(WaterWave::read_from(version, &mut reader)?);
+            }
+            let records = reader.consumed_bytes()[start..reader.offset()].to_vec();
+            (count, waves, records)
         } else {
-            (0, Vec::new())
+            (0, Vec::new(), Vec::new())
         };
         let sea_level = if version >= 131 {
             reader.read_f32_be()?
@@ -188,6 +290,7 @@ impl WaterSimulationData {
                 velocity_z,
                 sources,
                 wave_count,
+                waves,
                 wave_records,
                 sea_level,
                 pollution_rates,
@@ -223,9 +326,14 @@ impl WaterSimulationData {
         &self.sources
     }
 
-    /// Returns the number of opaque water wave records.
+    /// Returns the number of decoded water wave records.
     pub fn wave_count(&self) -> u16 {
         self.wave_count
+    }
+
+    /// Returns typed wave records in their original order.
+    pub fn waves(&self) -> &[WaterWave] {
+        &self.waves
     }
 
     /// Returns opaque wave records in their original on-disk order.
@@ -260,7 +368,10 @@ impl WaterSimulationData {
     /// Edited writes always use canonical array controls.
     pub fn into_editor(mut self) -> WaterSimulationEditor {
         self.serialized_body = Vec::new();
-        WaterSimulationEditor { data: self }
+        WaterSimulationEditor {
+            original_waves: self.waves.clone(),
+            data: self,
+        }
     }
 
     pub(crate) fn encoded_len(&self) -> usize {
@@ -305,6 +416,14 @@ impl WaterSimulationEditor {
         &mut self.data.sources
     }
 
+    /// Returns the editable wave list for inner versions 259 and newer.
+    ///
+    /// The writer preserves original wave bytes when this list is unchanged.
+    /// For versions 259–260, every edited `wave_type` must be 0 or 1.
+    pub fn waves_mut(&mut self) -> &mut Vec<WaterWave> {
+        &mut self.data.waves
+    }
+
     /// Sets the saved sea level.
     pub fn set_sea_level(&mut self, sea_level: f32) {
         self.data.sea_level = sea_level;
@@ -323,9 +442,10 @@ impl WaterSimulationEditor {
     /// Encodes changed fields for inner versions 184 and newer.
     ///
     /// Array blocks are regenerated using literal and repeated-delta controls,
-    /// so bytes can differ from the game's original run grouping. Opaque wave
-    /// records are preserved. Returns an error if source counts or 24-bit
-    /// parameters overflow, or if a value would be dropped by a sparse mask.
+    /// so bytes can differ from the game's original run grouping. Original
+    /// wave bytes are preserved when unchanged and re-encoded when edited.
+    /// Returns an error if counts or 24-bit parameters overflow, an old-version
+    /// wave type is unrepresentable, or a value would be dropped by a sparse mask.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let data = &self.data;
         if data.format_version < 184 {
@@ -406,18 +526,35 @@ impl WaterSimulationEditor {
         }
 
         if data.format_version >= 259 {
-            let record_length = if data.format_version >= 261 { 24 } else { 23 };
+            let wave_count = u16::try_from(data.waves.len())
+                .map_err(|_| invalid(output.len(), "water wave count exceeds 65,535"))?;
+            let record_length = if data.format_version >= 261 {
+                WATER_WAVE_RECORD_LENGTH
+            } else {
+                WATER_WAVE_LEGACY_RECORD_LENGTH
+            };
             let expected_length = usize::from(data.wave_count)
                 .checked_mul(record_length)
                 .ok_or(CrpError::ArithmeticOverflow("water wave table length"))?;
-            if data.wave_records.len() != expected_length {
-                return Err(invalid(
-                    output.len(),
-                    "wave record length does not match count",
-                ));
+            output.extend_from_slice(&wave_count.to_be_bytes());
+            if data.waves == self.original_waves && wave_count == data.wave_count {
+                if data.wave_records.len() != expected_length {
+                    return Err(invalid(
+                        output.len(),
+                        "wave record length does not match count",
+                    ));
+                }
+                output.extend_from_slice(&data.wave_records);
+            } else {
+                for wave in &data.waves {
+                    wave.write_to(data.format_version, &mut output)?;
+                }
             }
-            output.extend_from_slice(&data.wave_count.to_be_bytes());
-            output.extend_from_slice(&data.wave_records);
+        } else if !data.waves.is_empty() {
+            return Err(invalid(
+                output.len(),
+                "water waves are unavailable before version 259",
+            ));
         }
         output.extend_from_slice(&data.sea_level.to_bits().to_be_bytes());
         output.extend(data.pollution_rates.map(|rate| rate as u8));
@@ -436,7 +573,8 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CELL_COUNT, WaterSimulationData};
+    use super::{CELL_COUNT, WaterSimulationData, WaterWave};
+    use crate::data_serializer::Reader;
     use crate::encoded_array::write_encoded_ushort_array;
 
     fn zero_run(output: &mut Vec<u8>, mut remaining: usize) {
@@ -485,6 +623,10 @@ mod tests {
             assert_eq!(water.sources()[0].target, 8);
             assert_eq!(water.sources()[0].parameters, [1, 2, 3, 4, 5]);
             assert_eq!(water.wave_count(), u16::from(wave_record_length.is_some()));
+            assert_eq!(
+                water.waves().len(),
+                usize::from(wave_record_length.is_some())
+            );
             assert_eq!(water.sea_level(), 38.0);
             assert_eq!(water.pollution_rates(), [1, 2]);
             assert_eq!(water.frame_index(), 123);
@@ -497,6 +639,17 @@ mod tests {
         let bytes = sample_body(Some(24));
         assert!(WaterSimulationData::decode_prefix(261, &bytes[..bytes.len() - 1]).is_err());
         assert!(WaterSimulationData::decode_prefix(183, &bytes).is_err());
+        for (version, record_length) in [(259, 23), (261, 24)] {
+            let bytes = sample_body(Some(record_length));
+            let wave_start = bytes.len() - 10 - record_length;
+            assert!(
+                WaterSimulationData::decode_prefix(
+                    version,
+                    &bytes[..wave_start + record_length - 1]
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -594,6 +747,7 @@ mod tests {
         assert_eq!(decoded.velocity_z()[0], 3);
         assert_eq!(decoded.sources()[0].parameters[4], 0x00ab_cdef);
         assert_eq!(decoded.wave_count(), 1);
+        assert_eq!(decoded.waves()[0].wave_type, 0);
         assert_eq!(decoded.sea_level(), 41.5);
         assert_eq!(decoded.pollution_rates(), [-1, 2]);
         assert_eq!(decoded.frame_index(), 456);
@@ -616,5 +770,104 @@ mod tests {
         let source = editor.sources_mut()[0].clone();
         editor.sources_mut().resize(65_536, source);
         assert!(editor.encode().is_err());
+    }
+
+    fn known_wave() -> WaterWave {
+        WaterWave {
+            wave_type: 0x1234,
+            min_x: 1,
+            min_z: 2,
+            max_x: 3,
+            max_z: 4,
+            origin_x: 5,
+            origin_z: 6,
+            direction_x: -1,
+            direction_z: -2,
+            delta: -3,
+            duration: 7,
+            current_time: 8,
+        }
+    }
+
+    #[test]
+    fn water_wave_uses_independent_expected_bytes_for_both_version_gates() {
+        let suffix = [
+            0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xfd, 0, 7, 0, 8,
+        ];
+        let wave = known_wave();
+        let mut bytes = Vec::new();
+        wave.write_to(261, &mut bytes).unwrap();
+        assert_eq!(&bytes[..2], &[0x12, 0x34]);
+        assert_eq!(&bytes[2..], &suffix);
+        let decoded = WaterWave::read_from(261, &mut Reader::new(&bytes)).unwrap();
+        assert_eq!(decoded, wave);
+
+        let mut old_wave = wave;
+        old_wave.wave_type = 1;
+        bytes.clear();
+        old_wave.write_to(259, &mut bytes).unwrap();
+        assert_eq!(bytes[0], 1);
+        assert_eq!(&bytes[1..], &suffix);
+        let decoded = WaterWave::read_from(259, &mut Reader::new(&bytes)).unwrap();
+        assert_eq!(decoded, old_wave);
+        old_wave.wave_type = 2;
+        assert!(old_wave.write_to(259, &mut Vec::new()).is_err());
+        old_wave.wave_type = 0;
+        bytes.clear();
+        old_wave.write_to(259, &mut bytes).unwrap();
+        assert_eq!(bytes[0], 0);
+    }
+
+    #[test]
+    fn edited_wave_fields_are_written_without_changing_other_water_fields() {
+        for (version, record_length, wave_type) in [(259, 23, 1), (261, 24, 0x1234)] {
+            let original = sample_body(Some(record_length));
+            let (water, _) = WaterSimulationData::decode_prefix(version, &original).unwrap();
+            let mut editor = water.into_editor();
+            editor.waves_mut()[0] = WaterWave {
+                wave_type,
+                ..known_wave()
+            };
+            let encoded = editor.encode().unwrap();
+            let record_start = encoded.len() - 10 - record_length;
+            assert_eq!(encoded[record_start], if version >= 261 { 0x12 } else { 1 });
+            let (decoded, length) = WaterSimulationData::decode_prefix(version, &encoded).unwrap();
+            assert_eq!(length, encoded.len());
+            assert_eq!(decoded.waves()[0], editor.waves_mut()[0]);
+            assert_eq!(decoded.sources().len(), 1);
+            assert_eq!(decoded.sea_level(), 38.0);
+        }
+    }
+
+    #[test]
+    fn waves_cannot_be_added_before_the_wave_table_version() {
+        let (water, _) = WaterSimulationData::decode_prefix(258, &sample_body(None)).unwrap();
+        let mut editor = water.into_editor();
+        editor.waves_mut().push(known_wave());
+        assert!(editor.encode().is_err());
+
+        let (water, _) = WaterSimulationData::decode_prefix(259, &sample_body(Some(23))).unwrap();
+        let mut editor = water.into_editor();
+        editor.waves_mut()[0].wave_type = 2;
+        assert!(editor.encode().is_err());
+
+        let (water, _) = WaterSimulationData::decode_prefix(261, &sample_body(Some(24))).unwrap();
+        let mut editor = water.into_editor();
+        editor.waves_mut().resize(65_536, known_wave());
+        assert!(editor.encode().is_err());
+    }
+
+    #[test]
+    fn legacy_wave_bool_is_true_only_for_byte_one() {
+        let mut bytes = sample_body(Some(23));
+        let wave_start = bytes.len() - 10 - 23;
+        bytes[wave_start] = 2;
+        let (water, _) = WaterSimulationData::decode_prefix(259, &bytes).unwrap();
+        assert_eq!(water.waves()[0].wave_type, 0);
+        assert_eq!(water.encode(), bytes);
+        let editor = water.into_editor();
+        let canonical = editor.encode().unwrap();
+        let canonical_wave_start = canonical.len() - 10 - 23;
+        assert_eq!(canonical[canonical_wave_start], 2);
     }
 }

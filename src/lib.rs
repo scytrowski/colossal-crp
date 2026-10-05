@@ -26,7 +26,9 @@ pub use simulation_manager_data::{
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use terrain_manager_data::TerrainManagerData;
 pub use texture::TextureAsset;
-pub use water_simulation_data::{WaterSimulationData, WaterSimulationEditor, WaterSource};
+pub use water_simulation_data::{
+    WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
+};
 
 const MAGIC: &[u8; 4] = b"CRAP";
 const MIN_SUPPORTED_VERSION: u16 = 4;
@@ -1008,6 +1010,21 @@ mod tests {
         let mut editor = water.into_editor();
         editor.set_sea_level(41.5);
         editor.sources_mut()[0].parameters[4] = 42;
+        let new_wave = WaterWave {
+            wave_type: 2,
+            min_x: 1,
+            min_z: 2,
+            max_x: 3,
+            max_z: 4,
+            origin_x: 5,
+            origin_z: 6,
+            direction_x: -1,
+            direction_z: -2,
+            delta: -3,
+            duration: 7,
+            current_time: 8,
+        };
+        editor.waves_mut().push(new_wave.clone());
         manager.replace_water(&editor)?;
         let (_, new_water_end) = manager.decode_water_prefix()?;
         assert_eq!(
@@ -1032,6 +1049,7 @@ mod tests {
         let (water, _) = rewritten.decode_water_prefix()?;
         assert_eq!(water.sea_level(), 41.5);
         assert_eq!(water.sources()[0].parameters[4], 42);
+        assert_eq!(water.waves(), &[new_wave.clone()]);
 
         let mut package = sample_package();
         let mut payload = include_bytes!("../tests/fixtures/simulation-metadata-v6.bin").to_vec();
@@ -1056,6 +1074,7 @@ mod tests {
         let (water, _) = reread_manager.decode_water_prefix()?;
         assert_eq!(water.sea_level(), 41.5);
         assert_eq!(water.sources()[0].parameters[4], 42);
+        assert_eq!(water.waves(), &[new_wave]);
         Ok(())
     }
 
@@ -1521,6 +1540,7 @@ mod tests {
         assert!(!paths.is_empty(), "external corpus contains no .crp files");
 
         let mut simulation_metadata_count = 0;
+        let mut nonempty_wave_assets = 0;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -1591,6 +1611,9 @@ mod tests {
                         assert_eq!(water.pollution().len(), 1_168_561);
                         assert_eq!(water.velocity_x().len(), 1_168_561);
                         assert_eq!(water.velocity_z().len(), 1_168_561);
+                        if water.wave_count() != 0 {
+                            nonempty_wave_assets += 1;
+                        }
                         assert!(water_end > manager_prefix_bytes);
                         assert_eq!(
                             manager_data
@@ -1612,6 +1635,7 @@ mod tests {
                         assert_eq!(rewritten.velocity_x(), water.velocity_x());
                         assert_eq!(rewritten.velocity_z(), water.velocity_z());
                         assert_eq!(rewritten.wave_records(), water.wave_records());
+                        assert_eq!(rewritten.waves(), water.waves());
                         assert_eq!(rewritten.sea_level().to_bits(), water.sea_level().to_bits());
                         assert_eq!(rewritten.pollution_rates(), water.pollution_rates());
                         assert_eq!(rewritten.frame_index(), water.frame_index());
@@ -1636,6 +1660,9 @@ mod tests {
             }
         }
         assert!(simulation_metadata_count > 0);
+        eprintln!(
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves"
+        );
         Ok(())
     }
 }
