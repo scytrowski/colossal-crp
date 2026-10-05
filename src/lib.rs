@@ -1136,6 +1136,7 @@ mod tests {
         bytes.extend(std::iter::repeat_n(0xff, 2047));
         bytes.push(0xfb);
         bytes.extend_from_slice(&[0, 0, 5]);
+        bytes.extend_from_slice(&[0, 11, 0, 12, 0, 13, 0, 0, 14]);
         let (lanes, consumed) = NetLanePrefix::decode_prefix(116_020, &bytes)?;
         assert_eq!(consumed, bytes.len());
         assert_eq!(lanes.lane_flags().len(), 262_143);
@@ -1145,10 +1146,17 @@ mod tests {
             &[NetLane {
                 index: 1,
                 flags: 1,
-                next_lane: 5
+                next_lane: 5,
+                reserved_prev: 11,
+                reserved_next: 12,
+                reserved_frame: 13,
+                last_reserve_id: 14,
             }]
         );
         assert_eq!(lanes.encode(), bytes);
+        let (legacy, used) = NetLanePrefix::decode_prefix(205, &bytes[..bytes.len() - 3])?;
+        assert_eq!(used, bytes.len() - 3);
+        assert_eq!(legacy.active_lanes()[0].last_reserve_id, 0);
         assert!(NetLanePrefix::decode_prefix(116_020, &bytes[..bytes.len() - 1]).is_err());
         assert!(NetLanePrefix::decode_prefix(116_020, &[0, 0]).is_err());
         Ok(())
@@ -1156,9 +1164,13 @@ mod tests {
 
     #[test]
     fn net_lane_prefix_game_fixture_preserves_real_links() -> Result<(), CrpError> {
-        let fixture = include_bytes!("../tests/fixtures/net-lane-prefix-v116020-desert.bin");
-        let (lanes, consumed) = NetLanePrefix::decode_prefix(116_020, fixture)?;
-        assert_eq!(consumed, 61_883);
+        let mut fixture =
+            include_bytes!("../tests/fixtures/net-lane-prefix-v116020-desert.bin").to_vec();
+        fixture.extend_from_slice(include_bytes!(
+            "../tests/fixtures/net-lane-reservations-v116020-desert.bin"
+        ));
+        let (lanes, consumed) = NetLanePrefix::decode_prefix(116_020, &fixture)?;
+        assert_eq!(consumed, 62_131);
         assert_eq!(lanes.lane_flags().len(), 262_143);
         assert_eq!(lanes.active_lanes().len(), 7_867);
         assert_eq!(
@@ -1167,6 +1179,10 @@ mod tests {
                 index: 45,
                 flags: 1,
                 next_lane: 109_741,
+                reserved_prev: 0,
+                reserved_next: 0,
+                reserved_frame: 0,
+                last_reserve_id: 0,
             }
         );
         assert_eq!(lanes.encode(), fixture);
@@ -1761,6 +1777,7 @@ mod tests {
         let mut simulation_metadata_count = 0;
         let mut nonempty_wave_assets = 0;
         let mut active_net_lanes = 0_usize;
+        let mut reserved_net_lanes = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -1879,6 +1896,16 @@ mod tests {
                         assert_eq!(net_lanes.lane_flags().len(), 262_143);
                         assert!(net_prefix_end > path_end);
                         active_net_lanes += net_lanes.active_lanes().len();
+                        reserved_net_lanes += net_lanes
+                            .active_lanes()
+                            .iter()
+                            .filter(|lane| {
+                                lane.reserved_prev != 0
+                                    || lane.reserved_next != 0
+                                    || lane.reserved_frame != 0
+                                    || lane.last_reserve_id != 0
+                            })
+                            .count();
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -1916,7 +1943,7 @@ mod tests {
         }
         assert!(simulation_metadata_count > 0);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state"
         );
         Ok(())
     }

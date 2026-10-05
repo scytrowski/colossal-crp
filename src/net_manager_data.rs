@@ -1,10 +1,10 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::read_encoded_ushort_array;
+use crate::encoded_array::{read_encoded_byte_array, read_encoded_ushort_array};
 
 const LANE_COUNT: usize = 262_144;
 
-/// One active lane's serialized flags and link to the next lane.
+/// One active lane's serialized flags, link, and reservation state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetLane {
     /// One-based index in the game's fixed lane buffer.
@@ -13,12 +13,20 @@ pub struct NetLane {
     pub flags: u16,
     /// Next lane ID, stored as a 24-bit integer.
     pub next_lane: u32,
+    /// Previous reserved position; present from inner version 163.
+    pub reserved_prev: u8,
+    /// Next reserved position; present from inner version 163.
+    pub reserved_next: u8,
+    /// Reservation frame; present from inner version 163.
+    pub reserved_frame: u8,
+    /// Last reservation ID; present from inner version 206.
+    pub last_reserve_id: u16,
 }
 
-/// The first two fields of `NetManager+Data`: all lane flags and active links.
+/// The lane section of `NetManager+Data`, before node flags.
 ///
-/// This is a partial manager body. Later lane, node, and segment fields remain
-/// in the opaque manager graph and are not claimed to be decoded here.
+/// This is a partial manager body. Node and segment fields remain in the
+/// opaque manager graph and are not claimed to be decoded here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetLanePrefix {
     format_version: u32,
@@ -28,7 +36,7 @@ pub struct NetLanePrefix {
 }
 
 impl NetLanePrefix {
-    /// Decodes the first two NetManager fields for inner versions 164 and newer.
+    /// Decodes lane flags, links, and reservations for inner versions 164+.
     /// Returns bytes consumed, excluding the loading-profiler opening tag.
     /// Truncated encoded arrays or link lists return errors.
     pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
@@ -57,7 +65,27 @@ impl NetLanePrefix {
                     .map_err(|_| CrpError::ArithmeticOverflow("NetLane index"))?,
                 flags,
                 next_lane,
+                reserved_prev: 0,
+                reserved_next: 0,
+                reserved_frame: 0,
+                last_reserve_id: 0,
             });
+        }
+        for field in 0..3 {
+            let values = read_encoded_byte_array(&mut reader, active_count)?;
+            for (lane, value) in active_lanes.iter_mut().zip(values) {
+                match field {
+                    0 => lane.reserved_prev = value,
+                    1 => lane.reserved_next = value,
+                    _ => lane.reserved_frame = value,
+                }
+            }
+        }
+        if format_version >= 206 {
+            let values = read_encoded_ushort_array(&mut reader, active_count)?;
+            for (lane, value) in active_lanes.iter_mut().zip(values) {
+                lane.last_reserve_id = value;
+            }
         }
         let consumed = reader.offset();
         Ok((
