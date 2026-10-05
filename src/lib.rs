@@ -27,7 +27,7 @@ pub use metadata::{MapMetaData, ModInfo};
 pub use net_manager_data::{
     NetLane, NetLanePrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
     NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetSegmentFlag,
-    NetSegmentFlagsPrefix,
+    NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
@@ -1475,6 +1475,121 @@ mod tests {
     }
 
     #[test]
+    fn net_segment_problems_follow_version_gates() -> Result<(), CrpError> {
+        fn one_active_segment_flags(version: u32) -> Result<NetSegmentFlagsPrefix, CrpError> {
+            let mut bytes = vec![2];
+            for value in [1_u32, 0, 0] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            bytes.extend(std::iter::repeat_n(0xff, 287));
+            bytes.push(0xfb);
+            if version >= 114_012 {
+                bytes.extend(std::iter::repeat_n(0xff, 287));
+                bytes.push(0xfe);
+            }
+            Ok(NetSegmentFlagsPrefix::decode_prefix(version, &bytes)?.0)
+        }
+
+        let old_flags = one_active_segment_flags(225)?;
+        let (old, used) = NetSegmentProblemsPrefix::decode_prefix(225, &old_flags, &[0xaa])?;
+        assert_eq!(used, 0);
+        assert_eq!(
+            old.problems(),
+            &[NetSegmentProblem {
+                index: 1,
+                problems1: 0,
+                problems2: 0
+            }]
+        );
+        assert!(old.encode().is_empty());
+
+        let single_flags = one_active_segment_flags(226)?;
+        let mut one_value = vec![0];
+        one_value.extend_from_slice(&9_u64.to_be_bytes());
+        let (single, used) =
+            NetSegmentProblemsPrefix::decode_prefix(226, &single_flags, &one_value)?;
+        assert_eq!(used, one_value.len());
+        assert_eq!(
+            single.problems(),
+            &[NetSegmentProblem {
+                index: 1,
+                problems1: 9,
+                problems2: 0
+            }]
+        );
+        assert_eq!(single.encode(), one_value);
+        assert!(
+            NetSegmentProblemsPrefix::decode_prefix(226, &single_flags, &one_value[..8]).is_err()
+        );
+
+        let paired_flags = one_active_segment_flags(115_000)?;
+        let mut two_values = vec![1];
+        two_values.extend_from_slice(&11_u64.to_be_bytes());
+        two_values.extend_from_slice(&12_u64.to_be_bytes());
+        let (paired, used) =
+            NetSegmentProblemsPrefix::decode_prefix(115_000, &paired_flags, &two_values)?;
+        assert_eq!(used, two_values.len());
+        assert_eq!(
+            paired.problems(),
+            &[NetSegmentProblem {
+                index: 1,
+                problems1: 11,
+                problems2: 12
+            }]
+        );
+        assert_eq!(paired.encode(), two_values);
+        assert!(
+            NetSegmentProblemsPrefix::decode_prefix(115_000, &paired_flags, &two_values[..16])
+                .is_err()
+        );
+        assert!(NetSegmentProblemsPrefix::decode_prefix(226, &paired_flags, &one_value).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn net_segment_problem_fixtures_cover_game_versions() -> Result<(), CrpError> {
+        let co_flags = include_bytes!("../tests/fixtures/net-segment-flags-v241-co.bin");
+        let (co_flags, _) = NetSegmentFlagsPrefix::decode_prefix(241, co_flags)?;
+        let co_fixture = include_bytes!("../tests/fixtures/net-segment-problems-v241-co.bin");
+        let (co, used) = NetSegmentProblemsPrefix::decode_prefix(241, &co_flags, co_fixture)?;
+        assert_eq!(used, 27);
+        assert_eq!(co.problems().len(), 30);
+        assert_eq!(
+            co.problems()
+                .iter()
+                .filter(|problem| problem.problems1 != 0 || problem.problems2 != 0)
+                .collect::<Vec<_>>(),
+            vec![&NetSegmentProblem {
+                index: 14_842,
+                problems1: 4_611_686_018_695_823_360,
+                problems2: 0,
+            }]
+        );
+        assert_eq!(co.encode(), co_fixture);
+
+        let desert_flags = include_bytes!("../tests/fixtures/net-segment-flags-v116020-desert.bin");
+        let (desert_flags, _) = NetSegmentFlagsPrefix::decode_prefix(116_020, desert_flags)?;
+        let desert_fixture =
+            include_bytes!("../tests/fixtures/net-segment-problems-v116020-desert.bin");
+        let (desert, used) =
+            NetSegmentProblemsPrefix::decode_prefix(116_020, &desert_flags, desert_fixture)?;
+        assert_eq!(used, 33);
+        assert_eq!(desert.problems().len(), 2_081);
+        assert!(
+            desert
+                .problems()
+                .iter()
+                .all(|problem| problem.problems1 == 0 && problem.problems2 == 0)
+        );
+        assert_eq!(desert.encode(), desert_fixture);
+        assert!(
+            NetSegmentProblemsPrefix::decode_prefix(116_020, &desert_flags, &desert_fixture[..32])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn net_node_problems_respect_version_and_app_gates() -> Result<(), CrpError> {
         fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
             let count = if version < 202 {
@@ -2329,6 +2444,7 @@ mod tests {
         let mut nodes_with_event_routes = 0_usize;
         let mut active_net_segments = 0_usize;
         let mut segments_with_secondary_flags = 0_usize;
+        let mut segments_with_problems = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -2515,21 +2631,15 @@ mod tests {
                             .iter()
                             .filter(|segment| segment.flags2 != 0)
                             .count();
-                        if manager_data.format_version() >= 226 {
-                            let problem_count = if manager_data.format_version() >= 115_000 {
-                                active_segments * 2
-                            } else {
-                                active_segments
-                            };
-                            let mut problem_reader = crate::data_serializer::Reader::new(
-                                &manager_data.serialized_object_graph()[segment_end..],
-                            );
-                            let segment_problems = crate::encoded_array::read_encoded_ulong_array(
-                                &mut problem_reader,
-                                problem_count,
-                            )?;
-                            assert_eq!(segment_problems.len(), problem_count);
-                        }
+                        let (segment_problems, problems_end) = manager_data
+                            .decode_net_segment_problems_prefix(metadata.save_app_version)?;
+                        assert!(problems_end >= segment_end);
+                        assert_eq!(segment_problems.problems().len(), active_segments);
+                        segments_with_problems += segment_problems
+                            .problems()
+                            .iter()
+                            .filter(|problem| problem.problems1 != 0 || problem.problems2 != 0)
+                            .count();
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -2567,7 +2677,7 @@ mod tests {
         }
         assert!(simulation_metadata_count > 0);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems"
         );
         Ok(())
     }

@@ -14,6 +14,7 @@ const FULL_NODE_COUNT_VERSION: u32 = 202;
 const FULL_SEGMENT_COUNT_VERSION: u32 = 222;
 const TWO_SEGMENT_FLAGS_VERSION: u32 = 114_012;
 const TWO_PROBLEMS_VERSION: u32 = 115_000;
+const SEGMENT_PROBLEMS_VERSION: u32 = 226;
 const NODE_EVENT_ROUTE_VERSION: u32 = 121_007;
 const MAX_NODE_SEGMENTS: usize = 8;
 const SAVE_APP_PROBLEMS_VERSION: u32 = (1 << 27) + (3 << 22) + (1 << 13) + (1 << 8);
@@ -170,6 +171,27 @@ pub struct NetSegmentFlag {
 pub struct NetSegmentFlagsPrefix {
     format_version: u32,
     segment_flags: Vec<NetSegmentFlag>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Problem bits for one segment with nonzero primary flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentProblem {
+    /// One-based segment buffer index.
+    pub index: u16,
+    /// First 64 problem bits.
+    pub problems1: u64,
+    /// Second 64 problem bits, zero before inner version 115000.
+    pub problems2: u64,
+}
+
+/// Version-dependent segment problem array following the segment flags.
+///
+/// Later segment fields remain in the opaque manager graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentProblemsPrefix {
+    format_version: u32,
+    problems: Vec<NetSegmentProblem>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -666,6 +688,93 @@ impl NetSegmentFlagsPrefix {
     }
 
     /// Writes the original encoded flag arrays exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetSegmentProblemsPrefix {
+    /// Decodes problem bits for segments with nonzero primary flags.
+    ///
+    /// Before inner version 226 no problem array is stored and all values are
+    /// zero. Versions 226–114999 store one ULong per active segment; versions
+    /// 115000 and newer store two interleaved ULong values. The returned length
+    /// ends before later segment fields.
+    pub fn decode_prefix(
+        format_version: u32,
+        segment_flags: &NetSegmentFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || segment_flags.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data segment problems".to_owned(),
+                offset: 0,
+                reason: "problem version does not match segment flags".to_owned(),
+            });
+        }
+        let active_indices = segment_flags
+            .segment_flags()
+            .iter()
+            .filter(|segment| segment.flags != 0)
+            .map(|segment| segment.index)
+            .collect::<Vec<_>>();
+        let active_count = active_indices.len();
+        let mut reader = Reader::new(bytes);
+        let mut problems = Vec::with_capacity(active_count);
+        if format_version >= TWO_PROBLEMS_VERSION {
+            let value_count = active_count
+                .checked_mul(2)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "NetManager segment problem count",
+                ))?;
+            let values = read_encoded_ulong_array(&mut reader, value_count)?;
+            for (index, pair) in active_indices.into_iter().zip(values.chunks_exact(2)) {
+                problems.push(NetSegmentProblem {
+                    index,
+                    problems1: pair[0],
+                    problems2: pair[1],
+                });
+            }
+        } else if format_version >= SEGMENT_PROBLEMS_VERSION {
+            let values = read_encoded_ulong_array(&mut reader, active_count)?;
+            for (index, value) in active_indices.into_iter().zip(values) {
+                problems.push(NetSegmentProblem {
+                    index,
+                    problems1: value,
+                    problems2: 0,
+                });
+            }
+        } else {
+            for index in active_indices {
+                problems.push(NetSegmentProblem {
+                    index,
+                    problems1: 0,
+                    problems2: 0,
+                });
+            }
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                problems,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns problem bits for segments with nonzero primary flags.
+    pub fn problems(&self) -> &[NetSegmentProblem] {
+        &self.problems
+    }
+
+    /// Writes the original encoded problem-array bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
