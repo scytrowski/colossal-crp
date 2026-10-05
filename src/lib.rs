@@ -8,6 +8,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 mod asset_io;
 mod data_serializer;
+mod encoded_array;
 mod game_area_data;
 mod metadata;
 mod simulation_manager_data;
@@ -25,7 +26,7 @@ pub use simulation_manager_data::{
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use terrain_manager_data::TerrainManagerData;
 pub use texture::TextureAsset;
-pub use water_simulation_data::{WaterSimulationData, WaterSource};
+pub use water_simulation_data::{WaterSimulationData, WaterSimulationEditor, WaterSource};
 
 const MAGIC: &[u8; 4] = b"CRAP";
 const MIN_SUPPORTED_VERSION: u16 = 4;
@@ -964,6 +965,101 @@ mod tests {
     }
 
     #[test]
+    fn replacing_water_preserves_neighboring_manager_bodies() -> Result<(), CrpError> {
+        fn begin_tag(bytes: &mut Vec<u8>, name: &str) -> Result<(), CrpError> {
+            bytes.push(0xfe);
+            crate::data_serializer::write_unique_string(bytes, name)
+        }
+
+        let fixture = include_bytes!("../tests/fixtures/simulation-manager-data-v6-root.bin");
+        let root = DataSerializerStream::decode(fixture)?;
+        let mut graph = Vec::new();
+        begin_tag(&mut graph, "GameAreaManager")?;
+        graph.extend_from_slice(include_bytes!(
+            "../tests/fixtures/game-area-manager-body-v112004.bin"
+        ));
+        graph.extend_from_slice(&[0, 1]);
+        begin_tag(&mut graph, "TerrainManager")?;
+        // A full zero-height grid followed by an empty sparse block-delta grid.
+        graph.extend(std::iter::repeat_n(0xff, 9_129));
+        graph.push(0xb0);
+        graph.extend_from_slice(&524_288_i32.to_be_bytes());
+        graph.extend_from_slice(&[0xff; 3]);
+        graph.extend_from_slice(&[0, 2]);
+        begin_tag(&mut graph, "WaterSimulation")?;
+        graph.extend_from_slice(include_bytes!(
+            "../tests/fixtures/water-simulation-body-v116020-desert.bin"
+        ));
+        graph.extend_from_slice(&[0, 3]);
+        begin_tag(&mut graph, "InstanceManager")?;
+        graph.extend_from_slice(b"opaque next manager");
+
+        let mut root_data = root.root_data().to_vec();
+        root_data.extend_from_slice(&graph);
+        let stream = DataSerializerStream::from_parts(
+            root.format_version(),
+            root.root_type().to_owned(),
+            root_data,
+        )?;
+        let mut manager = SimulationManagerData::decode(&stream.encode())?;
+        let (_, terrain_end) = manager.decode_terrain_prefix()?;
+        let (water, old_water_end) = manager.decode_water_prefix()?;
+        let old_graph = manager.serialized_object_graph().to_vec();
+        let mut editor = water.into_editor();
+        editor.set_sea_level(41.5);
+        editor.sources_mut()[0].parameters[4] = 42;
+        manager.replace_water(&editor)?;
+        let (_, new_water_end) = manager.decode_water_prefix()?;
+        assert_eq!(
+            &manager.serialized_object_graph()[..terrain_end],
+            &old_graph[..terrain_end]
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[new_water_end..],
+            &old_graph[old_water_end..]
+        );
+        let stable_graph = manager.serialized_object_graph().to_vec();
+        editor.sources_mut()[0].parameters[0] = 0x0100_0000;
+        assert!(manager.replace_water(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), stable_graph);
+        let (other_version, _) = WaterSimulationData::decode_prefix(
+            116_020,
+            include_bytes!("../tests/fixtures/water-simulation-body-v116020-desert.bin"),
+        )?;
+        assert!(manager.replace_water(&other_version.into_editor()).is_err());
+        assert_eq!(manager.serialized_object_graph(), stable_graph);
+        let rewritten = SimulationManagerData::decode(&manager.encode()?)?;
+        let (water, _) = rewritten.decode_water_prefix()?;
+        assert_eq!(water.sea_level(), 41.5);
+        assert_eq!(water.sources()[0].parameters[4], 42);
+
+        let mut package = sample_package();
+        let mut payload = include_bytes!("../tests/fixtures/simulation-metadata-v6.bin").to_vec();
+        payload.extend_from_slice(&manager.encode()?);
+        package.assets.push(Asset {
+            name: "edited_Data".to_owned(),
+            checksum: String::new(),
+            asset_type: 52,
+            relative_offset: 0,
+            data: payload,
+        });
+        let mut package_bytes = Vec::new();
+        package.write_compact_to(&mut package_bytes)?;
+        let reread = Package::read_from(&mut Cursor::new(package_bytes))?;
+        let asset = reread
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("missing edited _Data asset"))?;
+        let (_, metadata_end) = SimulationMetaData::decode_from(&asset.data)?;
+        let reread_manager = SimulationManagerData::decode(&asset.data[metadata_end..])?;
+        let (water, _) = reread_manager.decode_water_prefix()?;
+        assert_eq!(water.sea_level(), 41.5);
+        assert_eq!(water.sources()[0].parameters[4], 42);
+        Ok(())
+    }
+
+    #[test]
     fn game_area_manager_fixture_decodes_fields_and_preserves_body() -> Result<(), CrpError> {
         let bytes = include_bytes!("../tests/fixtures/game-area-manager-body-v112004.bin");
         let (area, consumed) = GameAreaManagerData::decode_prefix(112_004, bytes)?;
@@ -1505,6 +1601,34 @@ mod tests {
                             "InstanceManager profile start in {}",
                             path.display()
                         );
+                        let canonical = water.clone().into_editor().encode()?;
+                        let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
+                            manager_data.format_version(),
+                            &canonical,
+                        )?;
+                        assert_eq!(rewritten_length, canonical.len());
+                        assert_eq!(rewritten.heights(), water.heights());
+                        assert_eq!(rewritten.pollution(), water.pollution());
+                        assert_eq!(rewritten.velocity_x(), water.velocity_x());
+                        assert_eq!(rewritten.velocity_z(), water.velocity_z());
+                        assert_eq!(rewritten.wave_records(), water.wave_records());
+                        assert_eq!(rewritten.sea_level().to_bits(), water.sea_level().to_bits());
+                        assert_eq!(rewritten.pollution_rates(), water.pollution_rates());
+                        assert_eq!(rewritten.frame_index(), water.frame_index());
+                        assert_eq!(rewritten.sources().len(), water.sources().len());
+                        for (actual, expected) in rewritten.sources().iter().zip(water.sources()) {
+                            assert_eq!(
+                                actual.input_position.map(f32::to_bits),
+                                expected.input_position.map(f32::to_bits)
+                            );
+                            assert_eq!(
+                                actual.output_position.map(f32::to_bits),
+                                expected.output_position.map(f32::to_bits)
+                            );
+                            assert_eq!(actual.source_type, expected.source_type);
+                            assert_eq!(actual.target, expected.target);
+                            assert_eq!(actual.parameters, expected.parameters);
+                        }
                         simulation_metadata_count += 1;
                     }
                     _ => {}

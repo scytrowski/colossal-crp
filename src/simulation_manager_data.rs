@@ -2,6 +2,7 @@ use crate::CrpError;
 use crate::GameAreaManagerData;
 use crate::TerrainManagerData;
 use crate::WaterSimulationData;
+use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
@@ -290,6 +291,45 @@ impl SimulationManagerData {
             expect_profile_tag(&mut reader, &mut strings, "InstanceManager")?;
         }
         Ok((water_data, end))
+    }
+
+    /// Replaces the WaterSimulation body while retaining profiler tags and all
+    /// other manager bytes in their original order.
+    ///
+    /// Pass an editor obtained from this stream's Water body. Inner serializer
+    /// versions must match. The replacement uses the editor's canonical array
+    /// encoding; the original body remains untouched if encoding fails.
+    pub fn replace_water(&mut self, edited: &WaterSimulationEditor) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited WaterSimulation version does not match this stream",
+            ));
+        }
+        let (original, _) = self.decode_water_prefix()?;
+        let (_, terrain_end) = self.decode_terrain_prefix()?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(terrain_end)?;
+        let mut strings = vec![
+            "SimulationManager".to_owned(),
+            "GameAreaManager".to_owned(),
+            "TerrainManager".to_owned(),
+        ];
+        expect_profile_tag(&mut reader, &mut strings, "WaterSimulation")?;
+        let body_start = reader.offset();
+        let body_end = body_start
+            .checked_add(original.encoded_len())
+            .ok_or(CrpError::ArithmeticOverflow("WaterSimulation body end"))?;
+        if body_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "WaterSimulation body extends past manager graph",
+            ));
+        }
+        let replacement = edited.encode()?;
+        self.serialized_object_graph
+            .splice(body_start..body_end, replacement);
+        Ok(())
     }
 
     /// Encodes the typed root fields and copies the manager object graph raw.
