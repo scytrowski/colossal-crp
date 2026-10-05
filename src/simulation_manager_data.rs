@@ -7,7 +7,7 @@ use crate::TerrainManagerData;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
-use crate::{NetLanePrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix};
+use crate::{NetLanePrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix};
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
 const BUILD_INDEX_HISTORY_LENGTH: usize = 32;
@@ -438,6 +438,25 @@ impl SimulationManagerData {
         let (data, body_length) = NetNodeProblemsPrefix::decode_prefix(
             self.format_version,
             save_app_version,
+            &node_flags,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes sparse node wait times and counters after the problem array.
+    /// The returned graph offset is before individual opaque node records.
+    pub fn decode_net_node_counters_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetNodeCountersPrefix, usize), CrpError> {
+        let (_, problem_end) = self.decode_net_node_problems_prefix(save_app_version)?;
+        let (node_flags, _) = self.decode_net_node_flags_prefix()?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(problem_end)?;
+        let (data, body_length) = NetNodeCountersPrefix::decode_prefix(
+            self.format_version,
             &node_flags,
             reader.remaining_bytes(),
         )?;

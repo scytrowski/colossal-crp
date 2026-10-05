@@ -25,7 +25,8 @@ pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{MapMetaData, ModInfo};
 pub use net_manager_data::{
-    NetLane, NetLanePrefix, NetNodeFlag, NetNodeFlagsPrefix, NetNodeProblem, NetNodeProblemsPrefix,
+    NetLane, NetLanePrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
+    NetNodeProblem, NetNodeProblemsPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
@@ -1109,6 +1110,8 @@ mod tests {
         );
         let (problems, _) = manager.decode_net_node_problems_prefix(Some(201_499_120))?;
         assert!(problems.problems().is_empty());
+        let (counters, _) = manager.decode_net_node_counters_prefix(Some(201_499_120))?;
+        assert!(counters.counters().is_empty());
 
         let mut package = sample_package();
         let mut payload = include_bytes!("../tests/fixtures/simulation-metadata-v6.bin").to_vec();
@@ -1144,6 +1147,84 @@ mod tests {
         assert_eq!(node_flags.node_flags().len(), 32_767);
         let (problems, _) = reread_manager.decode_net_node_problems_prefix(Some(201_499_120))?;
         assert!(problems.problems().is_empty());
+        let (counters, _) = reread_manager.decode_net_node_counters_prefix(Some(201_499_120))?;
+        assert!(counters.counters().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_counters_follow_active_node_order() -> Result<(), CrpError> {
+        let mut flag_bytes = vec![2];
+        for value in [1_u32, 0, 0] {
+            flag_bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        flag_bytes.extend(std::iter::repeat_n(0xff, 511));
+        flag_bytes.push(0xfa);
+        let (flags, _) = NetNodeFlagsPrefix::decode_prefix(115_018, &flag_bytes)?;
+        let bytes = [0, 10, 1, 0, 11, 0, 12];
+        let (counters, used) = NetNodeCountersPrefix::decode_prefix(115_018, &flags, &bytes)?;
+        assert_eq!(used, bytes.len());
+        assert_eq!(
+            counters.counters(),
+            &[NetNodeCounter {
+                index: 1,
+                max_wait_time: 10,
+                temp_counter: 11,
+                final_counter: 12,
+            }]
+        );
+        assert_eq!(counters.encode(), bytes);
+        assert!(NetNodeCountersPrefix::decode_prefix(115_018, &flags, &bytes[..6]).is_err());
+        assert!(NetNodeCountersPrefix::decode_prefix(115_000, &flags, &bytes).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_counters_game_fixture_preserves_sparse_arrays() -> Result<(), CrpError> {
+        let flags_fixture = include_bytes!("../tests/fixtures/net-node-flags-v116020-desert.bin");
+        let (flags, _) = NetNodeFlagsPrefix::decode_prefix(116_020, flags_fixture)?;
+        let fixture = include_bytes!("../tests/fixtures/net-node-counters-v116020-desert.bin");
+        let (counters, used) = NetNodeCountersPrefix::decode_prefix(116_020, &flags, fixture)?;
+        assert_eq!(used, 50);
+        assert_eq!(counters.counters().len(), 2_082);
+        assert_eq!(counters.counters()[0].index, 11);
+        assert!(counters.counters().iter().all(|counter| {
+            counter.max_wait_time == 0 && counter.temp_counter == 0 && counter.final_counter == 0
+        }));
+        assert_eq!(counters.encode(), fixture);
+        assert!(NetNodeCountersPrefix::decode_prefix(116_020, &flags, &fixture[..49]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_counters_game_fixture_preserves_nonzero_wait_time() -> Result<(), CrpError> {
+        let flags_fixture =
+            include_bytes!("../tests/fixtures/net-node-flags-v117013-mp23-map02.bin");
+        let (flags, flag_bytes_used) = NetNodeFlagsPrefix::decode_prefix(117_013, flags_fixture)?;
+        assert_eq!(flag_bytes_used, 31_793);
+        let fixture = include_bytes!("../tests/fixtures/net-node-counters-v117013-mp23-map02.bin");
+        let (counters, used) = NetNodeCountersPrefix::decode_prefix(117_013, &flags, fixture)?;
+        assert_eq!(used, 62);
+        assert_eq!(counters.counters().len(), 2_405);
+        let nonzero = counters
+            .counters()
+            .iter()
+            .filter(|counter| {
+                counter.max_wait_time != 0
+                    || counter.temp_counter != 0
+                    || counter.final_counter != 0
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            nonzero,
+            vec![&NetNodeCounter {
+                index: 4_269,
+                max_wait_time: 4,
+                temp_counter: 0,
+                final_counter: 0,
+            }]
+        );
+        assert_eq!(counters.encode(), fixture);
         Ok(())
     }
 
@@ -1997,6 +2078,7 @@ mod tests {
         let mut reserved_net_lanes = 0_usize;
         let mut active_net_nodes = 0_usize;
         let mut nodes_with_problems = 0_usize;
+        let mut nodes_with_counters = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -2142,6 +2224,18 @@ mod tests {
                             .iter()
                             .filter(|problem| problem.problems1 != 0 || problem.problems2 != 0)
                             .count();
+                        let (counters, counters_end) = manager_data
+                            .decode_net_node_counters_prefix(metadata.save_app_version)?;
+                        assert!(counters_end >= problems_end);
+                        nodes_with_counters += counters
+                            .counters()
+                            .iter()
+                            .filter(|counter| {
+                                counter.max_wait_time != 0
+                                    || counter.temp_counter != 0
+                                    || counter.final_counter != 0
+                            })
+                            .count();
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -2179,7 +2273,7 @@ mod tests {
         }
         assert!(simulation_metadata_count > 0);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters"
         );
         Ok(())
     }

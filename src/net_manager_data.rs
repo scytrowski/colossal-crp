@@ -86,6 +86,27 @@ pub struct NetNodeProblemsPrefix {
     serialized_prefix: Vec<u8>,
 }
 
+/// Wait time and two counters for one active network node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeCounter {
+    /// One-based node buffer index.
+    pub index: u16,
+    /// Maximum wait time for the node.
+    pub max_wait_time: u8,
+    /// Temporary counter value.
+    pub temp_counter: u16,
+    /// Final counter value.
+    pub final_counter: u16,
+}
+
+/// Sparse node counters following the problem array in `NetManager+Data`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeCountersPrefix {
+    format_version: u32,
+    counters: Vec<NetNodeCounter>,
+    serialized_prefix: Vec<u8>,
+}
+
 impl NetLanePrefix {
     /// Decodes lane flags, links, and reservations for inner versions 164+.
     /// Returns bytes consumed, excluding the loading-profiler opening tag.
@@ -345,6 +366,76 @@ impl NetNodeProblemsPrefix {
     }
 
     /// Writes the original encoded problem array exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetNodeCountersPrefix {
+    /// Decodes one byte and two UShort values for each active node.
+    ///
+    /// This crate supports inner versions 164+, which include both arrays.
+    /// The returned byte length ends before individual node records.
+    pub fn decode_prefix(
+        format_version: u32,
+        node_flags: &NetNodeFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || node_flags.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data node counters".to_owned(),
+                offset: 0,
+                reason: "counter version does not match node flags".to_owned(),
+            });
+        }
+        let active_indices = node_flags
+            .node_flags()
+            .iter()
+            .filter(|node| node.flags != 0)
+            .map(|node| node.index)
+            .collect::<Vec<_>>();
+        let active_count = active_indices.len();
+        let mut reader = Reader::new(bytes);
+        let max_wait_times = read_encoded_byte_array(&mut reader, active_count)?;
+        let counter_count = active_count
+            .checked_mul(2)
+            .ok_or(CrpError::ArithmeticOverflow("NetManager counter count"))?;
+        let counter_values = read_encoded_ushort_array(&mut reader, counter_count)?;
+        let mut counters = Vec::with_capacity(active_count);
+        for ((index, max_wait_time), pair) in active_indices
+            .into_iter()
+            .zip(max_wait_times)
+            .zip(counter_values.chunks_exact(2))
+        {
+            counters.push(NetNodeCounter {
+                index,
+                max_wait_time,
+                temp_counter: pair[0],
+                final_counter: pair[1],
+            });
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                counters,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns counters for nodes with nonzero primary flags.
+    pub fn counters(&self) -> &[NetNodeCounter] {
+        &self.counters
+    }
+
+    /// Writes the original encoded counter-array bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
