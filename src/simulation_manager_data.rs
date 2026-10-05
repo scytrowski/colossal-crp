@@ -7,7 +7,7 @@ use crate::TerrainManagerData;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
-use crate::{NetLanePrefix, NetNodeFlagsPrefix};
+use crate::{NetLanePrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix};
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
 const BUILD_INDEX_HISTORY_LENGTH: usize = 32;
@@ -421,6 +421,26 @@ impl SimulationManagerData {
         reader.read_bytes(lane_end)?;
         let (data, body_length) =
             NetNodeFlagsPrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes node problem bits after node flags. The save-app version from
+    /// the first type-52 root selects a legacy encoding for versions 221–114999.
+    /// The returned offset is before later opaque NetManager fields.
+    pub fn decode_net_node_problems_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetNodeProblemsPrefix, usize), CrpError> {
+        let (node_flags, node_end) = self.decode_net_node_flags_prefix()?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(node_end)?;
+        let (data, body_length) = NetNodeProblemsPrefix::decode_prefix(
+            self.format_version,
+            save_app_version,
+            &node_flags,
+            reader.remaining_bytes(),
+        )?;
         reader.read_bytes(body_length)?;
         Ok((data, reader.offset()))
     }

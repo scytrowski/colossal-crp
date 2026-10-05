@@ -24,7 +24,9 @@ pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{MapMetaData, ModInfo};
-pub use net_manager_data::{NetLane, NetLanePrefix, NetNodeFlag, NetNodeFlagsPrefix};
+pub use net_manager_data::{
+    NetLane, NetLanePrefix, NetNodeFlag, NetNodeFlagsPrefix, NetNodeProblem, NetNodeProblemsPrefix,
+};
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
     ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
@@ -1105,6 +1107,8 @@ mod tests {
                 .iter()
                 .all(|node| node.flags == 0 && node.flags2 == 0)
         );
+        let (problems, _) = manager.decode_net_node_problems_prefix(Some(201_499_120))?;
+        assert!(problems.problems().is_empty());
 
         let mut package = sample_package();
         let mut payload = include_bytes!("../tests/fixtures/simulation-metadata-v6.bin").to_vec();
@@ -1138,6 +1142,137 @@ mod tests {
         assert!(net_lanes.active_lanes().is_empty());
         let (node_flags, _) = reread_manager.decode_net_node_flags_prefix()?;
         assert_eq!(node_flags.node_flags().len(), 32_767);
+        let (problems, _) = reread_manager.decode_net_node_problems_prefix(Some(201_499_120))?;
+        assert!(problems.problems().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_problems_respect_version_and_app_gates() -> Result<(), CrpError> {
+        fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
+            let count = if version < 202 {
+                16_383
+            } else if version >= 115_018 {
+                65_534
+            } else {
+                32_767
+            };
+            let mut bytes = vec![2];
+            for value in [1_u32, 0, 0] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            let remaining = count - 3;
+            bytes.extend(std::iter::repeat_n(0xff, remaining / 128));
+            if remaining % 128 != 0 {
+                bytes.push(0x7f + (remaining % 128) as u8);
+            }
+            let (flags, used) = NetNodeFlagsPrefix::decode_prefix(version, &bytes)?;
+            assert_eq!(used, bytes.len());
+            Ok(flags)
+        }
+
+        let modern_flags = one_active_node_flags(115_000)?;
+        let mut two_values = vec![1];
+        two_values.extend_from_slice(&5_u64.to_be_bytes());
+        two_values.extend_from_slice(&7_u64.to_be_bytes());
+        let (modern, used) =
+            NetNodeProblemsPrefix::decode_prefix(115_000, None, &modern_flags, &two_values)?;
+        assert_eq!(used, two_values.len());
+        assert_eq!(
+            modern.problems(),
+            &[NetNodeProblem {
+                index: 1,
+                problems1: 5,
+                problems2: 7
+            }]
+        );
+        assert_eq!(modern.encode(), two_values);
+
+        let legacy_flags = one_active_node_flags(221)?;
+        let mut one_ulong = vec![0];
+        one_ulong.extend_from_slice(&9_u64.to_be_bytes());
+        let (legacy_ulong, used) = NetNodeProblemsPrefix::decode_prefix(
+            221,
+            Some(146_809_088),
+            &legacy_flags,
+            &one_ulong,
+        )?;
+        assert_eq!(used, one_ulong.len());
+        assert_eq!(legacy_ulong.problems()[0].problems1, 9);
+        let one_uint = [0, 0xc0, 0, 0, 1];
+        let (legacy_uint, used) =
+            NetNodeProblemsPrefix::decode_prefix(221, Some(146_809_087), &legacy_flags, &one_uint)?;
+        assert_eq!(used, one_uint.len());
+        assert_eq!(legacy_uint.problems()[0].problems1, 0xc000_0000_0000_0001);
+        assert!(NetNodeProblemsPrefix::decode_prefix(221, None, &legacy_flags, &one_uint).is_err());
+        assert!(
+            NetNodeProblemsPrefix::decode_prefix(
+                221,
+                Some(146_809_088),
+                &legacy_flags,
+                &one_ulong[..one_ulong.len() - 1]
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_problem_fixtures_cover_game_versions() -> Result<(), CrpError> {
+        let (modern_flags, _) = NetNodeFlagsPrefix::decode_prefix(
+            116_020,
+            include_bytes!("../tests/fixtures/net-node-flags-v116020-desert.bin"),
+        )?;
+        let modern_fixture =
+            include_bytes!("../tests/fixtures/net-node-problems-v116020-desert.bin");
+        let (modern, modern_len) = NetNodeProblemsPrefix::decode_prefix(
+            116_020,
+            Some(201_499_120),
+            &modern_flags,
+            modern_fixture,
+        )?;
+        assert_eq!(modern_len, 33);
+        assert_eq!(modern.problems().len(), 2_082);
+        assert!(
+            modern
+                .problems()
+                .iter()
+                .all(|problem| problem.problems1 == 0 && problem.problems2 == 0)
+        );
+        assert_eq!(modern.encode(), modern_fixture);
+
+        let (wolf_flags, _) = NetNodeFlagsPrefix::decode_prefix(
+            112_004,
+            include_bytes!("../tests/fixtures/net-node-flags-v112004-wolf-creek.bin"),
+        )?;
+        let wolf_fixture =
+            include_bytes!("../tests/fixtures/net-node-problems-v112004-wolf-creek.bin");
+        let (wolf, wolf_len) = NetNodeProblemsPrefix::decode_prefix(
+            112_004,
+            Some(184_558_064),
+            &wolf_flags,
+            wolf_fixture,
+        )?;
+        assert_eq!(wolf_len, 39);
+        assert_eq!(wolf.problems().len(), 1_551);
+        assert_eq!(
+            wolf.problems()
+                .iter()
+                .filter(|problem| problem.problems1 != 0)
+                .count(),
+            2
+        );
+        assert!(
+            wolf.problems()
+                .iter()
+                .any(|problem| problem.index == 15_865 && problem.problems1 == 4_096)
+        );
+        assert!(
+            wolf.problems()
+                .iter()
+                .any(|problem| problem.index == 27_884 && problem.problems1 == 4_096)
+        );
+        assert_eq!(wolf.encode(), wolf_fixture);
         Ok(())
     }
 
@@ -1861,6 +1996,7 @@ mod tests {
         let mut active_net_lanes = 0_usize;
         let mut reserved_net_lanes = 0_usize;
         let mut active_net_nodes = 0_usize;
+        let mut nodes_with_problems = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -1998,6 +2134,14 @@ mod tests {
                             .iter()
                             .filter(|node| node.flags != 0 || node.flags2 != 0)
                             .count();
+                        let (problems, problems_end) = manager_data
+                            .decode_net_node_problems_prefix(metadata.save_app_version)?;
+                        assert!(problems_end >= net_node_end);
+                        nodes_with_problems += problems
+                            .problems()
+                            .iter()
+                            .filter(|problem| problem.problems1 != 0 || problem.problems2 != 0)
+                            .count();
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -2035,7 +2179,7 @@ mod tests {
         }
         assert!(simulation_metadata_count > 0);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems"
         );
         Ok(())
     }

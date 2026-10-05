@@ -1,13 +1,16 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
-    read_encoded_byte_array, read_encoded_uint_array, read_encoded_ushort_array,
+    read_encoded_byte_array, read_encoded_uint_array, read_encoded_ulong_array,
+    read_encoded_ushort_array,
 };
 
 const LANE_COUNT: usize = 262_144;
 const NODE_COUNT: usize = 32_768;
 const TWO_NODE_FLAGS_VERSION: u32 = 115_018;
 const FULL_NODE_COUNT_VERSION: u32 = 202;
+const TWO_PROBLEMS_VERSION: u32 = 115_000;
+const SAVE_APP_PROBLEMS_VERSION: u32 = (1 << 27) + (3 << 22) + (1 << 13) + (1 << 8);
 
 /// One active lane's serialized flags, link, and reservation state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +61,28 @@ pub struct NetNodeFlag {
 pub struct NetNodeFlagsPrefix {
     format_version: u32,
     node_flags: Vec<NetNodeFlag>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Problem bits for one node with nonzero primary flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeProblem {
+    /// One-based node buffer index.
+    pub index: u16,
+    /// First 64 problem bits after the game's legacy bit relocation.
+    pub problems1: u64,
+    /// Second 64 problem bits, zero before inner version 115000.
+    pub problems2: u64,
+}
+
+/// Version-dependent node problem array following the node flags.
+///
+/// The next node counters and records remain opaque.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeProblemsPrefix {
+    format_version: u32,
+    save_app_version: Option<u32>,
+    problems: Vec<NetNodeProblem>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -216,6 +241,110 @@ impl NetNodeFlagsPrefix {
     }
 
     /// Writes the original encoded node-flag bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetNodeProblemsPrefix {
+    /// Decodes one or two problem values for each active node.
+    ///
+    /// From inner version 115000, the stream contains two `EncodedArray.ULong`
+    /// values per active node. Earlier version 221+ streams use one ULong only
+    /// when `save_app_version` is at least 1.3.0.1.1.0; otherwise one UInt
+    /// value is relocated into the legacy 64-bit problem representation.
+    /// Pass the first type-52 root's stored save-app version for this gate.
+    pub fn decode_prefix(
+        format_version: u32,
+        save_app_version: Option<u32>,
+        node_flags: &NetNodeFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || node_flags.format_version() != format_version {
+            return Err(invalid(
+                0,
+                "NetManager problem version does not match node flags",
+            ));
+        }
+        if (221..TWO_PROBLEMS_VERSION).contains(&format_version) && save_app_version.is_none() {
+            return Err(invalid(
+                0,
+                "save-app version is required for NetManager problems",
+            ));
+        }
+        let active_indices = node_flags
+            .node_flags()
+            .iter()
+            .filter(|node| node.flags != 0)
+            .map(|node| node.index)
+            .collect::<Vec<_>>();
+        let active_count = active_indices.len();
+        let mut reader = Reader::new(bytes);
+        let mut problems = Vec::with_capacity(active_count);
+        if format_version >= TWO_PROBLEMS_VERSION {
+            let count = active_count
+                .checked_mul(2)
+                .ok_or(CrpError::ArithmeticOverflow("NetManager problem count"))?;
+            let values = read_encoded_ulong_array(&mut reader, count)?;
+            for (index, pair) in active_indices.into_iter().zip(values.chunks_exact(2)) {
+                problems.push(NetNodeProblem {
+                    index,
+                    problems1: pair[0],
+                    problems2: pair[1],
+                });
+            }
+        } else if format_version >= 221
+            && save_app_version.is_some_and(|version| version >= SAVE_APP_PROBLEMS_VERSION)
+        {
+            let values = read_encoded_ulong_array(&mut reader, active_count)?;
+            for (index, value) in active_indices.into_iter().zip(values) {
+                problems.push(NetNodeProblem {
+                    index,
+                    problems1: value,
+                    problems2: 0,
+                });
+            }
+        } else {
+            let values = read_encoded_uint_array(&mut reader, active_count)?;
+            for (index, value) in active_indices.into_iter().zip(values) {
+                let value = u64::from(value);
+                // The older reader moves bits 30–31 to problem bits 62–63.
+                let relocated = ((value & 0xc000_0000) << 32) | (value & 0x3fff_ffff);
+                problems.push(NetNodeProblem {
+                    index,
+                    problems1: relocated,
+                    problems2: 0,
+                });
+            }
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                save_app_version,
+                problems,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns the save-app version supplied for the legacy format gate.
+    pub fn save_app_version(&self) -> Option<u32> {
+        self.save_app_version
+    }
+
+    /// Returns problem bits for nodes with nonzero primary flags.
+    pub fn problems(&self) -> &[NetNodeProblem] {
+        &self.problems
+    }
+
+    /// Writes the original encoded problem array exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
