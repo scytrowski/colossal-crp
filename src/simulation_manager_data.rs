@@ -9,7 +9,7 @@ use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 use crate::{
     NetLanePrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
-    NetNodeRecordsPrefix,
+    NetNodeRecordsPrefix, NetSegmentFlagsPrefix,
 };
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
@@ -482,6 +482,21 @@ impl SimulationManagerData {
             &node_flags,
             reader.remaining_bytes(),
         )?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes the versioned segment-flag arrays after node records.
+    /// The returned graph offset is before segment problems.
+    pub fn decode_net_segment_flags_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetSegmentFlagsPrefix, usize), CrpError> {
+        let (_, records_end) = self.decode_net_node_records_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(records_end)?;
+        let (data, body_length) =
+            NetSegmentFlagsPrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
         reader.read_bytes(body_length)?;
         Ok((data, reader.offset()))
     }

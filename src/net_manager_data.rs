@@ -7,8 +7,12 @@ use crate::encoded_array::{
 
 const LANE_COUNT: usize = 262_144;
 const NODE_COUNT: usize = 32_768;
+const SEGMENT_COUNT: usize = 36_864;
+const LEGACY_SEGMENT_COUNT: usize = 32_768;
 const TWO_NODE_FLAGS_VERSION: u32 = 115_018;
 const FULL_NODE_COUNT_VERSION: u32 = 202;
+const FULL_SEGMENT_COUNT_VERSION: u32 = 222;
+const TWO_SEGMENT_FLAGS_VERSION: u32 = 114_012;
 const TWO_PROBLEMS_VERSION: u32 = 115_000;
 const NODE_EVENT_ROUTE_VERSION: u32 = 121_007;
 const MAX_NODE_SEGMENTS: usize = 8;
@@ -145,6 +149,27 @@ pub struct NetNodeRecord {
 pub struct NetNodeRecordsPrefix {
     format_version: u32,
     records: Vec<NetNodeRecord>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Serialized flags for one one-based `NetSegment` buffer position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentFlag {
+    /// One-based segment buffer index.
+    pub index: u16,
+    /// Primary segment flags.
+    pub flags: u32,
+    /// Secondary segment flags, zero before inner version 114012.
+    pub flags2: u32,
+}
+
+/// Encoded segment-flag arrays following the individual node records.
+///
+/// Later segment problem arrays and records remain in the opaque graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentFlagsPrefix {
+    format_version: u32,
+    segment_flags: Vec<NetSegmentFlag>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -576,6 +601,71 @@ impl NetNodeRecordsPrefix {
     }
 
     /// Writes the original node-record bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetSegmentFlagsPrefix {
+    /// Decodes primary flags and the version-gated secondary flag array.
+    ///
+    /// Inner versions before 222 store only indices 1–32767 in the primary
+    /// array. Secondary flags are stored in a separate full-length array from
+    /// version 114012. Returns bytes consumed before segment problems.
+    pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data segment flags".to_owned(),
+                offset: 0,
+                reason: "segment flags require inner version 164 or newer".to_owned(),
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        let primary_count = if format_version < FULL_SEGMENT_COUNT_VERSION {
+            LEGACY_SEGMENT_COUNT - 1
+        } else {
+            SEGMENT_COUNT - 1
+        };
+        let primary = read_encoded_uint_array(&mut reader, primary_count)?;
+        let secondary = if format_version >= TWO_SEGMENT_FLAGS_VERSION {
+            Some(read_encoded_uint_array(&mut reader, SEGMENT_COUNT - 1)?)
+        } else {
+            None
+        };
+        let mut segment_flags = Vec::with_capacity(SEGMENT_COUNT - 1);
+        for index in 0..SEGMENT_COUNT - 1 {
+            segment_flags.push(NetSegmentFlag {
+                index: u16::try_from(index + 1)
+                    .map_err(|_| CrpError::ArithmeticOverflow("NetSegment index"))?,
+                flags: primary.get(index).copied().unwrap_or(0),
+                flags2: secondary
+                    .as_ref()
+                    .and_then(|values| values.get(index).copied())
+                    .unwrap_or(0),
+            });
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                segment_flags,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns flags for all 36,863 one-based segment positions.
+    pub fn segment_flags(&self) -> &[NetSegmentFlag] {
+        &self.segment_flags
+    }
+
+    /// Writes the original encoded flag arrays exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }

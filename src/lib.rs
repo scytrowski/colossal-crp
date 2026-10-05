@@ -26,7 +26,8 @@ pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, Inst
 pub use metadata::{MapMetaData, ModInfo};
 pub use net_manager_data::{
     NetLane, NetLanePrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
-    NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix,
+    NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetSegmentFlag,
+    NetSegmentFlagsPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
@@ -1344,6 +1345,136 @@ mod tests {
     }
 
     #[test]
+    fn net_segment_flags_follow_versioned_array_layout() -> Result<(), CrpError> {
+        fn flags_with_first_value(count: usize, first: u32) -> Vec<u8> {
+            let mut bytes = vec![2];
+            for value in [first, 0, 0] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            let remaining = count - 3;
+            bytes.extend(std::iter::repeat_n(0xff, remaining / 128));
+            bytes.push(0x7f + (remaining % 128) as u8);
+            bytes
+        }
+
+        let old_bytes = flags_with_first_value(32_767, 5);
+        let (old, used) = NetSegmentFlagsPrefix::decode_prefix(194, &old_bytes)?;
+        assert_eq!(used, old_bytes.len());
+        assert_eq!(old.segment_flags().len(), 36_863);
+        assert_eq!(
+            old.segment_flags()[0],
+            NetSegmentFlag {
+                index: 1,
+                flags: 5,
+                flags2: 0
+            }
+        );
+        assert_eq!(old.segment_flags()[32_767].flags, 0);
+        assert_eq!(old.encode(), old_bytes);
+
+        let middle_bytes = flags_with_first_value(36_863, 6);
+        let (middle, used) = NetSegmentFlagsPrefix::decode_prefix(222, &middle_bytes)?;
+        assert_eq!(used, middle_bytes.len());
+        assert_eq!(middle.segment_flags()[0].flags, 6);
+        assert_eq!(middle.segment_flags()[36_862].index, 36_863);
+
+        let mut modern_bytes = flags_with_first_value(36_863, 7);
+        modern_bytes.extend_from_slice(&flags_with_first_value(36_863, 9));
+        let (modern, used) = NetSegmentFlagsPrefix::decode_prefix(114_012, &modern_bytes)?;
+        assert_eq!(used, modern_bytes.len());
+        assert_eq!(
+            modern.segment_flags()[0],
+            NetSegmentFlag {
+                index: 1,
+                flags: 7,
+                flags2: 9
+            }
+        );
+        assert_eq!(modern.encode(), modern_bytes);
+        assert!(
+            NetSegmentFlagsPrefix::decode_prefix(114_012, &modern_bytes[..modern_bytes.len() - 1])
+                .is_err()
+        );
+        assert!(NetSegmentFlagsPrefix::decode_prefix(163, &old_bytes).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn net_segment_flag_fixtures_preserve_game_arrays() -> Result<(), CrpError> {
+        let desert = include_bytes!("../tests/fixtures/net-segment-flags-v116020-desert.bin");
+        let (modern, used) = NetSegmentFlagsPrefix::decode_prefix(116_020, desert)?;
+        assert_eq!(used, 21_446);
+        assert_eq!(modern.segment_flags().len(), 36_863);
+        assert_eq!(
+            modern.segment_flags()[5],
+            NetSegmentFlag {
+                index: 6,
+                flags: 805_306_385,
+                flags2: 0,
+            }
+        );
+        assert_eq!(
+            modern
+                .segment_flags()
+                .iter()
+                .filter(|segment| segment.flags != 0)
+                .count(),
+            2_081
+        );
+        assert!(
+            modern
+                .segment_flags()
+                .iter()
+                .all(|segment| segment.flags2 == 0)
+        );
+        assert_eq!(modern.encode(), desert);
+
+        let old = include_bytes!("../tests/fixtures/net-segment-flags-v241-co.bin");
+        let (legacy, used) = NetSegmentFlagsPrefix::decode_prefix(241, old)?;
+        assert_eq!(used, 517);
+        assert_eq!(
+            legacy.segment_flags()[474],
+            NetSegmentFlag {
+                index: 475,
+                flags: 17,
+                flags2: 0,
+            }
+        );
+        assert_eq!(
+            legacy
+                .segment_flags()
+                .iter()
+                .filter(|segment| segment.flags != 0)
+                .count(),
+            30
+        );
+        assert_eq!(legacy.encode(), old);
+        assert!(NetSegmentFlagsPrefix::decode_prefix(241, &old[..old.len() - 1]).is_err());
+
+        let mp23 = include_bytes!("../tests/fixtures/net-segment-flags-v117013-mp23-map01.bin");
+        let (with_secondary, used) = NetSegmentFlagsPrefix::decode_prefix(117_013, mp23)?;
+        assert_eq!(used, 52_158);
+        assert_eq!(
+            with_secondary.segment_flags()[51],
+            NetSegmentFlag {
+                index: 52,
+                flags: 1,
+                flags2: 192,
+            }
+        );
+        assert_eq!(
+            with_secondary
+                .segment_flags()
+                .iter()
+                .filter(|segment| segment.flags2 != 0)
+                .count(),
+            3_116
+        );
+        assert_eq!(with_secondary.encode(), mp23);
+        Ok(())
+    }
+
+    #[test]
     fn net_node_problems_respect_version_and_app_gates() -> Result<(), CrpError> {
         fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
             let count = if version < 202 {
@@ -2196,6 +2327,8 @@ mod tests {
         let mut nodes_with_counters = 0_usize;
         let mut nodes_with_segments = 0_usize;
         let mut nodes_with_event_routes = 0_usize;
+        let mut active_net_segments = 0_usize;
+        let mut segments_with_secondary_flags = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -2367,19 +2500,36 @@ mod tests {
                             .iter()
                             .filter(|record| record.event_route != 0)
                             .count();
-                        let mut segment_reader = crate::data_serializer::Reader::new(
-                            &manager_data.serialized_object_graph()[records_end..],
-                        );
-                        let segment_count = if manager_data.format_version() < 222 {
-                            32_767
-                        } else {
-                            36_863
-                        };
-                        let segment_flags = crate::encoded_array::read_encoded_uint_array(
-                            &mut segment_reader,
-                            segment_count,
-                        )?;
-                        assert_eq!(segment_flags.len(), segment_count);
+                        let (segment_flags, segment_end) = manager_data
+                            .decode_net_segment_flags_prefix(metadata.save_app_version)?;
+                        assert!(segment_end > records_end);
+                        assert_eq!(segment_flags.segment_flags().len(), 36_863);
+                        let active_segments = segment_flags
+                            .segment_flags()
+                            .iter()
+                            .filter(|segment| segment.flags != 0)
+                            .count();
+                        active_net_segments += active_segments;
+                        segments_with_secondary_flags += segment_flags
+                            .segment_flags()
+                            .iter()
+                            .filter(|segment| segment.flags2 != 0)
+                            .count();
+                        if manager_data.format_version() >= 226 {
+                            let problem_count = if manager_data.format_version() >= 115_000 {
+                                active_segments * 2
+                            } else {
+                                active_segments
+                            };
+                            let mut problem_reader = crate::data_serializer::Reader::new(
+                                &manager_data.serialized_object_graph()[segment_end..],
+                            );
+                            let segment_problems = crate::encoded_array::read_encoded_ulong_array(
+                                &mut problem_reader,
+                                problem_count,
+                            )?;
+                            assert_eq!(segment_problems.len(), problem_count);
+                        }
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -2417,7 +2567,7 @@ mod tests {
         }
         assert!(simulation_metadata_count > 0);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags"
         );
         Ok(())
     }
