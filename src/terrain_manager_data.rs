@@ -81,7 +81,10 @@ impl TerrainManagerData {
     }
 }
 
-fn read_encoded_ushort_array(reader: &mut Reader<'_>, count: usize) -> Result<Vec<u16>, CrpError> {
+pub(crate) fn read_encoded_ushort_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<Vec<u16>, CrpError> {
     let mut values = Vec::with_capacity(count);
     let mut previous_value = 0_u16;
     let mut previous_delta = 0_i16;

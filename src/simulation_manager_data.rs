@@ -1,6 +1,7 @@
 use crate::CrpError;
 use crate::GameAreaManagerData;
 use crate::TerrainManagerData;
+use crate::WaterSimulationData;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
@@ -53,8 +54,8 @@ pub struct SimulationManagerData {
     /// Serializable data owned by the game and mods; absent below version 186.
     pub serializable_data_storage: Option<Vec<SerializableDataEntry>>,
     root_fields_len: usize,
-    leading_shared_type_names: Vec<String>,
-    leading_shared_type_bytes: Vec<u8>,
+    root_profile_begin_bytes: Vec<u8>,
+    root_profile_end_bytes: Vec<u8>,
     manager_objects: Option<Vec<Option<ManagerObjectReference>>>,
     manager_array_bytes: Vec<u8>,
     serialized_object_graph: Vec<u8>,
@@ -84,8 +85,10 @@ impl SimulationManagerData {
         }
 
         let mut reader = Reader::new(&stream.root_data);
-        let (leading_shared_type_names, leading_shared_type_bytes) =
-            read_leading_shared_types(&mut reader)?;
+        let mut shared_strings = Vec::new();
+        let begin_start = reader.offset();
+        expect_profile_tag(&mut reader, &mut shared_strings, "SimulationManager")?;
+        let root_profile_begin_bytes = reader.consumed_bytes()[begin_start..].to_vec();
         let current_tick_index = reader.read_u32_be()?;
         let current_frame_index = reader.read_u32_be()?;
         let current_build_index = reader.read_u32_be()?;
@@ -102,8 +105,7 @@ impl SimulationManagerData {
         }
 
         let manager_array_start = reader.offset();
-        let manager_objects =
-            read_manager_array(&mut reader, &stream.root_type, &leading_shared_type_names)?;
+        let manager_objects = read_manager_array(&mut reader, &stream.root_type)?;
         let manager_array_end = reader.offset();
         let manager_array_bytes =
             reader.consumed_bytes()[manager_array_start..manager_array_end].to_vec();
@@ -132,6 +134,10 @@ impl SimulationManagerData {
             None
         };
 
+        let end_start = reader.offset();
+        expect_profile_tag(&mut reader, &mut shared_strings, "SimulationManager")?;
+        let root_profile_end_bytes = reader.consumed_bytes()[end_start..].to_vec();
+
         Ok(Self {
             format_version: version,
             current_tick_index,
@@ -144,8 +150,8 @@ impl SimulationManagerData {
             root_fields_len: stream.header_len.checked_add(reader.offset()).ok_or(
                 CrpError::ArithmeticOverflow("SimulationManager+Data root length"),
             )?,
-            leading_shared_type_names,
-            leading_shared_type_bytes,
+            root_profile_begin_bytes,
+            root_profile_end_bytes,
             manager_objects,
             manager_array_bytes,
             serialized_object_graph: reader.remaining_bytes().to_vec(),
@@ -166,11 +172,6 @@ impl SimulationManagerData {
     /// Returns the manager data references in their original order.
     pub fn manager_objects(&self) -> Option<&[Option<ManagerObjectReference>]> {
         self.manager_objects.as_deref()
-    }
-
-    /// Returns shared types declared before the scalar root fields.
-    pub fn leading_shared_type_names(&self) -> &[String] {
-        &self.leading_shared_type_names
     }
 
     /// Returns the uninterpreted queued manager-object serialization bytes.
@@ -200,7 +201,14 @@ impl SimulationManagerData {
                 ),
             ));
         }
-        GameAreaManagerData::decode_prefix(self.format_version, &self.serialized_object_graph)
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        let mut strings = vec!["SimulationManager".to_owned()];
+        expect_profile_tag(&mut reader, &mut strings, "GameAreaManager")?;
+        let (area, body_length) =
+            GameAreaManagerData::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(body_length)?;
+        expect_profile_tag(&mut reader, &mut strings, "GameAreaManager")?;
+        Ok((area, reader.offset()))
     }
 
     /// Decodes the queued `TerrainManager+Data` body after the game-area body.
@@ -224,17 +232,64 @@ impl SimulationManagerData {
                 ),
             ));
         }
-        let (_, area_length) = self.decode_game_area_prefix()?;
-        let remainder = self
-            .serialized_object_graph
-            .get(area_length..)
-            .ok_or_else(|| invalid(area_length, "game-area body extends past manager graph"))?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        let mut strings = vec!["SimulationManager".to_owned()];
+        expect_profile_tag(&mut reader, &mut strings, "GameAreaManager")?;
+        let (_, area_length) =
+            GameAreaManagerData::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(area_length)?;
+        expect_profile_tag(&mut reader, &mut strings, "GameAreaManager")?;
+        expect_profile_tag(&mut reader, &mut strings, "TerrainManager")?;
         let (terrain_data, terrain_length) =
-            TerrainManagerData::decode_prefix(self.format_version, remainder)?;
-        let consumed = area_length
-            .checked_add(terrain_length)
-            .ok_or(CrpError::ArithmeticOverflow("manager object prefix length"))?;
-        Ok((terrain_data, consumed))
+            TerrainManagerData::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(terrain_length)?;
+        expect_profile_tag(&mut reader, &mut strings, "TerrainManager")?;
+        Ok((terrain_data, reader.offset()))
+    }
+
+    /// Decodes the queued `WaterSimulation+Data` body after GameArea and Terrain.
+    ///
+    /// The returned length includes all three bodies and their profiler tags.
+    /// Water source records before inner version 184 are unsupported. The
+    /// original graph, including any later manager objects, remains unchanged.
+    pub fn decode_water_prefix(&self) -> Result<(WaterSimulationData, usize), CrpError> {
+        let Some(Some(water)) = self
+            .manager_objects
+            .as_ref()
+            .and_then(|objects| objects.get(2))
+        else {
+            return Err(invalid(0, "manager object array has no third object"));
+        };
+        if !water.type_name.starts_with("WaterSimulation+Data,") {
+            return Err(invalid(
+                0,
+                "third manager object is not WaterSimulation+Data",
+            ));
+        }
+        let (_, terrain_end) = self.decode_terrain_prefix()?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(terrain_end)?;
+        let mut strings = vec![
+            "SimulationManager".to_owned(),
+            "GameAreaManager".to_owned(),
+            "TerrainManager".to_owned(),
+        ];
+        expect_profile_tag(&mut reader, &mut strings, "WaterSimulation")?;
+        let (water_data, body_length) =
+            WaterSimulationData::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(body_length)?;
+        expect_profile_tag(&mut reader, &mut strings, "WaterSimulation")?;
+        let end = reader.offset();
+        if self
+            .manager_objects
+            .as_ref()
+            .and_then(|objects| objects.get(3))
+            .and_then(Option::as_ref)
+            .is_some_and(|next| next.type_name.starts_with("InstanceManager+Data,"))
+        {
+            expect_profile_tag(&mut reader, &mut strings, "InstanceManager")?;
+        }
+        Ok((water_data, end))
     }
 
     /// Encodes the typed root fields and copies the manager object graph raw.
@@ -268,7 +323,7 @@ impl SimulationManagerData {
             ));
         }
         let mut root_data = Vec::new();
-        root_data.extend_from_slice(&self.leading_shared_type_bytes);
+        root_data.extend_from_slice(&self.root_profile_begin_bytes);
         root_data.extend_from_slice(&self.current_tick_index.to_be_bytes());
         root_data.extend_from_slice(&self.current_frame_index.to_be_bytes());
         root_data.extend_from_slice(&self.current_build_index.to_be_bytes());
@@ -302,6 +357,7 @@ impl SimulationManagerData {
                 write_byte_array(&mut root_data, entry.data.as_deref())?;
             }
         }
+        root_data.extend_from_slice(&self.root_profile_end_bytes);
         Ok(root_data)
     }
 }
@@ -309,7 +365,6 @@ impl SimulationManagerData {
 fn read_manager_array(
     reader: &mut Reader<'_>,
     root_type: &str,
-    leading_shared_types: &[String],
 ) -> Result<Option<Vec<Option<ManagerObjectReference>>>, CrpError> {
     let first = reader.read_u8()?;
     if first == 0xff {
@@ -327,7 +382,6 @@ fn read_manager_array(
     let count = usize::try_from(count)
         .map_err(|_| reader.invalid("manager object count does not fit this platform"))?;
     let mut shared_types = vec![root_type.to_owned()];
-    shared_types.extend_from_slice(leading_shared_types);
     let mut object_types = vec![0_usize];
     let mut objects = Vec::with_capacity(count);
     for _ in 0..count {
@@ -390,24 +444,38 @@ fn read_manager_array(
     Ok(Some(objects))
 }
 
-fn read_leading_shared_types(reader: &mut Reader<'_>) -> Result<(Vec<String>, Vec<u8>), CrpError> {
-    let start = reader.offset();
-    let mut names = Vec::new();
-    while reader.peek_u8() == Some(0xfe) {
-        let marker = reader.read_u8()?;
-        if marker != 0xfe {
-            return Err(reader.invalid("invalid leading shared-type marker"));
+fn expect_profile_tag(
+    reader: &mut Reader<'_>,
+    strings: &mut Vec<String>,
+    expected: &str,
+) -> Result<(), CrpError> {
+    let marker = reader.read_u8()?;
+    let name = match marker {
+        0xff => return Err(reader.invalid("loading-profiler tag cannot be null")),
+        0xfe => {
+            let name = reader
+                .read_unique_string()?
+                .ok_or_else(|| reader.invalid("loading-profiler string cannot be null"))?;
+            if strings.len() >= MAX_SHARED_TYPES {
+                return Err(reader.invalid("shared-string table exceeds the game limit"));
+            }
+            strings.push(name.clone());
+            name
         }
-        let name = reader
-            .read_unique_string()?
-            .ok_or_else(|| reader.invalid("leading shared-type name cannot be null"))?;
-        if names.len() >= MAX_SHARED_TYPES - 1 {
-            return Err(reader.invalid("leading shared-type table exceeds the game limit"));
+        high => {
+            let index = usize::from(u16::from(high) << 8 | u16::from(reader.read_u8()?));
+            strings
+                .get(index)
+                .ok_or_else(|| reader.invalid("shared-string index is out of bounds"))?
+                .clone()
         }
-        names.push(name);
+    };
+    if name != expected {
+        return Err(reader.invalid(format!(
+            "expected loading-profiler tag {expected}, found {name}"
+        )));
     }
-    let bytes = reader.consumed_bytes()[start..].to_vec();
-    Ok((names, bytes))
+    Ok(())
 }
 
 fn read_byte_array(reader: &mut Reader<'_>) -> Result<Option<Vec<u8>>, CrpError> {

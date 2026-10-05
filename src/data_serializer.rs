@@ -137,10 +137,6 @@ impl<'a> Reader<'a> {
         Ok(self.read_bytes(1)?[0])
     }
 
-    pub(crate) fn peek_u8(&self) -> Option<u8> {
-        self.bytes.get(self.offset).copied()
-    }
-
     pub(crate) fn read_u32_be(&mut self) -> Result<u32, CrpError> {
         let bytes = self.read_bytes(4)?;
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))

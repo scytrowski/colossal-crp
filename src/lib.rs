@@ -14,6 +14,7 @@ mod simulation_manager_data;
 mod simulation_metadata;
 mod terrain_manager_data;
 mod texture;
+mod water_simulation_data;
 
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
@@ -24,6 +25,7 @@ pub use simulation_manager_data::{
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use terrain_manager_data::TerrainManagerData;
 pub use texture::TextureAsset;
+pub use water_simulation_data::{WaterSimulationData, WaterSource};
 
 const MAGIC: &[u8; 4] = b"CRAP";
 const MIN_SUPPORTED_VERSION: u16 = 4;
@@ -935,7 +937,6 @@ mod tests {
         assert_eq!(manager.randomizer_seed, 0x81c3_f923_d483_d023);
         assert_eq!(manager.day_time_offset_frames, Some(0x0000_a885));
         assert_eq!(manager.build_index_history.len(), 32);
-        assert_eq!(manager.leading_shared_type_names(), &["SimulationManager"]);
         assert_eq!(manager.manager_objects().map_or(0, <[_]>::len), 29);
         assert_eq!(
             manager.serializable_data_storage.as_ref().map(Vec::len),
@@ -948,17 +949,32 @@ mod tests {
     }
 
     #[test]
+    fn simulation_manager_rejects_missing_or_wrong_root_profile_end() {
+        let mut bytes =
+            include_bytes!("../tests/fixtures/simulation-manager-data-v6-root.bin").to_vec();
+        bytes.pop();
+        assert!(SimulationManagerData::decode(&bytes).is_err());
+
+        let mut bytes =
+            include_bytes!("../tests/fixtures/simulation-manager-data-v6-root.bin").to_vec();
+        if let Some(last) = bytes.last_mut() {
+            *last = 1;
+        }
+        assert!(SimulationManagerData::decode(&bytes).is_err());
+    }
+
+    #[test]
     fn game_area_manager_fixture_decodes_fields_and_preserves_body() -> Result<(), CrpError> {
         let bytes = include_bytes!("../tests/fixtures/game-area-manager-body-v112004.bin");
         let (area, consumed) = GameAreaManagerData::decode_prefix(112_004, bytes)?;
         assert_eq!(consumed, bytes.len());
         assert_eq!(area.area_count(), 0);
-        assert_eq!(area.start_tile(), 0);
+        assert_eq!(area.start_tile(), 12);
         assert_eq!(area.area_grid(), &[0; 25]);
-        assert_eq!(area.area_not_unlocked_reference(), &[0x80, 0x00, 0x0f]);
+        assert_eq!(&area.area_not_unlocked_reference()[..2], &[0xfe, 0xfe]);
         assert_eq!(
             area.buildable_area().map(f32::to_bits),
-            [0xc71a_0cf8, 0xdc31_f3fc, 0xec14_0df3, 0x06fe_0d00,]
+            [0x3f68_2598, 0x3f49_56fb, 0x3f2c_7bfa, 0x3f1d_1504]
         );
         assert_eq!(area.saved_camera_view().mode, -1);
         assert_eq!(area.encode(), bytes);
@@ -1463,13 +1479,6 @@ mod tests {
                             asset.name,
                             path.display()
                         );
-                        assert_eq!(
-                            manager_data.leading_shared_type_names(),
-                            &["SimulationManager"],
-                            "unexpected leading shared types for {:?} in {}",
-                            asset.name,
-                            path.display()
-                        );
                         let (game_area, game_area_bytes) =
                             manager_data.decode_game_area_prefix()?;
                         assert_eq!(game_area.area_grid().len(), 25);
@@ -1480,6 +1489,21 @@ mod tests {
                         assert_eq!(terrain.block_height_deltas().len(), 1_168_561);
                         assert!(
                             manager_prefix_bytes <= manager_data.serialized_object_graph().len()
+                        );
+                        let (water, water_end) = manager_data.decode_water_prefix()?;
+                        assert_eq!(water.heights().len(), 1_168_561);
+                        assert_eq!(water.pollution().len(), 1_168_561);
+                        assert_eq!(water.velocity_x().len(), 1_168_561);
+                        assert_eq!(water.velocity_z().len(), 1_168_561);
+                        assert!(water_end > manager_prefix_bytes);
+                        assert_eq!(
+                            manager_data
+                                .serialized_object_graph()
+                                .get(water_end..)
+                                .and_then(|remaining| remaining.get(..4)),
+                            Some(&[0xfe, 0x80, 0x00, 0x0f][..]),
+                            "InstanceManager profile start in {}",
+                            path.display()
                         );
                         simulation_metadata_count += 1;
                     }
