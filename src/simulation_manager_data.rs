@@ -2,6 +2,7 @@ use crate::CrpError;
 use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
 use crate::InstanceManagerEditor;
+use crate::PathManagerData;
 use crate::TerrainManagerData;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
@@ -334,6 +335,47 @@ impl SimulationManagerData {
             .is_some_and(|next| next.type_name.starts_with("PathManager+Data,"))
         {
             expect_profile_tag(&mut reader, &mut strings, "PathManager")?;
+        }
+        Ok((data, end))
+    }
+
+    /// Decodes the fifth queued manager body and returns the graph offset
+    /// following its closing profiler tag. Requires inner versions 164–121010.
+    pub fn decode_path_prefix(&self) -> Result<(PathManagerData, usize), CrpError> {
+        let Some(Some(path)) = self
+            .manager_objects
+            .as_ref()
+            .and_then(|objects| objects.get(4))
+        else {
+            return Err(invalid(0, "manager object array has no fifth object"));
+        };
+        if !path.type_name.starts_with("PathManager+Data,") {
+            return Err(invalid(0, "fifth manager object is not PathManager+Data"));
+        }
+        let (_, instance_end) = self.decode_instance_prefix()?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(instance_end)?;
+        let mut strings = vec![
+            "SimulationManager".to_owned(),
+            "GameAreaManager".to_owned(),
+            "TerrainManager".to_owned(),
+            "WaterSimulation".to_owned(),
+            "InstanceManager".to_owned(),
+        ];
+        expect_profile_tag(&mut reader, &mut strings, "PathManager")?;
+        let (data, body_length) =
+            PathManagerData::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(body_length)?;
+        expect_profile_tag(&mut reader, &mut strings, "PathManager")?;
+        let end = reader.offset();
+        if self
+            .manager_objects
+            .as_ref()
+            .and_then(|objects| objects.get(5))
+            .and_then(Option::as_ref)
+            .is_some_and(|next| next.type_name.starts_with("NetManager+Data,"))
+        {
+            expect_profile_tag(&mut reader, &mut strings, "NetManager")?;
         }
         Ok((data, end))
     }

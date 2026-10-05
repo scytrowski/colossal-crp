@@ -12,6 +12,7 @@ mod encoded_array;
 mod game_area_data;
 mod instance_manager_data;
 mod metadata;
+mod path_manager_data;
 mod simulation_manager_data;
 mod simulation_metadata;
 mod terrain_manager_data;
@@ -22,6 +23,7 @@ pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{MapMetaData, ModInfo};
+pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
     ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
 };
@@ -1001,6 +1003,11 @@ mod tests {
         ));
         graph.extend_from_slice(&[0, 4]);
         begin_tag(&mut graph, "PathManager")?;
+        graph.extend_from_slice(include_bytes!(
+            "../tests/fixtures/path-manager-body-v116020-desert.bin"
+        ));
+        graph.extend_from_slice(&[0, 5]);
+        begin_tag(&mut graph, "NetManager")?;
         graph.extend_from_slice(b"opaque next manager");
 
         let mut root_data = root.root_data().to_vec();
@@ -1076,6 +1083,13 @@ mod tests {
             manager.serialized_object_graph()[edited_instance_end..],
             after_instance
         );
+        let (path, path_end) = manager.decode_path_prefix()?;
+        assert!(path.active_units().is_empty());
+        assert!(path.simulation_flags().iter().all(|flag| *flag == 0));
+        assert_eq!(
+            &manager.serialized_object_graph()[path_end..path_end + 4],
+            &[0xfe, 0x80, 0, 10]
+        );
 
         let mut package = sample_package();
         let mut payload = include_bytes!("../tests/fixtures/simulation-metadata-v6.bin").to_vec();
@@ -1103,6 +1117,83 @@ mod tests {
         assert_eq!(water.waves(), &[new_wave]);
         let (instance, _) = reread_manager.decode_instance_prefix()?;
         assert_eq!(instance.names()[0].name.as_deref(), Some("A"));
+        let (path, _) = reread_manager.decode_path_prefix()?;
+        assert!(path.active_units().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn path_manager_fixture_and_active_unit_vector() -> Result<(), CrpError> {
+        let fixture = include_bytes!("../tests/fixtures/path-manager-body-v116020-desert.bin");
+        let (path, used) = PathManagerData::decode_prefix(116_020, fixture)?;
+        assert_eq!(used, 2048);
+        assert_eq!(path.simulation_flags().len(), 262_143);
+        assert!(path.simulation_flags().iter().all(|flag| *flag == 0));
+        assert!(path.active_units().is_empty());
+        assert_eq!(path.encode(), fixture);
+
+        let mut body = vec![2, 1, 0, 0];
+        body.extend(std::iter::repeat_n(0xff, 2047));
+        body.push(0xfb);
+        body.extend_from_slice(&[
+            2, 3, 0, 0, 0, 4, 1, 0, 0, 5, 0, 0, 0, 6, 0x3f, 0xc0, 0, 0, 100, 0, 7, 8, 9,
+        ]);
+        let (active, used) = PathManagerData::decode_prefix(116_020, &body)?;
+        assert_eq!(used, body.len());
+        assert_eq!(active.simulation_flags()[0], 1);
+        assert_eq!(active.active_units().len(), 1);
+        let unit = &active.active_units()[0];
+        assert_eq!(unit.index, 1);
+        assert_eq!(unit.vehicle_types, 4);
+        assert_eq!(unit.next_path_unit, 5);
+        assert_eq!(unit.build_index, 6);
+        assert_eq!(unit.length, 1.5);
+        assert_eq!(unit.speed, 100);
+        assert_eq!(
+            unit.positions,
+            [PathPosition {
+                segment: 7,
+                offset: 8,
+                lane: 9
+            }]
+        );
+        assert_eq!(active.encode(), body);
+        let flag_prefix = &body[..2052];
+        for (version, vehicle_bytes, speed_byte, expected_vehicle, expected_speed) in [
+            (194, &[0x12][..], None, 0x12, 100),
+            (311, &[0x12, 0x34][..], None, 0x1234, 100),
+            (110_026, &[0x12, 0x34][..], Some(77), 0x1234, 77),
+            (111_000, &[0x12, 0x34][..], None, 0x1234, 100),
+            (111_012, &[0x12, 0x34][..], Some(77), 0x1234, 77),
+            (
+                113_001,
+                &[0x12, 0x34, 0x56, 0x78][..],
+                Some(77),
+                0x1234_5678,
+                77,
+            ),
+        ] {
+            let mut bytes = flag_prefix.to_vec();
+            bytes.extend_from_slice(&[2, 3]);
+            bytes.extend_from_slice(vehicle_bytes);
+            bytes.extend_from_slice(&[0, 0, 0, 5, 0, 0, 0, 6, 0x3f, 0xc0, 0, 0]);
+            if let Some(speed) = speed_byte {
+                bytes.push(speed);
+            }
+            let (decoded, used) = PathManagerData::decode_prefix(version, &bytes)?;
+            assert_eq!(used, bytes.len(), "version {version}");
+            assert_eq!(decoded.active_units()[0].vehicle_types, expected_vehicle);
+            assert_eq!(decoded.active_units()[0].speed, expected_speed);
+            assert_eq!(decoded.encode(), bytes);
+        }
+        let mut too_many_positions = body.clone();
+        too_many_positions[2058] = 13;
+        assert!(PathManagerData::decode_prefix(116_020, &too_many_positions).is_err());
+        for cut in [0, 1, 2045, 2046, 2047] {
+            assert!(PathManagerData::decode_prefix(116_020, &fixture[..cut]).is_err());
+        }
+        assert!(PathManagerData::decode_prefix(116_020, &body[..body.len() - 1]).is_err());
+        assert!(PathManagerData::decode_prefix(121_011, fixture).is_err());
         Ok(())
     }
 
@@ -1719,6 +1810,18 @@ mod tests {
                             "{}",
                             path.display()
                         );
+                        let (path_data, path_end) = manager_data.decode_path_prefix()?;
+                        assert_eq!(path_data.simulation_flags().len(), 262_143);
+                        assert!(path_data.active_units().is_empty(), "{}", path.display());
+                        assert_eq!(
+                            path_data.encode(),
+                            include_bytes!(
+                                "../tests/fixtures/path-manager-body-v116020-desert.bin"
+                            ),
+                            "{}",
+                            path.display()
+                        );
+                        assert!(path_end > instance_end);
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),

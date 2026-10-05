@@ -1,6 +1,41 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
 
+pub(crate) fn read_encoded_byte_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<Vec<u8>, CrpError> {
+    let mut values = Vec::with_capacity(count);
+    let mut previous_value = 0_u8;
+    let mut previous_delta = 0_i8;
+    while values.len() < count {
+        let control = reader.read_u8()?;
+        if control < 0x80 {
+            let run_length = usize::from(control) + 1;
+            if run_length > count - values.len() {
+                return Err(
+                    reader.invalid("EncodedArray.Byte literal run exceeds the array length")
+                );
+            }
+            for _ in 0..run_length {
+                let value = reader.read_u8()?;
+                previous_delta = value.wrapping_sub(previous_value) as i8;
+                previous_value = value;
+                values.push(value);
+            }
+        } else {
+            let run_length = usize::from(control - 0x7f);
+            // The game decoder stops after filling its preallocated array even
+            // when a repeat control advertises a longer run.
+            for _ in 0..run_length.min(count - values.len()) {
+                previous_value = previous_value.wrapping_add(previous_delta as u8);
+                values.push(previous_value);
+            }
+        }
+    }
+    Ok(values)
+}
+
 // The encoded UShort and Short controls share the same 16-bit bit pattern.
 pub(crate) fn read_encoded_ushort_array(
     reader: &mut Reader<'_>,
