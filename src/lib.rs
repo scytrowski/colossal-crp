@@ -12,6 +12,7 @@ mod encoded_array;
 mod game_area_data;
 mod instance_manager_data;
 mod metadata;
+mod net_manager_data;
 mod path_manager_data;
 mod simulation_manager_data;
 mod simulation_metadata;
@@ -23,6 +24,7 @@ pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{MapMetaData, ModInfo};
+pub use net_manager_data::{NetLane, NetLanePrefix};
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
     ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
@@ -1008,6 +1010,8 @@ mod tests {
         ));
         graph.extend_from_slice(&[0, 5]);
         begin_tag(&mut graph, "NetManager")?;
+        graph.extend(std::iter::repeat_n(0xff, 2047));
+        graph.push(0xfe);
         graph.extend_from_slice(b"opaque next manager");
 
         let mut root_data = root.root_data().to_vec();
@@ -1090,6 +1094,8 @@ mod tests {
             &manager.serialized_object_graph()[path_end..path_end + 4],
             &[0xfe, 0x80, 0, 10]
         );
+        let (net_lanes, _) = manager.decode_net_lane_prefix()?;
+        assert!(net_lanes.active_lanes().is_empty());
 
         let mut package = sample_package();
         let mut payload = include_bytes!("../tests/fixtures/simulation-metadata-v6.bin").to_vec();
@@ -1119,6 +1125,52 @@ mod tests {
         assert_eq!(instance.names()[0].name.as_deref(), Some("A"));
         let (path, _) = reread_manager.decode_path_prefix()?;
         assert!(path.active_units().is_empty());
+        let (net_lanes, _) = reread_manager.decode_net_lane_prefix()?;
+        assert!(net_lanes.active_lanes().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn net_lane_prefix_reads_flags_and_links() -> Result<(), CrpError> {
+        let mut bytes = vec![2, 0, 1, 0, 0, 0, 0];
+        bytes.extend(std::iter::repeat_n(0xff, 2047));
+        bytes.push(0xfb);
+        bytes.extend_from_slice(&[0, 0, 5]);
+        let (lanes, consumed) = NetLanePrefix::decode_prefix(116_020, &bytes)?;
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(lanes.lane_flags().len(), 262_143);
+        assert_eq!(lanes.lane_flags()[0], 1);
+        assert_eq!(
+            lanes.active_lanes(),
+            &[NetLane {
+                index: 1,
+                flags: 1,
+                next_lane: 5
+            }]
+        );
+        assert_eq!(lanes.encode(), bytes);
+        assert!(NetLanePrefix::decode_prefix(116_020, &bytes[..bytes.len() - 1]).is_err());
+        assert!(NetLanePrefix::decode_prefix(116_020, &[0, 0]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn net_lane_prefix_game_fixture_preserves_real_links() -> Result<(), CrpError> {
+        let fixture = include_bytes!("../tests/fixtures/net-lane-prefix-v116020-desert.bin");
+        let (lanes, consumed) = NetLanePrefix::decode_prefix(116_020, fixture)?;
+        assert_eq!(consumed, 61_883);
+        assert_eq!(lanes.lane_flags().len(), 262_143);
+        assert_eq!(lanes.active_lanes().len(), 7_867);
+        assert_eq!(
+            lanes.active_lanes()[0],
+            NetLane {
+                index: 45,
+                flags: 1,
+                next_lane: 109_741,
+            }
+        );
+        assert_eq!(lanes.encode(), fixture);
+        assert!(NetLanePrefix::decode_prefix(116_020, &fixture[..fixture.len() - 1]).is_err());
         Ok(())
     }
 
@@ -1708,6 +1760,7 @@ mod tests {
 
         let mut simulation_metadata_count = 0;
         let mut nonempty_wave_assets = 0;
+        let mut active_net_lanes = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -1822,6 +1875,10 @@ mod tests {
                             path.display()
                         );
                         assert!(path_end > instance_end);
+                        let (net_lanes, net_prefix_end) = manager_data.decode_net_lane_prefix()?;
+                        assert_eq!(net_lanes.lane_flags().len(), 262_143);
+                        assert!(net_prefix_end > path_end);
+                        active_net_lanes += net_lanes.active_lanes().len();
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -1859,7 +1916,7 @@ mod tests {
         }
         assert!(simulation_metadata_count > 0);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes"
         );
         Ok(())
     }

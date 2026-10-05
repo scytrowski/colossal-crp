@@ -2,6 +2,7 @@ use crate::CrpError;
 use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
 use crate::InstanceManagerEditor;
+use crate::NetLanePrefix;
 use crate::PathManagerData;
 use crate::TerrainManagerData;
 use crate::WaterSimulationData;
@@ -378,6 +379,38 @@ impl SimulationManagerData {
             expect_profile_tag(&mut reader, &mut strings, "NetManager")?;
         }
         Ok((data, end))
+    }
+
+    /// Decodes NetManager's lane flags and active next-lane links after the
+    /// PathManager body. The returned offset is inside NetManager's body;
+    /// its later lane, node, and segment fields remain opaque.
+    pub fn decode_net_lane_prefix(&self) -> Result<(NetLanePrefix, usize), CrpError> {
+        let Some(Some(net)) = self
+            .manager_objects
+            .as_ref()
+            .and_then(|objects| objects.get(5))
+        else {
+            return Err(invalid(0, "manager object array has no sixth object"));
+        };
+        if !net.type_name.starts_with("NetManager+Data,") {
+            return Err(invalid(0, "sixth manager object is not NetManager+Data"));
+        }
+        let (_, path_end) = self.decode_path_prefix()?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(path_end)?;
+        let mut strings = vec![
+            "SimulationManager".to_owned(),
+            "GameAreaManager".to_owned(),
+            "TerrainManager".to_owned(),
+            "WaterSimulation".to_owned(),
+            "InstanceManager".to_owned(),
+            "PathManager".to_owned(),
+        ];
+        expect_profile_tag(&mut reader, &mut strings, "NetManager")?;
+        let (data, body_length) =
+            NetLanePrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
     }
 
     /// Replaces only the InstanceManager body; group references and all other
