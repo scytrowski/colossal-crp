@@ -120,6 +120,17 @@ pub(crate) fn read_encoded_uint_array(
     Ok(values)
 }
 
+/// `EncodedArray.Int` has the UInt control layout and modulo-32-bit deltas.
+pub(crate) fn read_encoded_int_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<Vec<i32>, CrpError> {
+    Ok(read_encoded_uint_array(reader, count)?
+        .into_iter()
+        .map(|bits| bits as i32)
+        .collect())
+}
+
 /// Decodes `EncodedArray.ULong`; close-delta adjustments are signed i32.
 pub(crate) fn read_encoded_ulong_array(
     reader: &mut Reader<'_>,

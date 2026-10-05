@@ -27,7 +27,8 @@ pub use metadata::{MapMetaData, ModInfo};
 pub use net_manager_data::{
     NetLane, NetLanePrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
     NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetSegmentFlag,
-    NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsPrefix,
+    NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentTrafficLight,
+    NetSegmentTrafficLightsPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
@@ -1590,6 +1591,118 @@ mod tests {
     }
 
     #[test]
+    fn net_segment_traffic_lights_follow_byte_and_int_gates() -> Result<(), CrpError> {
+        fn one_active_segment_flags(version: u32) -> Result<NetSegmentFlagsPrefix, CrpError> {
+            let mut bytes = vec![2];
+            for value in [1_u32, 0, 0] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            bytes.extend(std::iter::repeat_n(0xff, 287));
+            bytes.push(0xfb);
+            bytes.extend(std::iter::repeat_n(0xff, 287));
+            bytes.push(0xfe);
+            Ok(NetSegmentFlagsPrefix::decode_prefix(version, &bytes)?.0)
+        }
+
+        let old_flags = one_active_segment_flags(115_016)?;
+        let old_bytes = [1, 3, 250];
+        let (old, used) =
+            NetSegmentTrafficLightsPrefix::decode_prefix(115_016, &old_flags, &old_bytes)?;
+        assert_eq!(used, old_bytes.len());
+        assert_eq!(
+            old.states(),
+            &[NetSegmentTrafficLight {
+                index: 1,
+                state0: 3,
+                state1: 250
+            }]
+        );
+        assert_eq!(old.encode(), old_bytes);
+        assert!(
+            NetSegmentTrafficLightsPrefix::decode_prefix(115_016, &old_flags, &old_bytes[..2])
+                .is_err()
+        );
+
+        let new_flags = one_active_segment_flags(115_017)?;
+        let mut new_bytes = vec![1];
+        new_bytes.extend_from_slice(&(-3_i32).to_be_bytes());
+        new_bytes.extend_from_slice(&123_456_i32.to_be_bytes());
+        let (new, used) =
+            NetSegmentTrafficLightsPrefix::decode_prefix(115_017, &new_flags, &new_bytes)?;
+        assert_eq!(used, new_bytes.len());
+        assert_eq!(
+            new.states(),
+            &[NetSegmentTrafficLight {
+                index: 1,
+                state0: -3,
+                state1: 123_456
+            }]
+        );
+        assert_eq!(new.encode(), new_bytes);
+        assert!(
+            NetSegmentTrafficLightsPrefix::decode_prefix(
+                115_017,
+                &new_flags,
+                &new_bytes[..new_bytes.len() - 1]
+            )
+            .is_err()
+        );
+        assert!(
+            NetSegmentTrafficLightsPrefix::decode_prefix(115_016, &new_flags, &old_bytes).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn net_segment_traffic_light_fixtures_cover_game_versions() -> Result<(), CrpError> {
+        let co_flags = include_bytes!("../tests/fixtures/net-segment-flags-v241-co.bin");
+        let (co_flags, _) = NetSegmentFlagsPrefix::decode_prefix(241, co_flags)?;
+        let co_fixture = include_bytes!("../tests/fixtures/net-segment-traffic-v241-co.bin");
+        let (co, used) = NetSegmentTrafficLightsPrefix::decode_prefix(241, &co_flags, co_fixture)?;
+        assert_eq!(used, 1);
+        assert_eq!(co.states().len(), 30);
+        assert!(
+            co.states()
+                .iter()
+                .all(|state| state.state0 == 0 && state.state1 == 0)
+        );
+        assert_eq!(co.encode(), co_fixture);
+
+        let desert_flags = include_bytes!("../tests/fixtures/net-segment-flags-v116020-desert.bin");
+        let (desert_flags, _) = NetSegmentFlagsPrefix::decode_prefix(116_020, desert_flags)?;
+        let desert_fixture =
+            include_bytes!("../tests/fixtures/net-segment-traffic-v116020-desert.bin");
+        let (desert, used) =
+            NetSegmentTrafficLightsPrefix::decode_prefix(116_020, &desert_flags, desert_fixture)?;
+        assert_eq!(used, 89);
+        assert_eq!(desert.states().len(), 2_081);
+        assert_eq!(
+            desert
+                .states()
+                .iter()
+                .filter(|state| state.state0 != 0 || state.state1 != 0)
+                .count(),
+            6
+        );
+        assert!(
+            desert
+                .states()
+                .iter()
+                .any(|state| { state.index == 2_555 && state.state0 == 34 && state.state1 == 34 })
+        );
+        assert_eq!(desert.encode(), desert_fixture);
+        assert!(
+            NetSegmentTrafficLightsPrefix::decode_prefix(
+                116_020,
+                &desert_flags,
+                &desert_fixture[..88]
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn net_node_problems_respect_version_and_app_gates() -> Result<(), CrpError> {
         fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
             let count = if version < 202 {
@@ -2445,6 +2558,7 @@ mod tests {
         let mut active_net_segments = 0_usize;
         let mut segments_with_secondary_flags = 0_usize;
         let mut segments_with_problems = 0_usize;
+        let mut segments_with_traffic_lights = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -2640,6 +2754,25 @@ mod tests {
                             .iter()
                             .filter(|problem| problem.problems1 != 0 || problem.problems2 != 0)
                             .count();
+                        let (traffic_lights, lights_end) = manager_data
+                            .decode_net_segment_traffic_lights_prefix(metadata.save_app_version)?;
+                        assert!(lights_end >= problems_end);
+                        assert_eq!(traffic_lights.states().len(), active_segments);
+                        segments_with_traffic_lights += traffic_lights
+                            .states()
+                            .iter()
+                            .filter(|state| state.state0 != 0 || state.state1 != 0)
+                            .count();
+                        if manager_data.format_version() >= 185 {
+                            let mut coverage_reader = crate::data_serializer::Reader::new(
+                                &manager_data.serialized_object_graph()[lights_end..],
+                            );
+                            let fire_coverage = crate::encoded_array::read_encoded_byte_array(
+                                &mut coverage_reader,
+                                active_segments,
+                            )?;
+                            assert_eq!(fire_coverage.len(), active_segments);
+                        }
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -2677,7 +2810,7 @@ mod tests {
         }
         assert!(simulation_metadata_count > 0);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state"
         );
         Ok(())
     }

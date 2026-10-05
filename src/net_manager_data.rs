@@ -1,8 +1,8 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
-    read_encoded_byte_array, read_encoded_uint_array, read_encoded_ulong_array,
-    read_encoded_ushort_array,
+    read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
+    read_encoded_ulong_array, read_encoded_ushort_array,
 };
 
 const LANE_COUNT: usize = 262_144;
@@ -15,6 +15,7 @@ const FULL_SEGMENT_COUNT_VERSION: u32 = 222;
 const TWO_SEGMENT_FLAGS_VERSION: u32 = 114_012;
 const TWO_PROBLEMS_VERSION: u32 = 115_000;
 const SEGMENT_PROBLEMS_VERSION: u32 = 226;
+const INT_TRAFFIC_LIGHT_VERSION: u32 = 115_017;
 const NODE_EVENT_ROUTE_VERSION: u32 = 121_007;
 const MAX_NODE_SEGMENTS: usize = 8;
 const SAVE_APP_PROBLEMS_VERSION: u32 = (1 << 27) + (3 << 22) + (1 << 13) + (1 << 8);
@@ -192,6 +193,27 @@ pub struct NetSegmentProblem {
 pub struct NetSegmentProblemsPrefix {
     format_version: u32,
     problems: Vec<NetSegmentProblem>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Traffic-light state for one segment with nonzero primary flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentTrafficLight {
+    /// One-based segment buffer index.
+    pub index: u16,
+    /// First traffic-light state value.
+    pub state0: i32,
+    /// Second traffic-light state value.
+    pub state1: i32,
+}
+
+/// Sparse traffic-light state array following segment problems.
+///
+/// Later coverage and segment records remain in the opaque manager graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentTrafficLightsPrefix {
+    format_version: u32,
+    states: Vec<NetSegmentTrafficLight>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -775,6 +797,81 @@ impl NetSegmentProblemsPrefix {
     }
 
     /// Writes the original encoded problem-array bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetSegmentTrafficLightsPrefix {
+    /// Decodes two traffic-light values for each active segment.
+    ///
+    /// Inner versions 164–115016 store byte values. Versions 115017 and newer
+    /// store signed 32-bit values through `EncodedArray.Int`. The returned
+    /// length ends before the fire-coverage array.
+    pub fn decode_prefix(
+        format_version: u32,
+        segment_flags: &NetSegmentFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || segment_flags.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data traffic-light state".to_owned(),
+                offset: 0,
+                reason: "state version does not match segment flags".to_owned(),
+            });
+        }
+        let active_indices = segment_flags
+            .segment_flags()
+            .iter()
+            .filter(|segment| segment.flags != 0)
+            .map(|segment| segment.index)
+            .collect::<Vec<_>>();
+        let value_count =
+            active_indices
+                .len()
+                .checked_mul(2)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "NetManager traffic-light state count",
+                ))?;
+        let mut reader = Reader::new(bytes);
+        let values = if format_version >= INT_TRAFFIC_LIGHT_VERSION {
+            read_encoded_int_array(&mut reader, value_count)?
+        } else {
+            read_encoded_byte_array(&mut reader, value_count)?
+                .into_iter()
+                .map(i32::from)
+                .collect()
+        };
+        let mut states = Vec::with_capacity(active_indices.len());
+        for (index, pair) in active_indices.into_iter().zip(values.chunks_exact(2)) {
+            states.push(NetSegmentTrafficLight {
+                index,
+                state0: pair[0],
+                state1: pair[1],
+            });
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                states,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns traffic-light states for segments with nonzero primary flags.
+    pub fn states(&self) -> &[NetSegmentTrafficLight] {
+        &self.states
+    }
+
+    /// Writes the original encoded state array exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
