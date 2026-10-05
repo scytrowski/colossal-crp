@@ -1,5 +1,7 @@
 use crate::CrpError;
 use crate::GameAreaManagerData;
+use crate::InstanceManagerData;
+use crate::InstanceManagerEditor;
 use crate::TerrainManagerData;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
@@ -291,6 +293,85 @@ impl SimulationManagerData {
             expect_profile_tag(&mut reader, &mut strings, "InstanceManager")?;
         }
         Ok((water_data, end))
+    }
+
+    /// Decodes the fourth queued manager body and returns the graph offset
+    /// following its closing profiler tag. Later manager bytes remain opaque.
+    pub fn decode_instance_prefix(&self) -> Result<(InstanceManagerData, usize), CrpError> {
+        let Some(Some(instance)) = self
+            .manager_objects
+            .as_ref()
+            .and_then(|objects| objects.get(3))
+        else {
+            return Err(invalid(0, "manager object array has no fourth object"));
+        };
+        if !instance.type_name.starts_with("InstanceManager+Data,") {
+            return Err(invalid(
+                0,
+                "fourth manager object is not InstanceManager+Data",
+            ));
+        }
+        let (_, water_end) = self.decode_water_prefix()?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(water_end)?;
+        let mut strings = vec![
+            "SimulationManager".to_owned(),
+            "GameAreaManager".to_owned(),
+            "TerrainManager".to_owned(),
+            "WaterSimulation".to_owned(),
+        ];
+        expect_profile_tag(&mut reader, &mut strings, "InstanceManager")?;
+        let (data, body_length) =
+            InstanceManagerData::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(body_length)?;
+        expect_profile_tag(&mut reader, &mut strings, "InstanceManager")?;
+        let end = reader.offset();
+        if self
+            .manager_objects
+            .as_ref()
+            .and_then(|objects| objects.get(4))
+            .and_then(Option::as_ref)
+            .is_some_and(|next| next.type_name.starts_with("PathManager+Data,"))
+        {
+            expect_profile_tag(&mut reader, &mut strings, "PathManager")?;
+        }
+        Ok((data, end))
+    }
+
+    /// Replaces only the InstanceManager body; group references and all other
+    /// queued manager bodies keep their original bytes and order.
+    pub fn replace_instance(&mut self, edited: &InstanceManagerEditor) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited InstanceManager version does not match this stream",
+            ));
+        }
+        let (original, _) = self.decode_instance_prefix()?;
+        if !edited.retains_groups(&original) {
+            return Err(invalid(
+                0,
+                "edited InstanceManager group references differ from this stream",
+            ));
+        }
+        let (_, water_end) = self.decode_water_prefix()?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(water_end)?;
+        let mut strings = vec![
+            "SimulationManager".to_owned(),
+            "GameAreaManager".to_owned(),
+            "TerrainManager".to_owned(),
+            "WaterSimulation".to_owned(),
+        ];
+        expect_profile_tag(&mut reader, &mut strings, "InstanceManager")?;
+        let body_start = reader.offset();
+        let body_end = body_start
+            .checked_add(original.encode().len())
+            .ok_or(CrpError::ArithmeticOverflow("InstanceManager body end"))?;
+        let replacement = edited.encode()?;
+        self.serialized_object_graph
+            .splice(body_start..body_end, replacement);
+        Ok(())
     }
 
     /// Replaces the WaterSimulation body while retaining profiler tags and all

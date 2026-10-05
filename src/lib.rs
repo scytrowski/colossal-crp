@@ -10,6 +10,7 @@ mod asset_io;
 mod data_serializer;
 mod encoded_array;
 mod game_area_data;
+mod instance_manager_data;
 mod metadata;
 mod simulation_manager_data;
 mod simulation_metadata;
@@ -19,6 +20,7 @@ mod water_simulation_data;
 
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
+pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{MapMetaData, ModInfo};
 pub use simulation_manager_data::{
     ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
@@ -994,6 +996,11 @@ mod tests {
         ));
         graph.extend_from_slice(&[0, 3]);
         begin_tag(&mut graph, "InstanceManager")?;
+        graph.extend_from_slice(include_bytes!(
+            "../tests/fixtures/instance-manager-body-v116020-desert.bin"
+        ));
+        graph.extend_from_slice(&[0, 4]);
+        begin_tag(&mut graph, "PathManager")?;
         graph.extend_from_slice(b"opaque next manager");
 
         let mut root_data = root.root_data().to_vec();
@@ -1050,6 +1057,25 @@ mod tests {
         assert_eq!(water.sea_level(), 41.5);
         assert_eq!(water.sources()[0].parameters[4], 42);
         assert_eq!(water.waves(), &[new_wave.clone()]);
+        let (instance, instance_end) = manager.decode_instance_prefix()?;
+        assert_eq!(instance.names(), &[]);
+        assert_eq!(instance.group_count(), Some(0));
+        let after_instance = manager.serialized_object_graph()[instance_end..].to_vec();
+        let mut instance_editor = instance.into_editor();
+        instance_editor.names_mut().push(InstanceName {
+            id: 0x0102_0304,
+            name: Some("A".to_owned()),
+        });
+        manager.replace_instance(&instance_editor)?;
+        let (edited_instance, edited_instance_end) = manager.decode_instance_prefix()?;
+        assert_eq!(
+            edited_instance.names(),
+            instance_editor.names_mut().as_slice()
+        );
+        assert_eq!(
+            manager.serialized_object_graph()[edited_instance_end..],
+            after_instance
+        );
 
         let mut package = sample_package();
         let mut payload = include_bytes!("../tests/fixtures/simulation-metadata-v6.bin").to_vec();
@@ -1075,6 +1101,56 @@ mod tests {
         assert_eq!(water.sea_level(), 41.5);
         assert_eq!(water.sources()[0].parameters[4], 42);
         assert_eq!(water.waves(), &[new_wave]);
+        let (instance, _) = reread_manager.decode_instance_prefix()?;
+        assert_eq!(instance.names()[0].name.as_deref(), Some("A"));
+        Ok(())
+    }
+
+    #[test]
+    fn instance_manager_fixture_and_version_gate() -> Result<(), CrpError> {
+        let fixture = include_bytes!("../tests/fixtures/instance-manager-body-v116020-desert.bin");
+        let (instance, used) = InstanceManagerData::decode_prefix(116_020, fixture)?;
+        assert_eq!(used, 8);
+        assert!(instance.names().is_empty());
+        assert_eq!(instance.group_count(), Some(0));
+        assert_eq!(instance.encode(), fixture);
+        let (legacy, used) = InstanceManagerData::decode_prefix(194, &fixture[..4])?;
+        assert_eq!(used, 4);
+        assert_eq!(legacy.group_count(), None);
+        assert_eq!(legacy.encode(), &fixture[..4]);
+
+        // Independent DataSerializer byte vector: ID, compact "A", null name,
+        // one group ID with a null object reference.
+        let expected = [
+            0, 0, 0, 2, 1, 2, 3, 4, 0x80, 0, 1, 0xc1, 0, 0, 0, 5, 0xff, 0, 0, 0, 1, 0x0a, 0x0b,
+            0x0c, 0x0d, 0xff,
+        ];
+        let (instance, used) = InstanceManagerData::decode_prefix(258, &expected)?;
+        assert_eq!(used, expected.len());
+        assert_eq!(instance.names()[0].id, 0x0102_0304);
+        assert_eq!(instance.names()[0].name.as_deref(), Some("A"));
+        assert_eq!(instance.names()[1].name, None);
+        assert_eq!(instance.group_count(), Some(1));
+        assert_eq!(instance.encode(), expected);
+        assert_eq!(instance.into_editor().encode()?, expected);
+        let (legacy_names, legacy_used) = InstanceManagerData::decode_prefix(194, &expected[..17])?;
+        assert_eq!(legacy_used, 17);
+        let mut editor = legacy_names.into_editor();
+        assert_eq!(editor.encode()?, expected[..17]);
+        for cut in 0..expected.len() {
+            assert!(InstanceManagerData::decode_prefix(258, &expected[..cut]).is_err());
+        }
+        let duplicate_names = [0, 0, 0, 2, 0, 0, 0, 7, 0xff, 0, 0, 0, 7, 0xff];
+        assert!(InstanceManagerData::decode_prefix(194, &duplicate_names).is_err());
+        editor.names_mut().push(InstanceName {
+            id: 0x0102_0304,
+            name: None,
+        });
+        assert!(editor.encode().is_err());
+        let bad_count = [0xff, 0xff, 0xff, 0xff];
+        assert!(InstanceManagerData::decode_prefix(258, &bad_count).is_err());
+        let bad_utf16 = [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0xd8, 0];
+        assert!(InstanceManagerData::decode_prefix(194, &bad_utf16).is_err());
         Ok(())
     }
 
@@ -1622,6 +1698,25 @@ mod tests {
                                 .and_then(|remaining| remaining.get(..4)),
                             Some(&[0xfe, 0x80, 0x00, 0x0f][..]),
                             "InstanceManager profile start in {}",
+                            path.display()
+                        );
+                        let (instance, instance_end) = manager_data.decode_instance_prefix()?;
+                        assert!(instance.names().is_empty(), "{}", path.display());
+                        assert_eq!(
+                            instance.group_count(),
+                            (manager_data.format_version() >= 258).then_some(0),
+                            "{}",
+                            path.display()
+                        );
+                        assert!(instance_end > water_end);
+                        assert_eq!(
+                            instance.encode(),
+                            if manager_data.format_version() >= 258 {
+                                vec![0; 8]
+                            } else {
+                                vec![0; 4]
+                            },
+                            "{}",
                             path.display()
                         );
                         let canonical = water.clone().into_editor().encode()?;
