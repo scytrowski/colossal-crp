@@ -10,6 +10,8 @@ const NODE_COUNT: usize = 32_768;
 const TWO_NODE_FLAGS_VERSION: u32 = 115_018;
 const FULL_NODE_COUNT_VERSION: u32 = 202;
 const TWO_PROBLEMS_VERSION: u32 = 115_000;
+const NODE_EVENT_ROUTE_VERSION: u32 = 121_007;
+const MAX_NODE_SEGMENTS: usize = 8;
 const SAVE_APP_PROBLEMS_VERSION: u32 = (1 << 27) + (3 << 22) + (1 << 13) + (1 << 8);
 
 /// One active lane's serialized flags, link, and reservation state.
@@ -33,8 +35,8 @@ pub struct NetLane {
 
 /// The lane section of `NetManager+Data`, before node flags.
 ///
-/// This is a partial manager body. Node and segment fields remain in the
-/// opaque manager graph and are not claimed to be decoded here.
+/// This is a partial manager body. Later fields remain in the opaque manager
+/// graph and are not claimed to be decoded by this prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetLanePrefix {
     format_version: u32,
@@ -56,7 +58,7 @@ pub struct NetNodeFlag {
 
 /// The encoded node-flag array immediately after NetManager's lane section.
 ///
-/// Later node problem arrays and individual records remain opaque.
+/// Later fields can be decoded by separate prefixes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetNodeFlagsPrefix {
     format_version: u32,
@@ -77,7 +79,7 @@ pub struct NetNodeProblem {
 
 /// Version-dependent node problem array following the node flags.
 ///
-/// The next node counters and records remain opaque.
+/// Later fields can be decoded by separate prefixes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetNodeProblemsPrefix {
     format_version: u32,
@@ -104,6 +106,45 @@ pub struct NetNodeCounter {
 pub struct NetNodeCountersPrefix {
     format_version: u32,
     counters: Vec<NetNodeCounter>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Fields stored for one node with nonzero primary flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeRecord {
+    /// One-based node buffer index.
+    pub index: u16,
+    /// Exact IEEE 754 bits of the X, Y, and Z coordinates.
+    pub position_bits: [u32; 3],
+    /// Segment IDs in their serialized order, with at most eight entries.
+    pub segments: Vec<u16>,
+    /// Build index stored as a big-endian `u32`.
+    pub build_index: u32,
+    /// Associated building ID.
+    pub building: u16,
+    /// Next building-node ID.
+    pub next_building_node: u16,
+    /// Lane ID stored in 24 bits.
+    pub lane: u32,
+    /// Position along the lane.
+    pub lane_offset: u8,
+    /// Node elevation.
+    pub elevation: u8,
+    /// Height offset.
+    pub height_offset: u8,
+    /// Connection count.
+    pub connect_count: u8,
+    /// Event route ID, zero before inner version 121007.
+    pub event_route: u16,
+}
+
+/// Variable-length records following NetManager's sparse node counters.
+///
+/// The segment arrays and remaining NetManager fields follow this prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeRecordsPrefix {
+    format_version: u32,
+    records: Vec<NetNodeRecord>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -436,6 +477,105 @@ impl NetNodeCountersPrefix {
     }
 
     /// Writes the original encoded counter-array bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetNodeRecordsPrefix {
+    /// Decodes one variable-length record for each active node, in index order.
+    ///
+    /// Supports inner versions 164 and newer. A count above eight segments,
+    /// truncated fields, or mismatched flag version returns an error. The
+    /// consumed length ends before the segment-flag array.
+    pub fn decode_prefix(
+        format_version: u32,
+        node_flags: &NetNodeFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || node_flags.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data node records".to_owned(),
+                offset: 0,
+                reason: "record version does not match node flags".to_owned(),
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        let mut records = Vec::new();
+        for node in node_flags
+            .node_flags()
+            .iter()
+            .filter(|node| node.flags != 0)
+        {
+            let position_bits = [
+                reader.read_u32_be()?,
+                reader.read_u32_be()?,
+                reader.read_u32_be()?,
+            ];
+            let segment_count = usize::from(reader.read_u8()?);
+            if segment_count > MAX_NODE_SEGMENTS {
+                return Err(reader.invalid(format!(
+                    "node {} has {segment_count} segments; maximum is {MAX_NODE_SEGMENTS}",
+                    node.index
+                )));
+            }
+            let mut segments = Vec::with_capacity(segment_count);
+            for _ in 0..segment_count {
+                segments.push(reader.read_u16_be()?);
+            }
+            let build_index = reader.read_u32_be()?;
+            let building = reader.read_u16_be()?;
+            let next_building_node = reader.read_u16_be()?;
+            let lane_bytes = reader.read_bytes(3)?;
+            let lane = (u32::from(lane_bytes[0]) << 16)
+                | (u32::from(lane_bytes[1]) << 8)
+                | u32::from(lane_bytes[2]);
+            let lane_offset = reader.read_u8()?;
+            let elevation = reader.read_u8()?;
+            let height_offset = reader.read_u8()?;
+            let connect_count = reader.read_u8()?;
+            let event_route = if format_version >= NODE_EVENT_ROUTE_VERSION {
+                reader.read_u16_be()?
+            } else {
+                0
+            };
+            records.push(NetNodeRecord {
+                index: node.index,
+                position_bits,
+                segments,
+                build_index,
+                building,
+                next_building_node,
+                lane,
+                lane_offset,
+                elevation,
+                height_offset,
+                connect_count,
+                event_route,
+            });
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                records,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns records for nodes with nonzero primary flags.
+    pub fn records(&self) -> &[NetNodeRecord] {
+        &self.records
+    }
+
+    /// Writes the original node-record bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }

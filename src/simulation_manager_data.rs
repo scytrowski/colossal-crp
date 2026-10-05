@@ -7,7 +7,10 @@ use crate::TerrainManagerData;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
-use crate::{NetLanePrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix};
+use crate::{
+    NetLanePrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
+    NetNodeRecordsPrefix,
+};
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
 const BUILD_INDEX_HISTORY_LENGTH: usize = 32;
@@ -383,7 +386,7 @@ impl SimulationManagerData {
 
     /// Decodes NetManager's lane flags and active next-lane links after the
     /// PathManager body. The returned offset is inside NetManager's body;
-    /// its later lane, node, and segment fields remain opaque.
+    /// later fields can be decoded by other prefix methods.
     pub fn decode_net_lane_prefix(&self) -> Result<(NetLanePrefix, usize), CrpError> {
         let Some(Some(net)) = self
             .manager_objects
@@ -456,6 +459,25 @@ impl SimulationManagerData {
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(problem_end)?;
         let (data, body_length) = NetNodeCountersPrefix::decode_prefix(
+            self.format_version,
+            &node_flags,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes active node records after the sparse counter arrays.
+    /// The returned graph offset is before segment flags.
+    pub fn decode_net_node_records_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetNodeRecordsPrefix, usize), CrpError> {
+        let (_, counter_end) = self.decode_net_node_counters_prefix(save_app_version)?;
+        let (node_flags, _) = self.decode_net_node_flags_prefix()?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(counter_end)?;
+        let (data, body_length) = NetNodeRecordsPrefix::decode_prefix(
             self.format_version,
             &node_flags,
             reader.remaining_bytes(),

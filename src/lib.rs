@@ -26,7 +26,7 @@ pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, Inst
 pub use metadata::{MapMetaData, ModInfo};
 pub use net_manager_data::{
     NetLane, NetLanePrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
-    NetNodeProblem, NetNodeProblemsPrefix,
+    NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
@@ -1112,6 +1112,8 @@ mod tests {
         assert!(problems.problems().is_empty());
         let (counters, _) = manager.decode_net_node_counters_prefix(Some(201_499_120))?;
         assert!(counters.counters().is_empty());
+        let (records, _) = manager.decode_net_node_records_prefix(Some(201_499_120))?;
+        assert!(records.records().is_empty());
 
         let mut package = sample_package();
         let mut payload = include_bytes!("../tests/fixtures/simulation-metadata-v6.bin").to_vec();
@@ -1149,6 +1151,8 @@ mod tests {
         assert!(problems.problems().is_empty());
         let (counters, _) = reread_manager.decode_net_node_counters_prefix(Some(201_499_120))?;
         assert!(counters.counters().is_empty());
+        let (records, _) = reread_manager.decode_net_node_records_prefix(Some(201_499_120))?;
+        assert!(records.records().is_empty());
         Ok(())
     }
 
@@ -1225,6 +1229,117 @@ mod tests {
             }]
         );
         assert_eq!(counters.encode(), fixture);
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_records_follow_segment_and_event_route_gates() -> Result<(), CrpError> {
+        fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
+            let mut bytes = vec![2];
+            bytes.extend_from_slice(&1_u32.to_be_bytes());
+            bytes.extend_from_slice(&0_u32.to_be_bytes());
+            bytes.extend_from_slice(&0_u32.to_be_bytes());
+            bytes.extend(std::iter::repeat_n(0xff, 511));
+            bytes.push(0xfa);
+            Ok(NetNodeFlagsPrefix::decode_prefix(version, &bytes)?.0)
+        }
+
+        let mut bytes = Vec::new();
+        for bits in [1.25_f32.to_bits(), (-2.5_f32).to_bits(), 3.0_f32.to_bits()] {
+            bytes.extend_from_slice(&bits.to_be_bytes());
+        }
+        bytes.push(2);
+        bytes.extend_from_slice(&11_u16.to_be_bytes());
+        bytes.extend_from_slice(&22_u16.to_be_bytes());
+        bytes.extend_from_slice(&33_u32.to_be_bytes());
+        bytes.extend_from_slice(&44_u16.to_be_bytes());
+        bytes.extend_from_slice(&55_u16.to_be_bytes());
+        bytes.extend_from_slice(&[0x01, 0x02, 0x03, 66, 77, 88, 99]);
+        let legacy_flags = one_active_node_flags(121_006)?;
+        let (legacy, used) = NetNodeRecordsPrefix::decode_prefix(121_006, &legacy_flags, &bytes)?;
+        assert_eq!(used, bytes.len());
+        assert_eq!(legacy.records().len(), 1);
+        let record = &legacy.records()[0];
+        assert_eq!(record.index, 1);
+        assert_eq!(
+            record.position_bits,
+            [1.25_f32.to_bits(), (-2.5_f32).to_bits(), 3.0_f32.to_bits()]
+        );
+        assert_eq!(record.segments, [11, 22]);
+        assert_eq!(
+            (
+                record.build_index,
+                record.building,
+                record.next_building_node
+            ),
+            (33, 44, 55)
+        );
+        assert_eq!(
+            (
+                record.lane,
+                record.lane_offset,
+                record.elevation,
+                record.height_offset,
+                record.connect_count,
+                record.event_route
+            ),
+            (0x01_02_03, 66, 77, 88, 99, 0)
+        );
+        assert_eq!(legacy.encode(), bytes);
+        assert!(NetNodeRecordsPrefix::decode_prefix(121_006, &legacy_flags, &bytes[..12]).is_err());
+        let mut too_many = bytes.clone();
+        too_many[12] = 9;
+        assert!(NetNodeRecordsPrefix::decode_prefix(121_006, &legacy_flags, &too_many).is_err());
+
+        bytes.extend_from_slice(&123_u16.to_be_bytes());
+        let modern_flags = one_active_node_flags(121_007)?;
+        let (modern, used) = NetNodeRecordsPrefix::decode_prefix(121_007, &modern_flags, &bytes)?;
+        assert_eq!(used, bytes.len());
+        assert_eq!(modern.records()[0].event_route, 123);
+        assert_eq!(modern.encode(), bytes);
+        assert!(
+            NetNodeRecordsPrefix::decode_prefix(121_007, &modern_flags, &bytes[..bytes.len() - 1])
+                .is_err()
+        );
+        assert!(NetNodeRecordsPrefix::decode_prefix(121_006, &modern_flags, &bytes).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_records_game_fixture_preserves_segment_order() -> Result<(), CrpError> {
+        let flags_fixture = include_bytes!("../tests/fixtures/net-node-flags-v116020-desert.bin");
+        let (flags, _) = NetNodeFlagsPrefix::decode_prefix(116_020, flags_fixture)?;
+        let fixture = include_bytes!("../tests/fixtures/net-node-records-v116020-desert.bin");
+        let (records, used) = NetNodeRecordsPrefix::decode_prefix(116_020, &flags, fixture)?;
+        assert_eq!(used, 66_620);
+        assert_eq!(records.records().len(), 2_082);
+        assert_eq!(
+            records.records()[0],
+            NetNodeRecord {
+                index: 11,
+                position_bits: [1_173_408_624, 1_134_519_429, 1_116_051_800],
+                segments: vec![14_839, 4_636],
+                build_index: 2_124,
+                building: 0,
+                next_building_node: 0,
+                lane: 0,
+                lane_offset: 0,
+                elevation: 0,
+                height_offset: 64,
+                connect_count: 0,
+                event_route: 0,
+            }
+        );
+        assert_eq!(
+            records
+                .records()
+                .iter()
+                .filter(|record| !record.segments.is_empty())
+                .count(),
+            2_077
+        );
+        assert_eq!(records.encode(), fixture);
+        assert!(NetNodeRecordsPrefix::decode_prefix(116_020, &flags, &fixture[..66_619]).is_err());
         Ok(())
     }
 
@@ -2079,6 +2194,8 @@ mod tests {
         let mut active_net_nodes = 0_usize;
         let mut nodes_with_problems = 0_usize;
         let mut nodes_with_counters = 0_usize;
+        let mut nodes_with_segments = 0_usize;
+        let mut nodes_with_event_routes = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -2236,6 +2353,33 @@ mod tests {
                                     || counter.final_counter != 0
                             })
                             .count();
+                        let (records, records_end) = manager_data
+                            .decode_net_node_records_prefix(metadata.save_app_version)?;
+                        assert!(records_end >= counters_end);
+                        assert_eq!(records.records().len(), counters.counters().len());
+                        nodes_with_segments += records
+                            .records()
+                            .iter()
+                            .filter(|record| !record.segments.is_empty())
+                            .count();
+                        nodes_with_event_routes += records
+                            .records()
+                            .iter()
+                            .filter(|record| record.event_route != 0)
+                            .count();
+                        let mut segment_reader = crate::data_serializer::Reader::new(
+                            &manager_data.serialized_object_graph()[records_end..],
+                        );
+                        let segment_count = if manager_data.format_version() < 222 {
+                            32_767
+                        } else {
+                            36_863
+                        };
+                        let segment_flags = crate::encoded_array::read_encoded_uint_array(
+                            &mut segment_reader,
+                            segment_count,
+                        )?;
+                        assert_eq!(segment_flags.len(), segment_count);
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -2273,7 +2417,7 @@ mod tests {
         }
         assert!(simulation_metadata_count > 0);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes"
         );
         Ok(())
     }
