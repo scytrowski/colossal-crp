@@ -16,6 +16,8 @@ const TWO_SEGMENT_FLAGS_VERSION: u32 = 114_012;
 const TWO_PROBLEMS_VERSION: u32 = 115_000;
 const SEGMENT_PROBLEMS_VERSION: u32 = 226;
 const INT_TRAFFIC_LIGHT_VERSION: u32 = 115_017;
+const FIRE_COVERAGE_VERSION: u32 = 185;
+const WETNESS_VERSION: u32 = 224;
 const NODE_EVENT_ROUTE_VERSION: u32 = 121_007;
 const MAX_NODE_SEGMENTS: usize = 8;
 const SAVE_APP_PROBLEMS_VERSION: u32 = (1 << 27) + (3 << 22) + (1 << 13) + (1 << 8);
@@ -214,6 +216,27 @@ pub struct NetSegmentTrafficLight {
 pub struct NetSegmentTrafficLightsPrefix {
     format_version: u32,
     states: Vec<NetSegmentTrafficLight>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Environmental byte fields for one segment with nonzero primary flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentCoverage {
+    /// One-based segment buffer index.
+    pub index: u16,
+    /// Fire coverage; zero before inner version 185.
+    pub fire_coverage: u8,
+    /// Wetness; zero before inner version 224.
+    pub wetness: u8,
+}
+
+/// Sparse fire-coverage and wetness arrays following traffic-light state.
+///
+/// Later segment fields remain in the opaque manager graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentCoveragePrefix {
+    format_version: u32,
+    coverage: Vec<NetSegmentCoverage>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -872,6 +895,79 @@ impl NetSegmentTrafficLightsPrefix {
     }
 
     /// Writes the original encoded state array exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetSegmentCoveragePrefix {
+    /// Decodes sparse fire-coverage and wetness byte arrays.
+    ///
+    /// Fire coverage begins at inner version 185 and wetness at 224. Earlier
+    /// versions supply zeroes without consuming bytes. The returned length
+    /// ends before the condition array.
+    pub fn decode_prefix(
+        format_version: u32,
+        segment_flags: &NetSegmentFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || segment_flags.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data segment coverage".to_owned(),
+                offset: 0,
+                reason: "coverage version does not match segment flags".to_owned(),
+            });
+        }
+        let active_indices = segment_flags
+            .segment_flags()
+            .iter()
+            .filter(|segment| segment.flags != 0)
+            .map(|segment| segment.index)
+            .collect::<Vec<_>>();
+        let count = active_indices.len();
+        let mut reader = Reader::new(bytes);
+        let fire_coverage = if format_version >= FIRE_COVERAGE_VERSION {
+            read_encoded_byte_array(&mut reader, count)?
+        } else {
+            vec![0; count]
+        };
+        let wetness = if format_version >= WETNESS_VERSION {
+            read_encoded_byte_array(&mut reader, count)?
+        } else {
+            vec![0; count]
+        };
+        let mut coverage = Vec::with_capacity(count);
+        for ((index, fire_coverage), wetness) in
+            active_indices.into_iter().zip(fire_coverage).zip(wetness)
+        {
+            coverage.push(NetSegmentCoverage {
+                index,
+                fire_coverage,
+                wetness,
+            });
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                coverage,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns coverage fields for segments with nonzero primary flags.
+    pub fn coverage(&self) -> &[NetSegmentCoverage] {
+        &self.coverage
+    }
+
+    /// Writes the original encoded arrays exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }

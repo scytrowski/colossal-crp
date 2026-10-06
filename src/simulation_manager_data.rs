@@ -9,8 +9,8 @@ use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 use crate::{
     NetLanePrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
-    NetNodeRecordsPrefix, NetSegmentFlagsPrefix, NetSegmentProblemsPrefix,
-    NetSegmentTrafficLightsPrefix,
+    NetNodeRecordsPrefix, NetSegmentCoveragePrefix, NetSegmentFlagsPrefix,
+    NetSegmentProblemsPrefix, NetSegmentTrafficLightsPrefix,
 };
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
@@ -531,6 +531,25 @@ impl SimulationManagerData {
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(problems_end)?;
         let (data, body_length) = NetSegmentTrafficLightsPrefix::decode_prefix(
+            self.format_version,
+            &segment_flags,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes sparse segment fire coverage and wetness after traffic lights.
+    /// The returned graph offset is before the condition array.
+    pub fn decode_net_segment_coverage_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetSegmentCoveragePrefix, usize), CrpError> {
+        let (_, lights_end) = self.decode_net_segment_traffic_lights_prefix(save_app_version)?;
+        let (segment_flags, _) = self.decode_net_segment_flags_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(lights_end)?;
+        let (data, body_length) = NetSegmentCoveragePrefix::decode_prefix(
             self.format_version,
             &segment_flags,
             reader.remaining_bytes(),
