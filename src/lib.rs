@@ -23,6 +23,7 @@ mod water_simulation_data;
 
 pub use building_manager_data::{
     BuildingFlag, BuildingFlagsPrefix, BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix,
+    BuildingProblemPrefix, BuildingProblemWords,
 };
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
@@ -2516,7 +2517,8 @@ mod tests {
     }
 
     #[test]
-    fn building_object_headers_game_fixture_stops_before_problem_array() -> Result<(), CrpError> {
+    fn building_object_headers_game_fixture_decodes_following_problem_array() -> Result<(), CrpError>
+    {
         let flags_bytes = include_bytes!("../tests/fixtures/building-flags-v116020-desert.bin");
         let (flags, _) = BuildingFlagsPrefix::decode_prefix(116_020, flags_bytes)?;
         let prefab_bytes = include_bytes!("../tests/fixtures/building-prefabs-v116020-desert.bin");
@@ -2544,6 +2546,46 @@ mod tests {
         )?;
         assert_eq!(problems.len(), 378);
         assert_eq!(array_reader.remaining(), 0);
+        let (decoded, problem_bytes) =
+            BuildingProblemPrefix::decode_prefix(116_020, &flags, &bytes[used..])?;
+        assert_eq!(decoded.problems().len(), 189);
+        assert_eq!(
+            decoded.problems()[0],
+            BuildingProblemWords {
+                first: 0x0000_ffff_f9ff_bcff,
+                second: 0x0001_ffff_f3ff_79fe,
+            }
+        );
+        assert_eq!(
+            decoded.problems()[1],
+            BuildingProblemWords {
+                first: 0x0002_ffff_edff_36fd,
+                second: 0x0003_ffff_e7fe_f3fc,
+            }
+        );
+        assert_eq!(decoded.encode(), bytes[used..]);
+        assert_eq!(problem_bytes, bytes.len() - used);
+        Ok(())
+    }
+
+    #[test]
+    fn building_problem_array_is_absent_before_version_115000() -> Result<(), CrpError> {
+        let mut flag_bytes = vec![0xff; 383];
+        flag_bytes.push(0xfe);
+        flag_bytes.extend(std::iter::repeat_n(0xff, 383));
+        flag_bytes.push(0xfe);
+        let (flags, used) = BuildingFlagsPrefix::decode_prefix(114_999, &flag_bytes)?;
+        assert_eq!(used, flag_bytes.len());
+        assert!(
+            flags
+                .building_flags()
+                .iter()
+                .all(|building| building.flags == 0)
+        );
+        let (problems, used) = BuildingProblemPrefix::decode_prefix(114_999, &flags, &[1, 2, 3])?;
+        assert!(problems.problems().is_empty());
+        assert_eq!(problems.encode(), []);
+        assert_eq!(used, 0);
         Ok(())
     }
 
@@ -3425,12 +3467,14 @@ mod tests {
         let mut checked_building_flags_convenience = false;
         let mut checked_building_prefab_convenience = false;
         let mut checked_building_object_convenience = false;
+        let mut checked_building_problem_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
         let mut building_milestone_refs = 0_usize;
         let mut building_prefab_names = 0_usize;
         let mut building_object_headers = 0_usize;
+        let mut buildings_with_problem_words = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -3911,22 +3955,37 @@ mod tests {
                                 .filter(|building| building.flags != 0)
                                 .count();
                             let array_start = net_reader.offset();
-                            let problem_value_count = active_building_count.checked_mul(2).ok_or(
-                                CrpError::ArithmeticOverflow("BuildingManager problem value count"),
-                            )?;
-                            let problem_values = crate::encoded_array::read_encoded_ulong_array(
-                                &mut net_reader,
-                                problem_value_count,
-                            )?;
-                            assert_eq!(problem_values.len(), problem_value_count);
+                            let (building_problems, problem_used) =
+                                BuildingProblemPrefix::decode_prefix(
+                                    version,
+                                    &building_flags,
+                                    net_reader.remaining_bytes(),
+                                )?;
+                            net_reader.read_bytes(problem_used)?;
+                            assert_eq!(building_problems.problems().len(), active_building_count);
+                            assert_eq!(
+                                building_problems.encode(),
+                                &net_reader.consumed_bytes()[array_start..]
+                            );
+                            buildings_with_problem_words += building_problems
+                                .problems()
+                                .iter()
+                                .filter(|problem| problem.first != 0 || problem.second != 0)
+                                .count();
+                            if !checked_building_problem_convenience && active_segments > 0 {
+                                let (via_manager, graph_end) = manager_data
+                                    .decode_building_problems_prefix(metadata.save_app_version)?;
+                                assert_eq!(via_manager, building_problems);
+                                assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                                checked_building_problem_convenience = true;
+                            }
                             if std::env::var_os("CRP_EXTRACT_BUILDING_OBJECT_FIXTURE").is_some()
                                 && path
                                     .file_name()
                                     .is_some_and(|name| name == "CCMP2 Desert Map 1.crp")
                             {
                                 let mut fixture = building_objects.encode();
-                                fixture
-                                    .extend_from_slice(&net_reader.consumed_bytes()[array_start..]);
+                                fixture.extend_from_slice(&building_problems.encode());
                                 std::fs::write(
                                     "tests/fixtures/building-object-headers-v116020-desert.bin",
                                     fixture,
@@ -3990,10 +4049,11 @@ mod tests {
         assert!(checked_building_flags_convenience);
         assert!(checked_building_prefab_convenience);
         assert!(checked_building_object_convenience);
+        assert!(checked_building_problem_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density, {nonzero_guide_counts} with guide references, {nonzero_milestone_counts} with milestone references, {info_prefab_names} info prefab names, {tree_prefab_names} tree prefab names, {active_buildings} active buildings, {buildings_with_secondary_flags} with secondary flags, {building_guide_refs} building guide references, {building_milestone_refs} building milestone references, {building_prefab_names} building prefab names, {building_object_headers} BuildingManager object headers"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density, {nonzero_guide_counts} with guide references, {nonzero_milestone_counts} with milestone references, {info_prefab_names} info prefab names, {tree_prefab_names} tree prefab names, {active_buildings} active buildings, {buildings_with_secondary_flags} with secondary flags, {building_guide_refs} building guide references, {building_milestone_refs} building milestone references, {building_prefab_names} building prefab names, {building_object_headers} BuildingManager object headers, {buildings_with_problem_words} buildings with nonzero problem words"
         );
         Ok(())
     }

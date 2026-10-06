@@ -1,6 +1,8 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::{read_encoded_uint_array, read_encoded_ushort_array};
+use crate::encoded_array::{
+    read_encoded_uint_array, read_encoded_ulong_array, read_encoded_ushort_array,
+};
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 
 const BUILDING_COUNT: usize = 49_152;
@@ -48,6 +50,96 @@ pub struct BuildingManagerObjectHeadersPrefix {
     object_headers: Vec<NetObjectHeader>,
     trailing_problem_fields: Vec<u8>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Opaque two-word problem state for one active building.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildingProblemWords {
+    /// First serialized 64-bit word.
+    pub first: u64,
+    /// Second serialized 64-bit word.
+    pub second: u64,
+}
+
+/// Per-building problem states from inner version 115000 onward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingProblemPrefix {
+    format_version: u32,
+    problems: Vec<BuildingProblemWords>,
+    serialized_prefix: Vec<u8>,
+}
+
+impl BuildingProblemPrefix {
+    /// Decodes two encoded 64-bit words for each active building.
+    ///
+    /// Before inner version 115000 the game does not serialize this array;
+    /// those versions return an empty prefix without consuming bytes.
+    pub fn decode_prefix(
+        format_version: u32,
+        flags: &BuildingFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || flags.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "BuildingManager problem words".to_owned(),
+                offset: 0,
+                reason: "unsupported or mismatched inner version".to_owned(),
+            });
+        }
+        if format_version < 115_000 {
+            return Ok((
+                Self {
+                    format_version,
+                    problems: Vec::new(),
+                    serialized_prefix: Vec::new(),
+                },
+                0,
+            ));
+        }
+        let problem_count = flags
+            .building_flags()
+            .iter()
+            .filter(|building| building.flags != 0)
+            .count();
+        let word_count = problem_count
+            .checked_mul(2)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "BuildingManager problem word count",
+            ))?;
+        let mut reader = Reader::new(bytes);
+        let words = read_encoded_ulong_array(&mut reader, word_count)?;
+        let mut problems = Vec::with_capacity(problem_count);
+        for pair in words.chunks_exact(2) {
+            problems.push(BuildingProblemWords {
+                first: pair[0],
+                second: pair[1],
+            });
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                problems,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns one opaque word pair for each active building, in buffer order.
+    pub fn problems(&self) -> &[BuildingProblemWords] {
+        &self.problems
+    }
+
+    /// Writes the original encoded array exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
 }
 
 fn fixed_object_header_count(format_version: u32) -> usize {
