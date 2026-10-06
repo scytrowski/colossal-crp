@@ -21,7 +21,7 @@ mod terrain_manager_data;
 mod texture;
 mod water_simulation_data;
 
-pub use building_manager_data::{BuildingFlag, BuildingFlagsPrefix};
+pub use building_manager_data::{BuildingFlag, BuildingFlagsPrefix, BuildingPrefabPrefix};
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
@@ -2420,6 +2420,66 @@ mod tests {
     }
 
     #[test]
+    fn building_prefab_indices_follow_three_counts_and_names() -> Result<(), CrpError> {
+        let flag_bytes = include_bytes!("../tests/fixtures/building-flags-v116020-desert.bin");
+        let (flags, flag_bytes_used) = BuildingFlagsPrefix::decode_prefix(116_020, flag_bytes)?;
+        fn encoded_literals(values: &[u16]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for chunk in values.chunks(64) {
+                bytes.push(u8::try_from(chunk.len() - 1).unwrap());
+                for value in chunk {
+                    bytes.extend_from_slice(&value.to_be_bytes());
+                }
+            }
+            bytes
+        }
+        let building_indices = (100..289).collect::<Vec<u16>>();
+        let mut bytes = encoded_literals(&building_indices);
+        bytes.extend_from_slice(&[1, 0, 7, 0, 8]);
+        bytes.extend_from_slice(&[0, 0, 9]);
+        bytes.extend_from_slice(&[0, 2, 0xff]);
+        crate::data_serializer::write_unique_string(&mut bytes, "A")?;
+        let (prefabs, used) = BuildingPrefabPrefix::decode_prefix(116_020, &flags, 2, 1, &bytes)?;
+        assert_eq!(used, bytes.len());
+        assert_eq!(prefabs.building_indices(), building_indices);
+        assert_eq!(prefabs.guide_indices(), &[7, 8]);
+        assert_eq!(prefabs.milestone_indices(), &[9]);
+        assert_eq!(prefabs.names(), &[None, Some("A".to_owned())]);
+        assert_eq!(prefabs.encode(), bytes);
+        assert!(
+            BuildingPrefabPrefix::decode_prefix(116_020, &flags, 2, 1, &bytes[..used - 1]).is_err()
+        );
+        assert!(BuildingPrefabPrefix::decode_prefix(116_020, &flags, 0, 0, &[0]).is_err());
+        assert!(BuildingPrefabPrefix::decode_prefix(116_020, &flags, 0, 0, &[]).is_err());
+        assert!(flag_bytes_used < flag_bytes.len());
+        Ok(())
+    }
+
+    #[test]
+    fn building_prefab_game_fixture_preserves_names_and_boundary() -> Result<(), CrpError> {
+        let flag_bytes = include_bytes!("../tests/fixtures/building-flags-v116020-desert.bin");
+        let (flags, flags_used) = BuildingFlagsPrefix::decode_prefix(116_020, flag_bytes)?;
+        assert_eq!(&flag_bytes[flags_used..], &[0, 0, 0, 0]);
+        let bytes = include_bytes!("../tests/fixtures/building-prefabs-v116020-desert.bin");
+        let (prefabs, used) = BuildingPrefabPrefix::decode_prefix(116_020, &flags, 0, 0, bytes)?;
+        assert_eq!(used, 3_042);
+        assert_eq!(prefabs.building_indices().len(), 189);
+        assert_eq!(&prefabs.building_indices()[..4], &[498, 488, 2, 497]);
+        assert_eq!(prefabs.names().len(), 2_194);
+        assert_eq!(
+            prefabs.names().iter().filter(|name| name.is_some()).count(),
+            26
+        );
+        assert_eq!(prefabs.names()[2].as_deref(), Some("Wildlife Spawn Point"));
+        assert_eq!(prefabs.encode(), bytes[..used]);
+        assert_eq!(used, bytes.len());
+        assert!(
+            BuildingPrefabPrefix::decode_prefix(116_020, &flags, 0, 0, &bytes[..used - 1]).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn net_node_problems_respect_version_and_app_gates() -> Result<(), CrpError> {
         fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
             let count = if version < 202 {
@@ -3295,10 +3355,12 @@ mod tests {
         let mut checked_fence_prefab_convenience = false;
         let mut checked_net_tail_convenience = false;
         let mut checked_building_flags_convenience = false;
+        let mut checked_building_prefab_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
         let mut building_milestone_refs = 0_usize;
+        let mut building_prefab_names = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -3712,11 +3774,13 @@ mod tests {
                             crate::data_serializer::Reader::new(net_reader.remaining_bytes());
                         let guides = building_counts.read_u16_be()?;
                         let milestones = building_counts.read_u16_be()?;
+                        net_reader.read_bytes(building_counts.offset())?;
                         building_guide_refs += usize::from(guides);
                         building_milestone_refs += usize::from(milestones);
                         assert_eq!(
                             building_flags.encode(),
-                            net_reader.consumed_bytes()[net_reader.offset() - used..]
+                            net_reader.consumed_bytes()
+                                [net_reader.offset() - used - 4..net_reader.offset() - 4]
                         );
                         active_buildings += building_flags
                             .building_flags()
@@ -3732,8 +3796,38 @@ mod tests {
                             let (via_manager, graph_end) = manager_data
                                 .decode_building_flags_prefix(metadata.save_app_version)?;
                             assert_eq!(via_manager, building_flags);
-                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset() - 4);
                             checked_building_flags_convenience = true;
+                        }
+                        let (building_prefabs, prefab_used) = BuildingPrefabPrefix::decode_prefix(
+                            version,
+                            &building_flags,
+                            guides,
+                            milestones,
+                            net_reader.remaining_bytes(),
+                        )?;
+                        net_reader.read_bytes(prefab_used)?;
+                        building_prefab_names += building_prefabs
+                            .names()
+                            .iter()
+                            .filter(|name| name.is_some())
+                            .count();
+                        if !checked_building_prefab_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_prefabs_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, building_prefabs);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_building_prefab_convenience = true;
+                        }
+                        if std::env::var_os("CRP_EXTRACT_BUILDING_PREFAB_FIXTURE").is_some()
+                            && path
+                                .file_name()
+                                .is_some_and(|name| name == "CCMP2 Desert Map 1.crp")
+                        {
+                            std::fs::write(
+                                "tests/fixtures/building-prefabs-v116020-desert.bin",
+                                building_prefabs.encode(),
+                            )?;
                         }
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
@@ -3780,10 +3874,11 @@ mod tests {
         assert!(checked_fence_prefab_convenience);
         assert!(checked_net_tail_convenience);
         assert!(checked_building_flags_convenience);
+        assert!(checked_building_prefab_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density, {nonzero_guide_counts} with guide references, {nonzero_milestone_counts} with milestone references, {info_prefab_names} info prefab names, {tree_prefab_names} tree prefab names, {active_buildings} active buildings, {buildings_with_secondary_flags} with secondary flags, {building_guide_refs} building guide references, {building_milestone_refs} building milestone references"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density, {nonzero_guide_counts} with guide references, {nonzero_milestone_counts} with milestone references, {info_prefab_names} info prefab names, {tree_prefab_names} tree prefab names, {active_buildings} active buildings, {buildings_with_secondary_flags} with secondary flags, {building_guide_refs} building guide references, {building_milestone_refs} building milestone references, {building_prefab_names} building prefab names"
         );
         Ok(())
     }

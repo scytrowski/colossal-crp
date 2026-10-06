@@ -1,6 +1,6 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::read_encoded_uint_array;
+use crate::encoded_array::{read_encoded_uint_array, read_encoded_ushort_array};
 
 const BUILDING_COUNT: usize = 49_152;
 const LEGACY_BUILDING_COUNT: usize = 32_768;
@@ -27,6 +27,96 @@ pub struct BuildingFlagsPrefix {
     format_version: u32,
     building_flags: Vec<BuildingFlag>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Prefab index tables and names immediately after the BuildingManager counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingPrefabPrefix {
+    format_version: u32,
+    building_indices: Vec<u16>,
+    guide_indices: Vec<u16>,
+    milestone_indices: Vec<u16>,
+    names: Vec<Option<String>>,
+    serialized_prefix: Vec<u8>,
+}
+
+impl BuildingPrefabPrefix {
+    /// Decodes prefab indices for active buildings, guides, and milestones.
+    ///
+    /// `bytes` begins immediately after the two big-endian `u16` guide and
+    /// milestone counts. `flags` supplies the active building positions.
+    pub fn decode_prefix(
+        format_version: u32,
+        flags: &BuildingFlagsPrefix,
+        guide_count: u16,
+        milestone_count: u16,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || format_version != flags.format_version() {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "BuildingManager prefab indices".to_owned(),
+                offset: 0,
+                reason: "unsupported or mismatched inner version".to_owned(),
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        let building_count = flags
+            .building_flags()
+            .iter()
+            .filter(|building| building.flags != 0)
+            .count();
+        let building_indices = read_encoded_ushort_array(&mut reader, building_count)?;
+        let guide_indices = read_encoded_ushort_array(&mut reader, usize::from(guide_count))?;
+        let milestone_indices =
+            read_encoded_ushort_array(&mut reader, usize::from(milestone_count))?;
+        let name_count = usize::from(reader.read_u16_be()?);
+        let mut names = Vec::with_capacity(name_count);
+        for _ in 0..name_count {
+            names.push(reader.read_unique_string()?);
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                building_indices,
+                guide_indices,
+                milestone_indices,
+                names,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns indices corresponding to nonzero primary building flags.
+    pub fn building_indices(&self) -> &[u16] {
+        &self.building_indices
+    }
+
+    /// Returns prefab indices for guide entries.
+    pub fn guide_indices(&self) -> &[u16] {
+        &self.guide_indices
+    }
+
+    /// Returns prefab indices for milestone entries.
+    pub fn milestone_indices(&self) -> &[u16] {
+        &self.milestone_indices
+    }
+
+    /// Returns the prefab collection names, preserving null entries.
+    pub fn names(&self) -> &[Option<String>] {
+        &self.names
+    }
+
+    /// Writes the original encoded tables and names exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
 }
 
 impl BuildingFlagsPrefix {

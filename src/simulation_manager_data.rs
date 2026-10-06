@@ -1,4 +1,3 @@
-use crate::BuildingFlagsPrefix;
 use crate::CrpError;
 use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
@@ -8,6 +7,7 @@ use crate::TerrainManagerData;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
+use crate::{BuildingFlagsPrefix, BuildingPrefabPrefix};
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
     NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
@@ -714,6 +714,28 @@ impl SimulationManagerData {
         expect_profile_tag(&mut reader, &mut strings, "BuildingManager")?;
         let (data, used) =
             BuildingFlagsPrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes BuildingManager flags, counts, and the prefab index/name table.
+    /// The returned graph offset is before queued guide and milestone objects.
+    pub fn decode_building_prefabs_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingPrefabPrefix, usize), CrpError> {
+        let (flags, flags_end) = self.decode_building_flags_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(flags_end)?;
+        let guide_count = reader.read_u16_be()?;
+        let milestone_count = reader.read_u16_be()?;
+        let (data, used) = BuildingPrefabPrefix::decode_prefix(
+            self.format_version,
+            &flags,
+            guide_count,
+            milestone_count,
+            reader.remaining_bytes(),
+        )?;
         reader.read_bytes(used)?;
         Ok((data, reader.offset()))
     }
