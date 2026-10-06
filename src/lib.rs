@@ -2536,9 +2536,13 @@ mod tests {
                 .building_flags()
                 .iter()
                 .filter(|building| building.flags != 0)
-                .count(),
+                .count()
+                .checked_mul(2)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager problem value count",
+                ))?,
         )?;
-        assert_eq!(problems.len(), 189);
+        assert_eq!(problems.len(), 378);
         assert_eq!(array_reader.remaining(), 0);
         Ok(())
     }
@@ -3907,11 +3911,14 @@ mod tests {
                                 .filter(|building| building.flags != 0)
                                 .count();
                             let array_start = net_reader.offset();
+                            let problem_value_count = active_building_count.checked_mul(2).ok_or(
+                                CrpError::ArithmeticOverflow("BuildingManager problem value count"),
+                            )?;
                             let problem_values = crate::encoded_array::read_encoded_ulong_array(
                                 &mut net_reader,
-                                active_building_count,
+                                problem_value_count,
                             )?;
-                            assert_eq!(problem_values.len(), active_building_count);
+                            assert_eq!(problem_values.len(), problem_value_count);
                             if std::env::var_os("CRP_EXTRACT_BUILDING_OBJECT_FIXTURE").is_some()
                                 && path
                                     .file_name()
