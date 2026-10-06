@@ -21,7 +21,9 @@ mod terrain_manager_data;
 mod texture;
 mod water_simulation_data;
 
-pub use building_manager_data::{BuildingFlag, BuildingFlagsPrefix, BuildingPrefabPrefix};
+pub use building_manager_data::{
+    BuildingFlag, BuildingFlagsPrefix, BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix,
+};
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
@@ -2480,6 +2482,68 @@ mod tests {
     }
 
     #[test]
+    fn building_object_headers_follow_versioned_gates() -> Result<(), CrpError> {
+        let bytes = include_bytes!("../tests/fixtures/building-prefabs-v116020-desert.bin");
+        let flags_bytes = include_bytes!("../tests/fixtures/building-flags-v116020-desert.bin");
+        let (flags, _) = BuildingFlagsPrefix::decode_prefix(116_020, flags_bytes)?;
+        let (prefabs, _) = BuildingPrefabPrefix::decode_prefix(116_020, &flags, 0, 0, bytes)?;
+        let mut encoded = vec![0xff; 60];
+        encoded.extend_from_slice(&[0; 32]);
+        let (headers, used) =
+            BuildingManagerObjectHeadersPrefix::decode_prefix(116_020, &prefabs, &encoded)?;
+        assert_eq!(headers.object_headers().len(), 60);
+        assert!(
+            headers
+                .object_headers()
+                .iter()
+                .all(|header| *header == NetObjectHeader::Null)
+        );
+        assert_eq!(headers.trailing_problem_fields(), &[0; 32]);
+        assert_eq!(headers.encode(), encoded);
+        assert_eq!(used, encoded.len());
+        assert!(
+            BuildingManagerObjectHeadersPrefix::decode_prefix(
+                116_020,
+                &prefabs,
+                &encoded[..used - 1]
+            )
+            .is_err()
+        );
+        assert!(
+            BuildingManagerObjectHeadersPrefix::decode_prefix(164, &prefabs, &[0xff; 8]).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn building_object_headers_game_fixture_stops_before_problem_array() -> Result<(), CrpError> {
+        let flags_bytes = include_bytes!("../tests/fixtures/building-flags-v116020-desert.bin");
+        let (flags, _) = BuildingFlagsPrefix::decode_prefix(116_020, flags_bytes)?;
+        let prefab_bytes = include_bytes!("../tests/fixtures/building-prefabs-v116020-desert.bin");
+        let (prefabs, _) =
+            BuildingPrefabPrefix::decode_prefix(116_020, &flags, 0, 0, prefab_bytes)?;
+        let bytes = include_bytes!("../tests/fixtures/building-object-headers-v116020-desert.bin");
+        let (headers, used) =
+            BuildingManagerObjectHeadersPrefix::decode_prefix(116_020, &prefabs, bytes)?;
+        assert_eq!(headers.object_headers().len(), 60);
+        assert_eq!(headers.trailing_problem_fields().len(), 32);
+        assert!(used < bytes.len());
+        assert_eq!(headers.encode(), bytes[..used]);
+        let mut array_reader = crate::data_serializer::Reader::new(&bytes[used..]);
+        let problems = crate::encoded_array::read_encoded_ulong_array(
+            &mut array_reader,
+            flags
+                .building_flags()
+                .iter()
+                .filter(|building| building.flags != 0)
+                .count(),
+        )?;
+        assert_eq!(problems.len(), 189);
+        assert_eq!(array_reader.remaining(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn net_node_problems_respect_version_and_app_gates() -> Result<(), CrpError> {
         fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
             let count = if version < 202 {
@@ -3356,11 +3420,13 @@ mod tests {
         let mut checked_net_tail_convenience = false;
         let mut checked_building_flags_convenience = false;
         let mut checked_building_prefab_convenience = false;
+        let mut checked_building_object_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
         let mut building_milestone_refs = 0_usize;
         let mut building_prefab_names = 0_usize;
+        let mut building_object_headers = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -3819,6 +3885,47 @@ mod tests {
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_building_prefab_convenience = true;
                         }
+                        let (building_objects, object_used) =
+                            BuildingManagerObjectHeadersPrefix::decode_prefix(
+                                version,
+                                &building_prefabs,
+                                net_reader.remaining_bytes(),
+                            )?;
+                        net_reader.read_bytes(object_used)?;
+                        building_object_headers += building_objects.object_headers().len();
+                        if !checked_building_object_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_object_headers_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, building_objects);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_building_object_convenience = true;
+                        }
+                        if version >= 115_000 {
+                            let active_building_count = building_flags
+                                .building_flags()
+                                .iter()
+                                .filter(|building| building.flags != 0)
+                                .count();
+                            let array_start = net_reader.offset();
+                            let problem_values = crate::encoded_array::read_encoded_ulong_array(
+                                &mut net_reader,
+                                active_building_count,
+                            )?;
+                            assert_eq!(problem_values.len(), active_building_count);
+                            if std::env::var_os("CRP_EXTRACT_BUILDING_OBJECT_FIXTURE").is_some()
+                                && path
+                                    .file_name()
+                                    .is_some_and(|name| name == "CCMP2 Desert Map 1.crp")
+                            {
+                                let mut fixture = building_objects.encode();
+                                fixture
+                                    .extend_from_slice(&net_reader.consumed_bytes()[array_start..]);
+                                std::fs::write(
+                                    "tests/fixtures/building-object-headers-v116020-desert.bin",
+                                    fixture,
+                                )?;
+                            }
+                        }
                         if std::env::var_os("CRP_EXTRACT_BUILDING_PREFAB_FIXTURE").is_some()
                             && path
                                 .file_name()
@@ -3875,10 +3982,11 @@ mod tests {
         assert!(checked_net_tail_convenience);
         assert!(checked_building_flags_convenience);
         assert!(checked_building_prefab_convenience);
+        assert!(checked_building_object_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density, {nonzero_guide_counts} with guide references, {nonzero_milestone_counts} with milestone references, {info_prefab_names} info prefab names, {tree_prefab_names} tree prefab names, {active_buildings} active buildings, {buildings_with_secondary_flags} with secondary flags, {building_guide_refs} building guide references, {building_milestone_refs} building milestone references, {building_prefab_names} building prefab names"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density, {nonzero_guide_counts} with guide references, {nonzero_milestone_counts} with milestone references, {info_prefab_names} info prefab names, {tree_prefab_names} tree prefab names, {active_buildings} active buildings, {buildings_with_secondary_flags} with secondary flags, {building_guide_refs} building guide references, {building_milestone_refs} building milestone references, {building_prefab_names} building prefab names, {building_object_headers} BuildingManager object headers"
         );
         Ok(())
     }

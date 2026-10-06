@@ -7,7 +7,7 @@ use crate::TerrainManagerData;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
-use crate::{BuildingFlagsPrefix, BuildingPrefabPrefix};
+use crate::{BuildingFlagsPrefix, BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix};
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
     NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
@@ -734,6 +734,24 @@ impl SimulationManagerData {
             &flags,
             guide_count,
             milestone_count,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes BuildingManager prefab data and versioned object headers.
+    /// The returned graph offset is before later per-building serialized arrays.
+    pub fn decode_building_object_headers_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingManagerObjectHeadersPrefix, usize), CrpError> {
+        let (prefabs, prefab_end) = self.decode_building_prefabs_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(prefab_end)?;
+        let (data, used) = BuildingManagerObjectHeadersPrefix::decode_prefix(
+            self.format_version,
+            &prefabs,
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(used)?;

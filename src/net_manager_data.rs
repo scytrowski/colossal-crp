@@ -1767,7 +1767,7 @@ impl NetManagerTailPrefix {
     }
 }
 
-fn read_net_object_header(reader: &mut Reader<'_>) -> Result<NetObjectHeader, CrpError> {
+pub(crate) fn read_net_object_header(reader: &mut Reader<'_>) -> Result<NetObjectHeader, CrpError> {
     match reader.read_u8()? {
         0xff => Ok(NetObjectHeader::Null),
         0xfe => match reader.read_u8()? {
