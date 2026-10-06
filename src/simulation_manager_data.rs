@@ -8,8 +8,8 @@ use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 use crate::{
-    BuildingBufferFieldsPrefix, BuildingFlagsPrefix, BuildingManagerObjectHeadersPrefix,
-    BuildingPrefabPrefix, BuildingProblemPrefix,
+    BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingFlagsPrefix,
+    BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix, BuildingProblemPrefix,
 };
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
@@ -792,6 +792,25 @@ impl SimulationManagerData {
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(problem_end)?;
         let (data, used) = BuildingBufferFieldsPrefix::decode_prefix(
+            self.format_version,
+            &flags,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes versioned per-building byte state after network and utility buffers.
+    /// The returned graph offset is before the next BuildingManager arrays.
+    pub fn decode_building_byte_state_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingByteStatePrefix, usize), CrpError> {
+        let (flags, _) = self.decode_building_flags_prefix(save_app_version)?;
+        let (_, buffer_end) = self.decode_building_buffer_fields_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(buffer_end)?;
+        let (data, used) = BuildingByteStatePrefix::decode_prefix(
             self.format_version,
             &flags,
             reader.remaining_bytes(),

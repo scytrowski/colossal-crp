@@ -101,6 +101,29 @@ pub struct BuildingBufferFieldsPrefix {
     serialized_prefix: Vec<u8>,
 }
 
+/// Per-building byte state following utility buffers and pollution values.
+///
+/// The values are exposed as raw bytes because their game meanings have not
+/// been fully mapped. The original encoded prefix is retained for exact writeback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingByteStatePrefix {
+    format_version: u32,
+    construct_state: Vec<u8>,
+    fire_intensity: Vec<u8>,
+    fire_damage: Vec<u8>,
+    production_state: Vec<u8>,
+    health: Vec<u8>,
+    child_health: Vec<u8>,
+    senior_health: Vec<u8>,
+    happiness: Vec<u8>,
+    citizen_count: Vec<u8>,
+    temp_import: Vec<u8>,
+    temp_export: Vec<u8>,
+    final_import: Vec<u8>,
+    final_export: Vec<u8>,
+    serialized_prefix: Vec<u8>,
+}
+
 impl BuildingBufferFieldsPrefix {
     /// Decodes versioned network, utility, and byte fields for active buildings.
     ///
@@ -298,6 +321,135 @@ impl BuildingBufferFieldsPrefix {
     /// Returns water-pollution bytes.
     pub fn water_pollution(&self) -> &[u8] {
         &self.water_pollution
+    }
+    /// Writes the original encoded fields exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl BuildingByteStatePrefix {
+    /// Decodes the next versioned per-building byte arrays.
+    ///
+    /// Returns the decoded prefix and bytes consumed. Truncated data or a
+    /// mismatched flag-table version returns an error; later BuildingManager
+    /// arrays are left unread.
+    pub fn decode_prefix(
+        format_version: u32,
+        flags: &BuildingFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || flags.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "BuildingManager byte state".to_owned(),
+                offset: 0,
+                reason: "unsupported or mismatched inner version".to_owned(),
+            });
+        }
+        let count = flags
+            .building_flags()
+            .iter()
+            .filter(|building| building.flags != 0)
+            .count();
+        let mut reader = Reader::new(bytes);
+        let mut read = |since| {
+            if format_version >= since {
+                read_encoded_byte_array(&mut reader, count)
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let construct_state = read(33)?;
+        let fire_intensity = read(35)?;
+        let fire_damage = read(35)?;
+        let production_state = read(81)?;
+        let health = read(55)?;
+        let child_health = read(113_004)?;
+        let senior_health = read(113_004)?;
+        let happiness = read(55)?;
+        let citizen_count = read(55)?;
+        let temp_import = read(72)?;
+        let temp_export = read(72)?;
+        let final_import = read(72)?;
+        let final_export = read(72)?;
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                construct_state,
+                fire_intensity,
+                fire_damage,
+                production_state,
+                health,
+                child_health,
+                senior_health,
+                happiness,
+                citizen_count,
+                temp_import,
+                temp_export,
+                final_import,
+                final_export,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns raw construction-state bytes.
+    pub fn construct_state(&self) -> &[u8] {
+        &self.construct_state
+    }
+    /// Returns raw fire-intensity bytes from version 35 onward.
+    pub fn fire_intensity(&self) -> &[u8] {
+        &self.fire_intensity
+    }
+    /// Returns raw fire-damage bytes from version 35 onward.
+    pub fn fire_damage(&self) -> &[u8] {
+        &self.fire_damage
+    }
+    /// Returns raw production-state bytes from version 81 onward.
+    pub fn production_state(&self) -> &[u8] {
+        &self.production_state
+    }
+    /// Returns raw health bytes from version 55 onward.
+    pub fn health(&self) -> &[u8] {
+        &self.health
+    }
+    /// Returns raw child-health bytes from version 113004 onward.
+    pub fn child_health(&self) -> &[u8] {
+        &self.child_health
+    }
+    /// Returns raw senior-health bytes from version 113004 onward.
+    pub fn senior_health(&self) -> &[u8] {
+        &self.senior_health
+    }
+    /// Returns raw happiness bytes from version 55 onward.
+    pub fn happiness(&self) -> &[u8] {
+        &self.happiness
+    }
+    /// Returns raw citizen-count bytes from version 55 onward.
+    pub fn citizen_count(&self) -> &[u8] {
+        &self.citizen_count
+    }
+    /// Returns raw temporary-import bytes from version 72 onward.
+    pub fn temp_import(&self) -> &[u8] {
+        &self.temp_import
+    }
+    /// Returns raw temporary-export bytes from version 72 onward.
+    pub fn temp_export(&self) -> &[u8] {
+        &self.temp_export
+    }
+    /// Returns raw final-import bytes from version 72 onward.
+    pub fn final_import(&self) -> &[u8] {
+        &self.final_import
+    }
+    /// Returns raw final-export bytes from version 72 onward.
+    pub fn final_export(&self) -> &[u8] {
+        &self.final_export
     }
     /// Writes the original encoded fields exactly.
     pub fn encode(&self) -> Vec<u8> {

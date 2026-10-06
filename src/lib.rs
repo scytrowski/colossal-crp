@@ -22,7 +22,7 @@ mod texture;
 mod water_simulation_data;
 
 pub use building_manager_data::{
-    BuildingBufferFieldsPrefix, BuildingFlag, BuildingFlagsPrefix,
+    BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingFlag, BuildingFlagsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix, BuildingProblemPrefix,
     BuildingProblemWords,
 };
@@ -2743,6 +2743,71 @@ mod tests {
     }
 
     #[test]
+    fn building_byte_state_fields_follow_version_gates() -> Result<(), CrpError> {
+        fn encoded_literals(values: &[u8]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for chunk in values.chunks(128) {
+                bytes.push(u8::try_from(chunk.len() - 1).unwrap());
+                bytes.extend_from_slice(chunk);
+            }
+            bytes
+        }
+        let flags_bytes = include_bytes!("../tests/fixtures/building-flags-v116020-desert.bin");
+        let (flags, _) = BuildingFlagsPrefix::decode_prefix(116_020, flags_bytes)?;
+        let count = flags
+            .building_flags()
+            .iter()
+            .filter(|building| building.flags != 0)
+            .count();
+        let values = [1_u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+        let mut bytes = Vec::new();
+        for first in values {
+            let mut field = vec![0_u8; count];
+            field[0] = first;
+            bytes.extend(encoded_literals(&field));
+        }
+        let (decoded, used) = BuildingByteStatePrefix::decode_prefix(116_020, &flags, &bytes)?;
+        assert_eq!(used, bytes.len());
+        assert_eq!(decoded.construct_state()[0], 1);
+        assert_eq!(decoded.fire_intensity()[0], 2);
+        assert_eq!(decoded.fire_damage()[0], 3);
+        assert_eq!(decoded.production_state()[0], 4);
+        assert_eq!(decoded.health()[0], 5);
+        assert_eq!(decoded.child_health()[0], 6);
+        assert_eq!(decoded.senior_health()[0], 7);
+        assert_eq!(decoded.happiness()[0], 8);
+        assert_eq!(decoded.citizen_count()[0], 9);
+        assert_eq!(decoded.temp_import()[0], 10);
+        assert_eq!(decoded.temp_export()[0], 11);
+        assert_eq!(decoded.final_import()[0], 12);
+        assert_eq!(decoded.final_export()[0], 13);
+        assert_eq!(decoded.encode(), bytes);
+        assert!(
+            BuildingByteStatePrefix::decode_prefix(116_020, &flags, &bytes[..bytes.len() - 1])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn building_byte_state_game_fixture_preserves_order_and_boundary() -> Result<(), CrpError> {
+        let flags_bytes = include_bytes!("../tests/fixtures/building-flags-v116020-desert.bin");
+        let (flags, _) = BuildingFlagsPrefix::decode_prefix(116_020, flags_bytes)?;
+        let bytes = include_bytes!("../tests/fixtures/building-byte-state-v116020-desert.bin");
+        let (decoded, used) = BuildingByteStatePrefix::decode_prefix(116_020, &flags, bytes)?;
+        assert_eq!(used, bytes.len());
+        assert_eq!(decoded.construct_state().len(), 189);
+        assert_eq!(decoded.fire_damage().len(), 189);
+        assert_eq!(decoded.child_health().len(), 189);
+        assert_eq!(decoded.final_export().len(), 189);
+        assert_eq!(decoded.encode(), bytes);
+        assert!(
+            BuildingByteStatePrefix::decode_prefix(116_020, &flags, &bytes[..used - 1]).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn net_node_problems_respect_version_and_app_gates() -> Result<(), CrpError> {
         fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
             let count = if version < 202 {
@@ -3622,6 +3687,7 @@ mod tests {
         let mut checked_building_object_convenience = false;
         let mut checked_building_problem_convenience = false;
         let mut checked_building_buffer_convenience = false;
+        let mut checked_building_byte_state_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
@@ -4152,6 +4218,35 @@ mod tests {
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_building_buffer_convenience = true;
                         }
+                        let (building_byte_state, byte_state_used) =
+                            BuildingByteStatePrefix::decode_prefix(
+                                version,
+                                &building_flags,
+                                net_reader.remaining_bytes(),
+                            )?;
+                        let byte_state_start = net_reader.offset();
+                        net_reader.read_bytes(byte_state_used)?;
+                        assert_eq!(
+                            building_byte_state.encode(),
+                            &net_reader.consumed_bytes()[byte_state_start..]
+                        );
+                        if !checked_building_byte_state_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_byte_state_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, building_byte_state);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_building_byte_state_convenience = true;
+                        }
+                        if std::env::var_os("CRP_EXTRACT_BUILDING_BYTE_STATE_FIXTURE").is_some()
+                            && path
+                                .file_name()
+                                .is_some_and(|name| name == "CCMP2 Desert Map 1.crp")
+                        {
+                            std::fs::write(
+                                "tests/fixtures/building-byte-state-v116020-desert.bin",
+                                building_byte_state.encode(),
+                            )?;
+                        }
                         if std::env::var_os("CRP_EXTRACT_BUILDING_BUFFER_FIXTURE").is_some()
                             && path
                                 .file_name()
@@ -4233,6 +4328,7 @@ mod tests {
         assert!(checked_building_object_convenience);
         assert!(checked_building_problem_convenience);
         assert!(checked_building_buffer_convenience);
+        assert!(checked_building_byte_state_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(
