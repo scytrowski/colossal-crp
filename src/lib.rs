@@ -25,12 +25,13 @@ pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{MapMetaData, ModInfo};
 pub use net_manager_data::{
-    NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLane, NetLanePrefix, NetNodeCounter,
-    NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix, NetNodeProblem, NetNodeProblemsPrefix,
-    NetNodeRecord, NetNodeRecordsPrefix, NetSegmentCoverage, NetSegmentCoveragePrefix,
-    NetSegmentEnvironment, NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsPrefix,
-    NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsPrefix,
-    NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
+    NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLane, NetLanePrefix,
+    NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix, NetNodeProblem,
+    NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetSegmentCoverage,
+    NetSegmentCoveragePrefix, NetSegmentEnvironment, NetSegmentEnvironmentPrefix, NetSegmentFlag,
+    NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentRecord,
+    NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix,
+    NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
@@ -1994,10 +1995,10 @@ mod tests {
             (312, vec![0x12, 0x34], 55),
             (113_015, vec![0x12, 0x34, 1], 56),
             (114_002, vec![0x12, 0x34, 1, 1], 57),
-            (120_003, vec![0x12, 0x34, 1, 1, 1, 0], 59),
+            (120_003, vec![0x12, 0x34, 1, 1, 1, 1], 59),
             (
                 121_005,
-                vec![0x12, 0x34, 1, 1, 1, 0, 0xab, 0xcd, 0xef, 0x01],
+                vec![0x12, 0x34, 1, 1, 1, 1, 0xab, 0xcd, 0xef, 0x01],
                 63,
             ),
         ] {
@@ -2028,7 +2029,7 @@ mod tests {
             assert_eq!(record.tree_present, u8::from(version >= 114_002));
             assert_eq!(
                 record.fence_present,
-                if version >= 120_003 { [1, 0] } else { [0, 0] }
+                if version >= 120_003 { [1, 1] } else { [0, 0] }
             );
             assert_eq!(
                 record.event_route,
@@ -2053,6 +2054,44 @@ mod tests {
                 assert_eq!(tree_used, 0);
                 assert!(tree.indices().is_empty());
                 assert!(tree.encode().is_empty());
+            }
+            let fence_bytes = [0, 0, 21, 0, 1, 0xff, 0, 0, 22, 0, 1, 0x80, 0, 1, 0xd2, 0xee];
+            let (fence, fence_used) =
+                NetFencePrefabPrefix::decode_prefix(version, &prefix, &fence_bytes)?;
+            if version >= 120_003 {
+                assert_eq!(fence_used, 15);
+                assert_eq!(fence.left_indices(), [21]);
+                assert_eq!(fence.left_names(), [None]);
+                assert_eq!(fence.right_indices(), [22]);
+                assert_eq!(fence.right_names(), [Some("R".to_owned())]);
+                assert_eq!(fence.encode(), fence_bytes[..15]);
+                assert!(
+                    NetFencePrefabPrefix::decode_prefix(version, &prefix, &fence_bytes[..14])
+                        .is_err()
+                );
+                if version == 120_003 {
+                    let mut noncanonical_bool = bytes.clone();
+                    noncanonical_bool[57] = 2;
+                    noncanonical_bool[58] = 0;
+                    let (noncanonical_record, _) = NetSegmentRecordsPrefix::decode_prefix(
+                        version,
+                        &segment_flags,
+                        &noncanonical_bool,
+                    )?;
+                    let (empty_fence, used) = NetFencePrefabPrefix::decode_prefix(
+                        version,
+                        &noncanonical_record,
+                        &[0, 0, 0, 0],
+                    )?;
+                    assert_eq!(used, 4);
+                    assert!(empty_fence.left_indices().is_empty());
+                    assert!(empty_fence.right_indices().is_empty());
+                }
+            } else {
+                assert_eq!(fence_used, 0);
+                assert!(fence.left_indices().is_empty());
+                assert!(fence.right_indices().is_empty());
+                assert!(fence.encode().is_empty());
             }
             assert!(
                 NetSegmentRecordsPrefix::decode_prefix(
@@ -2211,7 +2250,8 @@ mod tests {
         assert!(tree.indices().is_empty());
         assert_eq!(tree.names().len(), 42);
         assert!(tree.names().iter().all(Option::is_none));
-        assert_eq!(tree.encode(), bytes);
+        assert_eq!(tree.encode(), &bytes[..used]);
+        assert_eq!(&bytes[used..], &[0xfe, 0xfe]);
         assert!(NetTreePrefabPrefix::decode_prefix(116_020, &records, &bytes[..43]).is_err());
         Ok(())
     }
@@ -3089,6 +3129,7 @@ mod tests {
         let mut checked_info_prefab_convenience = false;
         let mut tree_prefab_names = 0_usize;
         let mut checked_tree_prefab_convenience = false;
+        let mut checked_fence_prefab_convenience = false;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -3453,6 +3494,24 @@ mod tests {
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_tree_prefab_convenience = true;
                         }
+                        let (fence_prefabs, used) = NetFencePrefabPrefix::decode_prefix(
+                            version,
+                            &records,
+                            net_reader.remaining_bytes(),
+                        )?;
+                        net_reader.read_bytes(used)?;
+                        if version < 120_003 {
+                            assert_eq!(used, 0);
+                            assert!(fence_prefabs.left_indices().is_empty());
+                            assert!(fence_prefabs.right_indices().is_empty());
+                        }
+                        if !checked_fence_prefab_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_net_fence_prefab_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, fence_prefabs);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_fence_prefab_convenience = true;
+                        }
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -3495,6 +3554,7 @@ mod tests {
         assert!(checked_guide_counts_convenience);
         assert!(checked_info_prefab_convenience);
         assert!(checked_tree_prefab_convenience);
+        assert!(checked_fence_prefab_convenience);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(
             "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density, {nonzero_guide_counts} with guide references, {nonzero_milestone_counts} with milestone references, {info_prefab_names} info prefab names, {tree_prefab_names} tree prefab names"

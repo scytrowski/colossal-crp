@@ -8,10 +8,11 @@ use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 use crate::{
-    NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix, NetNodeCountersPrefix,
-    NetNodeFlagsPrefix, NetNodeProblemsPrefix, NetNodeRecordsPrefix, NetSegmentCoveragePrefix,
-    NetSegmentEnvironmentPrefix, NetSegmentFlagsPrefix, NetSegmentProblemsPrefix,
-    NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
+    NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
+    NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix, NetNodeRecordsPrefix,
+    NetSegmentCoveragePrefix, NetSegmentEnvironmentPrefix, NetSegmentFlagsPrefix,
+    NetSegmentProblemsPrefix, NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix,
+    NetTreePrefabPrefix,
 };
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
@@ -645,6 +646,25 @@ impl SimulationManagerData {
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(info_end)?;
         let (data, body_length) = NetTreePrefabPrefix::decode_prefix(
+            self.format_version,
+            &records,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes optional left and right fence-prefab tables after tree prefabs.
+    /// The returned graph offset is before guide and milestone object references.
+    pub fn decode_net_fence_prefab_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetFencePrefabPrefix, usize), CrpError> {
+        let (_, tree_end) = self.decode_net_tree_prefab_prefix(save_app_version)?;
+        let (records, _) = self.decode_net_segment_records_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(tree_end)?;
+        let (data, body_length) = NetFencePrefabPrefix::decode_prefix(
             self.format_version,
             &records,
             reader.remaining_bytes(),

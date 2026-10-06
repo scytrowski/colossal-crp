@@ -359,6 +359,20 @@ pub struct NetTreePrefabPrefix {
     serialized_prefix: Vec<u8>,
 }
 
+/// Left and right fence prefab tables after the tree-prefab table.
+///
+/// Each index list aligns with active segments whose corresponding on-disk
+/// fence-present bool is one. The original bytes are retained for writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetFencePrefabPrefix {
+    format_version: u32,
+    left_indices: Vec<u16>,
+    left_names: Vec<Option<String>>,
+    right_indices: Vec<u16>,
+    right_names: Vec<Option<String>>,
+    serialized_prefix: Vec<u8>,
+}
+
 impl NetLanePrefix {
     /// Decodes lane flags, links, and reservations for inner versions 164+.
     /// Returns bytes consumed, excluding the loading-profiler opening tag.
@@ -1512,6 +1526,89 @@ impl NetTreePrefabPrefix {
     }
 
     /// Writes the original encoded tree-prefab bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetFencePrefabPrefix {
+    /// Decodes separate left and right fence tables from inner version 120003.
+    /// Earlier supported versions consume no bytes. Returns an error on a
+    /// mismatched version, malformed encoded array, or invalid string. The
+    /// returned length ends before guide and milestone object references.
+    pub fn decode_prefix(
+        format_version: u32,
+        segment_records: &NetSegmentRecordsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || segment_records.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data fence prefab tables".to_owned(),
+                offset: 0,
+                reason: "fence-prefab version does not match segment records".to_owned(),
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        let (left_indices, left_names, right_indices, right_names) =
+            if format_version >= SEGMENT_FENCE_VERSION {
+                let left_count = segment_records
+                    .records()
+                    .iter()
+                    .filter(|record| record.fence_present[0] == 1)
+                    .count();
+                let left_indices = read_encoded_ushort_array(&mut reader, left_count)?;
+                let left_names = read_prefab_names(&mut reader)?;
+                let right_count = segment_records
+                    .records()
+                    .iter()
+                    .filter(|record| record.fence_present[1] == 1)
+                    .count();
+                let right_indices = read_encoded_ushort_array(&mut reader, right_count)?;
+                let right_names = read_prefab_names(&mut reader)?;
+                (left_indices, left_names, right_indices, right_names)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                left_indices,
+                left_names,
+                right_indices,
+                right_names,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns left-fence prefab indices in segment-buffer order.
+    pub fn left_indices(&self) -> &[u16] {
+        &self.left_indices
+    }
+
+    /// Returns left-fence prefab names in original table order.
+    pub fn left_names(&self) -> &[Option<String>] {
+        &self.left_names
+    }
+
+    /// Returns right-fence prefab indices in segment-buffer order.
+    pub fn right_indices(&self) -> &[u16] {
+        &self.right_indices
+    }
+
+    /// Returns right-fence prefab names in original table order.
+    pub fn right_names(&self) -> &[Option<String>] {
+        &self.right_names
+    }
+
+    /// Writes the original left and right table bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
