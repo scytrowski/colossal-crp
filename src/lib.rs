@@ -26,12 +26,12 @@ pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, Inst
 pub use metadata::{MapMetaData, ModInfo};
 pub use net_manager_data::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLane, NetLanePrefix,
-    NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix, NetNodeProblem,
-    NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetSegmentCoverage,
-    NetSegmentCoveragePrefix, NetSegmentEnvironment, NetSegmentEnvironmentPrefix, NetSegmentFlag,
-    NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentRecord,
-    NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix,
-    NetTreePrefabPrefix,
+    NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
+    NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader,
+    NetSegmentCoverage, NetSegmentCoveragePrefix, NetSegmentEnvironment,
+    NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsPrefix, NetSegmentProblem,
+    NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsPrefix, NetSegmentTrafficLight,
+    NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
@@ -2257,6 +2257,102 @@ mod tests {
     }
 
     #[test]
+    fn net_manager_tail_follows_object_and_scalar_version_gates() -> Result<(), CrpError> {
+        for version in [164, 166, 236, 237, 295, 318, 319, 321] {
+            let (counts, _) = NetGuideCountsPrefix::decode_prefix(version, &[0; 4])?;
+            let header_count = 8
+                + usize::from(version >= 166)
+                + 3 * usize::from(version >= 236)
+                + usize::from(version >= 237)
+                + 2 * usize::from(version >= 295)
+                + 3 * usize::from(version >= 318);
+            let mut bytes = vec![0xff; header_count];
+            if version >= 237 {
+                bytes.extend_from_slice(&[7, 8]);
+            }
+            if version >= 319 {
+                bytes.extend_from_slice(&[1, 2, 3]);
+            }
+            if version >= 321 {
+                bytes.extend_from_slice(&[0, 0, 2, 1]);
+                bytes.extend_from_slice(&1_u64.to_be_bytes());
+                bytes.extend_from_slice(&2_u64.to_be_bytes());
+            }
+            bytes.extend_from_slice(&[0, 6, 0xee]);
+            let (tail, used) = NetManagerTailPrefix::decode_prefix(version, &counts, &bytes)?;
+            assert_eq!(used, bytes.len() - 1);
+            assert_eq!(tail.object_headers().len(), header_count);
+            assert!(
+                tail.object_headers()
+                    .iter()
+                    .all(|item| *item == NetObjectHeader::Null)
+            );
+            assert_eq!(
+                tail.max_wetness(),
+                if version >= 237 { (7, 8) } else { (0, 0) }
+            );
+            assert_eq!(
+                tail.name_modified_count(),
+                if version >= 319 { 0x01_02_03 } else { 0 }
+            );
+            assert_eq!(
+                tail.adjusted_segments(),
+                if version >= 321 { &[1, 2][..] } else { &[][..] }
+            );
+            assert_eq!(tail.profile_end_shared_string_index(), Some(6));
+            assert_eq!(tail.encode(), bytes[..used]);
+            assert!(
+                NetManagerTailPrefix::decode_prefix(version, &counts, &bytes[..used - 1]).is_err()
+            );
+        }
+        let (counts, _) = NetGuideCountsPrefix::decode_prefix(164, &[0; 4])?;
+        let mut mixed = vec![0xfe, 0xfe, 0x80, 0, 1, 0xc1, 0xfe, 0, 1, 0, 0, 5];
+        mixed.extend(std::iter::repeat_n(0xff, 5));
+        mixed.extend_from_slice(&[0, 6]);
+        let (tail, used) = NetManagerTailPrefix::decode_prefix(164, &counts, &mixed)?;
+        assert_eq!(used, mixed.len());
+        assert_eq!(
+            tail.object_headers()[0],
+            NetObjectHeader::NewType("A".to_owned())
+        );
+        assert_eq!(tail.object_headers()[1], NetObjectHeader::NewSharedType(1));
+        assert_eq!(tail.object_headers()[2], NetObjectHeader::Existing(5));
+        assert!(NetManagerTailPrefix::decode_prefix(164, &counts, &[0xfe, 0xff]).is_err());
+        let (counts, _) = NetGuideCountsPrefix::decode_prefix(321, &[0; 4])?;
+        let mut oversized = vec![0xff; 18];
+        oversized.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x02, 0x41]);
+        assert!(NetManagerTailPrefix::decode_prefix(321, &counts, &oversized).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn net_manager_tail_game_fixture_reaches_building_manager() -> Result<(), CrpError> {
+        let bytes = include_bytes!("../tests/fixtures/net-manager-tail-v116020-desert.bin");
+        let (counts, _) = NetGuideCountsPrefix::decode_prefix(116_020, &[0; 4])?;
+        let (tail, used) = NetManagerTailPrefix::decode_prefix(116_020, &counts, bytes)?;
+        assert_eq!(used, 350);
+        assert_eq!(tail.object_headers().len(), 18);
+        assert_eq!(
+            tail.object_headers()[0],
+            NetObjectHeader::NewType(
+                "NetNodeInstanceGuide, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null".to_owned()
+            )
+        );
+        assert_eq!(tail.object_headers()[1], NetObjectHeader::NewSharedType(31));
+        assert_eq!(tail.profile_end_shared_string_index(), Some(6));
+        assert_eq!(tail.encode(), &bytes[..used]);
+        let mut next = crate::data_serializer::Reader::new(&bytes[used..]);
+        assert_eq!(next.read_u8()?, 0xfe);
+        assert_eq!(
+            next.read_unique_string()?.as_deref(),
+            Some("BuildingManager")
+        );
+        assert_eq!(next.remaining(), 0);
+        assert!(NetManagerTailPrefix::decode_prefix(116_020, &counts, &bytes[..used - 1]).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn net_node_problems_respect_version_and_app_gates() -> Result<(), CrpError> {
         fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
             let count = if version < 202 {
@@ -3130,6 +3226,7 @@ mod tests {
         let mut tree_prefab_names = 0_usize;
         let mut checked_tree_prefab_convenience = false;
         let mut checked_fence_prefab_convenience = false;
+        let mut checked_net_tail_convenience = false;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -3512,6 +3609,27 @@ mod tests {
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_fence_prefab_convenience = true;
                         }
+                        let (tail, used) = NetManagerTailPrefix::decode_prefix(
+                            version,
+                            &guide_counts,
+                            net_reader.remaining_bytes(),
+                        )?;
+                        net_reader.read_bytes(used)?;
+                        assert_eq!(tail.profile_end_shared_string_index(), Some(6));
+                        let mut next_manager =
+                            crate::data_serializer::Reader::new(net_reader.remaining_bytes());
+                        assert_eq!(next_manager.read_u8()?, 0xfe);
+                        assert_eq!(
+                            next_manager.read_unique_string()?.as_deref(),
+                            Some("BuildingManager")
+                        );
+                        if !checked_net_tail_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_net_manager_tail_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, tail);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_net_tail_convenience = true;
+                        }
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -3555,6 +3673,7 @@ mod tests {
         assert!(checked_info_prefab_convenience);
         assert!(checked_tree_prefab_convenience);
         assert!(checked_fence_prefab_convenience);
+        assert!(checked_net_tail_convenience);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(
             "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density, {nonzero_guide_counts} with guide references, {nonzero_milestone_counts} with milestone references, {info_prefab_names} info prefab names, {tree_prefab_names} tree prefab names"

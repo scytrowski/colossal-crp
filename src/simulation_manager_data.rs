@@ -9,10 +9,10 @@ use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
-    NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix, NetNodeRecordsPrefix,
-    NetSegmentCoveragePrefix, NetSegmentEnvironmentPrefix, NetSegmentFlagsPrefix,
-    NetSegmentProblemsPrefix, NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix,
-    NetTreePrefabPrefix,
+    NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
+    NetNodeRecordsPrefix, NetSegmentCoveragePrefix, NetSegmentEnvironmentPrefix,
+    NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsPrefix,
+    NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
@@ -667,6 +667,25 @@ impl SimulationManagerData {
         let (data, body_length) = NetFencePrefabPrefix::decode_prefix(
             self.format_version,
             &records,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes the final NetManager fields and profiler end tag.
+    /// The returned graph offset is before the next queued manager body.
+    pub fn decode_net_manager_tail_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetManagerTailPrefix, usize), CrpError> {
+        let (_, fence_end) = self.decode_net_fence_prefab_prefix(save_app_version)?;
+        let (guide_counts, _) = self.decode_net_guide_counts_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(fence_end)?;
+        let (data, body_length) = NetManagerTailPrefix::decode_prefix(
+            self.format_version,
+            &guide_counts,
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(body_length)?;

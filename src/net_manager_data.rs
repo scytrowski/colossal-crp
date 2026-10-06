@@ -26,6 +26,7 @@ const SEGMENT_PATH_OVERRIDE_VERSION: u32 = 113_015;
 const SEGMENT_TREE_VERSION: u32 = 114_002;
 const SEGMENT_FENCE_VERSION: u32 = 120_003;
 const SEGMENT_EVENT_ROUTE_VERSION: u32 = 121_005;
+const ADJUSTED_SEGMENT_WORDS: usize = 576;
 const NODE_EVENT_ROUTE_VERSION: u32 = 121_007;
 const MAX_NODE_SEGMENTS: usize = 8;
 const SAVE_APP_PROBLEMS_VERSION: u32 = (1 << 27) + (3 << 22) + (1 << 13) + (1 << 8);
@@ -370,6 +371,35 @@ pub struct NetFencePrefabPrefix {
     left_names: Vec<Option<String>>,
     right_indices: Vec<u16>,
     right_names: Vec<Option<String>>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// One DataSerializer object header in the NetManager tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetObjectHeader {
+    /// Null object marker (`FF`).
+    Null,
+    /// New object with an inline assembly-qualified type name.
+    NewType(String),
+    /// New object referring to an earlier shared type by 16-bit index.
+    NewSharedType(u16),
+    /// Existing object referring to an earlier object by 24-bit index.
+    Existing(u32),
+}
+
+/// Guide object headers and final scalar fields of `NetManager+Data`.
+///
+/// Newly declared object bodies are queued elsewhere in DataSerializer and
+/// remain opaque. This prefix retains every header and scalar byte exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetManagerTailPrefix {
+    format_version: u32,
+    object_headers: Vec<NetObjectHeader>,
+    last_max_wetness: u8,
+    current_max_wetness: u8,
+    name_modified_count: u32,
+    adjusted_segments: Vec<u64>,
+    profile_end_shared_string_index: Option<u16>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -1611,6 +1641,154 @@ impl NetFencePrefabPrefix {
     /// Writes the original left and right table bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+}
+
+impl NetManagerTailPrefix {
+    /// Decodes object headers, versioned scalars, and the profiler end tag.
+    ///
+    /// Supports inner versions 164+. The object type names and original bytes
+    /// are preserved; queued object bodies are not decoded. Invalid headers,
+    /// truncated fields, and adjusted-segment counts above the game's 576-word
+    /// allocation return errors. The returned length ends at the next queued
+    /// manager-body boundary.
+    pub fn decode_prefix(
+        format_version: u32,
+        guide_counts: &NetGuideCountsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || guide_counts.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data tail".to_owned(),
+                offset: 0,
+                reason: "tail version does not match guide counts".to_owned(),
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        let fixed_header_count = 8
+            + usize::from(format_version >= 166)
+            + 3 * usize::from(format_version >= 236)
+            + usize::from(format_version >= 237)
+            + 2 * usize::from(format_version >= 295)
+            + 3 * usize::from(format_version >= 318);
+        let header_count = usize::from(guide_counts.guide_count())
+            .checked_add(usize::from(guide_counts.milestone_count()))
+            .and_then(|count| count.checked_add(fixed_header_count))
+            .ok_or(CrpError::ArithmeticOverflow(
+                "NetManager object-header count",
+            ))?;
+        let mut object_headers = Vec::new();
+        for _ in 0..header_count {
+            object_headers.push(read_net_object_header(&mut reader)?);
+        }
+        let (last_max_wetness, current_max_wetness) = if format_version >= 237 {
+            (reader.read_u8()?, reader.read_u8()?)
+        } else {
+            (0, 0)
+        };
+        let name_modified_count = if format_version >= 319 {
+            read_segment_u24(&mut reader)?
+        } else {
+            0
+        };
+        let adjusted_segments = if format_version >= 321 {
+            let count = usize::try_from(read_segment_u24(&mut reader)?)
+                .map_err(|_| reader.invalid("adjusted-segment count does not fit platform"))?;
+            if count > ADJUSTED_SEGMENT_WORDS {
+                return Err(reader.invalid("adjusted-segment count exceeds 576 words"));
+            }
+            read_encoded_ulong_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let profile_marker = reader.read_u8()?;
+        let profile_end_shared_string_index = match profile_marker {
+            0xff => return Err(reader.invalid("NetManager profiler end tag cannot be null")),
+            0xfe => {
+                let name = reader.read_unique_string()?.ok_or_else(|| {
+                    reader.invalid("NetManager profiler end string cannot be null")
+                })?;
+                if name != "NetManager" {
+                    return Err(reader.invalid("wrong NetManager profiler end tag"));
+                }
+                None
+            }
+            high => Some(u16::from_be_bytes([high, reader.read_u8()?])),
+        };
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                object_headers,
+                last_max_wetness,
+                current_max_wetness,
+                name_modified_count,
+                adjusted_segments,
+                profile_end_shared_string_index,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns object headers in guide, milestone, and fixed-field order.
+    pub fn object_headers(&self) -> &[NetObjectHeader] {
+        &self.object_headers
+    }
+
+    /// Returns the last and current maximum wetness values, zero before 237.
+    pub fn max_wetness(&self) -> (u8, u8) {
+        (self.last_max_wetness, self.current_max_wetness)
+    }
+
+    /// Returns the 24-bit name-modification count, zero before 319.
+    pub fn name_modified_count(&self) -> u32 {
+        self.name_modified_count
+    }
+
+    /// Returns serialized adjusted-segment words from version 321 onward.
+    pub fn adjusted_segments(&self) -> &[u64] {
+        &self.adjusted_segments
+    }
+
+    /// Returns the profiler end's shared-string index, if it used one.
+    pub fn profile_end_shared_string_index(&self) -> Option<u16> {
+        self.profile_end_shared_string_index
+    }
+
+    /// Writes the original object headers, scalars, and profiler tag exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+fn read_net_object_header(reader: &mut Reader<'_>) -> Result<NetObjectHeader, CrpError> {
+    match reader.read_u8()? {
+        0xff => Ok(NetObjectHeader::Null),
+        0xfe => match reader.read_u8()? {
+            0xff => Err(reader.invalid("new object has a null shared type")),
+            0xfe => {
+                let name = reader
+                    .read_unique_string()?
+                    .ok_or_else(|| reader.invalid("new object type name cannot be null"))?;
+                Ok(NetObjectHeader::NewType(name))
+            }
+            high => Ok(NetObjectHeader::NewSharedType(u16::from_be_bytes([
+                high,
+                reader.read_u8()?,
+            ]))),
+        },
+        high => {
+            let suffix = reader.read_bytes(2)?;
+            Ok(NetObjectHeader::Existing(
+                (u32::from(high) << 16) | (u32::from(suffix[0]) << 8) | u32::from(suffix[1]),
+            ))
+        }
     }
 }
 
