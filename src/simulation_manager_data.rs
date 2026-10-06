@@ -8,10 +8,10 @@ use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 use crate::{
-    NetLanePrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
-    NetNodeRecordsPrefix, NetSegmentCoveragePrefix, NetSegmentEnvironmentPrefix,
-    NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsPrefix,
-    NetSegmentTrafficLightsPrefix,
+    NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix, NetNodeCountersPrefix,
+    NetNodeFlagsPrefix, NetNodeProblemsPrefix, NetNodeRecordsPrefix, NetSegmentCoveragePrefix,
+    NetSegmentEnvironmentPrefix, NetSegmentFlagsPrefix, NetSegmentProblemsPrefix,
+    NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
@@ -591,6 +591,62 @@ impl SimulationManagerData {
         let (data, body_length) = NetSegmentRecordsPrefix::decode_prefix(
             self.format_version,
             &segment_flags,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes the two guide-table counts after individual segment records.
+    /// The returned graph offset is before the prefab-reference tables.
+    pub fn decode_net_guide_counts_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetGuideCountsPrefix, usize), CrpError> {
+        let (_, records_end) = self.decode_net_segment_records_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(records_end)?;
+        let (data, body_length) =
+            NetGuideCountsPrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes the network-info prefab-index and name table after guide counts.
+    /// The returned graph offset is before the tree-prefab table.
+    pub fn decode_net_info_prefab_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetInfoPrefabPrefix, usize), CrpError> {
+        let (guide_counts, counts_end) = self.decode_net_guide_counts_prefix(save_app_version)?;
+        let (node_flags, _) = self.decode_net_node_flags_prefix()?;
+        let (segment_flags, _) = self.decode_net_segment_flags_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(counts_end)?;
+        let (data, body_length) = NetInfoPrefabPrefix::decode_prefix(
+            self.format_version,
+            &node_flags,
+            &segment_flags,
+            &guide_counts,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes the tree-prefab index and name table after network-info prefabs.
+    /// The returned graph offset is before optional fence-prefab tables.
+    pub fn decode_net_tree_prefab_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetTreePrefabPrefix, usize), CrpError> {
+        let (_, info_end) = self.decode_net_info_prefab_prefix(save_app_version)?;
+        let (records, _) = self.decode_net_segment_records_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(info_end)?;
+        let (data, body_length) = NetTreePrefabPrefix::decode_prefix(
+            self.format_version,
+            &records,
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(body_length)?;

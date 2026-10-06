@@ -25,11 +25,12 @@ pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{MapMetaData, ModInfo};
 pub use net_manager_data::{
-    NetLane, NetLanePrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
-    NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetSegmentCoverage,
-    NetSegmentCoveragePrefix, NetSegmentEnvironment, NetSegmentEnvironmentPrefix, NetSegmentFlag,
-    NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentRecord,
-    NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix,
+    NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLane, NetLanePrefix, NetNodeCounter,
+    NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix, NetNodeProblem, NetNodeProblemsPrefix,
+    NetNodeRecord, NetNodeRecordsPrefix, NetSegmentCoverage, NetSegmentCoveragePrefix,
+    NetSegmentEnvironment, NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsPrefix,
+    NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsPrefix,
+    NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
@@ -2037,6 +2038,22 @@ mod tests {
                 record.next_event_route_segment,
                 if version >= 121_005 { 0xef01 } else { 0 }
             );
+            let tree_bytes = [0, 0, 42, 0, 0, 0xee];
+            let (tree, tree_used) =
+                NetTreePrefabPrefix::decode_prefix(version, &prefix, &tree_bytes)?;
+            if version >= 114_002 {
+                assert_eq!(tree_used, 5);
+                assert_eq!(tree.indices(), [42]);
+                assert!(tree.names().is_empty());
+                assert_eq!(tree.encode(), tree_bytes[..5]);
+                assert!(
+                    NetTreePrefabPrefix::decode_prefix(version, &prefix, &tree_bytes[..4]).is_err()
+                );
+            } else {
+                assert_eq!(tree_used, 0);
+                assert!(tree.indices().is_empty());
+                assert!(tree.encode().is_empty());
+            }
             assert!(
                 NetSegmentRecordsPrefix::decode_prefix(
                     version,
@@ -2068,6 +2085,134 @@ mod tests {
         assert!(
             NetSegmentRecordsPrefix::decode_prefix(116_020, &flags, &bytes[..used - 1]).is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn net_guide_counts_follow_segment_records() -> Result<(), CrpError> {
+        let bytes = include_bytes!("../tests/fixtures/net-segment-records-v116020-desert.bin");
+        let (counts, used) = NetGuideCountsPrefix::decode_prefix(116_020, &bytes[118_617..])?;
+        assert_eq!(used, 4);
+        assert_eq!(counts.guide_count(), 0);
+        assert_eq!(counts.milestone_count(), 0);
+        assert_eq!(counts.encode(), [0, 0, 0, 0]);
+
+        let expected = [0x12, 0x34, 0xab, 0xcd, 0xef];
+        let (counts, used) = NetGuideCountsPrefix::decode_prefix(164, &expected)?;
+        assert_eq!(used, 4);
+        assert_eq!(counts.guide_count(), 0x1234);
+        assert_eq!(counts.milestone_count(), 0xabcd);
+        assert_eq!(counts.encode(), expected[..4]);
+        assert!(NetGuideCountsPrefix::decode_prefix(163, &expected).is_err());
+        for length in 0..4 {
+            assert!(NetGuideCountsPrefix::decode_prefix(164, &expected[..length]).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn net_info_prefab_table_reads_indices_and_names() -> Result<(), CrpError> {
+        let version = 164;
+        let mut node_bytes = vec![2];
+        for value in [1_u32, 0, 0] {
+            node_bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        node_bytes.extend(std::iter::repeat_n(0xff, 127));
+        node_bytes.push(0xfb);
+        let (nodes, _) = NetNodeFlagsPrefix::decode_prefix(version, &node_bytes)?;
+        let mut segment_bytes = vec![2];
+        for value in [1_u32, 0, 0] {
+            segment_bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        segment_bytes.extend(std::iter::repeat_n(0xff, 255));
+        segment_bytes.push(0xfb);
+        let (segments, _) = NetSegmentFlagsPrefix::decode_prefix(version, &segment_bytes)?;
+        let (counts, _) = NetGuideCountsPrefix::decode_prefix(version, &[0, 1, 0, 1])?;
+        // Four literal prefab indices, two names: null and compact "A".
+        let bytes = [
+            3, 0, 2, 0, 3, 0, 4, 0, 5, 0, 2, 0xff, 0x80, 0, 1, 0xc1, 0xee,
+        ];
+        let (table, used) =
+            NetInfoPrefabPrefix::decode_prefix(version, &nodes, &segments, &counts, &bytes)?;
+        assert_eq!(used, 16);
+        assert_eq!(table.node_info_indices(), [2]);
+        assert_eq!(table.segment_info_indices(), [3]);
+        assert_eq!(table.guide_indices(), [4]);
+        assert_eq!(table.milestone_indices(), [5]);
+        assert_eq!(table.names(), [None, Some("A".to_owned())]);
+        assert_eq!(table.encode(), bytes[..used]);
+        assert!(
+            NetInfoPrefabPrefix::decode_prefix(version, &nodes, &segments, &counts, &bytes[..15])
+                .is_err()
+        );
+        assert!(
+            NetInfoPrefabPrefix::decode_prefix(version + 1, &nodes, &segments, &counts, &bytes)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn net_info_prefab_game_fixture_preserves_names() -> Result<(), CrpError> {
+        let (nodes, _) = NetNodeFlagsPrefix::decode_prefix(
+            116_020,
+            include_bytes!("../tests/fixtures/net-node-flags-v116020-desert.bin"),
+        )?;
+        let (segments, _) = NetSegmentFlagsPrefix::decode_prefix(
+            116_020,
+            include_bytes!("../tests/fixtures/net-segment-flags-v116020-desert.bin"),
+        )?;
+        let (counts, _) = NetGuideCountsPrefix::decode_prefix(116_020, &[0; 4])?;
+        let bytes = include_bytes!("../tests/fixtures/net-info-prefabs-v116020-desert.bin");
+        let (table, used) =
+            NetInfoPrefabPrefix::decode_prefix(116_020, &nodes, &segments, &counts, bytes)?;
+        assert_eq!(used, 6_946);
+        assert_eq!(table.node_info_indices().len(), 2_082);
+        assert_eq!(table.segment_info_indices().len(), 2_081);
+        assert!(table.guide_indices().is_empty());
+        assert!(table.milestone_indices().is_empty());
+        assert_eq!(table.names()[0].as_deref(), Some("Pedestrian Gravel"));
+        assert_eq!(
+            table.names().iter().filter(|name| name.is_some()).count(),
+            22
+        );
+        assert!(
+            table
+                .names()
+                .iter()
+                .any(|name| name.as_deref() == Some("Water Pipe"))
+        );
+        assert_eq!(table.encode(), bytes);
+        assert!(
+            NetInfoPrefabPrefix::decode_prefix(
+                116_020,
+                &nodes,
+                &segments,
+                &counts,
+                &bytes[..bytes.len() - 1]
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn net_tree_prefab_game_fixture_preserves_null_names() -> Result<(), CrpError> {
+        let (flags, _) = NetSegmentFlagsPrefix::decode_prefix(
+            116_020,
+            include_bytes!("../tests/fixtures/net-segment-flags-v116020-desert.bin"),
+        )?;
+        let records_bytes =
+            include_bytes!("../tests/fixtures/net-segment-records-v116020-desert.bin");
+        let (records, _) = NetSegmentRecordsPrefix::decode_prefix(116_020, &flags, records_bytes)?;
+        let bytes = include_bytes!("../tests/fixtures/net-tree-prefabs-v116020-desert.bin");
+        let (tree, used) = NetTreePrefabPrefix::decode_prefix(116_020, &records, bytes)?;
+        assert_eq!(used, 44);
+        assert!(tree.indices().is_empty());
+        assert_eq!(tree.names().len(), 42);
+        assert!(tree.names().iter().all(Option::is_none));
+        assert_eq!(tree.encode(), bytes);
+        assert!(NetTreePrefabPrefix::decode_prefix(116_020, &records, &bytes[..43]).is_err());
         Ok(())
     }
 
@@ -2937,6 +3082,13 @@ mod tests {
         let mut checked_environment_convenience = false;
         let mut segment_records = 0_usize;
         let mut checked_records_convenience = false;
+        let mut nonzero_guide_counts = 0_usize;
+        let mut nonzero_milestone_counts = 0_usize;
+        let mut checked_guide_counts_convenience = false;
+        let mut info_prefab_names = 0_usize;
+        let mut checked_info_prefab_convenience = false;
+        let mut tree_prefab_names = 0_usize;
+        let mut checked_tree_prefab_convenience = false;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -3239,6 +3391,68 @@ mod tests {
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_records_convenience = true;
                         }
+                        let (guide_counts, used) = NetGuideCountsPrefix::decode_prefix(
+                            version,
+                            net_reader.remaining_bytes(),
+                        )?;
+                        net_reader.read_bytes(used)?;
+                        nonzero_guide_counts += usize::from(guide_counts.guide_count() != 0);
+                        nonzero_milestone_counts +=
+                            usize::from(guide_counts.milestone_count() != 0);
+                        if !checked_guide_counts_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_net_guide_counts_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, guide_counts);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_guide_counts_convenience = true;
+                        }
+                        let (info_prefabs, used) = NetInfoPrefabPrefix::decode_prefix(
+                            version,
+                            &net_nodes,
+                            &segment_flags,
+                            &guide_counts,
+                            net_reader.remaining_bytes(),
+                        )?;
+                        net_reader.read_bytes(used)?;
+                        assert_eq!(
+                            info_prefabs.node_info_indices().len(),
+                            net_nodes
+                                .node_flags()
+                                .iter()
+                                .filter(|node| node.flags != 0)
+                                .count()
+                        );
+                        assert_eq!(info_prefabs.segment_info_indices().len(), active_segments);
+                        info_prefab_names += info_prefabs
+                            .names()
+                            .iter()
+                            .filter(|name| name.is_some())
+                            .count();
+                        if !checked_info_prefab_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_net_info_prefab_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, info_prefabs);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_info_prefab_convenience = true;
+                        }
+                        let (tree_prefabs, used) = NetTreePrefabPrefix::decode_prefix(
+                            version,
+                            &records,
+                            net_reader.remaining_bytes(),
+                        )?;
+                        net_reader.read_bytes(used)?;
+                        tree_prefab_names += tree_prefabs
+                            .names()
+                            .iter()
+                            .filter(|name| name.is_some())
+                            .count();
+                        if !checked_tree_prefab_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_net_tree_prefab_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, tree_prefabs);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_tree_prefab_convenience = true;
+                        }
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -3278,9 +3492,12 @@ mod tests {
         assert!(checked_coverage_convenience);
         assert!(checked_environment_convenience);
         assert!(checked_records_convenience);
+        assert!(checked_guide_counts_convenience);
+        assert!(checked_info_prefab_convenience);
+        assert!(checked_tree_prefab_convenience);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density, {nonzero_guide_counts} with guide references, {nonzero_milestone_counts} with milestone references, {info_prefab_names} info prefab names, {tree_prefab_names} tree prefab names"
         );
         Ok(())
     }

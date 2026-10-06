@@ -319,6 +319,46 @@ pub struct NetSegmentRecordsPrefix {
     serialized_prefix: Vec<u8>,
 }
 
+/// Counts of saved network guide and milestone prefab references.
+///
+/// These two big-endian `u16` values follow the individual segment records
+/// from inner version 128. Later prefab-reference tables remain opaque.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetGuideCountsPrefix {
+    format_version: u32,
+    guide_count: u16,
+    milestone_count: u16,
+    serialized_prefix: Vec<u8>,
+}
+
+/// The first prefab-reference table after NetManager's guide counts.
+///
+/// Indices align with active node and segment buffers; guide and milestone
+/// indices align with their preceding counts. Names may be null. Original
+/// encoded bytes are retained for exact writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetInfoPrefabPrefix {
+    format_version: u32,
+    node_info_indices: Vec<u16>,
+    segment_info_indices: Vec<u16>,
+    guide_indices: Vec<u16>,
+    milestone_indices: Vec<u16>,
+    names: Vec<Option<String>>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Optional tree-prefab indices and names after the network-info table.
+///
+/// Indices align with active segments whose on-disk tree-present bool is one.
+/// Earlier versions contain no bytes for this table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetTreePrefabPrefix {
+    format_version: u32,
+    indices: Vec<u16>,
+    names: Vec<Option<String>>,
+    serialized_prefix: Vec<u8>,
+}
+
 impl NetLanePrefix {
     /// Decodes lane flags, links, and reservations for inner versions 164+.
     /// Returns bytes consumed, excluding the loading-profiler opening tag.
@@ -1261,6 +1301,229 @@ impl NetSegmentRecordsPrefix {
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
+}
+
+impl NetGuideCountsPrefix {
+    /// Decodes the two prefab-reference counts in inner versions 164+.
+    /// Returns an error on unsupported versions or truncation and stops before
+    /// the prefab-reference tables.
+    pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data guide counts".to_owned(),
+                offset: 0,
+                reason: "unsupported inner version before 164".to_owned(),
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        let guide_count = reader.read_u16_be()?;
+        let milestone_count = reader.read_u16_be()?;
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                guide_count,
+                milestone_count,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns the count of `m_netNotUsedGuides` references.
+    pub fn guide_count(&self) -> u16 {
+        self.guide_count
+    }
+
+    /// Returns the count of `m_UnlockMilestones` references.
+    pub fn milestone_count(&self) -> u16 {
+        self.milestone_count
+    }
+
+    /// Writes the two original count values exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetInfoPrefabPrefix {
+    /// Decodes the network-info UShort stream and its prefab-name table.
+    ///
+    /// Supports inner versions 164+. Rejects mismatched versions, count
+    /// overflow, malformed encoded arrays, and invalid names. The returned
+    /// length ends before the tree-prefab table in version 114002+.
+    pub fn decode_prefix(
+        format_version: u32,
+        node_flags: &NetNodeFlagsPrefix,
+        segment_flags: &NetSegmentFlagsPrefix,
+        guide_counts: &NetGuideCountsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164
+            || node_flags.format_version() != format_version
+            || segment_flags.format_version() != format_version
+            || guide_counts.format_version() != format_version
+        {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data info prefab table".to_owned(),
+                offset: 0,
+                reason: "prefab-table version does not match flags and counts".to_owned(),
+            });
+        }
+        let node_count = node_flags
+            .node_flags()
+            .iter()
+            .filter(|node| node.flags != 0)
+            .count();
+        let segment_count = segment_flags
+            .segment_flags()
+            .iter()
+            .filter(|segment| segment.flags != 0)
+            .count();
+        let guide_count = usize::from(guide_counts.guide_count());
+        let milestone_count = usize::from(guide_counts.milestone_count());
+        let total_count = node_count
+            .checked_add(segment_count)
+            .and_then(|count| count.checked_add(guide_count))
+            .and_then(|count| count.checked_add(milestone_count))
+            .ok_or(CrpError::ArithmeticOverflow(
+                "NetManager info prefab index count",
+            ))?;
+        let mut reader = Reader::new(bytes);
+        let indices = read_encoded_ushort_array(&mut reader, total_count)?;
+        let mut index_iter = indices.into_iter();
+        let node_info_indices = index_iter.by_ref().take(node_count).collect();
+        let segment_info_indices = index_iter.by_ref().take(segment_count).collect();
+        let guide_indices = index_iter.by_ref().take(guide_count).collect();
+        let milestone_indices = index_iter.take(milestone_count).collect();
+        let names = read_prefab_names(&mut reader)?;
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                node_info_indices,
+                segment_info_indices,
+                guide_indices,
+                milestone_indices,
+                names,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns prefab indices for active nodes, in buffer order.
+    pub fn node_info_indices(&self) -> &[u16] {
+        &self.node_info_indices
+    }
+
+    /// Returns prefab indices for active segments, in buffer order.
+    pub fn segment_info_indices(&self) -> &[u16] {
+        &self.segment_info_indices
+    }
+
+    /// Returns serialized guide prefab indices.
+    pub fn guide_indices(&self) -> &[u16] {
+        &self.guide_indices
+    }
+
+    /// Returns serialized milestone prefab indices.
+    pub fn milestone_indices(&self) -> &[u16] {
+        &self.milestone_indices
+    }
+
+    /// Returns the prefab names in their original table order.
+    pub fn names(&self) -> &[Option<String>] {
+        &self.names
+    }
+
+    /// Writes the original encoded index and name-table bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetTreePrefabPrefix {
+    /// Decodes the tree-prefab UShort stream and name table from version 114002.
+    /// Earlier supported versions return empty fields and consume no bytes.
+    /// Malformed arrays and strings return an error. The returned length ends
+    /// before left-fence prefabs when those are present.
+    pub fn decode_prefix(
+        format_version: u32,
+        segment_records: &NetSegmentRecordsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || segment_records.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data tree prefab table".to_owned(),
+                offset: 0,
+                reason: "tree-prefab version does not match segment records".to_owned(),
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        let (indices, names) = if format_version >= SEGMENT_TREE_VERSION {
+            let count = segment_records
+                .records()
+                .iter()
+                .filter(|record| record.tree_present == 1)
+                .count();
+            (
+                read_encoded_ushort_array(&mut reader, count)?,
+                read_prefab_names(&mut reader)?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                indices,
+                names,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns tree prefab indices in segment-buffer order.
+    pub fn indices(&self) -> &[u16] {
+        &self.indices
+    }
+
+    /// Returns the tree-prefab names in original order.
+    pub fn names(&self) -> &[Option<String>] {
+        &self.names
+    }
+
+    /// Writes the original encoded tree-prefab bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, CrpError> {
+    let name_count = usize::from(reader.read_u16_be()?);
+    let mut names = Vec::with_capacity(name_count);
+    for _ in 0..name_count {
+        names.push(reader.read_unique_string()?);
+    }
+    Ok(names)
 }
 
 fn read_segment_u24(reader: &mut Reader<'_>) -> Result<u32, CrpError> {
