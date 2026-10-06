@@ -2489,11 +2489,11 @@ mod tests {
         let flags_bytes = include_bytes!("../tests/fixtures/building-flags-v116020-desert.bin");
         let (flags, _) = BuildingFlagsPrefix::decode_prefix(116_020, flags_bytes)?;
         let (prefabs, _) = BuildingPrefabPrefix::decode_prefix(116_020, &flags, 0, 0, bytes)?;
-        let mut encoded = vec![0xff; 60];
+        let mut encoded = vec![0xff; 61];
         encoded.extend_from_slice(&[0; 32]);
         let (headers, used) =
             BuildingManagerObjectHeadersPrefix::decode_prefix(116_020, &prefabs, &encoded)?;
-        assert_eq!(headers.object_headers().len(), 60);
+        assert_eq!(headers.object_headers().len(), 61);
         assert!(
             headers
                 .object_headers()
@@ -2528,7 +2528,7 @@ mod tests {
         let bytes = include_bytes!("../tests/fixtures/building-object-headers-v116020-desert.bin");
         let (headers, used) =
             BuildingManagerObjectHeadersPrefix::decode_prefix(116_020, &prefabs, bytes)?;
-        assert_eq!(headers.object_headers().len(), 60);
+        assert_eq!(headers.object_headers().len(), 61);
         assert_eq!(headers.trailing_problem_fields().len(), 32);
         assert!(used < bytes.len());
         assert_eq!(headers.encode(), bytes[..used]);
@@ -2549,21 +2549,28 @@ mod tests {
         assert_eq!(array_reader.remaining(), 0);
         let (decoded, problem_bytes) =
             BuildingProblemPrefix::decode_prefix(116_020, None, &flags, &bytes[used..])?;
+        assert_eq!(&bytes[used..], &[0xff, 0xff, 0xf9]);
+        assert!(
+            decoded
+                .problems()
+                .iter()
+                .all(|entry| entry.first == 0 && entry.second == 0)
+        );
         assert_eq!(decoded.problems().len(), 189);
         assert_eq!(
             decoded.problems()[0],
             BuildingProblemWords {
                 index: 23,
-                first: 0x0000_ffff_f9ff_bcff,
-                second: 0x0001_ffff_f3ff_79fe,
+                first: 0,
+                second: 0,
             }
         );
         assert_eq!(
             decoded.problems()[1],
             BuildingProblemWords {
                 index: 39,
-                first: 0x0002_ffff_edff_36fd,
-                second: 0x0003_ffff_e7fe_f3fc,
+                first: 0,
+                second: 0,
             }
         );
         assert_eq!(decoded.encode(), bytes[used..]);
@@ -2804,6 +2811,33 @@ mod tests {
         assert!(
             BuildingByteStatePrefix::decode_prefix(116_020, &flags, &bytes[..used - 1]).is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn building_timer_boundary_matches_asanu_game_fixture() -> Result<(), CrpError> {
+        // This fixture begins immediately after the thirteen byte-state arrays
+        // in the version-114007 BuildingManager body. The DLL reads all eleven
+        // timer fields through one EncodedArray.Byte instance, field by field.
+        let bytes = include_bytes!("../tests/fixtures/building-timer-geometry-v114007-asanu.bin");
+        let mut reader = crate::data_serializer::Reader::new(bytes);
+        let timers = crate::encoded_array::read_encoded_byte_array(&mut reader, 554 * 11)?;
+        assert_eq!(reader.offset(), 48);
+        assert!(timers.iter().all(|value| *value == 0));
+
+        let level_up = crate::encoded_array::read_encoded_byte_array(&mut reader, 554)?;
+        assert_eq!(reader.offset(), 53);
+        assert!(level_up.iter().all(|value| *value == 0));
+
+        let width = crate::encoded_array::read_encoded_byte_array(&mut reader, 554)?;
+        assert_eq!(reader.offset(), 608);
+        assert_eq!(&width[..10], &[6, 2, 7, 8, 8, 8, 6, 2, 16, 2]);
+        assert!(width.iter().all(|value| (1..=16).contains(value)));
+
+        let length = crate::encoded_array::read_encoded_byte_array(&mut reader, 554)?;
+        assert_eq!(reader.offset(), bytes.len());
+        assert_eq!(&length[..10], &[6, 6, 7, 8, 8, 8, 6, 1, 8, 1]);
+        assert!(length.iter().all(|value| (1..=16).contains(value)));
         Ok(())
     }
 
@@ -4236,6 +4270,36 @@ mod tests {
                             assert_eq!(via_manager, building_byte_state);
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_building_byte_state_convenience = true;
+                        }
+                        let timer_field_count =
+                            9 + usize::from(version >= 231) + usize::from(version >= 172);
+                        let timer_count =
+                            active_building_count.checked_mul(timer_field_count).ok_or(
+                                CrpError::ArithmeticOverflow("BuildingManager timer value count"),
+                            )?;
+                        let timers = crate::encoded_array::read_encoded_byte_array(
+                            &mut net_reader,
+                            timer_count,
+                        )?;
+                        assert_eq!(timers.len(), timer_count);
+                        if version >= 170 {
+                            let level_up = crate::encoded_array::read_encoded_byte_array(
+                                &mut net_reader,
+                                active_building_count,
+                            )?;
+                            assert_eq!(level_up.len(), active_building_count);
+                        }
+                        for field in ["width", "length"] {
+                            let values = crate::encoded_array::read_encoded_byte_array(
+                                &mut net_reader,
+                                active_building_count,
+                            )?;
+                            assert_eq!(
+                                values.len(),
+                                active_building_count,
+                                "{field} in {}",
+                                path.display()
+                            );
                         }
                         if std::env::var_os("CRP_EXTRACT_BUILDING_BYTE_STATE_FIXTURE").is_some()
                             && path
