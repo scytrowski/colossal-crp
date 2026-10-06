@@ -22,8 +22,9 @@ mod texture;
 mod water_simulation_data;
 
 pub use building_manager_data::{
-    BuildingFlag, BuildingFlagsPrefix, BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix,
-    BuildingProblemPrefix, BuildingProblemWords,
+    BuildingBufferFieldsPrefix, BuildingFlag, BuildingFlagsPrefix,
+    BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix, BuildingProblemPrefix,
+    BuildingProblemWords,
 };
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
@@ -2547,11 +2548,12 @@ mod tests {
         assert_eq!(problems.len(), 378);
         assert_eq!(array_reader.remaining(), 0);
         let (decoded, problem_bytes) =
-            BuildingProblemPrefix::decode_prefix(116_020, &flags, &bytes[used..])?;
+            BuildingProblemPrefix::decode_prefix(116_020, None, &flags, &bytes[used..])?;
         assert_eq!(decoded.problems().len(), 189);
         assert_eq!(
             decoded.problems()[0],
             BuildingProblemWords {
+                index: 23,
                 first: 0x0000_ffff_f9ff_bcff,
                 second: 0x0001_ffff_f3ff_79fe,
             }
@@ -2559,6 +2561,7 @@ mod tests {
         assert_eq!(
             decoded.problems()[1],
             BuildingProblemWords {
+                index: 39,
                 first: 0x0002_ffff_edff_36fd,
                 second: 0x0003_ffff_e7fe_f3fc,
             }
@@ -2569,23 +2572,173 @@ mod tests {
     }
 
     #[test]
-    fn building_problem_array_is_absent_before_version_115000() -> Result<(), CrpError> {
-        let mut flag_bytes = vec![0xff; 383];
-        flag_bytes.push(0xfe);
+    fn building_problem_array_uses_save_app_gate_before_version_115000() -> Result<(), CrpError> {
+        let mut flag_bytes = vec![2];
+        for value in [1_u32, 0, 0] {
+            flag_bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        let primary_remaining = 49_151 - 3;
+        flag_bytes.extend(std::iter::repeat_n(0xff, primary_remaining / 128));
+        flag_bytes.push(0x7f + u8::try_from(primary_remaining % 128).unwrap());
         flag_bytes.extend(std::iter::repeat_n(0xff, 383));
         flag_bytes.push(0xfe);
         let (flags, used) = BuildingFlagsPrefix::decode_prefix(114_999, &flag_bytes)?;
         assert_eq!(used, flag_bytes.len());
+        assert_eq!(flags.building_flags()[0].flags, 1);
+        assert!(BuildingProblemPrefix::decode_prefix(114_999, None, &flags, &[]).is_err());
+
+        let save_app_gate = 146_809_088;
+        let one_ulong = [0, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        let (modern, modern_used) =
+            BuildingProblemPrefix::decode_prefix(114_999, Some(save_app_gate), &flags, &one_ulong)?;
+        assert_eq!(modern_used, one_ulong.len());
+        assert_eq!(modern.problems().len(), 1);
+        assert_eq!(modern.problems()[0].index, 1);
+        assert_eq!(modern.problems()[0].first, 0x0123_4567_89ab_cdef);
+        assert_eq!(modern.problems()[0].second, 0);
+        assert_eq!(modern.encode(), one_ulong);
+
+        let one_uint = [0, 0xc0, 0, 0, 1];
+        let (legacy, legacy_used) = BuildingProblemPrefix::decode_prefix(
+            114_999,
+            Some(save_app_gate - 1),
+            &flags,
+            &one_uint,
+        )?;
+        assert_eq!(legacy_used, one_uint.len());
+        assert_eq!(legacy.problems()[0].first, 0xc000_0000_0000_0001);
+        assert_eq!(legacy.problems()[0].second, 0);
+        assert_eq!(legacy.encode(), one_uint);
+        Ok(())
+    }
+
+    #[test]
+    fn building_buffer_fields_follow_version_gates_and_round_trip() -> Result<(), CrpError> {
+        fn ushort_literals(values: &[u16]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for chunk in values.chunks(64) {
+                bytes.push(u8::try_from(chunk.len() - 1).unwrap());
+                for value in chunk {
+                    bytes.extend_from_slice(&value.to_be_bytes());
+                }
+            }
+            bytes
+        }
+        fn byte_literals(values: &[u8]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for chunk in values.chunks(128) {
+                bytes.push(u8::try_from(chunk.len() - 1).unwrap());
+                bytes.extend_from_slice(chunk);
+            }
+            bytes
+        }
+
+        let flags_bytes = include_bytes!("../tests/fixtures/building-flags-v116020-desert.bin");
+        let (flags, _) = BuildingFlagsPrefix::decode_prefix(116_020, flags_bytes)?;
+        let count = flags
+            .building_flags()
+            .iter()
+            .filter(|building| building.flags != 0)
+            .count();
+        assert_eq!(count, 189);
+        let values = [11_u16, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23];
+        let mut bytes = Vec::new();
+        for first in values {
+            let mut field = vec![0_u16; count];
+            field[0] = first;
+            bytes.extend(ushort_literals(&field));
+        }
+        let mut production = vec![0_u8; count];
+        production[0] = 24;
+        bytes.extend(byte_literals(&production));
+        let mut pollution = vec![0_u8; count];
+        pollution[0] = 25;
+        bytes.extend(byte_literals(&pollution));
+
+        let (decoded, used) = BuildingBufferFieldsPrefix::decode_prefix(116_020, &flags, &bytes)?;
+        assert_eq!(used, bytes.len());
+        assert_eq!(decoded.net_node()[0], 11);
+        assert_eq!(decoded.sub_building()[0], 12);
+        assert_eq!(decoded.water_source()[0], 13);
+        assert_eq!(decoded.electricity_buffer()[0], 14);
+        assert_eq!(decoded.water_buffer()[0], 15);
+        assert_eq!(decoded.sewage_buffer()[0], 16);
+        assert_eq!(decoded.heating_buffer()[0], 17);
+        assert_eq!(decoded.garbage_buffer()[0], 18);
+        assert_eq!(decoded.crime_buffer()[0], 19);
+        assert_eq!(decoded.mail_buffer()[0], 20);
+        assert_eq!(decoded.custom_buffer1()[0], 21);
+        assert_eq!(decoded.custom_buffer2()[0], 22);
+        assert_eq!(decoded.build_water_height()[0], 23);
+        assert_eq!(decoded.production_rate()[0], 24);
+        assert_eq!(decoded.water_pollution()[0], 25);
+        assert_eq!(decoded.encode(), bytes);
         assert!(
-            flags
-                .building_flags()
-                .iter()
-                .all(|building| building.flags == 0)
+            BuildingBufferFieldsPrefix::decode_prefix(116_020, &flags, &bytes[..bytes.len() - 1])
+                .is_err()
         );
-        let (problems, used) = BuildingProblemPrefix::decode_prefix(114_999, &flags, &[1, 2, 3])?;
-        assert!(problems.problems().is_empty());
-        assert_eq!(problems.encode(), []);
-        assert_eq!(used, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn building_buffer_fields_include_legacy_water_source_release() -> Result<(), CrpError> {
+        fn encoded_one_active_flag() -> Vec<u8> {
+            let count = 32_767;
+            let remaining = count - 3;
+            let mut bytes = vec![2];
+            for value in [1_u32, 0, 0] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            bytes.extend(std::iter::repeat_n(0xff, remaining / 128));
+            if remaining % 128 != 0 {
+                bytes.push(0x7f + u8::try_from(remaining % 128).unwrap());
+            }
+            bytes
+        }
+        fn one_ushort(value: u16) -> [u8; 3] {
+            [0, (value >> 8) as u8, value as u8]
+        }
+
+        let (flags, _) = BuildingFlagsPrefix::decode_prefix(180, &encoded_one_active_flag())?;
+        let mut bytes = Vec::new();
+        for value in 1..=10 {
+            bytes.extend_from_slice(&one_ushort(value));
+        }
+        bytes.extend_from_slice(&[0, 11, 0, 12]);
+        let (decoded, used) = BuildingBufferFieldsPrefix::decode_prefix(180, &flags, &bytes)?;
+        assert_eq!(used, bytes.len());
+        assert_eq!(decoded.net_node(), &[1]);
+        assert_eq!(decoded.water_source(), &[2]);
+        assert_eq!(decoded.legacy_water_source_release(), &[3]);
+        assert_eq!(decoded.electricity_buffer(), &[4]);
+        assert_eq!(decoded.custom_buffer1(), &[9]);
+        assert_eq!(decoded.custom_buffer2(), &[10]);
+        assert_eq!(decoded.production_rate(), &[11]);
+        assert_eq!(decoded.water_pollution(), &[12]);
+        assert!(decoded.sub_building().is_empty());
+        assert!(decoded.mail_buffer().is_empty());
+        assert_eq!(decoded.encode(), bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn building_buffer_fields_game_fixture_preserves_order_and_boundary() -> Result<(), CrpError> {
+        let flags_bytes = include_bytes!("../tests/fixtures/building-flags-v116020-desert.bin");
+        let (flags, _) = BuildingFlagsPrefix::decode_prefix(116_020, flags_bytes)?;
+        let bytes = include_bytes!("../tests/fixtures/building-buffer-fields-v116020-desert.bin");
+        let (decoded, used) = BuildingBufferFieldsPrefix::decode_prefix(116_020, &flags, bytes)?;
+        assert_eq!(used, bytes.len());
+        assert_eq!(decoded.net_node().len(), 189);
+        assert_eq!(decoded.sub_building().len(), 189);
+        assert_eq!(decoded.water_source().len(), 189);
+        assert_eq!(decoded.heating_buffer().len(), 189);
+        assert_eq!(decoded.build_water_height().len(), 189);
+        assert_eq!(decoded.production_rate().len(), 189);
+        assert_eq!(decoded.water_pollution().len(), 189);
+        assert_eq!(decoded.encode(), bytes);
+        assert!(
+            BuildingBufferFieldsPrefix::decode_prefix(116_020, &flags, &bytes[..used - 1]).is_err()
+        );
         Ok(())
     }
 
@@ -3468,6 +3621,7 @@ mod tests {
         let mut checked_building_prefab_convenience = false;
         let mut checked_building_object_convenience = false;
         let mut checked_building_problem_convenience = false;
+        let mut checked_building_buffer_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
@@ -3948,49 +4102,77 @@ mod tests {
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_building_object_convenience = true;
                         }
-                        if version >= 115_000 {
-                            let active_building_count = building_flags
-                                .building_flags()
-                                .iter()
-                                .filter(|building| building.flags != 0)
-                                .count();
-                            let array_start = net_reader.offset();
-                            let (building_problems, problem_used) =
-                                BuildingProblemPrefix::decode_prefix(
-                                    version,
-                                    &building_flags,
-                                    net_reader.remaining_bytes(),
-                                )?;
-                            net_reader.read_bytes(problem_used)?;
-                            assert_eq!(building_problems.problems().len(), active_building_count);
-                            assert_eq!(
-                                building_problems.encode(),
-                                &net_reader.consumed_bytes()[array_start..]
-                            );
-                            buildings_with_problem_words += building_problems
-                                .problems()
-                                .iter()
-                                .filter(|problem| problem.first != 0 || problem.second != 0)
-                                .count();
-                            if !checked_building_problem_convenience && active_segments > 0 {
-                                let (via_manager, graph_end) = manager_data
-                                    .decode_building_problems_prefix(metadata.save_app_version)?;
-                                assert_eq!(via_manager, building_problems);
-                                assert_eq!(graph_end, net_prefix_end + net_reader.offset());
-                                checked_building_problem_convenience = true;
-                            }
-                            if std::env::var_os("CRP_EXTRACT_BUILDING_OBJECT_FIXTURE").is_some()
-                                && path
-                                    .file_name()
-                                    .is_some_and(|name| name == "CCMP2 Desert Map 1.crp")
-                            {
-                                let mut fixture = building_objects.encode();
-                                fixture.extend_from_slice(&building_problems.encode());
-                                std::fs::write(
-                                    "tests/fixtures/building-object-headers-v116020-desert.bin",
-                                    fixture,
-                                )?;
-                            }
+                        let active_building_count = building_flags
+                            .building_flags()
+                            .iter()
+                            .filter(|building| building.flags != 0)
+                            .count();
+                        let array_start = net_reader.offset();
+                        let (building_problems, problem_used) =
+                            BuildingProblemPrefix::decode_prefix(
+                                version,
+                                metadata.save_app_version,
+                                &building_flags,
+                                net_reader.remaining_bytes(),
+                            )?;
+                        net_reader.read_bytes(problem_used)?;
+                        assert_eq!(building_problems.problems().len(), active_building_count);
+                        assert_eq!(
+                            building_problems.encode(),
+                            &net_reader.consumed_bytes()[array_start..]
+                        );
+                        buildings_with_problem_words += building_problems
+                            .problems()
+                            .iter()
+                            .filter(|problem| problem.first != 0 || problem.second != 0)
+                            .count();
+                        if !checked_building_problem_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_problems_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, building_problems);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_building_problem_convenience = true;
+                        }
+                        let (building_buffers, buffer_used) =
+                            BuildingBufferFieldsPrefix::decode_prefix(
+                                version,
+                                &building_flags,
+                                net_reader.remaining_bytes(),
+                            )?;
+                        let buffer_start = net_reader.offset();
+                        net_reader.read_bytes(buffer_used)?;
+                        assert_eq!(
+                            building_buffers.encode(),
+                            &net_reader.consumed_bytes()[buffer_start..]
+                        );
+                        if !checked_building_buffer_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_buffer_fields_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, building_buffers);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_building_buffer_convenience = true;
+                        }
+                        if std::env::var_os("CRP_EXTRACT_BUILDING_BUFFER_FIXTURE").is_some()
+                            && path
+                                .file_name()
+                                .is_some_and(|name| name == "CCMP2 Desert Map 1.crp")
+                        {
+                            std::fs::write(
+                                "tests/fixtures/building-buffer-fields-v116020-desert.bin",
+                                building_buffers.encode(),
+                            )?;
+                        }
+                        if std::env::var_os("CRP_EXTRACT_BUILDING_OBJECT_FIXTURE").is_some()
+                            && path
+                                .file_name()
+                                .is_some_and(|name| name == "CCMP2 Desert Map 1.crp")
+                        {
+                            let mut fixture = building_objects.encode();
+                            fixture.extend_from_slice(&building_problems.encode());
+                            std::fs::write(
+                                "tests/fixtures/building-object-headers-v116020-desert.bin",
+                                fixture,
+                            )?;
                         }
                         if std::env::var_os("CRP_EXTRACT_BUILDING_PREFAB_FIXTURE").is_some()
                             && path
@@ -4050,6 +4232,7 @@ mod tests {
         assert!(checked_building_prefab_convenience);
         assert!(checked_building_object_convenience);
         assert!(checked_building_problem_convenience);
+        assert!(checked_building_buffer_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(

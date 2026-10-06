@@ -8,8 +8,8 @@ use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 use crate::{
-    BuildingFlagsPrefix, BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix,
-    BuildingProblemPrefix,
+    BuildingBufferFieldsPrefix, BuildingFlagsPrefix, BuildingManagerObjectHeadersPrefix,
+    BuildingPrefabPrefix, BuildingProblemPrefix,
 };
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
@@ -762,7 +762,7 @@ impl SimulationManagerData {
     }
 
     /// Decodes per-building problem words following the manager object headers.
-    /// Before version 115000 this returns an empty prefix at the same offset.
+    /// Pass the saved application version for the legacy version 221 gate.
     pub fn decode_building_problems_prefix(
         &self,
         save_app_version: Option<u32>,
@@ -772,6 +772,26 @@ impl SimulationManagerData {
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(object_end)?;
         let (data, used) = BuildingProblemPrefix::decode_prefix(
+            self.format_version,
+            save_app_version,
+            &flags,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes per-building network, utility, and byte fields after problem state.
+    /// The returned graph offset is before the next BuildingManager arrays.
+    pub fn decode_building_buffer_fields_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingBufferFieldsPrefix, usize), CrpError> {
+        let (flags, _) = self.decode_building_flags_prefix(save_app_version)?;
+        let (_, problem_end) = self.decode_building_problems_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(problem_end)?;
+        let (data, used) = BuildingBufferFieldsPrefix::decode_prefix(
             self.format_version,
             &flags,
             reader.remaining_bytes(),

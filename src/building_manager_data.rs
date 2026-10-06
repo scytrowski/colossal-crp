@@ -1,7 +1,8 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
-    read_encoded_uint_array, read_encoded_ulong_array, read_encoded_ushort_array,
+    read_encoded_byte_array, read_encoded_uint_array, read_encoded_ulong_array,
+    read_encoded_ushort_array,
 };
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 
@@ -9,6 +10,8 @@ const BUILDING_COUNT: usize = 49_152;
 const LEGACY_BUILDING_COUNT: usize = 32_768;
 const FULL_BUILDING_COUNT_VERSION: u32 = 222;
 const SECONDARY_BUILDING_FLAGS_VERSION: u32 = 112_030;
+const TWO_BUILDING_PROBLEMS_VERSION: u32 = 115_000;
+const SAVE_APP_PROBLEMS_VERSION: u32 = 146_809_088;
 
 /// Serialized flags for one one-based `Building` buffer position.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,9 +55,11 @@ pub struct BuildingManagerObjectHeadersPrefix {
     serialized_prefix: Vec<u8>,
 }
 
-/// Opaque two-word problem state for one active building.
+/// Opaque versioned problem state for one active building.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildingProblemWords {
+    /// One-based building buffer index for this problem state.
+    pub index: u16,
     /// First serialized 64-bit word.
     pub first: u64,
     /// Second serialized 64-bit word.
@@ -69,13 +74,248 @@ pub struct BuildingProblemPrefix {
     serialized_prefix: Vec<u8>,
 }
 
-impl BuildingProblemPrefix {
-    /// Decodes two encoded 64-bit words for each active building.
+/// Per-building buffer indices and byte fields following problem state.
+///
+/// The decoder supports inner versions 164 and newer and consumes only the
+/// version-gated prefix represented here. Values remain paired with the active
+/// building order from `BuildingFlagsPrefix`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingBufferFieldsPrefix {
+    format_version: u32,
+    net_node: Vec<u16>,
+    sub_building: Vec<u16>,
+    water_source: Vec<u16>,
+    legacy_water_source_release: Vec<u16>,
+    electricity_buffer: Vec<u16>,
+    water_buffer: Vec<u16>,
+    sewage_buffer: Vec<u16>,
+    heating_buffer: Vec<u16>,
+    garbage_buffer: Vec<u16>,
+    crime_buffer: Vec<u16>,
+    mail_buffer: Vec<u16>,
+    custom_buffer1: Vec<u16>,
+    custom_buffer2: Vec<u16>,
+    build_water_height: Vec<u16>,
+    production_rate: Vec<u8>,
+    water_pollution: Vec<u8>,
+    serialized_prefix: Vec<u8>,
+}
+
+impl BuildingBufferFieldsPrefix {
+    /// Decodes versioned network, utility, and byte fields for active buildings.
     ///
-    /// Before inner version 115000 the game does not serialize this array;
-    /// those versions return an empty prefix without consuming bytes.
+    /// Returns the decoded prefix and bytes consumed. Truncated data or a
+    /// mismatched flag-table version returns an error. Later BuildingManager
+    /// fields remain unread and the original prefix bytes are retained.
     pub fn decode_prefix(
         format_version: u32,
+        flags: &BuildingFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || flags.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "BuildingManager buffer fields".to_owned(),
+                offset: 0,
+                reason: "unsupported or mismatched inner version".to_owned(),
+            });
+        }
+        let count = flags
+            .building_flags()
+            .iter()
+            .filter(|building| building.flags != 0)
+            .count();
+        let mut reader = Reader::new(bytes);
+        let net_node = if format_version >= 33 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let sub_building = if format_version >= 208 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let water_source = if format_version >= 33 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let legacy_water_source_release = if (95..184).contains(&format_version) {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let electricity_buffer = if format_version >= 33 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let water_buffer = if format_version >= 33 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let sewage_buffer = if format_version >= 33 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let heating_buffer = if format_version >= 227 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let garbage_buffer = if format_version >= 33 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let crime_buffer = if format_version >= 33 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let mail_buffer = if format_version >= 111_003 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let custom_buffer1 = if format_version >= 33 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let custom_buffer2 = if format_version >= 66 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let build_water_height = if format_version >= 308 {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let production_rate = if format_version >= 33 {
+            read_encoded_byte_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let water_pollution = if format_version >= 33 {
+            read_encoded_byte_array(&mut reader, count)?
+        } else {
+            Vec::new()
+        };
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                net_node,
+                sub_building,
+                water_source,
+                legacy_water_source_release,
+                electricity_buffer,
+                water_buffer,
+                sewage_buffer,
+                heating_buffer,
+                garbage_buffer,
+                crime_buffer,
+                mail_buffer,
+                custom_buffer1,
+                custom_buffer2,
+                build_water_height,
+                production_rate,
+                water_pollution,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns network-node indices for active buildings.
+    pub fn net_node(&self) -> &[u16] {
+        &self.net_node
+    }
+    /// Returns sub-building indices from version 208 onward.
+    pub fn sub_building(&self) -> &[u16] {
+        &self.sub_building
+    }
+    /// Returns water-source indices.
+    pub fn water_source(&self) -> &[u16] {
+        &self.water_source
+    }
+    /// Returns legacy water-source release values from versions 95 through 183.
+    pub fn legacy_water_source_release(&self) -> &[u16] {
+        &self.legacy_water_source_release
+    }
+    /// Returns electricity-buffer indices.
+    pub fn electricity_buffer(&self) -> &[u16] {
+        &self.electricity_buffer
+    }
+    /// Returns water-buffer indices.
+    pub fn water_buffer(&self) -> &[u16] {
+        &self.water_buffer
+    }
+    /// Returns sewage-buffer indices.
+    pub fn sewage_buffer(&self) -> &[u16] {
+        &self.sewage_buffer
+    }
+    /// Returns heating-buffer indices from version 227 onward.
+    pub fn heating_buffer(&self) -> &[u16] {
+        &self.heating_buffer
+    }
+    /// Returns garbage-buffer indices.
+    pub fn garbage_buffer(&self) -> &[u16] {
+        &self.garbage_buffer
+    }
+    /// Returns crime-buffer indices.
+    pub fn crime_buffer(&self) -> &[u16] {
+        &self.crime_buffer
+    }
+    /// Returns mail-buffer indices from version 111003 onward.
+    pub fn mail_buffer(&self) -> &[u16] {
+        &self.mail_buffer
+    }
+    /// Returns custom-buffer-1 indices.
+    pub fn custom_buffer1(&self) -> &[u16] {
+        &self.custom_buffer1
+    }
+    /// Returns custom-buffer-2 indices from version 66 onward.
+    pub fn custom_buffer2(&self) -> &[u16] {
+        &self.custom_buffer2
+    }
+    /// Returns build-water-height values from version 308 onward.
+    pub fn build_water_height(&self) -> &[u16] {
+        &self.build_water_height
+    }
+    /// Returns production-rate bytes.
+    pub fn production_rate(&self) -> &[u8] {
+        &self.production_rate
+    }
+    /// Returns water-pollution bytes.
+    pub fn water_pollution(&self) -> &[u8] {
+        &self.water_pollution
+    }
+    /// Writes the original encoded fields exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl BuildingProblemPrefix {
+    /// Decodes versioned problem state for each active building.
+    ///
+    /// From inner version 115000 the game serializes two encoded 64-bit words.
+    /// Versions 221–114999 use one 64-bit or 32-bit value depending on the
+    /// saved-application version; earlier supported versions use one 32-bit
+    /// value. A save-app version is required between inner versions 221 and
+    /// 114999. The original encoded bytes are retained for exact writing.
+    pub fn decode_prefix(
+        format_version: u32,
+        save_app_version: Option<u32>,
         flags: &BuildingFlagsPrefix,
         bytes: &[u8],
     ) -> Result<(Self, usize), CrpError> {
@@ -86,34 +326,60 @@ impl BuildingProblemPrefix {
                 reason: "unsupported or mismatched inner version".to_owned(),
             });
         }
-        if format_version < 115_000 {
-            return Ok((
-                Self {
-                    format_version,
-                    problems: Vec::new(),
-                    serialized_prefix: Vec::new(),
-                },
-                0,
-            ));
+        if (221..TWO_BUILDING_PROBLEMS_VERSION).contains(&format_version)
+            && save_app_version.is_none()
+        {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "BuildingManager problem words".to_owned(),
+                offset: 0,
+                reason: "save-app version is required for the legacy problem encoding".to_owned(),
+            });
         }
-        let problem_count = flags
+        let active_indices = flags
             .building_flags()
             .iter()
             .filter(|building| building.flags != 0)
-            .count();
-        let word_count = problem_count
-            .checked_mul(2)
-            .ok_or(CrpError::ArithmeticOverflow(
-                "BuildingManager problem word count",
-            ))?;
+            .map(|building| building.index)
+            .collect::<Vec<_>>();
+        let problem_count = active_indices.len();
         let mut reader = Reader::new(bytes);
-        let words = read_encoded_ulong_array(&mut reader, word_count)?;
         let mut problems = Vec::with_capacity(problem_count);
-        for pair in words.chunks_exact(2) {
-            problems.push(BuildingProblemWords {
-                first: pair[0],
-                second: pair[1],
-            });
+        if format_version >= TWO_BUILDING_PROBLEMS_VERSION {
+            let word_count = problem_count
+                .checked_mul(2)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager problem word count",
+                ))?;
+            let words = read_encoded_ulong_array(&mut reader, word_count)?;
+            for (index, pair) in active_indices.into_iter().zip(words.chunks_exact(2)) {
+                problems.push(BuildingProblemWords {
+                    index,
+                    first: pair[0],
+                    second: pair[1],
+                });
+            }
+        } else if format_version >= 221
+            && save_app_version.is_some_and(|version| version >= SAVE_APP_PROBLEMS_VERSION)
+        {
+            let words = read_encoded_ulong_array(&mut reader, problem_count)?;
+            for (index, first) in active_indices.into_iter().zip(words) {
+                problems.push(BuildingProblemWords {
+                    index,
+                    first,
+                    second: 0,
+                });
+            }
+        } else {
+            let words = read_encoded_uint_array(&mut reader, problem_count)?;
+            for (index, raw) in active_indices.into_iter().zip(words) {
+                let raw = u64::from(raw);
+                let first = ((raw & 0xc000_0000) << 32) | (raw & 0x3fff_ffff);
+                problems.push(BuildingProblemWords {
+                    index,
+                    first,
+                    second: 0,
+                });
+            }
         }
         let consumed = reader.offset();
         Ok((
