@@ -10,7 +10,8 @@ use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_u
 use crate::{
     NetLanePrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
     NetNodeRecordsPrefix, NetSegmentCoveragePrefix, NetSegmentEnvironmentPrefix,
-    NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentTrafficLightsPrefix,
+    NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsPrefix,
+    NetSegmentTrafficLightsPrefix,
 };
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
@@ -569,6 +570,25 @@ impl SimulationManagerData {
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(coverage_end)?;
         let (data, body_length) = NetSegmentEnvironmentPrefix::decode_prefix(
+            self.format_version,
+            &segment_flags,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes individual active-segment records after the environment arrays.
+    /// The returned graph offset is before the guide-count tables.
+    pub fn decode_net_segment_records_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetSegmentRecordsPrefix, usize), CrpError> {
+        let (_, environment_end) = self.decode_net_segment_environment_prefix(save_app_version)?;
+        let (segment_flags, _) = self.decode_net_segment_flags_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(environment_end)?;
+        let (data, body_length) = NetSegmentRecordsPrefix::decode_prefix(
             self.format_version,
             &segment_flags,
             reader.remaining_bytes(),

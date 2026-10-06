@@ -28,8 +28,8 @@ pub use net_manager_data::{
     NetLane, NetLanePrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
     NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetSegmentCoverage,
     NetSegmentCoveragePrefix, NetSegmentEnvironment, NetSegmentEnvironmentPrefix, NetSegmentFlag,
-    NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentTrafficLight,
-    NetSegmentTrafficLightsPrefix,
+    NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentRecord,
+    NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
@@ -1959,6 +1959,119 @@ mod tests {
     }
 
     #[test]
+    fn net_segment_records_follow_fixed_field_gates() -> Result<(), CrpError> {
+        fn flags(version: u32) -> Result<NetSegmentFlagsPrefix, CrpError> {
+            let mut bytes = vec![2];
+            for value in [1_u32, 0, 0] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            bytes.extend(std::iter::repeat_n(
+                0xff,
+                if version < 222 { 255 } else { 287 },
+            ));
+            bytes.push(0xfb);
+            if version >= 114_012 {
+                bytes.extend(std::iter::repeat_n(0xff, 287));
+                bytes.push(0xfe);
+            }
+            Ok(NetSegmentFlagsPrefix::decode_prefix(version, &bytes)?.0)
+        }
+        let mut base = Vec::new();
+        base.extend_from_slice(&0x0102_0304_u32.to_be_bytes());
+        base.extend_from_slice(&0x0506_0708_u32.to_be_bytes());
+        base.extend_from_slice(&[0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e]);
+        for bits in [1_u32, 2, 3, 4, 5, 6] {
+            base.extend_from_slice(&bits.to_be_bytes());
+        }
+        for value in [7_u16, 8, 9, 10, 11, 12, 13] {
+            base.extend_from_slice(&value.to_be_bytes());
+        }
+        base.push(14);
+        assert_eq!(base.len(), 53);
+        for (version, suffix, expected_length) in [
+            (164, vec![], 53),
+            (312, vec![0x12, 0x34], 55),
+            (113_015, vec![0x12, 0x34, 1], 56),
+            (114_002, vec![0x12, 0x34, 1, 1], 57),
+            (120_003, vec![0x12, 0x34, 1, 1, 1, 0], 59),
+            (
+                121_005,
+                vec![0x12, 0x34, 1, 1, 1, 0, 0xab, 0xcd, 0xef, 0x01],
+                63,
+            ),
+        ] {
+            let mut bytes = base.clone();
+            bytes.extend_from_slice(&suffix);
+            let segment_flags = flags(version)?;
+            let (prefix, used) =
+                NetSegmentRecordsPrefix::decode_prefix(version, &segment_flags, &bytes)?;
+            assert_eq!(used, expected_length);
+            assert_eq!(prefix.encode(), bytes);
+            let record = &prefix.records()[0];
+            assert_eq!(record.index, 1);
+            assert_eq!(
+                (record.build_index, record.modified_index),
+                (0x0102_0304, 0x0506_0708)
+            );
+            assert_eq!((record.lanes, record.path), (0x09_0a_0b, 0x0c_0d_0e));
+            assert_eq!(record.start_direction_bits, [1, 2, 3]);
+            assert_eq!(record.end_direction_bits, [4, 5, 6]);
+            assert_eq!((record.start_node, record.end_node), (7, 8));
+            assert_eq!(record.blocks, [9, 10, 11, 12]);
+            assert_eq!((record.traffic_buffer, record.traffic_density), (13, 14));
+            assert_eq!(record.name_seed, if version >= 312 { 0x1234 } else { 0 });
+            assert_eq!(
+                record.override_path_find_direction_limit,
+                u8::from(version >= 113_015)
+            );
+            assert_eq!(record.tree_present, u8::from(version >= 114_002));
+            assert_eq!(
+                record.fence_present,
+                if version >= 120_003 { [1, 0] } else { [0, 0] }
+            );
+            assert_eq!(
+                record.event_route,
+                if version >= 121_005 { 0xabcd } else { 0 }
+            );
+            assert_eq!(
+                record.next_event_route_segment,
+                if version >= 121_005 { 0xef01 } else { 0 }
+            );
+            assert!(
+                NetSegmentRecordsPrefix::decode_prefix(
+                    version,
+                    &segment_flags,
+                    &bytes[..bytes.len() - 1]
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn net_segment_records_game_fixture_preserves_fields() -> Result<(), CrpError> {
+        let flags = include_bytes!("../tests/fixtures/net-segment-flags-v116020-desert.bin");
+        let (flags, _) = NetSegmentFlagsPrefix::decode_prefix(116_020, flags)?;
+        let bytes = include_bytes!("../tests/fixtures/net-segment-records-v116020-desert.bin");
+        let (prefix, used) = NetSegmentRecordsPrefix::decode_prefix(116_020, &flags, bytes)?;
+        assert_eq!(used, 118_617);
+        assert_eq!(prefix.records().len(), 2_081);
+        let first = &prefix.records()[0];
+        assert_eq!(first.index, 6);
+        assert_eq!((first.build_index, first.modified_index), (3916, 3917));
+        assert_eq!((first.lanes, first.path), (208_302, 0));
+        assert_eq!((first.start_node, first.end_node), (13_411, 7_207));
+        assert_eq!(first.name_seed, 25_077);
+        assert_eq!(prefix.encode(), &bytes[..used]);
+        assert_eq!(&bytes[used..], &[0, 0, 0, 0]);
+        assert!(
+            NetSegmentRecordsPrefix::decode_prefix(116_020, &flags, &bytes[..used - 1]).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn net_node_problems_respect_version_and_app_gates() -> Result<(), CrpError> {
         fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
             let count = if version < 202 {
@@ -2822,6 +2935,8 @@ mod tests {
         let mut segments_with_noise_buffer = 0_usize;
         let mut segments_with_noise_density = 0_usize;
         let mut checked_environment_convenience = false;
+        let mut segment_records = 0_usize;
+        let mut checked_records_convenience = false;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -3109,6 +3224,21 @@ mod tests {
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_environment_convenience = true;
                         }
+                        let (records, used) = NetSegmentRecordsPrefix::decode_prefix(
+                            version,
+                            &segment_flags,
+                            net_reader.remaining_bytes(),
+                        )?;
+                        net_reader.read_bytes(used)?;
+                        assert_eq!(records.records().len(), active_segments);
+                        segment_records += records.records().len();
+                        if !checked_records_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_net_segment_records_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, records);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_records_convenience = true;
+                        }
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -3147,6 +3277,8 @@ mod tests {
         assert!(simulation_metadata_count > 0);
         assert!(checked_coverage_convenience);
         assert!(checked_environment_convenience);
+        assert!(checked_records_convenience);
+        assert_eq!(segment_records, active_net_segments);
         eprintln!(
             "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density"
         );

@@ -21,6 +21,11 @@ const WETNESS_VERSION: u32 = 224;
 const SEGMENT_CONDITION_VERSION: u32 = 229;
 const SEGMENT_NOISE_VERSION: u32 = 109_007;
 const SEGMENT_ATTRACTIVENESS_VERSION: u32 = 121_030;
+const SEGMENT_NAME_SEED_VERSION: u32 = 312;
+const SEGMENT_PATH_OVERRIDE_VERSION: u32 = 113_015;
+const SEGMENT_TREE_VERSION: u32 = 114_002;
+const SEGMENT_FENCE_VERSION: u32 = 120_003;
+const SEGMENT_EVENT_ROUTE_VERSION: u32 = 121_005;
 const NODE_EVENT_ROUTE_VERSION: u32 = 121_007;
 const MAX_NODE_SEGMENTS: usize = 8;
 const SAVE_APP_PROBLEMS_VERSION: u32 = (1 << 27) + (3 << 22) + (1 << 13) + (1 << 8);
@@ -266,6 +271,51 @@ pub struct NetSegmentEnvironment {
 pub struct NetSegmentEnvironmentPrefix {
     format_version: u32,
     environment: Vec<NetSegmentEnvironment>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Fixed fields stored for one segment with nonzero primary flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentRecord {
+    /// One-based segment buffer index.
+    pub index: u16,
+    /// Build and modified indices, stored as big-endian `u32` values.
+    pub build_index: u32,
+    pub modified_index: u32,
+    /// First lane and path IDs, each stored in 24 bits.
+    pub lanes: u32,
+    pub path: u32,
+    /// Exact IEEE 754 bits of the start and end direction vectors.
+    pub start_direction_bits: [u32; 3],
+    pub end_direction_bits: [u32; 3],
+    /// Start and end node IDs.
+    pub start_node: u16,
+    pub end_node: u16,
+    /// Block IDs in start-left, start-right, end-left, end-right order.
+    pub blocks: [u16; 4],
+    pub traffic_buffer: u16,
+    pub traffic_density: u8,
+    /// Zero before inner version 312.
+    pub name_seed: u16,
+    /// Raw bool byte, zero before inner version 113015.
+    pub override_path_find_direction_limit: u8,
+    /// Raw bool byte, zero before inner version 114002.
+    pub tree_present: u8,
+    /// Raw bool bytes, zero before inner version 120003.
+    pub fence_present: [u8; 2],
+    /// Zero before inner version 121005.
+    pub event_route: u16,
+    pub next_event_route_segment: u16,
+}
+
+/// Individual active-segment records after the sparse environment arrays.
+///
+/// The original bytes are retained for exact rewriting. Later NetManager
+/// tables are outside this prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentRecordsPrefix {
+    format_version: u32,
+    records: Vec<NetSegmentRecord>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -1088,6 +1138,134 @@ impl NetSegmentEnvironmentPrefix {
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
+}
+
+impl NetSegmentRecordsPrefix {
+    /// Decodes fixed records for active segments in inner versions 164+.
+    ///
+    /// Rejects a mismatched flag version or truncated record. The returned
+    /// length ends before the following guide-count tables.
+    pub fn decode_prefix(
+        format_version: u32,
+        segment_flags: &NetSegmentFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || segment_flags.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data segment records".to_owned(),
+                offset: 0,
+                reason: "record version does not match segment flags".to_owned(),
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        let mut records = Vec::new();
+        for segment in segment_flags
+            .segment_flags()
+            .iter()
+            .filter(|segment| segment.flags != 0)
+        {
+            let build_index = reader.read_u32_be()?;
+            let modified_index = reader.read_u32_be()?;
+            let lanes = read_segment_u24(&mut reader)?;
+            let path = read_segment_u24(&mut reader)?;
+            let start_direction_bits = [
+                reader.read_u32_be()?,
+                reader.read_u32_be()?,
+                reader.read_u32_be()?,
+            ];
+            let end_direction_bits = [
+                reader.read_u32_be()?,
+                reader.read_u32_be()?,
+                reader.read_u32_be()?,
+            ];
+            let start_node = reader.read_u16_be()?;
+            let end_node = reader.read_u16_be()?;
+            let blocks = [
+                reader.read_u16_be()?,
+                reader.read_u16_be()?,
+                reader.read_u16_be()?,
+                reader.read_u16_be()?,
+            ];
+            let traffic_buffer = reader.read_u16_be()?;
+            let traffic_density = reader.read_u8()?;
+            let name_seed = if format_version >= SEGMENT_NAME_SEED_VERSION {
+                reader.read_u16_be()?
+            } else {
+                0
+            };
+            let override_path_find_direction_limit =
+                if format_version >= SEGMENT_PATH_OVERRIDE_VERSION {
+                    reader.read_u8()?
+                } else {
+                    0
+                };
+            let tree_present = if format_version >= SEGMENT_TREE_VERSION {
+                reader.read_u8()?
+            } else {
+                0
+            };
+            let fence_present = if format_version >= SEGMENT_FENCE_VERSION {
+                [reader.read_u8()?, reader.read_u8()?]
+            } else {
+                [0; 2]
+            };
+            let (event_route, next_event_route_segment) =
+                if format_version >= SEGMENT_EVENT_ROUTE_VERSION {
+                    (reader.read_u16_be()?, reader.read_u16_be()?)
+                } else {
+                    (0, 0)
+                };
+            records.push(NetSegmentRecord {
+                index: segment.index,
+                build_index,
+                modified_index,
+                lanes,
+                path,
+                start_direction_bits,
+                end_direction_bits,
+                start_node,
+                end_node,
+                blocks,
+                traffic_buffer,
+                traffic_density,
+                name_seed,
+                override_path_find_direction_limit,
+                tree_present,
+                fence_present,
+                event_route,
+                next_event_route_segment,
+            });
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                records,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns one record per segment with nonzero primary flags.
+    pub fn records(&self) -> &[NetSegmentRecord] {
+        &self.records
+    }
+
+    /// Writes the original record bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+fn read_segment_u24(reader: &mut Reader<'_>) -> Result<u32, CrpError> {
+    let bytes = reader.read_bytes(3)?;
+    Ok((u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]))
 }
 
 fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
