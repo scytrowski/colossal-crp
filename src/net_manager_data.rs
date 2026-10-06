@@ -18,6 +18,9 @@ const SEGMENT_PROBLEMS_VERSION: u32 = 226;
 const INT_TRAFFIC_LIGHT_VERSION: u32 = 115_017;
 const FIRE_COVERAGE_VERSION: u32 = 185;
 const WETNESS_VERSION: u32 = 224;
+const SEGMENT_CONDITION_VERSION: u32 = 229;
+const SEGMENT_NOISE_VERSION: u32 = 109_007;
+const SEGMENT_ATTRACTIVENESS_VERSION: u32 = 121_030;
 const NODE_EVENT_ROUTE_VERSION: u32 = 121_007;
 const MAX_NODE_SEGMENTS: usize = 8;
 const SAVE_APP_PROBLEMS_VERSION: u32 = (1 << 27) + (3 << 22) + (1 << 13) + (1 << 8);
@@ -237,6 +240,32 @@ pub struct NetSegmentCoverage {
 pub struct NetSegmentCoveragePrefix {
     format_version: u32,
     coverage: Vec<NetSegmentCoverage>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Later environmental fields for one segment with nonzero primary flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentEnvironment {
+    /// One-based segment buffer index.
+    pub index: u16,
+    /// Condition; zero before inner version 229.
+    pub condition: u8,
+    /// Noise buffer; zero before inner version 109007.
+    pub noise_buffer: u16,
+    /// Noise density; zero before inner version 109007.
+    pub noise_density: u8,
+    /// Attractiveness; zero before inner version 121030.
+    pub attractiveness: u8,
+}
+
+/// Sparse condition, noise, and attractiveness arrays after wetness.
+///
+/// The original encoded bytes are retained for exact rewriting. Individual
+/// segment records follow this prefix and remain outside its scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentEnvironmentPrefix {
+    format_version: u32,
+    environment: Vec<NetSegmentEnvironment>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -968,6 +997,94 @@ impl NetSegmentCoveragePrefix {
     }
 
     /// Writes the original encoded arrays exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+impl NetSegmentEnvironmentPrefix {
+    /// Decodes the four sparse arrays in serialized field order.
+    ///
+    /// Omitted fields are zero-filled without consuming bytes. Returns an
+    /// error on version mismatch or malformed encoded arrays. The consumed
+    /// length ends before the individual segment records.
+    pub fn decode_prefix(
+        format_version: u32,
+        segment_flags: &NetSegmentFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || segment_flags.format_version() != format_version {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "NetManager+Data segment environment".to_owned(),
+                offset: 0,
+                reason: "environment version does not match segment flags".to_owned(),
+            });
+        }
+        let active_indices = segment_flags
+            .segment_flags()
+            .iter()
+            .filter(|segment| segment.flags != 0)
+            .map(|segment| segment.index)
+            .collect::<Vec<_>>();
+        let count = active_indices.len();
+        let mut reader = Reader::new(bytes);
+        let condition = if format_version >= SEGMENT_CONDITION_VERSION {
+            read_encoded_byte_array(&mut reader, count)?
+        } else {
+            vec![0; count]
+        };
+        let noise_buffer = if format_version >= SEGMENT_NOISE_VERSION {
+            read_encoded_ushort_array(&mut reader, count)?
+        } else {
+            vec![0; count]
+        };
+        let noise_density = if format_version >= SEGMENT_NOISE_VERSION {
+            read_encoded_byte_array(&mut reader, count)?
+        } else {
+            vec![0; count]
+        };
+        let attractiveness = if format_version >= SEGMENT_ATTRACTIVENESS_VERSION {
+            read_encoded_byte_array(&mut reader, count)?
+        } else {
+            vec![0; count]
+        };
+        let mut environment = Vec::with_capacity(count);
+        for (((index, condition), noise_buffer), (noise_density, attractiveness)) in active_indices
+            .into_iter()
+            .zip(condition)
+            .zip(noise_buffer)
+            .zip(noise_density.into_iter().zip(attractiveness))
+        {
+            environment.push(NetSegmentEnvironment {
+                index,
+                condition,
+                noise_buffer,
+                noise_density,
+                attractiveness,
+            });
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                environment,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns fields for segments with nonzero primary flags.
+    pub fn environment(&self) -> &[NetSegmentEnvironment] {
+        &self.environment
+    }
+
+    /// Writes the original encoded arrays exactly, preserving unknown run grouping.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }

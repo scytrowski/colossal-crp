@@ -27,8 +27,9 @@ pub use metadata::{MapMetaData, ModInfo};
 pub use net_manager_data::{
     NetLane, NetLanePrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
     NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetSegmentCoverage,
-    NetSegmentCoveragePrefix, NetSegmentFlag, NetSegmentFlagsPrefix, NetSegmentProblem,
-    NetSegmentProblemsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix,
+    NetSegmentCoveragePrefix, NetSegmentEnvironment, NetSegmentEnvironmentPrefix, NetSegmentFlag,
+    NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentTrafficLight,
+    NetSegmentTrafficLightsPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
@@ -1830,6 +1831,134 @@ mod tests {
     }
 
     #[test]
+    fn net_segment_environment_respects_version_gates_and_encoded_bytes() -> Result<(), CrpError> {
+        fn flags(version: u32) -> Result<NetSegmentFlagsPrefix, CrpError> {
+            let mut bytes = vec![2];
+            for value in [1_u32, 0, 0] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            bytes.extend(std::iter::repeat_n(
+                0xff,
+                if version < 222 { 255 } else { 287 },
+            ));
+            bytes.push(0xfb);
+            if version >= 114_012 {
+                bytes.extend(std::iter::repeat_n(0xff, 287));
+                bytes.push(0xfe);
+            }
+            Ok(NetSegmentFlagsPrefix::decode_prefix(version, &bytes)?.0)
+        }
+        let expected = |condition, noise_buffer, noise_density, attractiveness| {
+            vec![NetSegmentEnvironment {
+                index: 1,
+                condition,
+                noise_buffer,
+                noise_density,
+                attractiveness,
+            }]
+        };
+        for (version, bytes, fields) in [
+            (228, vec![], expected(0, 0, 0, 0)),
+            (229, vec![0, 7], expected(7, 0, 0, 0)),
+            (109_006, vec![0, 7], expected(7, 0, 0, 0)),
+            (
+                109_007,
+                vec![0, 7, 0, 0x12, 0x34, 0, 8],
+                expected(7, 0x1234, 8, 0),
+            ),
+            (
+                121_029,
+                vec![0, 7, 0, 0x12, 0x34, 0, 8],
+                expected(7, 0x1234, 8, 0),
+            ),
+            (
+                121_030,
+                vec![0, 7, 0, 0x12, 0x34, 0, 8, 0, 9],
+                expected(7, 0x1234, 8, 9),
+            ),
+        ] {
+            let segment_flags = flags(version)?;
+            let (prefix, used) =
+                NetSegmentEnvironmentPrefix::decode_prefix(version, &segment_flags, &bytes)?;
+            assert_eq!(used, bytes.len());
+            assert_eq!(prefix.environment(), fields);
+            assert_eq!(prefix.encode(), bytes);
+            if !bytes.is_empty() {
+                assert!(
+                    NetSegmentEnvironmentPrefix::decode_prefix(
+                        version,
+                        &segment_flags,
+                        &bytes[..bytes.len() - 1]
+                    )
+                    .is_err()
+                );
+            }
+            assert!(
+                NetSegmentEnvironmentPrefix::decode_prefix(version + 1, &segment_flags, &bytes)
+                    .is_err()
+            );
+        }
+        let mut empty_flags_bytes = vec![0xff; 287];
+        empty_flags_bytes.push(0xfe);
+        empty_flags_bytes.extend(std::iter::repeat_n(0xff, 287));
+        empty_flags_bytes.push(0xfe);
+        let empty_flags = NetSegmentFlagsPrefix::decode_prefix(121_030, &empty_flags_bytes)?.0;
+        let (empty, used) =
+            NetSegmentEnvironmentPrefix::decode_prefix(121_030, &empty_flags, &[0xaa])?;
+        assert_eq!(used, 0);
+        assert!(empty.environment().is_empty());
+        assert!(empty.encode().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn net_segment_environment_fixtures_preserve_game_bytes() -> Result<(), CrpError> {
+        for (version, flag_bytes, environment_bytes, count) in [
+            (
+                241,
+                &include_bytes!("../tests/fixtures/net-segment-flags-v241-co.bin")[..],
+                &include_bytes!("../tests/fixtures/net-segment-environment-v241-co.bin")[..],
+                30,
+            ),
+            (
+                116_020,
+                &include_bytes!("../tests/fixtures/net-segment-flags-v116020-desert.bin")[..],
+                &include_bytes!("../tests/fixtures/net-segment-environment-v116020-desert.bin")[..],
+                2_081,
+            ),
+            (
+                117_013,
+                &include_bytes!("../tests/fixtures/net-segment-flags-v117013-mp23-map01.bin")[..],
+                &include_bytes!("../tests/fixtures/net-segment-environment-v117013-mp23-map01.bin")
+                    [..],
+                3_116,
+            ),
+        ] {
+            let (flags, _) = NetSegmentFlagsPrefix::decode_prefix(version, flag_bytes)?;
+            let (environment, used) =
+                NetSegmentEnvironmentPrefix::decode_prefix(version, &flags, environment_bytes)?;
+            assert_eq!(used, environment_bytes.len());
+            assert_eq!(environment.environment().len(), count);
+            assert!(environment.environment().iter().all(|item| {
+                item.condition == 0
+                    && item.noise_buffer == 0
+                    && item.noise_density == 0
+                    && item.attractiveness == 0
+            }));
+            assert_eq!(environment.encode(), environment_bytes);
+            assert!(
+                NetSegmentEnvironmentPrefix::decode_prefix(
+                    version,
+                    &flags,
+                    &environment_bytes[..environment_bytes.len() - 1]
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn net_node_problems_respect_version_and_app_gates() -> Result<(), CrpError> {
         fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
             let count = if version < 202 {
@@ -2689,6 +2818,10 @@ mod tests {
         let mut segments_with_fire_coverage = 0_usize;
         let mut wet_segments = 0_usize;
         let mut checked_coverage_convenience = false;
+        let mut segments_with_condition = 0_usize;
+        let mut segments_with_noise_buffer = 0_usize;
+        let mut segments_with_noise_density = 0_usize;
+        let mut checked_environment_convenience = false;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -2947,12 +3080,34 @@ mod tests {
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_coverage_convenience = true;
                         }
-                        if version >= 229 {
-                            let condition = crate::encoded_array::read_encoded_byte_array(
-                                &mut net_reader,
-                                active_segments,
-                            )?;
-                            assert_eq!(condition.len(), active_segments);
+                        let (environment, used) = NetSegmentEnvironmentPrefix::decode_prefix(
+                            version,
+                            &segment_flags,
+                            net_reader.remaining_bytes(),
+                        )?;
+                        net_reader.read_bytes(used)?;
+                        assert_eq!(environment.environment().len(), active_segments);
+                        segments_with_condition += environment
+                            .environment()
+                            .iter()
+                            .filter(|item| item.condition != 0)
+                            .count();
+                        segments_with_noise_buffer += environment
+                            .environment()
+                            .iter()
+                            .filter(|item| item.noise_buffer != 0)
+                            .count();
+                        segments_with_noise_density += environment
+                            .environment()
+                            .iter()
+                            .filter(|item| item.noise_density != 0)
+                            .count();
+                        if !checked_environment_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_net_segment_environment_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, environment);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_environment_convenience = true;
                         }
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
@@ -2991,8 +3146,9 @@ mod tests {
         }
         assert!(simulation_metadata_count > 0);
         assert!(checked_coverage_convenience);
+        assert!(checked_environment_convenience);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density"
         );
         Ok(())
     }
