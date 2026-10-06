@@ -1,3 +1,4 @@
+use crate::BuildingFlagsPrefix;
 use crate::CrpError;
 use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
@@ -689,6 +690,31 @@ impl SimulationManagerData {
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(body_length)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes the first two BuildingManager flag arrays after the NetManager body.
+    /// The returned graph offset is before the guide and milestone counts.
+    pub fn decode_building_flags_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingFlagsPrefix, usize), CrpError> {
+        let (_, net_end) = self.decode_net_manager_tail_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(net_end)?;
+        let mut strings = vec![
+            "SimulationManager".to_owned(),
+            "GameAreaManager".to_owned(),
+            "TerrainManager".to_owned(),
+            "WaterSimulation".to_owned(),
+            "InstanceManager".to_owned(),
+            "PathManager".to_owned(),
+            "NetManager".to_owned(),
+        ];
+        expect_profile_tag(&mut reader, &mut strings, "BuildingManager")?;
+        let (data, used) =
+            BuildingFlagsPrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(used)?;
         Ok((data, reader.offset()))
     }
 

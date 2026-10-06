@@ -7,6 +7,7 @@ use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 mod asset_io;
+mod building_manager_data;
 mod data_serializer;
 mod encoded_array;
 mod game_area_data;
@@ -20,6 +21,7 @@ mod terrain_manager_data;
 mod texture;
 mod water_simulation_data;
 
+pub use building_manager_data::{BuildingFlag, BuildingFlagsPrefix};
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
@@ -2353,6 +2355,71 @@ mod tests {
     }
 
     #[test]
+    fn building_flags_follow_both_inner_version_gates() -> Result<(), CrpError> {
+        fn encoded_flags(count: usize, first: u32) -> Vec<u8> {
+            let mut bytes = vec![2];
+            for value in [first, 0_u32, 0_u32] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            let remaining = count - 3;
+            bytes.extend(std::iter::repeat_n(0xff, remaining / 128));
+            bytes.push(0x7f + u8::try_from(remaining % 128).unwrap());
+            bytes
+        }
+        for (version, primary_count, secondary) in [
+            (221, 32_767, false),
+            (222, 49_151, false),
+            (112_029, 49_151, false),
+            (112_030, 49_151, true),
+        ] {
+            let mut bytes = encoded_flags(primary_count, 0x1234_5678);
+            if secondary {
+                bytes.extend(encoded_flags(49_151, 0x8765_4321));
+            }
+            bytes.extend_from_slice(&[0, 1, 0, 2]);
+            let (flags, used) = BuildingFlagsPrefix::decode_prefix(version, &bytes)?;
+            assert_eq!(flags.format_version(), version);
+            assert_eq!(flags.building_flags().len(), 49_151);
+            assert_eq!(flags.building_flags()[0].index, 1);
+            assert_eq!(flags.building_flags()[0].flags, 0x1234_5678);
+            assert_eq!(
+                flags.building_flags()[0].flags2,
+                if secondary { 0x8765_4321 } else { 0 }
+            );
+            assert_eq!(flags.building_flags()[32_767].flags, 0);
+            assert_eq!(flags.building_flags()[49_150].flags2, 0);
+            assert_eq!(flags.encode(), bytes[..used]);
+            assert_eq!(&bytes[used..], &[0, 1, 0, 2]);
+            assert!(BuildingFlagsPrefix::decode_prefix(version, &bytes[..used - 1]).is_err());
+        }
+        assert!(BuildingFlagsPrefix::decode_prefix(163, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn building_flags_game_fixture_preserves_boundary() -> Result<(), CrpError> {
+        let bytes = include_bytes!("../tests/fixtures/building-flags-v116020-desert.bin");
+        let (flags, used) = BuildingFlagsPrefix::decode_prefix(116_020, bytes)?;
+        assert_eq!(used, 2_792);
+        assert_eq!(flags.encode(), bytes[..used]);
+        assert_eq!(flags.building_flags()[22].flags, 0x25);
+        assert_eq!(flags.building_flags()[38].flags, 0x05);
+        assert_eq!(flags.building_flags()[305].flags, 0x10_0025);
+        assert_eq!(
+            flags
+                .building_flags()
+                .iter()
+                .filter(|item| item.flags != 0)
+                .count(),
+            189
+        );
+        assert!(flags.building_flags().iter().all(|item| item.flags2 == 0));
+        assert_eq!(&bytes[used..], &[0, 0, 0, 0]);
+        assert!(BuildingFlagsPrefix::decode_prefix(116_020, &bytes[..used - 1]).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn net_node_problems_respect_version_and_app_gates() -> Result<(), CrpError> {
         fn one_active_node_flags(version: u32) -> Result<NetNodeFlagsPrefix, CrpError> {
             let count = if version < 202 {
@@ -3227,6 +3294,11 @@ mod tests {
         let mut checked_tree_prefab_convenience = false;
         let mut checked_fence_prefab_convenience = false;
         let mut checked_net_tail_convenience = false;
+        let mut checked_building_flags_convenience = false;
+        let mut active_buildings = 0_usize;
+        let mut buildings_with_secondary_flags = 0_usize;
+        let mut building_guide_refs = 0_usize;
+        let mut building_milestone_refs = 0_usize;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -3630,6 +3702,39 @@ mod tests {
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_net_tail_convenience = true;
                         }
+                        net_reader.read_bytes(next_manager.offset())?;
+                        let (building_flags, used) = BuildingFlagsPrefix::decode_prefix(
+                            version,
+                            net_reader.remaining_bytes(),
+                        )?;
+                        net_reader.read_bytes(used)?;
+                        let mut building_counts =
+                            crate::data_serializer::Reader::new(net_reader.remaining_bytes());
+                        let guides = building_counts.read_u16_be()?;
+                        let milestones = building_counts.read_u16_be()?;
+                        building_guide_refs += usize::from(guides);
+                        building_milestone_refs += usize::from(milestones);
+                        assert_eq!(
+                            building_flags.encode(),
+                            net_reader.consumed_bytes()[net_reader.offset() - used..]
+                        );
+                        active_buildings += building_flags
+                            .building_flags()
+                            .iter()
+                            .filter(|flag| flag.flags != 0)
+                            .count();
+                        buildings_with_secondary_flags += building_flags
+                            .building_flags()
+                            .iter()
+                            .filter(|flag| flag.flags2 != 0)
+                            .count();
+                        if !checked_building_flags_convenience && active_segments > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_flags_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, building_flags);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_building_flags_convenience = true;
+                        }
                         let canonical = water.clone().into_editor().encode()?;
                         let (rewritten, rewritten_length) = WaterSimulationData::decode_prefix(
                             manager_data.format_version(),
@@ -3674,9 +3779,11 @@ mod tests {
         assert!(checked_tree_prefab_convenience);
         assert!(checked_fence_prefab_convenience);
         assert!(checked_net_tail_convenience);
+        assert!(checked_building_flags_convenience);
+        assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(
-            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density, {nonzero_guide_counts} with guide references, {nonzero_milestone_counts} with milestone references, {info_prefab_names} info prefab names, {tree_prefab_names} tree prefab names"
+            "external corpus: {simulation_metadata_count} type-52 assets, {nonempty_wave_assets} with waves, {active_net_lanes} active lanes, {reserved_net_lanes} with nonzero reservation state, {active_net_nodes} active nodes, {nodes_with_problems} with problems, {nodes_with_counters} with counters, {nodes_with_segments} with segments, {nodes_with_event_routes} with event routes, {active_net_segments} active segments, {segments_with_secondary_flags} with secondary flags, {segments_with_problems} with problems, {segments_with_traffic_lights} with traffic-light state, {segments_with_fire_coverage} with fire coverage, {wet_segments} wet, {segments_with_condition} with condition, {segments_with_noise_buffer} with noise buffer, {segments_with_noise_density} with noise density, {nonzero_guide_counts} with guide references, {nonzero_milestone_counts} with milestone references, {info_prefab_names} info prefab names, {tree_prefab_names} tree prefab names, {active_buildings} active buildings, {buildings_with_secondary_flags} with secondary flags, {building_guide_refs} building guide references, {building_milestone_refs} building milestone references"
         );
         Ok(())
     }
