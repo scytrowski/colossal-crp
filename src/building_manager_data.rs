@@ -2825,6 +2825,9 @@ mod tests {
         assert_eq!(edited_used, edited_bytes.len());
         assert_eq!(decoded_edit.indices(), [1, 2]);
         assert_eq!(decoded_edit.prefab_names()[0].as_deref(), Some("new team"));
+        let mut too_many_names = decoded_edit.into_editor();
+        *too_many_names.prefab_names_mut() = vec![None; usize::from(u16::MAX) + 1];
+        assert!(too_many_names.encode().is_err());
         assert!(
             BuildingRaceTeamReferencesPrefix::decode_after_unassigned(
                 120_002,
