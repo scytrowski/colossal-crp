@@ -23,9 +23,9 @@ mod water_simulation_data;
 
 pub use building_manager_data::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingFlag, BuildingFlagsPrefix,
-    BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix, BuildingProblemPrefix,
-    BuildingProblemWords, BuildingTimerField, BuildingTimerGeometryEditor,
-    BuildingTimerGeometryPrefix,
+    BuildingManagerObjectHeadersPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
+    BuildingPrefabPrefix, BuildingProblemPrefix, BuildingProblemWords, BuildingTimerField,
+    BuildingTimerGeometryEditor, BuildingTimerGeometryPrefix,
 };
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
@@ -3771,6 +3771,7 @@ mod tests {
         let mut checked_building_buffer_convenience = false;
         let mut checked_building_byte_state_convenience = false;
         let mut checked_building_timer_convenience = false;
+        let mut checked_building_population_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
@@ -4361,6 +4362,48 @@ mod tests {
                             );
                             checked_building_timer_convenience = true;
                         }
+                        let population_start = net_reader.offset();
+                        let (building_population, population_used) =
+                            BuildingPopulationPrefix::decode_prefix(
+                                version,
+                                &building_flags,
+                                net_reader.remaining_bytes(),
+                            )?;
+                        net_reader.read_bytes(population_used)?;
+                        assert_eq!(
+                            building_population.encode(),
+                            &net_reader.consumed_bytes()
+                                [population_start..population_start + population_used]
+                        );
+                        assert_eq!(
+                            building_population.education1().len(),
+                            active_building_count
+                        );
+                        assert_eq!(building_population.teens().len(), active_building_count);
+                        if !checked_building_population_convenience && active_building_count > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_population_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, building_population);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+
+                            let mut edited_manager = manager_data.clone();
+                            let mut editor = building_population.into_editor();
+                            let original_education = editor.education1_mut()[0];
+                            let edited_education = original_education.wrapping_add(1);
+                            editor.education1_mut()[0] = edited_education;
+                            let original_suffix =
+                                manager_data.serialized_object_graph()[graph_end..].to_vec();
+                            edited_manager
+                                .replace_building_population(&editor, metadata.save_app_version)?;
+                            let (rewritten, rewritten_end) = edited_manager
+                                .decode_building_population_prefix(metadata.save_app_version)?;
+                            assert_eq!(rewritten.education1()[0], edited_education);
+                            assert_eq!(
+                                &edited_manager.serialized_object_graph()[rewritten_end..],
+                                original_suffix
+                            );
+                            checked_building_population_convenience = true;
+                        }
                         if std::env::var_os("CRP_EXTRACT_BUILDING_BYTE_STATE_FIXTURE").is_some()
                             && path
                                 .file_name()
@@ -4454,6 +4497,7 @@ mod tests {
         assert!(checked_building_buffer_convenience);
         assert!(checked_building_byte_state_convenience);
         assert!(checked_building_timer_convenience);
+        assert!(checked_building_population_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(

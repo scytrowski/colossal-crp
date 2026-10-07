@@ -1,4 +1,3 @@
-use crate::BuildingTimerGeometryEditor;
 use crate::CrpError;
 use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
@@ -10,9 +9,10 @@ use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingFlagsPrefix,
-    BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix, BuildingProblemPrefix,
-    BuildingTimerGeometryPrefix,
+    BuildingManagerObjectHeadersPrefix, BuildingPopulationPrefix, BuildingPrefabPrefix,
+    BuildingProblemPrefix, BuildingTimerGeometryPrefix,
 };
+use crate::{BuildingPopulationEditor, BuildingTimerGeometryEditor};
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
     NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
@@ -842,6 +842,26 @@ impl SimulationManagerData {
         Ok((data, reader.offset()))
     }
 
+    /// Decodes education, population, hazard, and level arrays after geometry.
+    ///
+    /// Returns the decoded prefix and its end offset in the serialized object
+    /// graph. The original encoded bytes are retained for exact writeback.
+    pub fn decode_building_population_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingPopulationPrefix, usize), CrpError> {
+        let (_, geometry_end) = self.decode_building_timer_geometry_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(geometry_end)?;
+        let (data, used) = BuildingPopulationPrefix::decode_prefix(
+            self.format_version,
+            &self.decode_building_flags_prefix(save_app_version)?.0,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
     /// Replaces timer and building-dimension arrays, preserving the rest of the graph.
     ///
     /// The editor must come from this stream's BuildingManager body. Edited
@@ -876,6 +896,43 @@ impl SimulationManagerData {
             return Err(invalid(
                 body_start,
                 "BuildingManager timer body extends past manager graph",
+            ));
+        }
+        self.serialized_object_graph
+            .splice(body_start..graph_end, replacement);
+        Ok(())
+    }
+
+    /// Replaces only the population-related arrays, preserving all other graph bytes.
+    pub fn replace_building_population(
+        &mut self,
+        edited: &BuildingPopulationEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited BuildingManager population version does not match this stream",
+            ));
+        }
+        let (original, graph_end) = self.decode_building_population_prefix(save_app_version)?;
+        if edited.active_building_count() != original.active_building_count() {
+            return Err(invalid(
+                0,
+                "edited BuildingManager active-building count does not match this stream",
+            ));
+        }
+        let body_start =
+            graph_end
+                .checked_sub(original.encode().len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager population body start",
+                ))?;
+        let replacement = edited.encode()?;
+        if graph_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager population body extends past manager graph",
             ));
         }
         self.serialized_object_graph

@@ -181,6 +181,45 @@ pub struct BuildingTimerGeometryEditor {
     length: Vec<u8>,
 }
 
+/// Per-building education, population, hazard, and level arrays after geometry.
+///
+/// Values are retained as raw bytes. The game ignores the serialized level
+/// column for inner versions 207 through 111004, so this API does not assign
+/// semantic meaning to that legacy column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingPopulationPrefix {
+    format_version: u32,
+    active_building_count: usize,
+    education1: Vec<u8>,
+    education2: Vec<u8>,
+    education3: Vec<u8>,
+    children: Vec<u8>,
+    teens: Vec<u8>,
+    youngs: Vec<u8>,
+    adults: Vec<u8>,
+    seniors: Vec<u8>,
+    fire_hazard: Vec<u8>,
+    level: Vec<u8>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Editable per-building education, population, hazard, and level arrays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingPopulationEditor {
+    format_version: u32,
+    active_building_count: usize,
+    education1: Vec<u8>,
+    education2: Vec<u8>,
+    education3: Vec<u8>,
+    children: Vec<u8>,
+    teens: Vec<u8>,
+    youngs: Vec<u8>,
+    adults: Vec<u8>,
+    seniors: Vec<u8>,
+    fire_hazard: Vec<u8>,
+    level: Vec<u8>,
+}
+
 impl BuildingBufferFieldsPrefix {
     /// Decodes versioned network, utility, and byte fields for active buildings.
     ///
@@ -709,6 +748,253 @@ impl BuildingTimerGeometryEditor {
     }
 }
 
+impl BuildingPopulationPrefix {
+    /// Decodes population-related arrays after timer and geometry state.
+    ///
+    /// Supports inner versions 164 and newer. The original encoded bytes are
+    /// retained for exact writeback; truncated arrays or mismatched flag-table
+    /// versions return an error.
+    pub fn decode_prefix(
+        format_version: u32,
+        flags: &BuildingFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || flags.format_version() != format_version {
+            return Err(invalid_population(
+                "unsupported or mismatched inner version",
+            ));
+        }
+        let active_building_count = flags
+            .building_flags()
+            .iter()
+            .filter(|building| building.flags != 0)
+            .count();
+        let mut reader = Reader::new(bytes);
+        let education1 = read_encoded_byte_array(&mut reader, active_building_count)?;
+        let education2 = read_encoded_byte_array(&mut reader, active_building_count)?;
+        let education3 = read_encoded_byte_array(&mut reader, active_building_count)?;
+        let children = if format_version >= 113_005 {
+            read_encoded_byte_array(&mut reader, active_building_count)?
+        } else {
+            Vec::new()
+        };
+        let teens = read_encoded_byte_array(&mut reader, active_building_count)?;
+        let youngs = read_encoded_byte_array(&mut reader, active_building_count)?;
+        let adults = read_encoded_byte_array(&mut reader, active_building_count)?;
+        let seniors = read_encoded_byte_array(&mut reader, active_building_count)?;
+        let fire_hazard = if format_version >= 175 {
+            read_encoded_byte_array(&mut reader, active_building_count)?
+        } else {
+            Vec::new()
+        };
+        // Before 111005 the game consumes and discards this column from 207 onward.
+        let level = if format_version >= 207 {
+            read_encoded_byte_array(&mut reader, active_building_count)?
+        } else {
+            Vec::new()
+        };
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                active_building_count,
+                education1,
+                education2,
+                education3,
+                children,
+                teens,
+                youngs,
+                adults,
+                seniors,
+                fire_hazard,
+                level,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns the number of buildings with nonzero primary flags.
+    pub fn active_building_count(&self) -> usize {
+        self.active_building_count
+    }
+    /// Returns education-level-1 values from version 98 onward.
+    pub fn education1(&self) -> &[u8] {
+        &self.education1
+    }
+    /// Returns education-level-2 values from version 98 onward.
+    pub fn education2(&self) -> &[u8] {
+        &self.education2
+    }
+    /// Returns education-level-3 values from version 98 onward.
+    pub fn education3(&self) -> &[u8] {
+        &self.education3
+    }
+    /// Returns child counts from version 113005 onward.
+    pub fn children(&self) -> &[u8] {
+        &self.children
+    }
+    /// Returns teen counts from version 98 onward.
+    pub fn teens(&self) -> &[u8] {
+        &self.teens
+    }
+    /// Returns young-adult counts from version 98 onward.
+    pub fn youngs(&self) -> &[u8] {
+        &self.youngs
+    }
+    /// Returns adult counts from version 98 onward.
+    pub fn adults(&self) -> &[u8] {
+        &self.adults
+    }
+    /// Returns senior counts from version 98 onward.
+    pub fn seniors(&self) -> &[u8] {
+        &self.seniors
+    }
+    /// Returns raw fire-hazard values from version 175 onward.
+    pub fn fire_hazard(&self) -> &[u8] {
+        &self.fire_hazard
+    }
+    /// Returns raw serialized level bytes from version 207 onward.
+    ///
+    /// The game ignores these values before version 111005; versions below 207
+    /// encode the legacy level in flag bits instead and have no separate column.
+    pub fn level(&self) -> &[u8] {
+        &self.level
+    }
+    /// Writes the original encoded fields exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+
+    /// Creates an editor; changed arrays will use canonical literal encoding.
+    pub fn into_editor(self) -> BuildingPopulationEditor {
+        BuildingPopulationEditor {
+            format_version: self.format_version,
+            active_building_count: self.active_building_count,
+            education1: self.education1,
+            education2: self.education2,
+            education3: self.education3,
+            children: self.children,
+            teens: self.teens,
+            youngs: self.youngs,
+            adults: self.adults,
+            seniors: self.seniors,
+            fire_hazard: self.fire_hazard,
+            level: self.level,
+        }
+    }
+}
+
+impl BuildingPopulationEditor {
+    /// Returns the inner DataSerializer version associated with these arrays.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns the number of active buildings represented by these arrays.
+    pub fn active_building_count(&self) -> usize {
+        self.active_building_count
+    }
+    /// Returns editable education-level-1 values.
+    pub fn education1_mut(&mut self) -> &mut [u8] {
+        &mut self.education1
+    }
+    /// Returns editable education-level-2 values.
+    pub fn education2_mut(&mut self) -> &mut [u8] {
+        &mut self.education2
+    }
+    /// Returns editable education-level-3 values.
+    pub fn education3_mut(&mut self) -> &mut [u8] {
+        &mut self.education3
+    }
+    /// Returns editable child counts, empty before version 113005.
+    pub fn children_mut(&mut self) -> &mut [u8] {
+        &mut self.children
+    }
+    /// Returns editable teen counts.
+    pub fn teens_mut(&mut self) -> &mut [u8] {
+        &mut self.teens
+    }
+    /// Returns editable young-adult counts.
+    pub fn youngs_mut(&mut self) -> &mut [u8] {
+        &mut self.youngs
+    }
+    /// Returns editable adult counts.
+    pub fn adults_mut(&mut self) -> &mut [u8] {
+        &mut self.adults
+    }
+    /// Returns editable senior counts.
+    pub fn seniors_mut(&mut self) -> &mut [u8] {
+        &mut self.seniors
+    }
+    /// Returns editable fire-hazard values, empty before version 175.
+    pub fn fire_hazard_mut(&mut self) -> &mut [u8] {
+        &mut self.fire_hazard
+    }
+    /// Returns editable raw level bytes, empty before version 207.
+    pub fn level_mut(&mut self) -> &mut [u8] {
+        &mut self.level
+    }
+
+    /// Encodes the version-gated arrays with canonical literal controls.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.format_version < 164 {
+            return Err(invalid_population("unsupported inner version"));
+        }
+        let count = self.active_building_count;
+        let has_children = self.format_version >= 113_005;
+        let has_fire_hazard = self.format_version >= 175;
+        let has_level = self.format_version >= 207;
+        if [
+            self.education1.len(),
+            self.education2.len(),
+            self.education3.len(),
+            self.teens.len(),
+            self.youngs.len(),
+            self.adults.len(),
+            self.seniors.len(),
+        ]
+        .iter()
+        .any(|length| *length != count)
+            || self.children.len() != if has_children { count } else { 0 }
+            || self.fire_hazard.len() != if has_fire_hazard { count } else { 0 }
+            || self.level.len() != if has_level { count } else { 0 }
+        {
+            return Err(invalid_population(
+                "one or more array counts do not match version and active buildings",
+            ));
+        }
+        let mut output = Vec::new();
+        for array in [&self.education1, &self.education2, &self.education3] {
+            write_encoded_byte_array(&mut output, array);
+        }
+        if has_children {
+            write_encoded_byte_array(&mut output, &self.children);
+        }
+        for array in [&self.teens, &self.youngs, &self.adults, &self.seniors] {
+            write_encoded_byte_array(&mut output, array);
+        }
+        if has_fire_hazard {
+            write_encoded_byte_array(&mut output, &self.fire_hazard);
+        }
+        if has_level {
+            write_encoded_byte_array(&mut output, &self.level);
+        }
+        Ok(output)
+    }
+}
+
+fn invalid_population(reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "BuildingManager population fields".to_owned(),
+        offset: 0,
+        reason: reason.into(),
+    }
+}
+
 fn timer_fields_for_version(format_version: u32) -> Vec<BuildingTimerField> {
     let mut fields = vec![BuildingTimerField::Electricity];
     if format_version >= 231 {
@@ -943,6 +1229,7 @@ impl BuildingManagerObjectHeadersPrefix {
 #[cfg(test)]
 mod tests {
     use super::{
+        BuildingFlag, BuildingFlagsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
         BuildingTimerField, BuildingTimerGeometryEditor, fixed_object_header_count,
         timer_fields_for_version,
     };
@@ -1020,6 +1307,94 @@ mod tests {
         let invalid = BuildingTimerGeometryEditor {
             width: vec![2],
             ..editor
+        };
+        assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn building_population_prefix_obeys_version_gates_and_preserves_legacy_level() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 207,
+            building_flags: vec![
+                BuildingFlag {
+                    index: 1,
+                    flags: 1,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 2,
+                    flags: 0,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 3,
+                    flags: 1,
+                    flags2: 0,
+                },
+            ],
+            serialized_prefix: Vec::new(),
+        };
+        // Nine one-value literal columns: education x3, age groups x4,
+        // fire hazard, and the legacy level bytes discarded by the game.
+        let encoded = [
+            1, 11, 12, 1, 21, 22, 1, 31, 32, 1, 41, 42, 1, 51, 52, 1, 61, 62, 1, 71, 72, 1, 81, 82,
+            1, 91, 92,
+        ];
+        let (prefix, used) = BuildingPopulationPrefix::decode_prefix(207, &flags, &encoded)
+            .expect("valid version 207 population fields");
+        assert_eq!(used, encoded.len());
+        assert_eq!(prefix.active_building_count(), 2);
+        assert_eq!(prefix.education1(), [11, 12]);
+        assert_eq!(prefix.seniors(), [71, 72]);
+        assert_eq!(prefix.fire_hazard(), [81, 82]);
+        assert_eq!(prefix.level(), [91, 92]);
+        assert_eq!(prefix.encode(), encoded);
+
+        let mut editor = prefix.into_editor();
+        editor.level_mut()[1] = 93;
+        let rewritten = editor.encode().expect("valid editor");
+        let (updated, _) = BuildingPopulationPrefix::decode_prefix(207, &flags, &rewritten)
+            .expect("rewritten population fields");
+        assert_eq!(updated.level(), [91, 93]);
+        assert!(updated.children().is_empty());
+    }
+
+    #[test]
+    fn building_population_prefix_includes_children_at_gate() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 113_005,
+            building_flags: vec![BuildingFlag {
+                index: 1,
+                flags: 1,
+                flags2: 0,
+            }],
+            serialized_prefix: Vec::new(),
+        };
+        // Ten one-value literal columns, with children between education
+        // and teen fields as written by BuildingManager+Data.Serialize.
+        let encoded = [0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10];
+        let (prefix, used) = BuildingPopulationPrefix::decode_prefix(113_005, &flags, &encoded)
+            .expect("valid version 113005 population fields");
+        assert_eq!(used, encoded.len());
+        assert_eq!(prefix.children(), [4]);
+        assert_eq!(prefix.teens(), [5]);
+        assert_eq!(prefix.fire_hazard(), [9]);
+        assert_eq!(prefix.level(), [10]);
+        assert_eq!(prefix.encode(), encoded);
+
+        let invalid = BuildingPopulationEditor {
+            format_version: 113_005,
+            active_building_count: 1,
+            education1: vec![1],
+            education2: vec![2],
+            education3: vec![3],
+            children: Vec::new(),
+            teens: vec![5],
+            youngs: vec![6],
+            adults: vec![7],
+            seniors: vec![8],
+            fire_hazard: vec![9],
+            level: vec![10],
         };
         assert!(invalid.encode().is_err());
     }
