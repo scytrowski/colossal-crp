@@ -82,6 +82,9 @@ const TYPE_ZERO_PARK_HAPPINESS_U16_VERSION: u32 = 115_011;
 const TYPE_ZERO_PARK_HAPPINESS_U32_VERSION: u32 = 115_022;
 const TYPE_ZERO_PARK_EARLY_BYTES: usize = 62;
 const TYPE_ZERO_PARK_BASE_TYPE_OFFSET: usize = 42;
+const DISTRICT_GRID_CELLS: usize = 262_144;
+const DISTRICT_GRID_PLANES: usize = 8;
+const DISTRICT_GRID_VALUES: usize = DISTRICT_GRID_CELLS * DISTRICT_GRID_PLANES;
 
 /// The initial known fields from `DistrictManager+Data`.
 ///
@@ -116,6 +119,86 @@ pub struct DistrictParkRecord {
     condition: u16,
     level: u8,
     serialized: Vec<u8>,
+}
+
+/// The decoded district and optional park grid planes from `DistrictManager+Data`.
+///
+/// Each grid contains eight 262,144-cell byte planes in district1–4, alpha1–4
+/// order. The original encoded bytes are retained for exact unchanged writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictManagerGridData {
+    district_values: Vec<u8>,
+    park_values: Option<Vec<u8>>,
+    serialized: Vec<u8>,
+}
+
+impl DistrictManagerGridData {
+    /// Decodes the grid streams and returns the number of consumed bytes.
+    ///
+    /// Inner versions 164 and newer are supported. The park grid is serialized
+    /// from version 110001. Truncated streams return an error. The byte count
+    /// ends before the following manager objects.
+    pub fn decode(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 {
+            return Err(invalid_district_manager(
+                0,
+                "DistrictManager grids require inner version 164 or newer",
+            ));
+        }
+        let mut reader = Reader::new(bytes);
+        let district_values =
+            read_encoded_byte_array(&mut reader, DISTRICT_GRID_VALUES).map_err(|error| {
+                invalid_district_manager(reader.offset(), format!("district grid: {error}"))
+            })?;
+        let park_values = if format_version >= PARK_FLAGS_VERSION {
+            Some(
+                read_encoded_byte_array(&mut reader, DISTRICT_GRID_VALUES).map_err(|error| {
+                    invalid_district_manager(reader.offset(), format!("park grid: {error}"))
+                })?,
+            )
+        } else {
+            None
+        };
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                district_values,
+                park_values,
+                serialized: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns one district plane by index 0–7, or `None` for an invalid index.
+    pub fn district_plane(&self, index: usize) -> Option<&[u8]> {
+        grid_plane(&self.district_values, index)
+    }
+
+    /// Returns one park plane by index 0–7, or `None` when absent or invalid.
+    pub fn park_plane(&self, index: usize) -> Option<&[u8]> {
+        self.park_values
+            .as_deref()
+            .and_then(|values| grid_plane(values, index))
+    }
+
+    /// Returns whether the park grid is serialized in this version.
+    pub fn park_grid_present(&self) -> bool {
+        self.park_values.is_some()
+    }
+
+    /// Writes the exact encoded grid bytes without normalizing their runs.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized.clone()
+    }
+}
+
+fn grid_plane(values: &[u8], index: usize) -> Option<&[u8]> {
+    if index >= DISTRICT_GRID_PLANES {
+        return None;
+    }
+    let start = index * DISTRICT_GRID_CELLS;
+    values.get(start..start + DISTRICT_GRID_CELLS)
 }
 
 impl DistrictParkRecord {
@@ -1279,7 +1362,8 @@ fn invalid_district_manager(offset: usize, reason: impl Into<String>) -> CrpErro
 #[cfg(test)]
 mod tests {
     use super::{
-        DISTRICT_COUNT, DistrictManagerFlagsPrefix, POLICY_COUNT, district_policy_bool_count,
+        DISTRICT_COUNT, DISTRICT_GRID_CELLS, DistrictManagerFlagsPrefix, DistrictManagerGridData,
+        POLICY_COUNT, district_policy_bool_count,
     };
     use crate::data_serializer::write_unique_string;
     use crate::encoded_array::{
@@ -1674,6 +1758,91 @@ mod tests {
             );
             assert_eq!(grid.offset(), 2048);
             assert_eq!(used + grid.offset(), bytes.len());
+        }
+    }
+
+    #[test]
+    fn grid_streams_obey_park_version_gate_and_preserve_exact_controls() {
+        // EncodedArray.Byte control 0xff repeats a zero delta 128 times.
+        let zero_grid = vec![0xff; 8 * DISTRICT_GRID_CELLS / 128];
+        for (version, park_grid_present) in [(110_000, false), (110_001, true)] {
+            let mut bytes = zero_grid.clone();
+            if park_grid_present {
+                bytes.extend_from_slice(&zero_grid);
+            }
+            bytes.push(0xfe); // First byte after the grid streams.
+            let (grids, used) = DistrictManagerGridData::decode(version, &bytes).unwrap();
+            assert_eq!(used, bytes.len() - 1);
+            assert_eq!(grids.park_grid_present(), park_grid_present);
+            assert_eq!(
+                grids.district_plane(0).unwrap(),
+                vec![0; DISTRICT_GRID_CELLS]
+            );
+            assert_eq!(
+                grids.district_plane(7).unwrap(),
+                vec![0; DISTRICT_GRID_CELLS]
+            );
+            assert_eq!(grids.park_plane(7).is_some(), park_grid_present);
+            assert!(grids.district_plane(8).is_none());
+            assert!(grids.park_plane(8).is_none());
+            assert_eq!(grids.encode(), bytes[..used]);
+            assert_eq!(bytes[used], 0xfe);
+            assert!(DistrictManagerGridData::decode(version, &bytes[..used - 1]).is_err());
+        }
+        assert!(DistrictManagerGridData::decode(163, &[]).is_err());
+    }
+
+    #[test]
+    fn game_produced_grid_streams_preserve_default_and_nondefault_planes() {
+        for (version, bytes, expected_len) in [
+            (
+                112_004,
+                &include_bytes!("../tests/fixtures/district-grids-v112004-wolf-creek.bin")[..],
+                32_798,
+            ),
+            (
+                117_013,
+                &include_bytes!("../tests/fixtures/district-grids-v117013-mp23-map04.bin")[..],
+                32_999,
+            ),
+        ] {
+            let (grids, used) = DistrictManagerGridData::decode(version, bytes).unwrap();
+            assert_eq!(used, expected_len);
+            assert_eq!(grids.encode(), bytes);
+            for (index, default_value) in [0, 1, 2, 3, 255, 0, 0, 0].into_iter().enumerate() {
+                let district = grids.district_plane(index).unwrap();
+                let park = grids.park_plane(index).unwrap();
+                assert_eq!(district.len(), DISTRICT_GRID_CELLS);
+                assert_eq!(park.len(), DISTRICT_GRID_CELLS);
+                if version == 112_004 {
+                    assert!(district.iter().all(|value| *value == default_value));
+                    assert!(park.iter().all(|value| *value == default_value));
+                }
+            }
+            if version == 117_013 {
+                assert_eq!(
+                    grids
+                        .district_plane(0)
+                        .unwrap()
+                        .iter()
+                        .filter(|value| **value == 1)
+                        .count(),
+                    26_496
+                );
+                assert_eq!(
+                    grids
+                        .park_plane(7)
+                        .unwrap()
+                        .iter()
+                        .filter(|value| **value != 0)
+                        .count(),
+                    3_940
+                );
+                assert_eq!(
+                    &grids.park_plane(7).unwrap()[235_775..235_778],
+                    &[30, 60, 90]
+                );
+            }
         }
     }
 

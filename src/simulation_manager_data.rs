@@ -1,5 +1,4 @@
 use crate::CrpError;
-use crate::DistrictManagerFlagsPrefix;
 use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
 use crate::InstanceManagerEditor;
@@ -22,6 +21,7 @@ use crate::{
     BuildingRaceTeamUnassignedPrefix, BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
 };
 use crate::{BuildingEconomicFieldsEditor, BuildingPopulationEditor, BuildingTimerGeometryEditor};
+use crate::{DistrictManagerFlagsPrefix, DistrictManagerGridData};
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
     NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
@@ -873,6 +873,28 @@ impl SimulationManagerData {
             .checked_add(body_len)
             .ok_or(CrpError::ArithmeticOverflow("DistrictManager prefix end"))?;
         Ok((districts, end))
+    }
+
+    /// Decodes the district and park grids after supported type-0 park records.
+    ///
+    /// This requires the park-record decoder's inner-version and park-type
+    /// support. The returned graph offset points after the grids, before the
+    /// following versioned manager objects. Unchanged grid bytes are retained.
+    pub fn decode_district_manager_grids(
+        &self,
+    ) -> Result<(DistrictManagerGridData, usize), CrpError> {
+        let (prefix, park_start) = self.decode_district_manager_flags_prefix()?;
+        let graph = &self.serialized_object_graph;
+        let (_, park_len) = prefix.decode_type_zero_park_records(&graph[park_start..])?;
+        let grid_start = park_start
+            .checked_add(park_len)
+            .ok_or(CrpError::ArithmeticOverflow("DistrictManager grid start"))?;
+        let (grids, grid_len) =
+            DistrictManagerGridData::decode(self.format_version, &graph[grid_start..])?;
+        let grid_end = grid_start
+            .checked_add(grid_len)
+            .ok_or(CrpError::ArithmeticOverflow("DistrictManager grid end"))?;
+        Ok((grids, grid_end))
     }
 
     /// Decodes the first two BuildingManager flag arrays after the NetManager body.
@@ -2016,6 +2038,22 @@ mod manager_boundary_tests {
         assert_eq!(districts.district_flags(), &[0; 128]);
         assert_eq!(districts.park_flags(), &[0; 128]);
         assert_eq!(district_end, data.serialized_object_graph().len());
+    }
+
+    #[test]
+    fn district_grid_lookup_follows_the_park_records() {
+        let mut data = synthetic_manager_data();
+        let grid_start = data.serialized_object_graph.len();
+        // Each 0xff EncodedArray.Byte control reconstructs 128 zero values.
+        data.serialized_object_graph
+            .extend(vec![0xff; 2 * 8 * 262_144 / 128]);
+
+        let (grids, grid_end) = data.decode_district_manager_grids().unwrap();
+        assert_eq!(grid_end, data.serialized_object_graph.len());
+        assert_eq!(grid_end - grid_start, 32_768);
+        assert_eq!(grids.district_plane(0).unwrap()[0], 0);
+        assert_eq!(grids.park_plane(7).unwrap()[262_143], 0);
+        assert_eq!(grids.encode(), data.serialized_object_graph()[grid_start..]);
     }
 
     #[test]
