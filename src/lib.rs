@@ -41,7 +41,7 @@ pub use building_manager_data::{
 pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictManagerFlagsPrefix,
-    DistrictPopulationRecord,
+    DistrictPopulationRecord, DistrictPrivateDataBlock, DistrictPrivateDataKind,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
@@ -3923,6 +3923,17 @@ mod tests {
                                 .all(|record| {
                                     record.final_crime_rate().is_some()
                                         == (districts.format_version() >= 203)
+                                        && record.last_average_lifespan().is_some()
+                                            == (districts.format_version() >= 113_006)
+                                        && record.private_data().len() == 5
+                                        && record.private_data().iter().all(|block| {
+                                            block.as_bytes().len()
+                                                == if districts.format_version() >= 256 {
+                                                    79
+                                                } else {
+                                                    75
+                                                }
+                                        })
                                 })
                         );
                         assert!(districts_end < manager_data.serialized_object_graph().len());

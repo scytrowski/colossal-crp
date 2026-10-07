@@ -17,15 +17,29 @@ const DISTRICT_CRIME_RATE_VERSION: u32 = 203;
 const DISTRICT_ELIGIBLE_AGE_VERSION: u32 = 112_031;
 const DISTRICT_DETAILED_AGE_VERSION: u32 = 113_003;
 const DISTRICT_DEAD_SENIORS_VERSION: u32 = 113_006;
+const DISTRICT_VISITOR_DATA_VERSION: u32 = 71;
+const DISTRICT_PRIVATE_LEVELS_VERSION: u32 = 117;
+const DISTRICT_PRIVATE_HEALTH_VERSION: u32 = 142;
+const DISTRICT_PRIVATE_BUILDING_COUNTS_VERSION: u32 = 143;
+const DISTRICT_PRIVATE_ALIVE_COUNT_VERSION: u32 = 145;
+const DISTRICT_PRIVATE_CRIME_RATE_VERSION: u32 = 181;
+const DISTRICT_PRIVATE_COLLAPSED_COUNT_VERSION: u32 = 256;
 const POLICY_COUNT: usize = 32;
 const POPULATION_DELTA_COUNT: usize = 16;
+const PRIVATE_DATA_BASE_BYTES: usize = 21;
+const PRIVATE_DATA_LEVEL_BYTES: usize = 20;
+const PRIVATE_DATA_HEALTH_BYTES: usize = 5;
+const PRIVATE_DATA_BUILDING_BYTES: usize = 18;
+const PRIVATE_DATA_ALIVE_BYTES: usize = 6;
+const PRIVATE_DATA_CRIME_BYTES: usize = 5;
+const PRIVATE_DATA_COLLAPSED_BYTES: usize = 4;
 
 /// The initial known fields from `DistrictManager+Data`.
 ///
 /// The policy bool values are retained in serialized order: category first,
 /// then policy bit 0–31, then district or park index 0–127. Active district
-/// population fields are decoded through final happiness and the versioned
-/// crime-rate byte. Original bytes are retained for exact unchanged writing.
+/// population and age fields are decoded, followed by the versioned district
+/// private-data blocks. Original bytes are retained for exact unchanged writing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictManagerFlagsPrefix {
     format_version: u32,
@@ -53,6 +67,36 @@ pub struct DistrictPopulationRecord {
     final_crime_rate: Option<u8>,
     age_populations: Vec<DistrictAgePopulation>,
     last_average_lifespan: Option<i8>,
+    private_data: Vec<DistrictPrivateDataBlock>,
+}
+
+/// A raw, version-bounded `DistrictPrivateData` block for one district.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictPrivateDataBlock {
+    kind: DistrictPrivateDataKind,
+    bytes: Vec<u8>,
+}
+
+impl DistrictPrivateDataBlock {
+    /// Returns which district category this block belongs to.
+    pub fn kind(&self) -> DistrictPrivateDataKind {
+        self.kind
+    }
+
+    /// Returns the exact serialized bytes for this currently opaque block.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// The district category for a private population and building-statistics block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistrictPrivateDataKind {
+    Residential,
+    Commercial,
+    Visitor,
+    Industrial,
+    Office,
 }
 
 /// A named pair of temporary and final age-group counts in a district.
@@ -134,14 +178,19 @@ impl DistrictPopulationRecord {
     pub fn last_average_lifespan(&self) -> Option<i8> {
         self.last_average_lifespan
     }
+
+    /// Returns the exact private-data blocks in serialized category order.
+    pub fn private_data(&self) -> &[DistrictPrivateDataBlock] {
+        &self.private_data
+    }
 }
 
 impl DistrictManagerFlagsPrefix {
     /// Decodes the opening fields and both known policy bool streams.
     ///
     /// This prefix supports inner versions 164 and newer. It stops before the
-    /// district private and service data that follow population fields. Truncated or
-    /// malformed fields return an error.
+    /// player and specialization data that follow the district private-data blocks.
+    /// Truncated or malformed fields return an error.
     pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         if format_version < 164 {
             return Err(invalid_district_manager(
@@ -243,6 +292,34 @@ impl DistrictManagerFlagsPrefix {
                     age_populations.push(read_district_age_population(&mut reader, category)?);
                 }
             }
+            let mut private_data = Vec::with_capacity(5);
+            for kind in [
+                DistrictPrivateDataKind::Residential,
+                DistrictPrivateDataKind::Commercial,
+            ] {
+                private_data.push(read_district_private_data(
+                    &mut reader,
+                    format_version,
+                    kind,
+                )?);
+            }
+            if format_version >= DISTRICT_VISITOR_DATA_VERSION {
+                private_data.push(read_district_private_data(
+                    &mut reader,
+                    format_version,
+                    DistrictPrivateDataKind::Visitor,
+                )?);
+            }
+            for kind in [
+                DistrictPrivateDataKind::Industrial,
+                DistrictPrivateDataKind::Office,
+            ] {
+                private_data.push(read_district_private_data(
+                    &mut reader,
+                    format_version,
+                    kind,
+                )?);
+            }
             district_population_records.push(DistrictPopulationRecord {
                 district_index,
                 random_seed,
@@ -253,6 +330,7 @@ impl DistrictManagerFlagsPrefix {
                 final_crime_rate,
                 age_populations,
                 last_average_lifespan,
+                private_data,
             });
         }
         let consumed = reader.offset();
@@ -345,6 +423,40 @@ fn read_district_age_population(
         temporary: reader.read_u24_be()?,
         final_count: reader.read_u24_be()?,
     })
+}
+
+fn read_district_private_data(
+    reader: &mut Reader<'_>,
+    format_version: u32,
+    kind: DistrictPrivateDataKind,
+) -> Result<DistrictPrivateDataBlock, CrpError> {
+    let bytes = reader
+        .read_bytes(district_private_data_size(format_version))?
+        .to_vec();
+    Ok(DistrictPrivateDataBlock { kind, bytes })
+}
+
+fn district_private_data_size(format_version: u32) -> usize {
+    let mut size = PRIVATE_DATA_BASE_BYTES;
+    if format_version >= DISTRICT_PRIVATE_LEVELS_VERSION {
+        size += PRIVATE_DATA_LEVEL_BYTES;
+    }
+    if format_version >= DISTRICT_PRIVATE_HEALTH_VERSION {
+        size += PRIVATE_DATA_HEALTH_BYTES;
+    }
+    if format_version >= DISTRICT_PRIVATE_BUILDING_COUNTS_VERSION {
+        size += PRIVATE_DATA_BUILDING_BYTES;
+    }
+    if format_version >= DISTRICT_PRIVATE_ALIVE_COUNT_VERSION {
+        size += PRIVATE_DATA_ALIVE_BYTES;
+    }
+    if format_version >= DISTRICT_PRIVATE_CRIME_RATE_VERSION {
+        size += PRIVATE_DATA_CRIME_BYTES;
+    }
+    if format_version >= DISTRICT_PRIVATE_COLLAPSED_COUNT_VERSION {
+        size += PRIVATE_DATA_COLLAPSED_BYTES;
+    }
+    size
 }
 
 fn district_policy_bool_count(format_version: u32) -> Result<usize, CrpError> {
@@ -542,6 +654,17 @@ mod tests {
                     append_age_pair(&mut bytes, index as u32 + 1);
                 }
             }
+            let private_kinds = [
+                super::DistrictPrivateDataKind::Residential,
+                super::DistrictPrivateDataKind::Commercial,
+                super::DistrictPrivateDataKind::Visitor,
+                super::DistrictPrivateDataKind::Industrial,
+                super::DistrictPrivateDataKind::Office,
+            ];
+            let private_size = super::district_private_data_size(version);
+            for (index, _) in private_kinds.iter().enumerate() {
+                bytes.extend(std::iter::repeat_n(index as u8 + 1, private_size));
+            }
 
             let (prefix, used) =
                 DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
@@ -567,6 +690,13 @@ mod tests {
                 record.last_average_lifespan(),
                 (version >= super::DISTRICT_DEAD_SENIORS_VERSION).then_some(-7)
             );
+            assert_eq!(record.private_data().len(), private_kinds.len());
+            for ((block, expected_kind), index) in
+                record.private_data().iter().zip(private_kinds).zip(0_u8..)
+            {
+                assert_eq!(block.kind(), expected_kind);
+                assert_eq!(block.as_bytes(), vec![index + 1; private_size]);
+            }
             assert_eq!(prefix.encode(), bytes);
         }
     }
