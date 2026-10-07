@@ -9,9 +9,9 @@ use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
-    BuildingFlagsPrefix, BuildingManagerObjectHeadersPrefix, BuildingPopulationPrefix,
-    BuildingPrefabPrefix, BuildingProblemPrefix, BuildingServiceSelectionPrefix,
-    BuildingTimerGeometryPrefix,
+    BuildingFlagsPrefix, BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
+    BuildingManagerObjectHeadersPrefix, BuildingPopulationPrefix, BuildingPrefabPrefix,
+    BuildingProblemPrefix, BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
 };
 use crate::{BuildingEconomicFieldsEditor, BuildingPopulationEditor, BuildingTimerGeometryEditor};
 use crate::{
@@ -892,6 +892,26 @@ impl SimulationManagerData {
         Ok((data, reader.offset()))
     }
 
+    /// Decodes direct per-active-building records after service-selection tables.
+    /// The returned graph offset is before later BuildingManager arrays and queued objects.
+    pub fn decode_building_instance_records_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingInstanceRecordsPrefix, usize), CrpError> {
+        let (_, selections_end) =
+            self.decode_building_service_selection_prefix(save_app_version)?;
+        let (flags, _) = self.decode_building_flags_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(selections_end)?;
+        let (data, used) = BuildingInstanceRecordsPrefix::decode_prefix(
+            self.format_version,
+            &flags,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
     fn building_manager_shared_strings(
         &self,
         save_app_version: Option<u32>,
@@ -1013,6 +1033,45 @@ impl SimulationManagerData {
             return Err(invalid(
                 body_start,
                 "BuildingManager economic fields extend past manager graph",
+            ));
+        }
+        self.serialized_object_graph
+            .splice(body_start..graph_end, replacement);
+        Ok(())
+    }
+
+    /// Replaces direct building records while preserving later BuildingManager bytes.
+    pub fn replace_building_instance_records(
+        &mut self,
+        edited: &BuildingInstanceRecordsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited BuildingManager instance-record version does not match this stream",
+            ));
+        }
+        let (original, graph_end) =
+            self.decode_building_instance_records_prefix(save_app_version)?;
+        if edited.record_count() != original.records().len() {
+            return Err(invalid(
+                0,
+                "edited BuildingManager instance-record count does not match this stream",
+            ));
+        }
+        let original_bytes = original.encode();
+        let body_start =
+            graph_end
+                .checked_sub(original_bytes.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager instance-record body start",
+                ))?;
+        let replacement = edited.encode()?;
+        if graph_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager instance records extend past manager graph",
             ));
         }
         self.serialized_object_graph

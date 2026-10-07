@@ -23,7 +23,8 @@ mod water_simulation_data;
 
 pub use building_manager_data::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsEditor,
-    BuildingEconomicFieldsPrefix, BuildingFlag, BuildingFlagsPrefix,
+    BuildingEconomicFieldsPrefix, BuildingFlag, BuildingFlagsPrefix, BuildingInstanceRecord,
+    BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
     BuildingPrefabPrefix, BuildingProblemPrefix, BuildingProblemWords, BuildingServiceSelection,
     BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
@@ -3776,6 +3777,7 @@ mod tests {
         let mut checked_building_population_convenience = false;
         let mut checked_building_economic_convenience = false;
         let mut checked_building_selection_convenience = false;
+        let mut checked_building_records_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
@@ -4497,6 +4499,52 @@ mod tests {
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_building_selection_convenience = true;
                         }
+                        let instance_records_start = net_reader.offset();
+                        let (instance_records, instance_records_used) =
+                            BuildingInstanceRecordsPrefix::decode_prefix(
+                                version,
+                                &building_flags,
+                                net_reader.remaining_bytes(),
+                            )?;
+                        net_reader.read_bytes(instance_records_used)?;
+                        assert_eq!(
+                            instance_records.encode(),
+                            &net_reader.consumed_bytes()[instance_records_start
+                                ..instance_records_start + instance_records_used]
+                        );
+                        if !checked_building_records_convenience
+                            && !instance_records.records().is_empty()
+                        {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_instance_records_prefix(
+                                    metadata.save_app_version,
+                                )?;
+                            assert_eq!(via_manager, instance_records);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+
+                            let mut edited_manager = manager_data.clone();
+                            let mut editor = instance_records.clone().into_editor();
+                            editor.records_mut()[0].angle_bits ^= 1;
+                            let original_suffix =
+                                manager_data.serialized_object_graph()[graph_end..].to_vec();
+                            edited_manager.replace_building_instance_records(
+                                &editor,
+                                metadata.save_app_version,
+                            )?;
+                            let (rewritten, rewritten_end) = edited_manager
+                                .decode_building_instance_records_prefix(
+                                    metadata.save_app_version,
+                                )?;
+                            assert_eq!(
+                                rewritten.records()[0].angle_bits,
+                                editor.records_mut()[0].angle_bits
+                            );
+                            assert_eq!(
+                                &edited_manager.serialized_object_graph()[rewritten_end..],
+                                original_suffix
+                            );
+                            checked_building_records_convenience = true;
+                        }
                         if std::env::var_os("CRP_EXTRACT_BUILDING_BYTE_STATE_FIXTURE").is_some()
                             && path
                                 .file_name()
@@ -4593,6 +4641,7 @@ mod tests {
         assert!(checked_building_population_convenience);
         assert!(checked_building_economic_convenience);
         assert!(checked_building_selection_convenience);
+        assert!(checked_building_records_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(

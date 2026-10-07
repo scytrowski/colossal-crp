@@ -289,6 +289,36 @@ pub struct BuildingServiceSelectionPrefix {
     serialized_prefix: Vec<u8>,
 }
 
+/// Directly serialized fields for one active BuildingManager entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildingInstanceRecord {
+    /// Building prefab/build index.
+    pub building_index: u32,
+    /// IEEE-754 bit patterns for the x, y, and z coordinates.
+    pub position_bits: [u32; 3],
+    /// IEEE-754 bit pattern for the building angle.
+    pub angle_bits: u32,
+    /// Base height byte.
+    pub base_height: u8,
+    /// 24-bit citizen-unit index.
+    pub citizen_units: u32,
+}
+
+/// Direct per-active-building records after service-selection tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingInstanceRecordsPrefix {
+    format_version: u32,
+    records: Vec<BuildingInstanceRecord>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Editable direct per-active-building records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingInstanceRecordsEditor {
+    format_version: u32,
+    records: Vec<BuildingInstanceRecord>,
+}
+
 impl BuildingBufferFieldsPrefix {
     /// Decodes versioned network, utility, and byte fields for active buildings.
     ///
@@ -1501,6 +1531,137 @@ impl BuildingServiceSelectionPrefix {
     }
 }
 
+impl BuildingInstanceRecordsPrefix {
+    /// Decodes fixed-layout records for every building with nonzero primary flags.
+    ///
+    /// The supported 164+ stream layout uses `u32`, three float bit patterns,
+    /// one byte, and a 24-bit citizen-unit index per active building.
+    pub fn decode_prefix(
+        format_version: u32,
+        flags: &BuildingFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || flags.format_version() != format_version {
+            return Err(invalid_building_records(
+                "unsupported or mismatched inner version",
+            ));
+        }
+        let count = flags
+            .building_flags()
+            .iter()
+            .filter(|building| building.flags != 0)
+            .count();
+        let expected_bytes = count.checked_mul(24).ok_or(CrpError::ArithmeticOverflow(
+            "BuildingManager instance-record byte count",
+        ))?;
+        let mut reader = Reader::new(bytes);
+        if expected_bytes > reader.remaining() {
+            return Err(reader.invalid("truncated BuildingManager instance records"));
+        }
+        let mut records = Vec::with_capacity(count);
+        for _ in 0..count {
+            records.push(BuildingInstanceRecord {
+                building_index: reader.read_u32_be()?,
+                position_bits: [
+                    reader.read_u32_be()?,
+                    reader.read_u32_be()?,
+                    reader.read_u32_be()?,
+                ],
+                angle_bits: reader.read_u32_be()?,
+                base_height: reader.read_u8()?,
+                citizen_units: reader.read_u24_be()?,
+            });
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                records,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns records in active primary-flag order.
+    pub fn records(&self) -> &[BuildingInstanceRecord] {
+        &self.records
+    }
+    /// Writes original record bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+    /// Creates an editor for record fields.
+    pub fn into_editor(self) -> BuildingInstanceRecordsEditor {
+        BuildingInstanceRecordsEditor {
+            format_version: self.format_version,
+            records: self.records,
+        }
+    }
+}
+
+impl BuildingInstanceRecordsEditor {
+    /// Returns the inner DataSerializer version associated with these records.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns editable records in active primary-flag order.
+    pub fn records_mut(&mut self) -> &mut [BuildingInstanceRecord] {
+        &mut self.records
+    }
+    /// Returns the number of editable active-building records.
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+    /// Encodes records in the fixed 24-byte layout used by inner version 164+.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.format_version < 164 {
+            return Err(invalid_building_records("unsupported inner version"));
+        }
+        if self
+            .records
+            .iter()
+            .any(|record| record.citizen_units > 0x00ff_ffff)
+        {
+            return Err(invalid_building_records(
+                "citizen-unit index does not fit in 24 bits",
+            ));
+        }
+        let capacity = self
+            .records
+            .len()
+            .checked_mul(24)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "BuildingManager instance-record byte count",
+            ))?;
+        let mut output = Vec::with_capacity(capacity);
+        for record in &self.records {
+            output.extend_from_slice(&record.building_index.to_be_bytes());
+            for position in record.position_bits {
+                output.extend_from_slice(&position.to_be_bytes());
+            }
+            output.extend_from_slice(&record.angle_bits.to_be_bytes());
+            output.push(record.base_height);
+            output.push((record.citizen_units >> 16) as u8);
+            output.push((record.citizen_units >> 8) as u8);
+            output.push(record.citizen_units as u8);
+        }
+        Ok(output)
+    }
+}
+
+fn invalid_building_records(reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "BuildingManager instance records".to_owned(),
+        offset: 0,
+        reason: reason.into(),
+    }
+}
+
 fn read_service_selection_table(
     reader: &mut Reader<'_>,
     shared_strings: &mut Vec<Option<String>>,
@@ -1784,10 +1945,81 @@ impl BuildingManagerObjectHeadersPrefix {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildingEconomicFieldsPrefix, BuildingFlag, BuildingFlagsPrefix, BuildingPopulationEditor,
-        BuildingPopulationPrefix, BuildingServiceSelectionPrefix, BuildingTimerField,
-        BuildingTimerGeometryEditor, fixed_object_header_count, timer_fields_for_version,
+        BuildingEconomicFieldsPrefix, BuildingFlag, BuildingFlagsPrefix,
+        BuildingInstanceRecordsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
+        BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
+        fixed_object_header_count, timer_fields_for_version,
     };
+
+    #[test]
+    fn building_instance_records_decode_and_encode_exact_big_endian_fields() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 164,
+            building_flags: vec![
+                BuildingFlag {
+                    index: 1,
+                    flags: 1,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 2,
+                    flags: 0,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 3,
+                    flags: 2,
+                    flags2: 0,
+                },
+            ],
+            serialized_prefix: Vec::new(),
+        };
+        let bytes = [
+            0x00, 0x00, 0x08, 0x55, 0x3f, 0x80, 0x00, 0x00, 0xc0, 0x20, 0x00, 0x00, 0x40, 0x48,
+            0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x07, 0x12, 0x34, 0x56, 0x00, 0x00, 0x09, 0xaa,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0xbf, 0x80,
+            0x00, 0x00, 0x08, 0xab, 0xcd, 0xef,
+        ];
+        let (decoded, consumed) = BuildingInstanceRecordsPrefix::decode_prefix(164, &flags, &bytes)
+            .expect("valid records decode");
+        assert_eq!(consumed, 48);
+        assert_eq!(decoded.encode(), bytes);
+        assert_eq!(decoded.records()[0].building_index, 0x855);
+        assert_eq!(
+            decoded.records()[0].position_bits,
+            [0x3f80_0000, 0xc020_0000, 0x4048_0000]
+        );
+        assert_eq!(decoded.records()[0].angle_bits, 0x3f00_0000);
+        assert_eq!(decoded.records()[0].base_height, 7);
+        assert_eq!(decoded.records()[0].citizen_units, 0x123456);
+        assert_eq!(decoded.records()[1].building_index, 0x9aa);
+        assert_eq!(decoded.records()[1].citizen_units, 0xabcdef);
+
+        let mut editor = decoded.into_editor();
+        editor.records_mut()[0].angle_bits = 0x4000_0000;
+        let edited = editor.encode().expect("edited records encode");
+        assert_eq!(&edited[16..20], &[0x40, 0x00, 0x00, 0x00]);
+        assert_eq!(edited.len(), 48);
+    }
+
+    #[test]
+    fn building_instance_records_reject_truncation_and_oversized_u24() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 164,
+            building_flags: vec![BuildingFlag {
+                index: 1,
+                flags: 1,
+                flags2: 0,
+            }],
+            serialized_prefix: Vec::new(),
+        };
+        assert!(BuildingInstanceRecordsPrefix::decode_prefix(164, &flags, &[0; 23]).is_err());
+        let (decoded, _) = BuildingInstanceRecordsPrefix::decode_prefix(164, &flags, &[0; 24])
+            .expect("zero record decodes");
+        let mut editor = decoded.into_editor();
+        editor.records_mut()[0].citizen_units = 0x0100_0000;
+        assert!(editor.encode().is_err());
+    }
 
     #[test]
     fn building_object_header_count_tracks_version_gates() {

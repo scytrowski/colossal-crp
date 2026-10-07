@@ -154,6 +154,11 @@ impl<'a> Reader<'a> {
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
+    pub(crate) fn read_u24_be(&mut self) -> Result<u32, CrpError> {
+        let bytes = self.read_bytes(3)?;
+        Ok((u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]))
+    }
+
     pub(crate) fn read_i16_be(&mut self) -> Result<i16, CrpError> {
         Ok(self.read_u16_be()? as i16)
     }
