@@ -41,7 +41,7 @@ pub use building_manager_data::{
 pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictDemographicBlock, DistrictDemographicKind,
-    DistrictHotelBlock, DistrictManagerFlagsPrefix, DistrictPopulationRecord,
+    DistrictHotelBlock, DistrictManagerFlagsPrefix, DistrictParkRecord, DistrictPopulationRecord,
     DistrictPrivateDataBlock, DistrictPrivateDataKind, DistrictSpecializationBlock,
     DistrictSpecializationKind, DistrictStatisticsBlock, DistrictStatisticsKind,
     DistrictSubCultureBlock, DistrictSubCultureKind, DistrictTourismBlock, DistrictTourismKind,
