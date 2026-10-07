@@ -314,7 +314,7 @@ impl DistrictParkRecord {
         self.park_index
     }
 
-    /// Returns the serialized park type (0–9 in the current reader).
+    /// Returns the serialized park type (0–9 or 14 in the current reader).
     pub fn park_type(&self) -> u8 {
         self.park_type
     }
@@ -1132,7 +1132,7 @@ impl DistrictManagerFlagsPrefix {
         &self.district_population_records
     }
 
-    /// Decodes park types 0–9 in buffer order from the bytes after this prefix.
+    /// Decodes park types 0–9 and 14 in buffer order from the bytes after this prefix.
     ///
     /// Active records are supported for inner versions 110025–118011.
     /// An empty park buffer is supported from inner version 164 onward because
@@ -1144,7 +1144,7 @@ impl DistrictManagerFlagsPrefix {
         &self,
         bytes: &[u8],
     ) -> Result<(Vec<DistrictParkRecord>, usize), CrpError> {
-        self.decode_park_records_with_type_limit(bytes, 9)
+        self.decode_park_records_with_type_limit(bytes, 14)
     }
 
     /// Decodes only type-0 park records, retaining the previous strict scope.
@@ -1193,7 +1193,7 @@ impl DistrictManagerFlagsPrefix {
                 invalid_district_manager(offset, format!("park {park_index} record: {error}"))
             })?;
             let park_type = fixed[type_offset];
-            if park_type > maximum_type {
+            if park_type > maximum_type || (10..=13).contains(&park_type) {
                 return Err(invalid_district_manager(
                     offset + type_offset,
                     format!("park {park_index} has unsupported type {park_type}"),
@@ -1232,6 +1232,16 @@ impl DistrictManagerFlagsPrefix {
                         format!("park {park_index} campus block: {error}"),
                     )
                 })?;
+            }
+            if park_type == 14 {
+                reader
+                    .read_bytes(airport_park_bytes(self.format_version))
+                    .map_err(|error| {
+                        invalid_district_manager(
+                            offset + reader.offset(),
+                            format!("park {park_index} airport fields: {error}"),
+                        )
+                    })?;
             }
             let end = offset
                 .checked_add(reader.offset())
@@ -1279,6 +1289,14 @@ fn park_scalar_bytes(format_version: u32) -> usize {
         bytes += 8; // u32 production and two u16 worker counts.
     }
     bytes
+}
+
+fn airport_park_bytes(format_version: u32) -> usize {
+    usize::from(format_version >= 114_000) * 4
+        + usize::from(format_version >= 114_004) * 8
+        + usize::from(format_version >= 114_008) * 3
+        + usize::from(format_version >= 114_010) * 8
+        + usize::from(format_version >= 114_011) * 8
 }
 
 fn read_district_age_population(
@@ -1803,6 +1821,82 @@ mod tests {
         assert!(
             prefix
                 .decode_park_records(&bytes[..expected_len - 1])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn airport_park_fields_follow_each_version_gate() {
+        for (version, airport_bytes) in [
+            (114_000, 4),
+            (114_003, 4),
+            (114_004, 12),
+            (114_007, 12),
+            (114_008, 15),
+            (114_009, 15),
+            (114_010, 23),
+            (114_011, 31),
+        ] {
+            assert_eq!(super::airport_park_bytes(version), airport_bytes);
+            let mut prefix_bytes = Vec::new();
+            if version >= AIRLINE_NAME_VERSION {
+                write_unique_string(&mut prefix_bytes, "").unwrap();
+            }
+            if version >= AIRPORT_PANEL_VERSION {
+                prefix_bytes.push(0);
+            }
+            zero_flags(&mut prefix_bytes);
+            let mut park_flags = [0_u32; DISTRICT_COUNT];
+            park_flags[5] = 1;
+            write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+            zero_policy_bools(&mut prefix_bytes, version);
+            let (prefix, _) =
+                DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+            let mut record = vec![0; super::park_scalar_bytes(version)];
+            record[42] = 14;
+            record.extend(vec![0x5a; airport_bytes]);
+            let mut bytes = record.clone();
+            bytes.push(0xff);
+            let (parks, used) = prefix.decode_park_records(&bytes).unwrap();
+            assert_eq!(used, record.len());
+            assert_eq!(parks[0].park_type(), 14);
+            assert_eq!(parks[0].encode(), record);
+            assert_eq!(bytes[used], 0xff);
+            assert!(
+                prefix
+                    .decode_park_records(&record[..record.len() - 1])
+                    .is_err()
+            );
+            for unsupported in [10, 11, 12, 13, 15] {
+                record[42] = unsupported;
+                assert!(prefix.decode_park_records(&record).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn airport_fields_follow_slot_zero_campus_compatibility_block() {
+        let version = 114_011;
+        let mut prefix_bytes = Vec::new();
+        write_unique_string(&mut prefix_bytes, "").unwrap();
+        prefix_bytes.push(0);
+        zero_flags(&mut prefix_bytes);
+        let mut park_flags = [0_u32; DISTRICT_COUNT];
+        park_flags[0] = 1;
+        write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+        zero_policy_bools(&mut prefix_bytes, version);
+        let (prefix, _) =
+            DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+        let mut record = vec![0; super::park_scalar_bytes(version)];
+        record[42] = 14;
+        record.extend_from_slice(&zero_slot_zero_campus());
+        record.extend([0x5a; 31]);
+        let (parks, used) = prefix.decode_park_records(&record).unwrap();
+        assert_eq!(used, record.len());
+        assert_eq!(parks[0].encode(), record);
+        assert!(
+            prefix
+                .decode_park_records(&record[..record.len() - 1])
                 .is_err()
         );
     }
