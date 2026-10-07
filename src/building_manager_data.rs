@@ -3,7 +3,8 @@ use crate::data_serializer::Reader;
 use crate::encoded_array::{
     read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
     read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
-    write_encoded_int_array, write_encoded_uint_array, write_encoded_ushort_array,
+    write_encoded_int_array, write_encoded_uint_array, write_encoded_ulong_array,
+    write_encoded_ushort_array,
 };
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 
@@ -73,6 +74,14 @@ pub struct BuildingProblemPrefix {
     format_version: u32,
     problems: Vec<BuildingProblemWords>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editable opaque problem-state words for active buildings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingProblemEditor {
+    format_version: u32,
+    active_indices: Vec<u16>,
+    problems: Vec<BuildingProblemWords>,
 }
 
 /// Per-building buffer indices and byte fields following problem state.
@@ -1840,6 +1849,114 @@ impl BuildingProblemPrefix {
     /// Writes the original encoded array exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+    /// Creates an editor for the decoded problem words.
+    pub fn into_editor(self) -> BuildingProblemEditor {
+        BuildingProblemEditor {
+            format_version: self.format_version,
+            active_indices: self.problems.iter().map(|problem| problem.index).collect(),
+            problems: self.problems,
+        }
+    }
+}
+
+impl BuildingProblemEditor {
+    /// Returns the inner DataSerializer version associated with these words.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns editable opaque problem words in active-building order.
+    /// Changing a record's index is rejected during encoding because flags
+    /// determine the index-to-record mapping.
+    pub fn problems_mut(&mut self) -> &mut [BuildingProblemWords] {
+        &mut self.problems
+    }
+
+    /// Returns the number of active-building problem records.
+    pub fn problem_count(&self) -> usize {
+        self.problems.len()
+    }
+
+    /// Encodes words using the version and saved-application gates from the game.
+    /// Legacy 32-bit values are accepted only when the widened representation
+    /// contains no bits that the old format cannot preserve.
+    pub fn encode(&self, save_app_version: Option<u32>) -> Result<Vec<u8>, CrpError> {
+        if self.format_version < 164 {
+            return Err(invalid_building_problems("unsupported inner version"));
+        }
+        if self.problems.len() != self.active_indices.len()
+            || self
+                .problems
+                .iter()
+                .zip(&self.active_indices)
+                .any(|(problem, index)| problem.index != *index)
+        {
+            return Err(invalid_building_problems(
+                "problem record indices do not match the active-building order",
+            ));
+        }
+        let mut output = Vec::new();
+        if self.format_version >= TWO_BUILDING_PROBLEMS_VERSION {
+            let value_count =
+                self.problems
+                    .len()
+                    .checked_mul(2)
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "BuildingManager problem word count",
+                    ))?;
+            let mut values = Vec::with_capacity(value_count);
+            for problem in &self.problems {
+                values.push(problem.first);
+                values.push(problem.second);
+            }
+            write_encoded_ulong_array(&mut output, &values);
+        } else if (221..TWO_BUILDING_PROBLEMS_VERSION).contains(&self.format_version)
+            && save_app_version.is_none()
+        {
+            return Err(invalid_building_problems(
+                "save-app version is required for the legacy problem encoding",
+            ));
+        } else if (221..TWO_BUILDING_PROBLEMS_VERSION).contains(&self.format_version)
+            && save_app_version.is_some_and(|version| version >= SAVE_APP_PROBLEMS_VERSION)
+        {
+            if self.problems.iter().any(|problem| problem.second != 0) {
+                return Err(invalid_building_problems(
+                    "legacy single-word problem encoding cannot store the second word",
+                ));
+            }
+            write_encoded_ulong_array(
+                &mut output,
+                &self
+                    .problems
+                    .iter()
+                    .map(|problem| problem.first)
+                    .collect::<Vec<_>>(),
+            );
+        } else {
+            const LEGACY_WORD_MASK: u64 = 0xc000_0000_3fff_ffff;
+            let mut values = Vec::with_capacity(self.problems.len());
+            for problem in &self.problems {
+                if problem.second != 0 || problem.first & !LEGACY_WORD_MASK != 0 {
+                    return Err(invalid_building_problems(
+                        "problem word cannot be represented by the legacy 32-bit encoding",
+                    ));
+                }
+                let value = ((problem.first >> 32) as u32 & 0xc000_0000)
+                    | (problem.first as u32 & 0x3fff_ffff);
+                values.push(value);
+            }
+            write_encoded_uint_array(&mut output, &values);
+        }
+        Ok(output)
+    }
+}
+
+fn invalid_building_problems(reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "BuildingManager problem words".to_owned(),
+        offset: 0,
+        reason: reason.into(),
     }
 }
 

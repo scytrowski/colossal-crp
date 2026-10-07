@@ -58,6 +58,16 @@ pub(crate) fn write_encoded_uint_array(output: &mut Vec<u8>, values: &[u32]) {
     }
 }
 
+/// Writes unsigned 64-bit values as canonical EncodedArray literal blocks.
+pub(crate) fn write_encoded_ulong_array(output: &mut Vec<u8>, values: &[u64]) {
+    for chunk in values.chunks(64) {
+        output.push((chunk.len() - 1) as u8);
+        for value in chunk {
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+
 /// Writes signed 32-bit values using the unsigned codec's identical bit layout.
 pub(crate) fn write_encoded_int_array(output: &mut Vec<u8>, values: &[i32]) {
     for chunk in values.chunks(64) {

@@ -26,9 +26,9 @@ pub use building_manager_data::{
     BuildingEconomicFieldsPrefix, BuildingFlag, BuildingFlagsPrefix, BuildingInstanceRecord,
     BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
-    BuildingPrefabPrefix, BuildingProblemPrefix, BuildingProblemWords, BuildingServiceSelection,
-    BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
-    BuildingTimerGeometryPrefix,
+    BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix, BuildingProblemWords,
+    BuildingServiceSelection, BuildingServiceSelectionPrefix, BuildingTimerField,
+    BuildingTimerGeometryEditor, BuildingTimerGeometryPrefix,
 };
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
@@ -2608,6 +2608,11 @@ mod tests {
         assert_eq!(modern.problems()[0].first, 0x0123_4567_89ab_cdef);
         assert_eq!(modern.problems()[0].second, 0);
         assert_eq!(modern.encode(), one_ulong);
+        let mut modern_editor = modern.clone().into_editor();
+        modern_editor.problems_mut()[0].first = 0xfedc_ba98_7654_3210;
+        let mut expected_ulong = vec![0];
+        expected_ulong.extend_from_slice(&0xfedc_ba98_7654_3210_u64.to_be_bytes());
+        assert_eq!(modern_editor.encode(Some(save_app_gate))?, expected_ulong);
 
         let one_uint = [0, 0xc0, 0, 0, 1];
         let (legacy, legacy_used) = BuildingProblemPrefix::decode_prefix(
@@ -2620,6 +2625,35 @@ mod tests {
         assert_eq!(legacy.problems()[0].first, 0xc000_0000_0000_0001);
         assert_eq!(legacy.problems()[0].second, 0);
         assert_eq!(legacy.encode(), one_uint);
+        let mut legacy_editor = legacy.clone().into_editor();
+        legacy_editor.problems_mut()[0].first = 0xc000_0000_0000_0002;
+        assert_eq!(
+            legacy_editor.encode(Some(save_app_gate - 1))?,
+            [0, 0xc0, 0, 0, 2]
+        );
+        legacy_editor.problems_mut()[0].first |= 1_u64 << 40;
+        assert!(legacy_editor.encode(Some(save_app_gate - 1)).is_err());
+        let mut remapped_legacy_editor = legacy.clone().into_editor();
+        remapped_legacy_editor.problems_mut()[0].index = 2;
+        assert!(
+            remapped_legacy_editor
+                .encode(Some(save_app_gate - 1))
+                .is_err()
+        );
+
+        let (paired_flags, _) = BuildingFlagsPrefix::decode_prefix(115_000, &flag_bytes)?;
+        let (paired, _) = BuildingProblemPrefix::decode_prefix(
+            115_000,
+            None,
+            &paired_flags,
+            &[1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2],
+        )?;
+        let mut paired_editor = paired.into_editor();
+        paired_editor.problems_mut()[0].second = 3;
+        assert_eq!(
+            paired_editor.encode(None)?,
+            [1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3]
+        );
         Ok(())
     }
 
@@ -4287,6 +4321,26 @@ mod tests {
                                 .decode_building_problems_prefix(metadata.save_app_version)?;
                             assert_eq!(via_manager, building_problems);
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+
+                            if !building_problems.problems().is_empty() {
+                                let mut edited_manager = manager_data.clone();
+                                let mut editor = building_problems.clone().into_editor();
+                                let edited_first = editor.problems_mut()[0].first.wrapping_add(1);
+                                editor.problems_mut()[0].first = edited_first;
+                                let original_suffix =
+                                    manager_data.serialized_object_graph()[graph_end..].to_vec();
+                                edited_manager.replace_building_problems(
+                                    &editor,
+                                    metadata.save_app_version,
+                                )?;
+                                let (rewritten, rewritten_end) = edited_manager
+                                    .decode_building_problems_prefix(metadata.save_app_version)?;
+                                assert_eq!(rewritten.problems()[0].first, edited_first);
+                                assert_eq!(
+                                    &edited_manager.serialized_object_graph()[rewritten_end..],
+                                    original_suffix
+                                );
+                            }
                             checked_building_problem_convenience = true;
                         }
                         let (building_buffers, buffer_used) =

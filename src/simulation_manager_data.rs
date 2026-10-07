@@ -11,7 +11,8 @@ use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
     BuildingFlagsPrefix, BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingPopulationPrefix, BuildingPrefabPrefix,
-    BuildingProblemPrefix, BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
+    BuildingProblemEditor, BuildingProblemPrefix, BuildingServiceSelectionPrefix,
+    BuildingTimerGeometryPrefix,
 };
 use crate::{BuildingEconomicFieldsEditor, BuildingPopulationEditor, BuildingTimerGeometryEditor};
 use crate::{
@@ -774,6 +775,43 @@ impl SimulationManagerData {
         )?;
         reader.read_bytes(used)?;
         Ok((data, reader.offset()))
+    }
+
+    /// Replaces opaque per-building problem words and preserves the following fields.
+    pub fn replace_building_problems(
+        &mut self,
+        edited: &BuildingProblemEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited BuildingManager problem version does not match this stream",
+            ));
+        }
+        let (original, graph_end) = self.decode_building_problems_prefix(save_app_version)?;
+        if edited.problem_count() != original.problems().len() {
+            return Err(invalid(
+                0,
+                "edited BuildingManager problem count does not match this stream",
+            ));
+        }
+        let body_start =
+            graph_end
+                .checked_sub(original.encode().len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager problem body start",
+                ))?;
+        let replacement = edited.encode(save_app_version)?;
+        if graph_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager problem words extend past manager graph",
+            ));
+        }
+        self.serialized_object_graph
+            .splice(body_start..graph_end, replacement);
+        Ok(())
     }
 
     /// Decodes per-building network, utility, and byte fields after problem state.
