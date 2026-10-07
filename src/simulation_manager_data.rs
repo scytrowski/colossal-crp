@@ -875,10 +875,11 @@ impl SimulationManagerData {
         Ok((districts, end))
     }
 
-    /// Decodes the district and park grids after supported type-0 park records.
+    /// Decodes the district and park grids after the park-record sequence.
     ///
-    /// This requires the park-record decoder's inner-version and park-type
-    /// support. The returned graph offset points after the grids, before the
+    /// Empty park buffers need no record decoding from inner version 164 onward;
+    /// active parks require the type-0 decoder's supported version range.
+    /// The returned graph offset points after the grids, before the
     /// following versioned manager objects. Unchanged grid bytes are retained.
     pub fn decode_district_manager_grids(
         &self,
@@ -2108,6 +2109,23 @@ mod manager_boundary_tests {
         let stable = data.serialized_object_graph.clone();
         assert!(data.replace_district_manager_grids(&editor).is_err());
         assert_eq!(data.serialized_object_graph, stable);
+    }
+
+    #[test]
+    fn empty_park_buffer_allows_grid_edit_after_active_record_version_range() {
+        let mut data = synthetic_manager_data();
+        data.format_version = 118_012;
+        data.serialized_object_graph
+            .extend(vec![0xff; 2 * 8 * 262_144 / 128]);
+        let (grids, _) = data.decode_district_manager_grids().unwrap();
+        let mut editor = grids.into_editor();
+        let mut plane = vec![0; 262_144];
+        plane[262_143] = 7;
+        editor.replace_district_plane(7, &plane).unwrap();
+        data.replace_district_manager_grids(&editor).unwrap();
+        let (updated, end) = data.decode_district_manager_grids().unwrap();
+        assert_eq!(end, data.serialized_object_graph.len());
+        assert_eq!(updated.district_plane(7).unwrap(), plane);
     }
 
     #[test]

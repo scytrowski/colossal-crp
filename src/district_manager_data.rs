@@ -1125,14 +1125,19 @@ impl DistrictManagerFlagsPrefix {
 
     /// Decodes park type 0 records in buffer order from the bytes after this prefix.
     ///
-    /// This layout is supported for inner versions 110025–118011 only.
-    /// Other versions or park types return an error. Each record preserves its
+    /// Active type-0 records are supported for inner versions 110025–118011.
+    /// An empty park buffer is supported from inner version 164 onward because
+    /// it contains no record bytes. Other active versions or park types return
+    /// an error. Each record preserves its
     /// original bytes for exact unchanged writing. The returned byte count
     /// ends before the district grid.
     pub fn decode_type_zero_park_records(
         &self,
         bytes: &[u8],
     ) -> Result<(Vec<DistrictParkRecord>, usize), CrpError> {
+        if self.park_flags.iter().all(|flags| *flags == 0) {
+            return Ok((Vec::new(), 0));
+        }
         if !(TYPE_ZERO_PARK_FIRST_VERSION..=TYPE_ZERO_PARK_LAST_VERSION)
             .contains(&self.format_version)
         {
@@ -1465,8 +1470,9 @@ fn invalid_district_manager(offset: usize, reason: impl Into<String>) -> CrpErro
 #[cfg(test)]
 mod tests {
     use super::{
-        DISTRICT_COUNT, DISTRICT_GRID_CELLS, DISTRICT_GRID_VALUES, DistrictManagerFlagsPrefix,
-        DistrictManagerGridData, POLICY_COUNT, district_policy_bool_count,
+        AIRLINE_NAME_VERSION, AIRPORT_PANEL_VERSION, DISTRICT_COUNT, DISTRICT_GRID_CELLS,
+        DISTRICT_GRID_VALUES, DistrictManagerFlagsPrefix, DistrictManagerGridData,
+        PARK_FLAGS_VERSION, POLICY_COUNT, district_policy_bool_count,
     };
     use crate::data_serializer::write_unique_string;
     use crate::encoded_array::{
@@ -1739,6 +1745,38 @@ mod tests {
             } else {
                 assert!(result.is_err());
             }
+        }
+    }
+
+    #[test]
+    fn empty_park_buffer_has_no_record_bytes_across_version_gates() {
+        for version in [164, 110_000, 110_001, 110_024, 118_012] {
+            let mut prefix_bytes = Vec::new();
+            if version >= AIRLINE_NAME_VERSION {
+                write_unique_string(&mut prefix_bytes, "").unwrap();
+            }
+            if version >= AIRPORT_PANEL_VERSION {
+                prefix_bytes.push(0);
+            }
+            zero_flags(&mut prefix_bytes);
+            if version >= PARK_FLAGS_VERSION {
+                zero_flags(&mut prefix_bytes);
+            }
+            zero_policy_bools(&mut prefix_bytes, version);
+            let (prefix, used) =
+                DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+            assert_eq!(used, prefix_bytes.len());
+            let grid = vec![0xff; DISTRICT_GRID_VALUES / 128];
+            let (parks, park_used) = prefix.decode_type_zero_park_records(&grid).unwrap();
+            assert!(parks.is_empty());
+            assert_eq!(park_used, 0);
+            let mut streams = grid.clone();
+            if version >= PARK_FLAGS_VERSION {
+                streams.extend_from_slice(&grid);
+            }
+            let (grids, grid_used) = DistrictManagerGridData::decode(version, &streams).unwrap();
+            assert_eq!(grid_used, streams.len());
+            assert_eq!(grids.park_grid_present(), version >= PARK_FLAGS_VERSION);
         }
     }
 
