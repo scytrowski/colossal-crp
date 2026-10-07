@@ -20,6 +20,7 @@ mod simulation_metadata;
 mod terrain_manager_data;
 mod texture;
 mod water_simulation_data;
+mod zone_manager_data;
 
 pub use building_manager_data::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsEditor,
@@ -58,6 +59,7 @@ pub use texture::TextureAsset;
 pub use water_simulation_data::{
     WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
 };
+pub use zone_manager_data::{ZoneBlockRecord, ZoneManagerDataPrefix};
 
 const MAGIC: &[u8; 4] = b"CRAP";
 const MIN_SUPPORTED_VERSION: u16 = 4;
