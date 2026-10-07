@@ -1,6 +1,9 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::{read_encoded_bool_array, read_encoded_uint_array};
+use crate::encoded_array::{
+    read_encoded_bool_array, read_encoded_byte_array, read_encoded_uint_array,
+    read_encoded_ulong_array,
+};
 
 const DISTRICT_COUNT: usize = 128;
 const PARK_FLAGS_VERSION: u32 = 110_001;
@@ -70,7 +73,8 @@ const DISTRICT_TOURIST_BASE_BYTES: usize = 6;
 const DISTRICT_SUBCULTURE_BYTES: usize = 11;
 const DISTRICT_HOTEL_BASE_BYTES: usize = 12;
 const TYPE_ZERO_PARK_FIRST_VERSION: u32 = 111_015;
-const TYPE_ZERO_PARK_LAST_VERSION: u32 = 114_004;
+const TYPE_ZERO_PARK_LAST_VERSION: u32 = 114_011;
+const TYPE_ZERO_PARK_CAMPUS_VERSION: u32 = 114_005;
 const TYPE_ZERO_PARK_BYTES: usize = 78;
 const TYPE_ZERO_PARK_TYPE_OFFSET: usize = 42;
 const TYPE_ZERO_PARK_LEVEL_OFFSET: usize = 43;
@@ -96,7 +100,7 @@ pub struct DistrictManagerFlagsPrefix {
     serialized_prefix: Vec<u8>,
 }
 
-/// A park type 0 record from inner versions 111015–114004.
+/// A park type 0 record from inner versions 111015–114011.
 ///
 /// Only the leading scalar fields are interpreted. The exact record bytes are
 /// retained for unchanged writing, including fields not yet modeled.
@@ -107,7 +111,7 @@ pub struct DistrictParkRecord {
     main_gate: u16,
     condition: u16,
     level: u8,
-    serialized: [u8; TYPE_ZERO_PARK_BYTES],
+    serialized: Vec<u8>,
 }
 
 impl DistrictParkRecord {
@@ -137,8 +141,8 @@ impl DistrictParkRecord {
     }
 
     /// Writes the exact record bytes, including fields not yet modeled.
-    pub fn encode(&self) -> [u8; TYPE_ZERO_PARK_BYTES] {
-        self.serialized
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized.clone()
     }
 }
 
@@ -931,7 +935,7 @@ impl DistrictManagerFlagsPrefix {
 
     /// Decodes park type 0 records in buffer order from the bytes after this prefix.
     ///
-    /// This fixed layout is supported for inner versions 111015–114004 only.
+    /// This layout is supported for inner versions 111015–114011 only.
     /// Other versions or park types return an error. Each record preserves its
     /// original bytes for exact unchanged writing. The returned byte count
     /// ends before the district grid.
@@ -957,40 +961,45 @@ impl DistrictManagerFlagsPrefix {
             if flags == 0 {
                 continue;
             }
-            let end =
-                offset
-                    .checked_add(TYPE_ZERO_PARK_BYTES)
-                    .ok_or(CrpError::ArithmeticOverflow(
-                        "DistrictManager park record end",
-                    ))?;
-            let serialized: [u8; TYPE_ZERO_PARK_BYTES] = bytes
-                .get(offset..end)
-                .ok_or_else(|| {
-                    invalid_district_manager(
-                        offset,
-                        format!("park {park_index} record is truncated"),
-                    )
-                })?
-                .try_into()
-                .map_err(|_| invalid_district_manager(offset, "invalid park record length"))?;
-            let park_type = serialized[TYPE_ZERO_PARK_TYPE_OFFSET];
+            let mut reader = Reader::new(bytes.get(offset..).ok_or_else(|| {
+                invalid_district_manager(offset, format!("park {park_index} record is truncated"))
+            })?);
+            let fixed = reader.read_bytes(TYPE_ZERO_PARK_BYTES).map_err(|error| {
+                invalid_district_manager(offset, format!("park {park_index} record: {error}"))
+            })?;
+            let park_type = fixed[TYPE_ZERO_PARK_TYPE_OFFSET];
             if park_type != 0 {
                 return Err(invalid_district_manager(
                     offset + TYPE_ZERO_PARK_TYPE_OFFSET,
                     format!("park {park_index} has unsupported type {park_type}"),
                 ));
             }
-            let mut reader = Reader::new(&serialized);
-            let random_seed = reader.read_u64_be()?;
-            let main_gate = reader.read_u16_be()?;
-            let condition = reader.read_u16_be()?;
+            let random_seed = u64::from_be_bytes(fixed[..8].try_into().map_err(|_| {
+                invalid_district_manager(offset, "invalid park random seed length")
+            })?);
+            let main_gate = u16::from_be_bytes([fixed[8], fixed[9]]);
+            let condition = u16::from_be_bytes([fixed[10], fixed[11]]);
+            let level = fixed[TYPE_ZERO_PARK_LEVEL_OFFSET];
+            if self.format_version >= TYPE_ZERO_PARK_CAMPUS_VERSION && park_index == 0 {
+                skip_slot_zero_campus(&mut reader, self.format_version).map_err(|error| {
+                    invalid_district_manager(
+                        offset + reader.offset(),
+                        format!("park {park_index} campus block: {error}"),
+                    )
+                })?;
+            }
+            let end = offset
+                .checked_add(reader.offset())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "DistrictManager park record end",
+                ))?;
             records.push(DistrictParkRecord {
                 park_index,
                 random_seed,
                 main_gate,
                 condition,
-                level: serialized[TYPE_ZERO_PARK_LEVEL_OFFSET],
-                serialized,
+                level,
+                serialized: bytes[offset..end].to_vec(),
             });
             offset = end;
         }
@@ -1012,6 +1021,41 @@ fn read_district_age_population(
         temporary: reader.read_u24_be()?,
         final_count: reader.read_u24_be()?,
     })
+}
+
+fn skip_slot_zero_campus(reader: &mut Reader<'_>, format_version: u32) -> Result<(), CrpError> {
+    // DistrictManager+Data.Deserialize reads this branch for slot 0 from 114005,
+    // even when its park type is zero. All supported versions here are past the
+    // nested 112026 field gates.
+    reader.read_bytes(6 + 16)?; // Student fields and AcademicWorksData.
+    for _ in 0..13 {
+        skip_year_report(reader, format_version)?;
+    }
+    reader.read_bytes(5 + 5)?; // Campus state, coach fields, academic staff.
+    // EncodedArray.Long has the ULong control layout and 64-bit wire width.
+    read_encoded_ulong_array(reader, 25)?;
+    reader.read_bytes(3)?; // Win probability and varsity identity.
+    read_encoded_byte_array(reader, 3)?; // Varsity color.
+    reader.read_bytes(8)?; // Four versioned i16 varsity/sports fields.
+    read_encoded_bool_array(reader, 5)?; // Away matches.
+    reader.read_bytes(2)?; // Campus building count.
+    Ok(())
+}
+
+fn skip_year_report(reader: &mut Reader<'_>, format_version: u32) -> Result<(), CrpError> {
+    reader.read_bytes(36)?; // Counts, grant fields, academic works, prize money.
+    read_encoded_ulong_array(reader, 5)?; // Ticket income.
+    read_encoded_ulong_array(reader, 5)?; // Winnings income.
+    for _ in 0..3 {
+        read_encoded_byte_array(reader, 5)?; // Match results.
+    }
+    read_encoded_bool_array(reader, 5)?; // Trophies.
+    reader.read_bytes(25)?; // Toga count and three 64-bit seeds.
+    reader.read_unique_string()?; // Milestone name.
+    if format_version >= 112_026 {
+        reader.read_bytes(2)?; // Total works.
+    }
+    Ok(())
 }
 
 fn read_district_private_data(
@@ -1223,6 +1267,27 @@ mod tests {
         }
     }
 
+    fn zero_slot_zero_campus() -> Vec<u8> {
+        let mut bytes = vec![0; 22]; // Student fields and academic works.
+        for _ in 0..13 {
+            bytes.extend_from_slice(&[0; 36]);
+            bytes.extend_from_slice(&[0x84; 2]); // Two five-value ULong arrays.
+            bytes.extend_from_slice(&[0x84; 3]); // Three five-value Byte arrays.
+            bytes.push(0x80); // Five false bools in one packed byte.
+            bytes.extend_from_slice(&[0; 25]);
+            write_unique_string(&mut bytes, "").unwrap();
+            bytes.extend_from_slice(&[0; 2]);
+        }
+        bytes.extend_from_slice(&[0; 10]);
+        bytes.push(0x98); // 25 zero Long values.
+        bytes.extend_from_slice(&[0; 3]);
+        bytes.push(0x82); // Three zero color bytes.
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.push(0x80); // Five false bools.
+        bytes.extend_from_slice(&[0; 2]);
+        bytes
+    }
+
     #[test]
     fn district_and_park_flags_follow_version_gate() {
         for (version, park_flags_present) in [(110_000, false), (110_001, true)] {
@@ -1398,22 +1463,92 @@ mod tests {
             (111_014, false),
             (111_015, true),
             (114_004, true),
-            (114_005, false),
+            (114_005, true),
+            (114_011, true),
+            (114_012, false),
         ] {
             let mut bytes = Vec::new();
+            if version >= 114_006 {
+                write_unique_string(&mut bytes, "").unwrap();
+            }
+            if version >= 114_007 {
+                bytes.push(0);
+            }
             zero_flags(&mut bytes);
             let mut park_flags = [0_u32; DISTRICT_COUNT];
             park_flags[0] = 1;
             write_encoded_uint_array(&mut bytes, &park_flags);
             zero_policy_bools(&mut bytes, version);
             let (prefix, _) = DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
-            let result = prefix.decode_type_zero_park_records(&[0; 78]);
+            let mut record = vec![0; 78];
+            if version >= 114_005 {
+                record.extend_from_slice(&zero_slot_zero_campus());
+            }
+            let result = prefix.decode_type_zero_park_records(&record);
             if supported {
-                assert_eq!(result.unwrap().1, 78);
+                let (records, consumed) = result.unwrap();
+                assert_eq!(consumed, record.len());
+                assert_eq!(records[0].encode(), record);
             } else {
                 assert!(result.is_err());
             }
         }
+    }
+
+    #[test]
+    fn slot_zero_campus_rejects_truncation_and_preserves_wire_bytes() {
+        let version = 114_008;
+        let mut prefix_bytes = Vec::new();
+        write_unique_string(&mut prefix_bytes, "").unwrap();
+        prefix_bytes.push(0);
+        zero_flags(&mut prefix_bytes);
+        let mut park_flags = [0_u32; DISTRICT_COUNT];
+        park_flags[0] = 1;
+        write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+        zero_policy_bools(&mut prefix_bytes, version);
+        let (prefix, _) =
+            DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+
+        let mut park = vec![0; 78];
+        park.extend_from_slice(&zero_slot_zero_campus());
+        let (records, used) = prefix.decode_type_zero_park_records(&park).unwrap();
+        assert_eq!(used, park.len());
+        assert_eq!(records[0].encode(), park);
+        assert!(
+            prefix
+                .decode_type_zero_park_records(&park[..park.len() - 1])
+                .is_err()
+        );
+        park[42] = 15;
+        assert!(prefix.decode_type_zero_park_records(&park).is_err());
+    }
+
+    #[test]
+    fn game_produced_campus_compatibility_record_stops_before_grid() {
+        let version = 114_011;
+        let mut prefix_bytes = Vec::new();
+        write_unique_string(&mut prefix_bytes, "").unwrap();
+        prefix_bytes.push(0);
+        zero_flags(&mut prefix_bytes);
+        let mut park_flags = [0_u32; DISTRICT_COUNT];
+        park_flags[0] = 1;
+        write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+        zero_policy_bools(&mut prefix_bytes, version);
+        let (prefix, _) =
+            DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+
+        let bytes = include_bytes!("../tests/fixtures/district-park-v114011-ccp-map1.bin");
+        let (records, used) = prefix.decode_type_zero_park_records(bytes).unwrap();
+        assert_eq!(used, 1039);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].park_index(), 0);
+        assert_eq!(records[0].encode(), bytes[..used]);
+        let mut grid = crate::data_serializer::Reader::new(&bytes[used..]);
+        assert_eq!(
+            read_encoded_byte_array(&mut grid, 262_144).unwrap(),
+            vec![0; 262_144]
+        );
+        assert_eq!(grid.offset(), 2048);
     }
 
     #[test]
