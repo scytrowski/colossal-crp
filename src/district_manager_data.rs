@@ -32,6 +32,13 @@ const DISTRICT_EDUCATION_DATA_VERSION: u32 = 67;
 const DISTRICT_EDUCATION_WORKER_VERSION: u32 = 140;
 const DISTRICT_EDUCATION_AGE_VERSION: u32 = 113;
 const DISTRICT_STUDENT_AGE_VERSION: u32 = 143;
+const DISTRICT_PRODUCTION_VERSION: u32 = 92;
+const DISTRICT_USAGE_VERSION: u32 = 239;
+const DISTRICT_GROUND_VERSION: u32 = 97;
+const DISTRICT_RESOURCE_VERSION: u32 = 118;
+const DISTRICT_CONSUMPTION_EXPANSION_VERSION: u32 = 234;
+const DISTRICT_RESOURCE_ALIVE_VERSION: u32 = 111_014;
+const DISTRICT_RESOURCE_FIELDS_VERSION: u32 = 113_013;
 const POLICY_COUNT: usize = 32;
 const POPULATION_DELTA_COUNT: usize = 16;
 const PRIVATE_DATA_BASE_BYTES: usize = 21;
@@ -44,6 +51,11 @@ const PRIVATE_DATA_COLLAPSED_BYTES: usize = 4;
 const DISTRICT_AGE_PAIR_BYTES: usize = 6;
 const DISTRICT_EDUCATION_BASE_BYTES: usize = 18;
 const DISTRICT_EDUCATION_WORKER_BYTES: usize = 24;
+const DISTRICT_PRODUCTION_BASE_BYTES: usize = 86;
+const DISTRICT_CONSUMPTION_BASE_BYTES: usize = 72;
+const DISTRICT_USAGE_BYTES: usize = 24;
+const DISTRICT_GROUND_BYTES: usize = 15;
+const DISTRICT_RESOURCE_BASE_BYTES: usize = 60;
 
 /// The initial known fields from `DistrictManager+Data`.
 ///
@@ -81,6 +93,41 @@ pub struct DistrictPopulationRecord {
     private_data: Vec<DistrictPrivateDataBlock>,
     specializations: Vec<DistrictSpecializationBlock>,
     demographic_data: Vec<DistrictDemographicBlock>,
+    statistics: Vec<DistrictStatisticsBlock>,
+}
+
+/// An opaque fixed-size production, consumption, or resource data block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictStatisticsBlock {
+    kind: DistrictStatisticsKind,
+    bytes: Vec<u8>,
+}
+
+impl DistrictStatisticsBlock {
+    /// Returns which statistics field this block represents.
+    pub fn kind(&self) -> DistrictStatisticsKind {
+        self.kind
+    }
+
+    /// Returns the exact serialized bytes for this currently opaque block.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// A district statistics block in its wire-order position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistrictStatisticsKind {
+    Production,
+    PlayerConsumption,
+    ResidentialConsumption,
+    CommercialConsumption,
+    IndustrialConsumption,
+    OfficeConsumption,
+    Usage,
+    Ground,
+    ImportResources,
+    ExportResources,
 }
 
 /// A version-bounded birth, education, or student counter block.
@@ -276,14 +323,21 @@ impl DistrictPopulationRecord {
     pub fn demographic_data(&self) -> &[DistrictDemographicBlock] {
         &self.demographic_data
     }
+
+    /// Returns the production, consumption, ground, and resource blocks in wire order.
+    pub fn statistics(&self) -> &[DistrictStatisticsBlock] {
+        &self.statistics
+    }
 }
 
 impl DistrictManagerFlagsPrefix {
     /// Decodes the opening fields and both known policy bool streams.
     ///
-    /// This prefix supports inner versions 164 and newer. It stops before the
-    /// player and specialization data that follow the district private-data blocks.
-    /// Truncated or malformed fields return an error.
+    /// This prefix supports inner versions 164 and newer. It decodes district
+    /// population, age, private, specialization, demographic, and fixed-size
+    /// statistics blocks, then stops before the next manager field. Opaque
+    /// blocks retain their exact serialized bytes. Truncated or malformed fields
+    /// return an error.
     pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         if format_version < 164 {
             return Err(invalid_district_manager(
@@ -500,6 +554,54 @@ impl DistrictManagerFlagsPrefix {
                     )?);
                 }
             }
+            let mut statistics = Vec::new();
+            if format_version >= DISTRICT_PRODUCTION_VERSION {
+                statistics.push(read_district_statistics(
+                    &mut reader,
+                    DistrictStatisticsKind::Production,
+                    district_production_data_size(format_version),
+                )?);
+                for kind in [
+                    DistrictStatisticsKind::PlayerConsumption,
+                    DistrictStatisticsKind::ResidentialConsumption,
+                    DistrictStatisticsKind::CommercialConsumption,
+                    DistrictStatisticsKind::IndustrialConsumption,
+                    DistrictStatisticsKind::OfficeConsumption,
+                ] {
+                    statistics.push(read_district_statistics(
+                        &mut reader,
+                        kind,
+                        district_consumption_data_size(format_version),
+                    )?);
+                }
+            }
+            if format_version >= DISTRICT_USAGE_VERSION {
+                statistics.push(read_district_statistics(
+                    &mut reader,
+                    DistrictStatisticsKind::Usage,
+                    DISTRICT_USAGE_BYTES,
+                )?);
+            }
+            if format_version >= DISTRICT_GROUND_VERSION {
+                statistics.push(read_district_statistics(
+                    &mut reader,
+                    DistrictStatisticsKind::Ground,
+                    DISTRICT_GROUND_BYTES,
+                )?);
+            }
+            if format_version >= DISTRICT_RESOURCE_VERSION {
+                let resource_bytes = district_resource_data_size(format_version);
+                statistics.push(read_district_statistics(
+                    &mut reader,
+                    DistrictStatisticsKind::ImportResources,
+                    resource_bytes,
+                )?);
+                statistics.push(read_district_statistics(
+                    &mut reader,
+                    DistrictStatisticsKind::ExportResources,
+                    resource_bytes,
+                )?);
+            }
             district_population_records.push(DistrictPopulationRecord {
                 district_index,
                 random_seed,
@@ -513,6 +615,7 @@ impl DistrictManagerFlagsPrefix {
                 private_data,
                 specializations,
                 demographic_data,
+                statistics,
             });
         }
         let consumed = reader.offset();
@@ -634,6 +737,60 @@ fn read_district_demographic(
 ) -> Result<DistrictDemographicBlock, CrpError> {
     let bytes = reader.read_bytes(byte_count)?.to_vec();
     Ok(DistrictDemographicBlock { kind, bytes })
+}
+
+fn read_district_statistics(
+    reader: &mut Reader<'_>,
+    kind: DistrictStatisticsKind,
+    byte_count: usize,
+) -> Result<DistrictStatisticsBlock, CrpError> {
+    let bytes = reader.read_bytes(byte_count)?.to_vec();
+    Ok(DistrictStatisticsBlock { kind, bytes })
+}
+
+fn district_production_data_size(format_version: u32) -> usize {
+    let mut size = DISTRICT_PRODUCTION_BASE_BYTES;
+    for (gate, added_bytes) in [
+        (215, 12),
+        (216, 8),
+        (219, 4),
+        (226, 16),
+        (228, 6),
+        (240, 8),
+        (307, 28),
+        (109_010, 12),
+        (112_006, 6),
+        (116_008, 24),
+        (116_011, 90),
+    ] {
+        if format_version >= gate {
+            size += added_bytes;
+        }
+    }
+    size
+}
+
+fn district_consumption_data_size(format_version: u32) -> usize {
+    DISTRICT_CONSUMPTION_BASE_BYTES
+        + if format_version >= DISTRICT_CONSUMPTION_EXPANSION_VERSION {
+            6
+        } else {
+            0
+        }
+}
+
+fn district_resource_data_size(format_version: u32) -> usize {
+    DISTRICT_RESOURCE_BASE_BYTES
+        + if format_version >= DISTRICT_RESOURCE_ALIVE_VERSION {
+            12
+        } else {
+            0
+        }
+        + if format_version >= DISTRICT_RESOURCE_FIELDS_VERSION {
+            12
+        } else {
+            0
+        }
 }
 
 fn district_private_data_size(format_version: u32) -> usize {
@@ -815,13 +972,27 @@ mod tests {
             (164, None, 5),
             (194, None, 5),
             (203, Some(41), 5),
+            (234, Some(41), 5),
             (237, Some(41), 5),
+            (239, Some(41), 5),
+            (256, Some(41), 5),
+            (307, Some(41), 5),
             (109_006, Some(41), 5),
+            (109_010, Some(41), 5),
+            (111_014, Some(41), 5),
             (112_031, Some(41), 8),
             (113_003, Some(41), 13),
             (113_006, Some(41), 14),
+            (113_013, Some(41), 14),
+            (116_011, Some(41), 14),
         ] {
             let mut bytes = Vec::new();
+            if version >= super::AIRLINE_NAME_VERSION {
+                write_unique_string(&mut bytes, "SkyLink").unwrap();
+            }
+            if version >= super::AIRPORT_PANEL_VERSION {
+                bytes.push(0);
+            }
             let mut flags = [0_u32; DISTRICT_COUNT];
             flags[17] = 1;
             write_encoded_uint_array(&mut bytes, &flags);
@@ -877,6 +1048,10 @@ mod tests {
             for (index, (_, byte_count)) in demographic_blocks.iter().enumerate() {
                 bytes.extend(std::iter::repeat_n(index as u8 + 20, *byte_count));
             }
+            let statistics_blocks = expected_statistics_blocks(version);
+            for (index, (_, byte_count)) in statistics_blocks.iter().enumerate() {
+                bytes.extend(std::iter::repeat_n(index as u8 + 30, *byte_count));
+            }
 
             let (prefix, used) =
                 DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
@@ -929,6 +1104,16 @@ mod tests {
                 assert_eq!(block.kind(), expected_kind);
                 assert_eq!(block.as_bytes(), vec![index + 20; byte_count]);
             }
+            assert_eq!(record.statistics().len(), statistics_blocks.len());
+            for ((block, (expected_kind, byte_count)), index) in record
+                .statistics()
+                .iter()
+                .zip(statistics_blocks)
+                .zip(0_u8..)
+            {
+                assert_eq!(block.kind(), expected_kind);
+                assert_eq!(block.as_bytes(), vec![index + 30; byte_count]);
+            }
             assert_eq!(prefix.encode(), bytes);
 
             let mut truncated = bytes.clone();
@@ -973,6 +1158,41 @@ mod tests {
             ]);
         }
         categories
+    }
+
+    fn expected_statistics_blocks(version: u32) -> Vec<(super::DistrictStatisticsKind, usize)> {
+        use super::DistrictStatisticsKind as Kind;
+
+        let mut blocks = Vec::new();
+        if version >= super::DISTRICT_PRODUCTION_VERSION {
+            blocks.push((
+                Kind::Production,
+                super::district_production_data_size(version),
+            ));
+            let consumption_size = super::district_consumption_data_size(version);
+            blocks.extend(
+                [
+                    Kind::PlayerConsumption,
+                    Kind::ResidentialConsumption,
+                    Kind::CommercialConsumption,
+                    Kind::IndustrialConsumption,
+                    Kind::OfficeConsumption,
+                ]
+                .map(|kind| (kind, consumption_size)),
+            );
+        }
+        if version >= super::DISTRICT_USAGE_VERSION {
+            blocks.push((Kind::Usage, super::DISTRICT_USAGE_BYTES));
+        }
+        if version >= super::DISTRICT_GROUND_VERSION {
+            blocks.push((Kind::Ground, super::DISTRICT_GROUND_BYTES));
+        }
+        if version >= super::DISTRICT_RESOURCE_VERSION {
+            let resource_size = super::district_resource_data_size(version);
+            blocks.push((Kind::ImportResources, resource_size));
+            blocks.push((Kind::ExportResources, resource_size));
+        }
+        blocks
     }
 
     fn expected_specialization_kinds(version: u32) -> Vec<super::DistrictSpecializationKind> {

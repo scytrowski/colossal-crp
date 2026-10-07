@@ -43,6 +43,7 @@ pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictDemographicBlock, DistrictDemographicKind,
     DistrictManagerFlagsPrefix, DistrictPopulationRecord, DistrictPrivateDataBlock,
     DistrictPrivateDataKind, DistrictSpecializationBlock, DistrictSpecializationKind,
+    DistrictStatisticsBlock, DistrictStatisticsKind,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
@@ -3771,6 +3772,63 @@ mod tests {
         Ok(())
     }
 
+    fn district_statistics_match_version(record: &DistrictPopulationRecord, version: u32) -> bool {
+        let mut expected = Vec::new();
+        if version >= 92 {
+            let mut production_bytes = 86;
+            for (gate, added_bytes) in [
+                (215, 12),
+                (216, 8),
+                (219, 4),
+                (226, 16),
+                (228, 6),
+                (240, 8),
+                (307, 28),
+                (109_010, 12),
+                (112_006, 6),
+                (116_008, 24),
+                (116_011, 90),
+            ] {
+                if version >= gate {
+                    production_bytes += added_bytes;
+                }
+            }
+            expected.push((DistrictStatisticsKind::Production, production_bytes));
+            let consumption_bytes = 72 + if version >= 234 { 6 } else { 0 };
+            expected.extend(
+                [
+                    DistrictStatisticsKind::PlayerConsumption,
+                    DistrictStatisticsKind::ResidentialConsumption,
+                    DistrictStatisticsKind::CommercialConsumption,
+                    DistrictStatisticsKind::IndustrialConsumption,
+                    DistrictStatisticsKind::OfficeConsumption,
+                ]
+                .map(|kind| (kind, consumption_bytes)),
+            );
+        }
+        if version >= 239 {
+            expected.push((DistrictStatisticsKind::Usage, 24));
+        }
+        if version >= 97 {
+            expected.push((DistrictStatisticsKind::Ground, 15));
+        }
+        if version >= 118 {
+            let resource_bytes = 60
+                + if version >= 111_014 { 12 } else { 0 }
+                + if version >= 113_013 { 12 } else { 0 };
+            expected.push((DistrictStatisticsKind::ImportResources, resource_bytes));
+            expected.push((DistrictStatisticsKind::ExportResources, resource_bytes));
+        }
+        record.statistics().len() == expected.len()
+            && record
+                .statistics()
+                .iter()
+                .zip(expected)
+                .all(|(actual, (kind, byte_count))| {
+                    actual.kind() == kind && actual.as_bytes().len() == byte_count
+                })
+    }
+
     #[test]
     #[ignore = "set CRP_CORPUS_DIR and run explicitly to check a local full corpus"]
     fn validates_optional_external_map_corpus() -> Result<(), Box<dyn std::error::Error>> {
@@ -3952,6 +4010,10 @@ mod tests {
                                                 + usize::from(districts.format_version() >= 67) * 4
                                                 + usize::from(districts.format_version() >= 113) * 3
                                                 + usize::from(districts.format_version() >= 143) * 3
+                                        && district_statistics_match_version(
+                                            record,
+                                            districts.format_version(),
+                                        )
                                 })
                         );
                         assert!(districts_end < manager_data.serialized_object_graph().len());
