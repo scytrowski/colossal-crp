@@ -22,7 +22,8 @@ mod texture;
 mod water_simulation_data;
 
 pub use building_manager_data::{
-    BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingFlag, BuildingFlagsPrefix,
+    BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsEditor,
+    BuildingEconomicFieldsPrefix, BuildingFlag, BuildingFlagsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
     BuildingPrefabPrefix, BuildingProblemPrefix, BuildingProblemWords, BuildingTimerField,
     BuildingTimerGeometryEditor, BuildingTimerGeometryPrefix,
@@ -3772,6 +3773,7 @@ mod tests {
         let mut checked_building_byte_state_convenience = false;
         let mut checked_building_timer_convenience = false;
         let mut checked_building_population_convenience = false;
+        let mut checked_building_economic_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
@@ -4404,6 +4406,60 @@ mod tests {
                             );
                             checked_building_population_convenience = true;
                         }
+                        let economic_start = net_reader.offset();
+                        let (building_economic, economic_used) =
+                            BuildingEconomicFieldsPrefix::decode_prefix(
+                                version,
+                                &building_flags,
+                                net_reader.remaining_bytes(),
+                            )?;
+                        net_reader.read_bytes(economic_used)?;
+                        assert_eq!(
+                            building_economic.encode(),
+                            &net_reader.consumed_bytes()
+                                [economic_start..economic_start + economic_used]
+                        );
+                        assert_eq!(
+                            building_economic.cargo_traffic_rate().len(),
+                            if version >= 115_004 {
+                                active_building_count
+                            } else {
+                                0
+                            }
+                        );
+                        if !checked_building_economic_convenience
+                            && active_building_count > 0
+                            && version >= 115_004
+                        {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_economic_fields_prefix(
+                                    metadata.save_app_version,
+                                )?;
+                            assert_eq!(via_manager, building_economic);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+
+                            let mut edited_manager = manager_data.clone();
+                            let mut editor = building_economic.into_editor();
+                            let original_rate = editor.cargo_traffic_rate_mut()[0];
+                            let edited_rate = original_rate.wrapping_add(1);
+                            editor.cargo_traffic_rate_mut()[0] = edited_rate;
+                            let original_suffix =
+                                manager_data.serialized_object_graph()[graph_end..].to_vec();
+                            edited_manager.replace_building_economic_fields(
+                                &editor,
+                                metadata.save_app_version,
+                            )?;
+                            let (rewritten, rewritten_end) = edited_manager
+                                .decode_building_economic_fields_prefix(
+                                    metadata.save_app_version,
+                                )?;
+                            assert_eq!(rewritten.cargo_traffic_rate()[0], edited_rate);
+                            assert_eq!(
+                                &edited_manager.serialized_object_graph()[rewritten_end..],
+                                original_suffix
+                            );
+                            checked_building_economic_convenience = true;
+                        }
                         if std::env::var_os("CRP_EXTRACT_BUILDING_BYTE_STATE_FIXTURE").is_some()
                             && path
                                 .file_name()
@@ -4498,6 +4554,7 @@ mod tests {
         assert!(checked_building_byte_state_convenience);
         assert!(checked_building_timer_convenience);
         assert!(checked_building_population_convenience);
+        assert!(checked_building_economic_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(

@@ -1,8 +1,9 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
-    read_encoded_byte_array, read_encoded_uint_array, read_encoded_ulong_array,
-    read_encoded_ushort_array, write_encoded_byte_array,
+    read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
+    read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
+    write_encoded_int_array, write_encoded_uint_array, write_encoded_ushort_array,
 };
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 
@@ -218,6 +219,51 @@ pub struct BuildingPopulationEditor {
     seniors: Vec<u8>,
     fire_hazard: Vec<u8>,
     level: Vec<u8>,
+}
+
+/// Traffic, routing, cash, room, and employment columns following population.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingEconomicFieldsPrefix {
+    format_version: u32,
+    active_building_count: usize,
+    cargo_traffic_rate: Vec<u32>,
+    garbage_traffic_rate: Vec<u32>,
+    access_segment: Vec<u16>,
+    event_access_segment: Vec<u16>,
+    cash_buffer: Vec<i32>,
+    room_cost: Vec<u16>,
+    room_cost_target: Vec<u16>,
+    room_max: Vec<u16>,
+    room_used: Vec<u16>,
+    educated0_unemployed: Vec<u8>,
+    educated1_unemployed: Vec<u8>,
+    educated2_unemployed: Vec<u8>,
+    educated3_unemployed: Vec<u8>,
+    all_unemployed: Vec<u8>,
+    event_route_index: Vec<u16>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Editable traffic, routing, cash, room, and employment columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingEconomicFieldsEditor {
+    format_version: u32,
+    active_building_count: usize,
+    cargo_traffic_rate: Vec<u32>,
+    garbage_traffic_rate: Vec<u32>,
+    access_segment: Vec<u16>,
+    event_access_segment: Vec<u16>,
+    cash_buffer: Vec<i32>,
+    room_cost: Vec<u16>,
+    room_cost_target: Vec<u16>,
+    room_max: Vec<u16>,
+    room_used: Vec<u16>,
+    educated0_unemployed: Vec<u8>,
+    educated1_unemployed: Vec<u8>,
+    educated2_unemployed: Vec<u8>,
+    educated3_unemployed: Vec<u8>,
+    all_unemployed: Vec<u8>,
+    event_route_index: Vec<u16>,
 }
 
 impl BuildingBufferFieldsPrefix {
@@ -987,6 +1033,399 @@ impl BuildingPopulationEditor {
     }
 }
 
+impl BuildingEconomicFieldsPrefix {
+    /// Decodes version-gated traffic, room, employment, and routing arrays.
+    pub fn decode_prefix(
+        format_version: u32,
+        flags: &BuildingFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || flags.format_version() != format_version {
+            return Err(invalid_economic("unsupported or mismatched inner version"));
+        }
+        let active_building_count = flags
+            .building_flags()
+            .iter()
+            .filter(|building| building.flags != 0)
+            .count();
+        let mut reader = Reader::new(bytes);
+        let cargo_traffic_rate = if format_version >= 115_004 {
+            read_encoded_uint_array(&mut reader, active_building_count)?
+        } else {
+            Vec::new()
+        };
+        let garbage_traffic_rate = if format_version >= 115_022 {
+            read_encoded_uint_array(&mut reader, active_building_count)?
+        } else {
+            Vec::new()
+        };
+        let access_segment = if format_version >= 115_013 {
+            read_encoded_ushort_array(&mut reader, active_building_count)?
+        } else {
+            Vec::new()
+        };
+        let event_access_segment = if format_version >= 121_017 {
+            read_encoded_ushort_array(&mut reader, active_building_count)?
+        } else {
+            Vec::new()
+        };
+        let cash_buffer = if format_version >= 116_006 {
+            read_encoded_int_array(&mut reader, active_building_count)?
+        } else if format_version >= 116_001 {
+            read_encoded_ushort_array(&mut reader, active_building_count)?
+                .into_iter()
+                .map(i32::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (room_cost, room_cost_target, room_max, room_used) = if format_version >= 117_005 {
+            (
+                read_encoded_ushort_array(&mut reader, active_building_count)?,
+                read_encoded_ushort_array(&mut reader, active_building_count)?,
+                read_encoded_ushort_array(&mut reader, active_building_count)?,
+                read_encoded_ushort_array(&mut reader, active_building_count)?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
+        let (
+            educated0_unemployed,
+            educated1_unemployed,
+            educated2_unemployed,
+            educated3_unemployed,
+            all_unemployed,
+        ) = if format_version >= 120_001 {
+            (
+                read_encoded_byte_array(&mut reader, active_building_count)?,
+                read_encoded_byte_array(&mut reader, active_building_count)?,
+                read_encoded_byte_array(&mut reader, active_building_count)?,
+                read_encoded_byte_array(&mut reader, active_building_count)?,
+                read_encoded_byte_array(&mut reader, active_building_count)?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
+        let event_route_index = if format_version >= 121_005 {
+            read_encoded_ushort_array(&mut reader, active_building_count)?
+        } else {
+            Vec::new()
+        };
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                active_building_count,
+                cargo_traffic_rate,
+                garbage_traffic_rate,
+                access_segment,
+                event_access_segment,
+                cash_buffer,
+                room_cost,
+                room_cost_target,
+                room_max,
+                room_used,
+                educated0_unemployed,
+                educated1_unemployed,
+                educated2_unemployed,
+                educated3_unemployed,
+                all_unemployed,
+                event_route_index,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns the active-building count represented by these arrays.
+    pub fn active_building_count(&self) -> usize {
+        self.active_building_count
+    }
+    /// Returns cargo traffic values, empty before version 115004.
+    pub fn cargo_traffic_rate(&self) -> &[u32] {
+        &self.cargo_traffic_rate
+    }
+    /// Returns garbage traffic values, empty before version 115022.
+    pub fn garbage_traffic_rate(&self) -> &[u32] {
+        &self.garbage_traffic_rate
+    }
+    /// Returns access segment indices, empty before version 115013.
+    pub fn access_segment(&self) -> &[u16] {
+        &self.access_segment
+    }
+    /// Returns event access segment indices, empty before version 121017.
+    pub fn event_access_segment(&self) -> &[u16] {
+        &self.event_access_segment
+    }
+    /// Returns cash buffer values, empty before version 116001.
+    pub fn cash_buffer(&self) -> &[i32] {
+        &self.cash_buffer
+    }
+    /// Returns room-cost values, empty before version 117005.
+    pub fn room_cost(&self) -> &[u16] {
+        &self.room_cost
+    }
+    /// Returns target room-cost values, empty before version 117005.
+    pub fn room_cost_target(&self) -> &[u16] {
+        &self.room_cost_target
+    }
+    /// Returns maximum room values, empty before version 117005.
+    pub fn room_max(&self) -> &[u16] {
+        &self.room_max
+    }
+    /// Returns used room values, empty before version 117005.
+    pub fn room_used(&self) -> &[u16] {
+        &self.room_used
+    }
+    /// Returns unemployed counts for education level zero, empty before 120001.
+    pub fn educated0_unemployed(&self) -> &[u8] {
+        &self.educated0_unemployed
+    }
+    /// Returns unemployed counts for education level one, empty before 120001.
+    pub fn educated1_unemployed(&self) -> &[u8] {
+        &self.educated1_unemployed
+    }
+    /// Returns unemployed counts for education level two, empty before 120001.
+    pub fn educated2_unemployed(&self) -> &[u8] {
+        &self.educated2_unemployed
+    }
+    /// Returns unemployed counts for education level three, empty before 120001.
+    pub fn educated3_unemployed(&self) -> &[u8] {
+        &self.educated3_unemployed
+    }
+    /// Returns total unemployed counts, empty before 120001.
+    pub fn all_unemployed(&self) -> &[u8] {
+        &self.all_unemployed
+    }
+    /// Returns event route indices, empty before version 121005.
+    pub fn event_route_index(&self) -> &[u16] {
+        &self.event_route_index
+    }
+    /// Writes the original encoded fields exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+
+    /// Creates an editor; changed fields use valid canonical array encoding.
+    pub fn into_editor(self) -> BuildingEconomicFieldsEditor {
+        BuildingEconomicFieldsEditor {
+            format_version: self.format_version,
+            active_building_count: self.active_building_count,
+            cargo_traffic_rate: self.cargo_traffic_rate,
+            garbage_traffic_rate: self.garbage_traffic_rate,
+            access_segment: self.access_segment,
+            event_access_segment: self.event_access_segment,
+            cash_buffer: self.cash_buffer,
+            room_cost: self.room_cost,
+            room_cost_target: self.room_cost_target,
+            room_max: self.room_max,
+            room_used: self.room_used,
+            educated0_unemployed: self.educated0_unemployed,
+            educated1_unemployed: self.educated1_unemployed,
+            educated2_unemployed: self.educated2_unemployed,
+            educated3_unemployed: self.educated3_unemployed,
+            all_unemployed: self.all_unemployed,
+            event_route_index: self.event_route_index,
+        }
+    }
+}
+
+impl BuildingEconomicFieldsEditor {
+    /// Returns the inner DataSerializer version associated with these fields.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns the active-building count represented by these fields.
+    pub fn active_building_count(&self) -> usize {
+        self.active_building_count
+    }
+    /// Returns editable cargo traffic values.
+    pub fn cargo_traffic_rate_mut(&mut self) -> &mut [u32] {
+        &mut self.cargo_traffic_rate
+    }
+    /// Returns editable garbage traffic values.
+    pub fn garbage_traffic_rate_mut(&mut self) -> &mut [u32] {
+        &mut self.garbage_traffic_rate
+    }
+    /// Returns editable access segment indices.
+    pub fn access_segment_mut(&mut self) -> &mut [u16] {
+        &mut self.access_segment
+    }
+    /// Returns editable event access segment indices.
+    pub fn event_access_segment_mut(&mut self) -> &mut [u16] {
+        &mut self.event_access_segment
+    }
+    /// Returns editable cash buffer values.
+    pub fn cash_buffer_mut(&mut self) -> &mut [i32] {
+        &mut self.cash_buffer
+    }
+    /// Returns editable room-cost values.
+    pub fn room_cost_mut(&mut self) -> &mut [u16] {
+        &mut self.room_cost
+    }
+    /// Returns editable target room-cost values.
+    pub fn room_cost_target_mut(&mut self) -> &mut [u16] {
+        &mut self.room_cost_target
+    }
+    /// Returns editable maximum room values.
+    pub fn room_max_mut(&mut self) -> &mut [u16] {
+        &mut self.room_max
+    }
+    /// Returns editable used room values.
+    pub fn room_used_mut(&mut self) -> &mut [u16] {
+        &mut self.room_used
+    }
+    /// Returns editable unemployed counts for education level zero.
+    pub fn educated0_unemployed_mut(&mut self) -> &mut [u8] {
+        &mut self.educated0_unemployed
+    }
+    /// Returns editable unemployed counts for education level one.
+    pub fn educated1_unemployed_mut(&mut self) -> &mut [u8] {
+        &mut self.educated1_unemployed
+    }
+    /// Returns editable unemployed counts for education level two.
+    pub fn educated2_unemployed_mut(&mut self) -> &mut [u8] {
+        &mut self.educated2_unemployed
+    }
+    /// Returns editable unemployed counts for education level three.
+    pub fn educated3_unemployed_mut(&mut self) -> &mut [u8] {
+        &mut self.educated3_unemployed
+    }
+    /// Returns editable total unemployed counts.
+    pub fn all_unemployed_mut(&mut self) -> &mut [u8] {
+        &mut self.all_unemployed
+    }
+    /// Returns editable event route indices.
+    pub fn event_route_index_mut(&mut self) -> &mut [u16] {
+        &mut self.event_route_index
+    }
+
+    /// Encodes the version-gated arrays and checks each active-building count.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.format_version < 164 {
+            return Err(invalid_economic("unsupported inner version"));
+        }
+        let count = self.active_building_count;
+        let gate_counts = [
+            (
+                self.format_version >= 115_004,
+                self.cargo_traffic_rate.len(),
+            ),
+            (
+                self.format_version >= 115_022,
+                self.garbage_traffic_rate.len(),
+            ),
+            (self.format_version >= 115_013, self.access_segment.len()),
+            (
+                self.format_version >= 121_017,
+                self.event_access_segment.len(),
+            ),
+            (self.format_version >= 116_001, self.cash_buffer.len()),
+            (self.format_version >= 117_005, self.room_cost.len()),
+            (self.format_version >= 117_005, self.room_cost_target.len()),
+            (self.format_version >= 117_005, self.room_max.len()),
+            (self.format_version >= 117_005, self.room_used.len()),
+            (
+                self.format_version >= 120_001,
+                self.educated0_unemployed.len(),
+            ),
+            (
+                self.format_version >= 120_001,
+                self.educated1_unemployed.len(),
+            ),
+            (
+                self.format_version >= 120_001,
+                self.educated2_unemployed.len(),
+            ),
+            (
+                self.format_version >= 120_001,
+                self.educated3_unemployed.len(),
+            ),
+            (self.format_version >= 120_001, self.all_unemployed.len()),
+            (self.format_version >= 121_005, self.event_route_index.len()),
+        ];
+        if gate_counts
+            .iter()
+            .any(|(present, actual)| *actual != if *present { count } else { 0 })
+        {
+            return Err(invalid_economic(
+                "one or more array counts do not match version and active buildings",
+            ));
+        }
+        if self.format_version < 116_006
+            && self.format_version >= 116_001
+            && self
+                .cash_buffer
+                .iter()
+                .any(|value| !(0..=i32::from(u16::MAX)).contains(value))
+        {
+            return Err(invalid_economic(
+                "legacy cash buffer value does not fit in u16",
+            ));
+        }
+        let mut output = Vec::new();
+        if self.format_version >= 115_004 {
+            write_encoded_uint_array(&mut output, &self.cargo_traffic_rate);
+        }
+        if self.format_version >= 115_022 {
+            write_encoded_uint_array(&mut output, &self.garbage_traffic_rate);
+        }
+        if self.format_version >= 115_013 {
+            write_encoded_ushort_array(&mut output, &self.access_segment);
+        }
+        if self.format_version >= 121_017 {
+            write_encoded_ushort_array(&mut output, &self.event_access_segment);
+        }
+        if self.format_version >= 116_006 {
+            write_encoded_int_array(&mut output, &self.cash_buffer);
+        } else if self.format_version >= 116_001 {
+            let values = self
+                .cash_buffer
+                .iter()
+                .map(|value| *value as u16)
+                .collect::<Vec<_>>();
+            write_encoded_ushort_array(&mut output, &values);
+        }
+        if self.format_version >= 117_005 {
+            for values in [
+                &self.room_cost,
+                &self.room_cost_target,
+                &self.room_max,
+                &self.room_used,
+            ] {
+                write_encoded_ushort_array(&mut output, values);
+            }
+        }
+        if self.format_version >= 120_001 {
+            for values in [
+                &self.educated0_unemployed,
+                &self.educated1_unemployed,
+                &self.educated2_unemployed,
+                &self.educated3_unemployed,
+                &self.all_unemployed,
+            ] {
+                write_encoded_byte_array(&mut output, values);
+            }
+        }
+        if self.format_version >= 121_005 {
+            write_encoded_ushort_array(&mut output, &self.event_route_index);
+        }
+        Ok(output)
+    }
+}
+
+fn invalid_economic(reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "BuildingManager economic fields".to_owned(),
+        offset: 0,
+        reason: reason.into(),
+    }
+}
+
 fn invalid_population(reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "BuildingManager population fields".to_owned(),
@@ -1229,9 +1668,9 @@ impl BuildingManagerObjectHeadersPrefix {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildingFlag, BuildingFlagsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
-        BuildingTimerField, BuildingTimerGeometryEditor, fixed_object_header_count,
-        timer_fields_for_version,
+        BuildingEconomicFieldsPrefix, BuildingFlag, BuildingFlagsPrefix, BuildingPopulationEditor,
+        BuildingPopulationPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
+        fixed_object_header_count, timer_fields_for_version,
     };
 
     #[test]
@@ -1397,6 +1836,79 @@ mod tests {
             level: vec![10],
         };
         assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn building_economic_fields_follow_version_gates_and_round_trip() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 121_017,
+            building_flags: vec![BuildingFlag {
+                index: 1,
+                flags: 1,
+                flags2: 0,
+            }],
+            serialized_prefix: Vec::new(),
+        };
+        let encoded = [
+            0, 0, 0, 0, 7, // cargo traffic UInt
+            0, 0, 0, 0, 8, // garbage traffic UInt
+            0, 0, 9, // access segment UShort
+            0, 0, 10, // event access segment UShort
+            0, 0xff, 0xff, 0xff, 0xf6, // cash buffer Int (-10)
+            0, 0, 11, 0, 0, 12, 0, 0, 13, 0, 0, 14, // room columns
+            0, 15, 0, 16, 0, 17, 0, 18, 0, 19, // unemployment columns
+            0, 0, 20, // event route UShort
+        ];
+        let (prefix, used) = BuildingEconomicFieldsPrefix::decode_prefix(121_017, &flags, &encoded)
+            .expect("valid economic fields");
+        assert_eq!(used, encoded.len());
+        assert_eq!(prefix.cargo_traffic_rate(), [7]);
+        assert_eq!(prefix.garbage_traffic_rate(), [8]);
+        assert_eq!(prefix.access_segment(), [9]);
+        assert_eq!(prefix.event_access_segment(), [10]);
+        assert_eq!(prefix.cash_buffer(), [-10]);
+        assert_eq!(prefix.room_max(), [13]);
+        assert_eq!(prefix.all_unemployed(), [19]);
+        assert_eq!(prefix.event_route_index(), [20]);
+        assert_eq!(prefix.encode(), encoded);
+
+        let mut editor = prefix.into_editor();
+        editor.cash_buffer_mut()[0] = -11;
+        editor.event_route_index_mut()[0] = 21;
+        let rewritten = editor.encode().expect("valid edited economic fields");
+        let (updated, _) = BuildingEconomicFieldsPrefix::decode_prefix(121_017, &flags, &rewritten)
+            .expect("rewritten economic fields");
+        assert_eq!(updated.cash_buffer(), [-11]);
+        assert_eq!(updated.event_route_index(), [21]);
+    }
+
+    #[test]
+    fn building_cash_buffer_preserves_legacy_ushort_gate() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 116_001,
+            building_flags: vec![BuildingFlag {
+                index: 1,
+                flags: 1,
+                flags2: 0,
+            }],
+            serialized_prefix: Vec::new(),
+        };
+        let encoded = [
+            0, 0, 0, 0, 1, // cargo traffic
+            0, 0, 0, 0, 2, // garbage traffic
+            0, 0, 3, // access segment
+            0, 0, 4, // legacy UShort cash buffer
+        ];
+        let (prefix, used) = BuildingEconomicFieldsPrefix::decode_prefix(116_001, &flags, &encoded)
+            .expect("valid legacy economic fields");
+        assert_eq!(used, encoded.len());
+        assert_eq!(prefix.cash_buffer(), [4]);
+        assert!(prefix.room_cost().is_empty());
+        assert_eq!(prefix.encode(), encoded);
+
+        let mut editor = prefix.into_editor();
+        editor.cash_buffer_mut()[0] = i32::from(u16::MAX) + 1;
+        assert!(editor.encode().is_err());
     }
 }
 
