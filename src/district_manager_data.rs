@@ -698,6 +698,10 @@ mod tests {
                 assert_eq!(block.as_bytes(), vec![index + 1; private_size]);
             }
             assert_eq!(prefix.encode(), bytes);
+
+            let mut truncated = bytes.clone();
+            truncated.pop();
+            assert!(DistrictManagerFlagsPrefix::decode_prefix(version, &truncated).is_err());
         }
     }
 
