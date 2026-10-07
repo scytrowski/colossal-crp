@@ -208,6 +208,33 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Reads a DataSerializer shared string and appends new strings to `table`.
+    pub(crate) fn read_shared_string(
+        &mut self,
+        table: &mut Vec<Option<String>>,
+    ) -> Result<Option<String>, CrpError> {
+        const MAX_SHARED_STRINGS: usize = 65_024;
+        let marker = self.read_u8()?;
+        match marker {
+            0xfe => {
+                let value = self.read_unique_string()?;
+                if table.len() >= MAX_SHARED_STRINGS {
+                    return Err(self.invalid("shared-string table exceeds the game limit"));
+                }
+                table.push(value.clone());
+                Ok(value)
+            }
+            0xff => Err(self.invalid("shared-string index uses a reserved marker")),
+            high => {
+                let index = usize::from(u16::from(high) << 8 | u16::from(self.read_u8()?));
+                table
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| self.invalid("shared-string index is out of bounds"))
+            }
+        }
+    }
+
     pub(crate) fn offset(&self) -> usize {
         self.offset
     }

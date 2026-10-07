@@ -266,6 +266,29 @@ pub struct BuildingEconomicFieldsEditor {
     event_route_index: Vec<u16>,
 }
 
+/// One keyed shared-string entry in a BuildingManager service-selection table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingServiceSelection {
+    /// Service prefab index stored as a `u16`.
+    pub service_index: u16,
+    /// Shared string value; null values are preserved if present in the stream.
+    pub value: Option<String>,
+}
+
+/// Versioned service-vehicle selection tables following economic fields.
+///
+/// The original table bytes are retained exactly. The shared-string table
+/// snapshot includes known preceding manager tags and strings introduced here,
+/// so a later decoder can continue from the correct shared-string indices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingServiceSelectionPrefix {
+    format_version: u32,
+    vehicle_selection: Vec<BuildingServiceSelection>,
+    additional_vehicle_selection: Vec<BuildingServiceSelection>,
+    shared_strings: Vec<Option<String>>,
+    serialized_prefix: Vec<u8>,
+}
+
 impl BuildingBufferFieldsPrefix {
     /// Decodes versioned network, utility, and byte fields for active buildings.
     ///
@@ -1418,6 +1441,99 @@ impl BuildingEconomicFieldsEditor {
     }
 }
 
+impl BuildingServiceSelectionPrefix {
+    /// Decodes the service-selection tables using the stream's shared-string state.
+    ///
+    /// `shared_strings` must contain every shared string read earlier in this
+    /// DataSerializer stream, in original order. The returned prefix includes
+    /// the updated table snapshot and original bytes for exact writeback.
+    pub fn decode_prefix(
+        format_version: u32,
+        bytes: &[u8],
+        mut shared_strings: Vec<Option<String>>,
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 {
+            return Err(invalid_service_selection("unsupported inner version"));
+        }
+        let mut reader = Reader::new(bytes);
+        let vehicle_selection = if format_version >= 114_001 {
+            read_service_selection_table(&mut reader, &mut shared_strings)?
+        } else {
+            Vec::new()
+        };
+        let additional_vehicle_selection = if format_version >= 116_020 {
+            read_service_selection_table(&mut reader, &mut shared_strings)?
+        } else {
+            Vec::new()
+        };
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                vehicle_selection,
+                additional_vehicle_selection,
+                shared_strings,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns the primary vehicle-selection entries in serialized order.
+    pub fn vehicle_selection(&self) -> &[BuildingServiceSelection] {
+        &self.vehicle_selection
+    }
+    /// Returns additional vehicle-selection entries from version 116020 onward.
+    pub fn additional_vehicle_selection(&self) -> &[BuildingServiceSelection] {
+        &self.additional_vehicle_selection
+    }
+    /// Returns shared strings known after these tables, including prior entries.
+    pub fn shared_strings(&self) -> &[Option<String>] {
+        &self.shared_strings
+    }
+    /// Writes the original encoded table bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+fn read_service_selection_table(
+    reader: &mut Reader<'_>,
+    shared_strings: &mut Vec<Option<String>>,
+) -> Result<Vec<BuildingServiceSelection>, CrpError> {
+    let count = reader.read_i16_be()?;
+    if count < 0 {
+        return Err(reader.invalid(format!("negative service-selection count {count}")));
+    }
+    let count = usize::try_from(count)
+        .map_err(|_| reader.invalid("service-selection count does not fit this platform"))?;
+    if count > reader.remaining() / 3 {
+        return Err(reader.invalid("service-selection count cannot fit in remaining bytes"));
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let service_index = reader.read_u16_be()?;
+        let value = reader.read_shared_string(shared_strings)?;
+        entries.push(BuildingServiceSelection {
+            service_index,
+            value,
+        });
+    }
+    Ok(entries)
+}
+
+fn invalid_service_selection(reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "BuildingManager service-selection tables".to_owned(),
+        offset: 0,
+        reason: reason.into(),
+    }
+}
+
 fn invalid_economic(reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "BuildingManager economic fields".to_owned(),
@@ -1669,8 +1785,8 @@ impl BuildingManagerObjectHeadersPrefix {
 mod tests {
     use super::{
         BuildingEconomicFieldsPrefix, BuildingFlag, BuildingFlagsPrefix, BuildingPopulationEditor,
-        BuildingPopulationPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
-        fixed_object_header_count, timer_fields_for_version,
+        BuildingPopulationPrefix, BuildingServiceSelectionPrefix, BuildingTimerField,
+        BuildingTimerGeometryEditor, fixed_object_header_count, timer_fields_for_version,
     };
 
     #[test]
@@ -1909,6 +2025,54 @@ mod tests {
         let mut editor = prefix.into_editor();
         editor.cash_buffer_mut()[0] = i32::from(u16::MAX) + 1;
         assert!(editor.encode().is_err());
+    }
+
+    #[test]
+    fn building_service_selection_tables_share_strings_and_preserve_bytes() {
+        let shared = [
+            "SimulationManager",
+            "GameAreaManager",
+            "TerrainManager",
+            "WaterSimulation",
+            "InstanceManager",
+            "PathManager",
+            "NetManager",
+            "BuildingManager",
+        ]
+        .into_iter()
+        .map(|value| Some(value.to_owned()))
+        .collect();
+        let encoded = [
+            0, 2, 0, 5, 0xfe, 0x80, 0, 1, 0xd0, 0, 6, 0, 8, 0, 1, 0, 7, 0, 8,
+        ];
+        let (prefix, used) =
+            BuildingServiceSelectionPrefix::decode_prefix(116_020, &encoded, shared)
+                .expect("valid service selection tables");
+        assert_eq!(used, encoded.len());
+        assert_eq!(prefix.vehicle_selection().len(), 2);
+        assert_eq!(prefix.vehicle_selection()[0].service_index, 5);
+        assert_eq!(prefix.vehicle_selection()[0].value.as_deref(), Some("P"));
+        assert_eq!(prefix.vehicle_selection()[1].value.as_deref(), Some("P"));
+        assert_eq!(prefix.additional_vehicle_selection()[0].service_index, 7);
+        assert_eq!(
+            prefix.additional_vehicle_selection()[0].value.as_deref(),
+            Some("P")
+        );
+        assert_eq!(prefix.shared_strings().len(), 9);
+        assert_eq!(prefix.encode(), encoded);
+    }
+
+    #[test]
+    fn building_service_selection_rejects_negative_counts_and_bad_indices() {
+        let shared = vec![Some("BuildingManager".to_owned())];
+        assert!(
+            BuildingServiceSelectionPrefix::decode_prefix(114_001, &[0xff, 0xff], shared.clone(),)
+                .is_err()
+        );
+        assert!(
+            BuildingServiceSelectionPrefix::decode_prefix(114_001, &[0, 1, 0, 1, 0, 2], shared,)
+                .is_err()
+        );
     }
 }
 

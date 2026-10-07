@@ -25,8 +25,9 @@ pub use building_manager_data::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsEditor,
     BuildingEconomicFieldsPrefix, BuildingFlag, BuildingFlagsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
-    BuildingPrefabPrefix, BuildingProblemPrefix, BuildingProblemWords, BuildingTimerField,
-    BuildingTimerGeometryEditor, BuildingTimerGeometryPrefix,
+    BuildingPrefabPrefix, BuildingProblemPrefix, BuildingProblemWords, BuildingServiceSelection,
+    BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
+    BuildingTimerGeometryPrefix,
 };
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
@@ -3774,6 +3775,7 @@ mod tests {
         let mut checked_building_timer_convenience = false;
         let mut checked_building_population_convenience = false;
         let mut checked_building_economic_convenience = false;
+        let mut checked_building_selection_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
@@ -4460,6 +4462,41 @@ mod tests {
                             );
                             checked_building_economic_convenience = true;
                         }
+                        let service_selection_start = net_reader.offset();
+                        let shared_strings = [
+                            "SimulationManager",
+                            "GameAreaManager",
+                            "TerrainManager",
+                            "WaterSimulation",
+                            "InstanceManager",
+                            "PathManager",
+                            "NetManager",
+                            "BuildingManager",
+                        ]
+                        .into_iter()
+                        .map(|value| Some(value.to_owned()))
+                        .collect();
+                        let (service_selection, service_selection_used) =
+                            BuildingServiceSelectionPrefix::decode_prefix(
+                                version,
+                                net_reader.remaining_bytes(),
+                                shared_strings,
+                            )?;
+                        net_reader.read_bytes(service_selection_used)?;
+                        assert_eq!(
+                            service_selection.encode(),
+                            &net_reader.consumed_bytes()[service_selection_start
+                                ..service_selection_start + service_selection_used]
+                        );
+                        if !checked_building_selection_convenience && active_building_count > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_service_selection_prefix(
+                                    metadata.save_app_version,
+                                )?;
+                            assert_eq!(via_manager, service_selection);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            checked_building_selection_convenience = true;
+                        }
                         if std::env::var_os("CRP_EXTRACT_BUILDING_BYTE_STATE_FIXTURE").is_some()
                             && path
                                 .file_name()
@@ -4555,6 +4592,7 @@ mod tests {
         assert!(checked_building_timer_convenience);
         assert!(checked_building_population_convenience);
         assert!(checked_building_economic_convenience);
+        assert!(checked_building_selection_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(

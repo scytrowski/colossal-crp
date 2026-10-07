@@ -10,7 +10,8 @@ use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_u
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
     BuildingFlagsPrefix, BuildingManagerObjectHeadersPrefix, BuildingPopulationPrefix,
-    BuildingPrefabPrefix, BuildingProblemPrefix, BuildingTimerGeometryPrefix,
+    BuildingPrefabPrefix, BuildingProblemPrefix, BuildingServiceSelectionPrefix,
+    BuildingTimerGeometryPrefix,
 };
 use crate::{BuildingEconomicFieldsEditor, BuildingPopulationEditor, BuildingTimerGeometryEditor};
 use crate::{
@@ -707,15 +708,7 @@ impl SimulationManagerData {
         let (_, net_end) = self.decode_net_manager_tail_prefix(save_app_version)?;
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(net_end)?;
-        let mut strings = vec![
-            "SimulationManager".to_owned(),
-            "GameAreaManager".to_owned(),
-            "TerrainManager".to_owned(),
-            "WaterSimulation".to_owned(),
-            "InstanceManager".to_owned(),
-            "PathManager".to_owned(),
-            "NetManager".to_owned(),
-        ];
+        let mut strings = manager_profiler_seed();
         expect_profile_tag(&mut reader, &mut strings, "BuildingManager")?;
         let (data, used) =
             BuildingFlagsPrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
@@ -877,6 +870,38 @@ impl SimulationManagerData {
         )?;
         reader.read_bytes(used)?;
         Ok((data, reader.offset()))
+    }
+
+    /// Decodes versioned service-vehicle selection tables after economic fields.
+    ///
+    /// The shared-string table is seeded from the preceding root and manager
+    /// profiler tags, then extended by newly encountered strings in these tables.
+    pub fn decode_building_service_selection_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingServiceSelectionPrefix, usize), CrpError> {
+        let (_, economic_end) = self.decode_building_economic_fields_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(economic_end)?;
+        let (data, used) = BuildingServiceSelectionPrefix::decode_prefix(
+            self.format_version,
+            reader.remaining_bytes(),
+            self.building_manager_shared_strings(save_app_version)?,
+        )?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
+    fn building_manager_shared_strings(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<Option<String>>, CrpError> {
+        let (_, net_end) = self.decode_net_manager_tail_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(net_end)?;
+        let mut strings = manager_profiler_seed();
+        expect_profile_tag(&mut reader, &mut strings, "BuildingManager")?;
+        Ok(strings.into_iter().map(Some).collect())
     }
 
     /// Replaces timer and building-dimension arrays, preserving the rest of the graph.
@@ -1254,6 +1279,21 @@ fn expect_profile_tag(
         )));
     }
     Ok(())
+}
+
+fn manager_profiler_seed() -> Vec<String> {
+    [
+        "SimulationManager",
+        "GameAreaManager",
+        "TerrainManager",
+        "WaterSimulation",
+        "InstanceManager",
+        "PathManager",
+        "NetManager",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 fn read_byte_array(reader: &mut Reader<'_>) -> Result<Option<Vec<u8>>, CrpError> {
