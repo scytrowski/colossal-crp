@@ -165,7 +165,9 @@ impl DistrictManagerTailData {
     /// Decodes the tail for inner versions 164 and newer.
     ///
     /// The returned byte count includes the DistrictManager profiler end tag.
-    /// Truncated headers, scalars, or tags return an error.
+    /// This follows the examined DLL layout. Files with additional opaque tail
+    /// bytes, including the observed MP23 variant, return an error. Truncated
+    /// headers, scalars, or tags also return an error.
     pub fn decode(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         if format_version < 164 {
             return Err(invalid_district_manager(
