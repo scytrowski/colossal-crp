@@ -897,6 +897,30 @@ impl SimulationManagerData {
         Ok((grids, grid_end))
     }
 
+    /// Replaces district and park grid streams in the manager graph.
+    ///
+    /// The editor must originate from this graph's current grid bytes. Other
+    /// manager bytes, including the park records and following objects, remain
+    /// unchanged. Modified grids use literal `EncodedArray.Byte` blocks.
+    pub fn replace_district_manager_grids(
+        &mut self,
+        edited: &crate::DistrictManagerGridEditor,
+    ) -> Result<(), CrpError> {
+        let (original, grid_end) = self.decode_district_manager_grids()?;
+        if edited.original_bytes() != original.original_bytes() {
+            return Err(invalid(
+                0,
+                "edited district grids do not match this manager graph",
+            ));
+        }
+        let grid_start = grid_end
+            .checked_sub(original.original_bytes().len())
+            .ok_or(CrpError::ArithmeticOverflow("DistrictManager grid start"))?;
+        self.serialized_object_graph
+            .splice(grid_start..grid_end, edited.encode());
+        Ok(())
+    }
+
     /// Decodes the first two BuildingManager flag arrays after the NetManager body.
     /// The returned graph offset is before the guide and milestone counts.
     pub fn decode_building_flags_prefix(
@@ -2054,6 +2078,36 @@ mod manager_boundary_tests {
         assert_eq!(grids.district_plane(0).unwrap()[0], 0);
         assert_eq!(grids.park_plane(7).unwrap()[262_143], 0);
         assert_eq!(grids.encode(), data.serialized_object_graph()[grid_start..]);
+    }
+
+    #[test]
+    fn replaces_only_district_grid_bytes_in_manager_graph() {
+        let mut data = synthetic_manager_data();
+        let grid_start = data.serialized_object_graph.len();
+        data.serialized_object_graph
+            .extend(vec![0xff; 2 * 8 * 262_144 / 128]);
+        let grid_end = data.serialized_object_graph.len();
+        data.serialized_object_graph
+            .extend_from_slice(&[0xfe, 0x12, 0x34]);
+        let prefix = data.serialized_object_graph[..grid_start].to_vec();
+        let suffix = data.serialized_object_graph[grid_end..].to_vec();
+        let (grids, _) = data.decode_district_manager_grids().unwrap();
+        let mut editor = grids.into_editor();
+        let mut plane = vec![0; 262_144];
+        plane[0] = 42;
+        editor.replace_park_plane(3, &plane).unwrap();
+        data.replace_district_manager_grids(&editor).unwrap();
+        assert_eq!(&data.serialized_object_graph[..grid_start], prefix);
+        let (updated, new_end) = data.decode_district_manager_grids().unwrap();
+        assert_eq!(updated.park_plane(3).unwrap()[0], 42);
+        assert_eq!(&data.serialized_object_graph[new_end..], suffix);
+        assert_eq!(
+            &data.serialized_object_graph[grid_start..grid_start + 16_384],
+            &[0xff; 16_384]
+        );
+        let stable = data.serialized_object_graph.clone();
+        assert!(data.replace_district_manager_grids(&editor).is_err());
+        assert_eq!(data.serialized_object_graph, stable);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
     read_encoded_bool_array, read_encoded_byte_array, read_encoded_uint_array,
-    read_encoded_ulong_array,
+    read_encoded_ulong_array, write_encoded_byte_array,
 };
 
 const DISTRICT_COUNT: usize = 128;
@@ -129,7 +129,19 @@ pub struct DistrictParkRecord {
 pub struct DistrictManagerGridData {
     district_values: Vec<u8>,
     park_values: Option<Vec<u8>>,
+    district_encoded_len: usize,
     serialized: Vec<u8>,
+}
+
+/// Edits district or park grid planes while retaining the other encoded stream.
+///
+/// A changed grid is encoded as literal `EncodedArray.Byte` blocks. Its run
+/// grouping may therefore differ from the game-produced bytes.
+#[derive(Debug, Clone)]
+pub struct DistrictManagerGridEditor {
+    original: DistrictManagerGridData,
+    district_dirty: bool,
+    park_dirty: bool,
 }
 
 impl DistrictManagerGridData {
@@ -150,6 +162,7 @@ impl DistrictManagerGridData {
             read_encoded_byte_array(&mut reader, DISTRICT_GRID_VALUES).map_err(|error| {
                 invalid_district_manager(reader.offset(), format!("district grid: {error}"))
             })?;
+        let district_encoded_len = reader.offset();
         let park_values = if format_version >= PARK_FLAGS_VERSION {
             Some(
                 read_encoded_byte_array(&mut reader, DISTRICT_GRID_VALUES).map_err(|error| {
@@ -164,6 +177,7 @@ impl DistrictManagerGridData {
             Self {
                 district_values,
                 park_values,
+                district_encoded_len,
                 serialized: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -191,6 +205,95 @@ impl DistrictManagerGridData {
     pub fn encode(&self) -> Vec<u8> {
         self.serialized.clone()
     }
+
+    pub(crate) fn original_bytes(&self) -> &[u8] {
+        &self.serialized
+    }
+
+    /// Converts the decoded grids into an editor for explicit plane changes.
+    pub fn into_editor(self) -> DistrictManagerGridEditor {
+        DistrictManagerGridEditor {
+            original: self,
+            district_dirty: false,
+            park_dirty: false,
+        }
+    }
+}
+
+impl DistrictManagerGridEditor {
+    /// Replaces one district plane (index 0–7) of exactly 262,144 bytes.
+    pub fn replace_district_plane(&mut self, index: usize, values: &[u8]) -> Result<(), CrpError> {
+        replace_grid_plane(&mut self.original.district_values, index, values)?;
+        self.district_dirty = true;
+        Ok(())
+    }
+
+    /// Replaces one park plane (index 0–7) of exactly 262,144 bytes.
+    ///
+    /// Returns an error when this inner version has no serialized park grid.
+    pub fn replace_park_plane(&mut self, index: usize, values: &[u8]) -> Result<(), CrpError> {
+        let park = self.original.park_values.as_mut().ok_or_else(|| {
+            invalid_district_manager(0, "park grid is absent in this inner version")
+        })?;
+        replace_grid_plane(park, index, values)?;
+        self.park_dirty = true;
+        Ok(())
+    }
+
+    /// Returns a district plane, or `None` for an invalid index.
+    pub fn district_plane(&self, index: usize) -> Option<&[u8]> {
+        self.original.district_plane(index)
+    }
+
+    /// Returns a park plane, or `None` when absent or invalid.
+    pub fn park_plane(&self, index: usize) -> Option<&[u8]> {
+        self.original.park_plane(index)
+    }
+
+    /// Writes edited grids, preserving each unchanged grid stream byte for byte.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        if self.district_dirty {
+            write_encoded_byte_array(&mut output, &self.original.district_values);
+        } else {
+            output
+                .extend_from_slice(&self.original.serialized[..self.original.district_encoded_len]);
+        }
+        if self.park_dirty {
+            if let Some(park) = &self.original.park_values {
+                write_encoded_byte_array(&mut output, park);
+            }
+        } else {
+            output
+                .extend_from_slice(&self.original.serialized[self.original.district_encoded_len..]);
+        }
+        output
+    }
+
+    pub(crate) fn original_bytes(&self) -> &[u8] {
+        &self.original.serialized
+    }
+}
+
+fn replace_grid_plane(grid: &mut [u8], index: usize, values: &[u8]) -> Result<(), CrpError> {
+    if index >= DISTRICT_GRID_PLANES {
+        return Err(invalid_district_manager(
+            0,
+            format!("grid plane index {index} is outside 0–7"),
+        ));
+    }
+    if values.len() != DISTRICT_GRID_CELLS {
+        return Err(invalid_district_manager(
+            0,
+            format!(
+                "grid plane has {} bytes; expected {DISTRICT_GRID_CELLS}",
+                values.len()
+            ),
+        ));
+    }
+    let start = index * DISTRICT_GRID_CELLS;
+    grid[start..start + DISTRICT_GRID_CELLS].copy_from_slice(values);
+    Ok(())
 }
 
 fn grid_plane(values: &[u8], index: usize) -> Option<&[u8]> {
@@ -1362,8 +1465,8 @@ fn invalid_district_manager(offset: usize, reason: impl Into<String>) -> CrpErro
 #[cfg(test)]
 mod tests {
     use super::{
-        DISTRICT_COUNT, DISTRICT_GRID_CELLS, DistrictManagerFlagsPrefix, DistrictManagerGridData,
-        POLICY_COUNT, district_policy_bool_count,
+        DISTRICT_COUNT, DISTRICT_GRID_CELLS, DISTRICT_GRID_VALUES, DistrictManagerFlagsPrefix,
+        DistrictManagerGridData, POLICY_COUNT, district_policy_bool_count,
     };
     use crate::data_serializer::write_unique_string;
     use crate::encoded_array::{
@@ -1793,6 +1896,68 @@ mod tests {
     }
 
     #[test]
+    fn grid_editor_writes_exact_literals_and_preserves_the_other_stream() {
+        let zero_grid = vec![0xff; DISTRICT_GRID_VALUES / 128];
+        let mut bytes = zero_grid.clone();
+        bytes.extend_from_slice(&zero_grid);
+        let (grids, used) = DistrictManagerGridData::decode(110_001, &bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        let mut editor = grids.into_editor();
+        assert_eq!(editor.encode(), bytes);
+        let mut plane = vec![0; DISTRICT_GRID_CELLS];
+        for (value, byte) in plane.iter_mut().take(128).enumerate() {
+            *byte = value as u8;
+        }
+        assert!(editor.replace_district_plane(8, &plane).is_err());
+        assert!(editor.replace_district_plane(0, &plane[..128]).is_err());
+        assert_eq!(editor.encode(), bytes);
+        editor.replace_district_plane(0, &plane).unwrap();
+        assert_eq!(editor.district_plane(0).unwrap(), plane);
+
+        let mut expected = Vec::new();
+        for block in 0..DISTRICT_GRID_VALUES / 128 {
+            expected.push(0x7f);
+            if block == 0 {
+                expected.extend(0_u8..128);
+            } else {
+                expected.extend([0; 128]);
+            }
+        }
+        expected.extend_from_slice(&zero_grid);
+        assert_eq!(editor.encode(), expected);
+        let (decoded, consumed) = DistrictManagerGridData::decode(110_001, &expected).unwrap();
+        assert_eq!(consumed, expected.len());
+        assert_eq!(decoded.district_plane(0).unwrap(), plane);
+        assert_eq!(decoded.park_plane(0).unwrap(), vec![0; DISTRICT_GRID_CELLS]);
+
+        let (grids, _) = DistrictManagerGridData::decode(110_001, &bytes).unwrap();
+        let mut park_editor = grids.into_editor();
+        park_editor.replace_park_plane(7, &plane).unwrap();
+        let encoded_park = park_editor.encode();
+        assert_eq!(&encoded_park[..zero_grid.len()], zero_grid);
+        let mut expected_park = zero_grid.clone();
+        for block in 0..DISTRICT_GRID_VALUES / 128 {
+            expected_park.push(0x7f);
+            if block == 7 * DISTRICT_GRID_CELLS / 128 {
+                expected_park.extend(0_u8..128);
+            } else {
+                expected_park.extend([0; 128]);
+            }
+        }
+        assert_eq!(encoded_park, expected_park);
+        let (decoded, _) = DistrictManagerGridData::decode(110_001, &encoded_park).unwrap();
+        assert_eq!(decoded.park_plane(7).unwrap(), plane);
+
+        let (old_grids, _) = DistrictManagerGridData::decode(110_000, &zero_grid).unwrap();
+        assert!(
+            old_grids
+                .into_editor()
+                .replace_park_plane(0, &plane)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn game_produced_grid_streams_preserve_default_and_nondefault_planes() {
         for (version, bytes, expected_len) in [
             (
@@ -1844,6 +2009,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn edited_game_grid_retains_untouched_nondefault_park_stream() {
+        let bytes = include_bytes!("../tests/fixtures/district-grids-v117013-mp23-map04.bin");
+        let (grids, _) = DistrictManagerGridData::decode(117_013, bytes).unwrap();
+        let original_park = &bytes[grids.district_encoded_len..];
+        let mut editor = grids.into_editor();
+        let mut plane = editor.district_plane(0).unwrap().to_vec();
+        plane[0] = 42;
+        editor.replace_district_plane(0, &plane).unwrap();
+        let encoded = editor.encode();
+        let (decoded, used) = DistrictManagerGridData::decode(117_013, &encoded).unwrap();
+        assert_eq!(used, encoded.len());
+        assert_eq!(decoded.district_plane(0).unwrap(), plane);
+        assert_eq!(&encoded[decoded.district_encoded_len..], original_park);
+        assert_eq!(
+            &decoded.park_plane(7).unwrap()[235_775..235_778],
+            &[30, 60, 90]
+        );
     }
 
     #[test]
