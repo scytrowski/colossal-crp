@@ -3810,6 +3810,8 @@ mod tests {
         let mut checked_tree_prefab_convenience = false;
         let mut checked_fence_prefab_convenience = false;
         let mut checked_net_tail_convenience = false;
+        let mut checked_zone_manager_convenience = false;
+        let mut checked_prop_manager_convenience = false;
         let mut checked_building_flags_convenience = false;
         let mut checked_building_prefab_convenience = false;
         let mut checked_building_object_convenience = false;
@@ -3885,6 +3887,16 @@ mod tests {
                             asset.name,
                             path.display()
                         );
+                        let (zone, zone_end) = manager_data.decode_zone_manager_prefix()?;
+                        assert_eq!(zone.format_version(), manager_data.format_version());
+                        assert_eq!(zone.object_references().len(), 13);
+                        assert!(zone_end < manager_data.serialized_object_graph().len());
+                        checked_zone_manager_convenience = true;
+                        let (props, prop_end) = manager_data.decode_prop_manager_prefix()?;
+                        assert_eq!(props.format_version(), manager_data.format_version());
+                        assert_eq!(props.flags().len(), 65_535);
+                        assert!(prop_end < manager_data.serialized_object_graph().len());
+                        checked_prop_manager_convenience = true;
                         let (game_area, game_area_bytes) =
                             manager_data.decode_game_area_prefix()?;
                         assert_eq!(game_area.area_grid().len(), 25);
@@ -4824,6 +4836,8 @@ mod tests {
         assert!(checked_tree_prefab_convenience);
         assert!(checked_fence_prefab_convenience);
         assert!(checked_net_tail_convenience);
+        assert!(checked_zone_manager_convenience);
+        assert!(checked_prop_manager_convenience);
         assert!(checked_building_flags_convenience);
         assert!(checked_building_prefab_convenience);
         assert!(checked_building_object_convenience);

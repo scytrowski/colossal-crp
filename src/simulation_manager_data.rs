@@ -3,9 +3,11 @@ use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
 use crate::InstanceManagerEditor;
 use crate::PathManagerData;
+use crate::PropManagerDataPrefix;
 use crate::TerrainManagerData;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
+use crate::ZoneManagerDataPrefix;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
@@ -32,6 +34,7 @@ const MAX_MANAGER_OBJECTS: u32 = 1_000_000;
 const MAX_STORAGE_ENTRIES: u32 = 1_000_000;
 const MAX_OBJECT_ID: u32 = 0xfe_0000;
 const MAX_SHARED_TYPES: usize = 65_024;
+const LOADING_PROFILER_END_TAG_BYTES: usize = 2;
 
 /// A non-null reference in `SimulationManager+Data`'s manager-data array.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -701,6 +704,95 @@ impl SimulationManagerData {
         )?;
         reader.read_bytes(body_length)?;
         Ok((data, reader.offset()))
+    }
+
+    /// Decodes ZoneManager after locating its profiler tag in the queued graph.
+    ///
+    /// The type array must contain `ZoneManager+Data` at slot 13 and
+    /// `PropManager+Data` at slot 14. Returns the graph offset after
+    /// ZoneManager's closing profiler reference and before PropManager's
+    /// opening profiler tag.
+    pub fn decode_zone_manager_prefix(&self) -> Result<(ZoneManagerDataPrefix, usize), CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 13, "ZoneManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 14, "PropManager+Data")?;
+
+        let graph = &self.serialized_object_graph;
+        let zone_tag = new_profiler_tag_bytes("ZoneManager")?;
+        let zone_body_start = find_unique_bytes(graph, &zone_tag, "ZoneManager profiler tag")?
+            .checked_add(zone_tag.len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "ZoneManager profiler tag offset",
+            ))?;
+        let (zone, body_len) =
+            ZoneManagerDataPrefix::decode_prefix(self.format_version, &graph[zone_body_start..])?;
+        let end_tag_start = zone_body_start
+            .checked_add(body_len)
+            .ok_or(CrpError::ArithmeticOverflow("ZoneManager body end"))?;
+        let prop_tag = new_profiler_tag_bytes("PropManager")?;
+        let prop_tag_start = end_tag_start
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow("ZoneManager end tag"))?;
+        if graph
+            .get(end_tag_start)
+            .is_none_or(|marker| *marker >= 0xfe)
+            || !graph
+                .get(prop_tag_start..)
+                .is_some_and(|tail| tail.starts_with(&prop_tag))
+        {
+            return Err(invalid(
+                end_tag_start,
+                "ZoneManager fields are not followed by its closing tag and PropManager",
+            ));
+        }
+        Ok((zone, prop_tag_start))
+    }
+
+    /// Decodes PropManager after the ZoneManager boundary in the manager graph.
+    ///
+    /// The type array must contain `PropManager+Data` at slot 14 and
+    /// `TreeManager+Data` at slot 15. Returns the graph offset after
+    /// PropManager's closing profiler reference and before TreeManager.
+    pub fn decode_prop_manager_prefix(&self) -> Result<(PropManagerDataPrefix, usize), CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 14, "PropManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 15, "TreeManager+Data")?;
+
+        let (_, prop_tag_start) = self.decode_zone_manager_prefix()?;
+        let graph = &self.serialized_object_graph;
+        let prop_tag = new_profiler_tag_bytes("PropManager")?;
+        if !graph
+            .get(prop_tag_start..)
+            .is_some_and(|tail| tail.starts_with(&prop_tag))
+        {
+            return Err(invalid(
+                prop_tag_start,
+                "expected PropManager opening profiler tag",
+            ));
+        }
+        let prop_body_start = prop_tag_start
+            .checked_add(prop_tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("PropManager profiler tag"))?;
+        let (props, body_len) =
+            PropManagerDataPrefix::decode_prefix(self.format_version, &graph[prop_body_start..])?;
+        let end_tag_start = prop_body_start
+            .checked_add(body_len)
+            .ok_or(CrpError::ArithmeticOverflow("PropManager body end"))?;
+        let tree_tag = new_profiler_tag_bytes("TreeManager")?;
+        let tree_tag_start = end_tag_start
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow("PropManager end tag"))?;
+        if graph
+            .get(end_tag_start)
+            .is_none_or(|marker| *marker >= 0xfe)
+            || !graph
+                .get(tree_tag_start..)
+                .is_some_and(|tail| tail.starts_with(&tree_tag))
+        {
+            return Err(invalid(
+                end_tag_start,
+                "PropManager fields are not followed by its closing tag and TreeManager",
+            ));
+        }
+        Ok((props, tree_tag_start))
     }
 
     /// Decodes the first two BuildingManager flag arrays after the NetManager body.
@@ -1691,5 +1783,143 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
         name: "SimulationManager+Data".to_owned(),
         offset,
         reason: reason.into(),
+    }
+}
+
+fn expect_manager_type(
+    manager_objects: Option<&[Option<ManagerObjectReference>]>,
+    index: usize,
+    expected: &str,
+) -> Result<(), CrpError> {
+    let Some(Some(reference)) = manager_objects.and_then(|objects| objects.get(index)) else {
+        return Err(invalid(
+            index,
+            format!("missing manager reference for {expected}"),
+        ));
+    };
+    if !reference.type_name.starts_with(expected) {
+        return Err(invalid(
+            index,
+            format!(
+                "manager slot {index} is {}, expected {expected}",
+                reference.type_name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn new_profiler_tag_bytes(name: &str) -> Result<Vec<u8>, CrpError> {
+    let mut bytes = vec![0xfe];
+    write_unique_string(&mut bytes, name)?;
+    Ok(bytes)
+}
+
+fn find_unique_bytes(haystack: &[u8], needle: &[u8], description: &str) -> Result<usize, CrpError> {
+    let mut matches = haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == needle).then_some(offset));
+    let Some(offset) = matches.next() else {
+        return Err(invalid(
+            0,
+            format!("{description} not found in manager graph"),
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(invalid(
+            offset,
+            format!("{description} is ambiguous in manager graph"),
+        ));
+    }
+    Ok(offset)
+}
+
+#[cfg(test)]
+mod manager_boundary_tests {
+    use super::{ManagerObjectReference, SimulationManagerData};
+    use crate::data_serializer::write_unique_string;
+    use crate::encoded_array::{write_encoded_uint_array, write_encoded_ushort_array};
+
+    fn synthetic_manager_data() -> SimulationManagerData {
+        let mut graph = profiler_tag("ZoneManager");
+        write_encoded_uint_array(&mut graph, &vec![0; 16_383]);
+        graph.extend_from_slice(&[0; 3 + 3 + 16]);
+        graph.extend_from_slice(&[0xff; 13]);
+        graph.extend_from_slice(&[0, 14]);
+        graph.extend(profiler_tag("PropManager"));
+        write_encoded_ushort_array(&mut graph, &vec![0; 65_535]);
+        graph.extend_from_slice(&[0, 0]); // Empty PropInfo name table.
+        graph.extend_from_slice(&[0, 15]);
+        graph.extend(profiler_tag("TreeManager"));
+
+        let names = [
+            (13, "ZoneManager+Data"),
+            (14, "PropManager+Data"),
+            (15, "TreeManager+Data"),
+        ];
+        let mut manager_objects = vec![None; 16];
+        for (slot, type_name) in names {
+            manager_objects[slot] = Some(ManagerObjectReference {
+                object_id: slot as u32,
+                type_name: format!("{type_name}, Assembly-CSharp"),
+            });
+        }
+
+        SimulationManagerData {
+            format_version: 194,
+            current_tick_index: 0,
+            current_frame_index: 0,
+            current_build_index: 0,
+            randomizer_seed: 0,
+            day_time_offset_frames: None,
+            build_index_history: vec![0; 32],
+            serializable_data_storage: None,
+            root_fields_len: 0,
+            root_profile_begin_bytes: Vec::new(),
+            root_profile_end_bytes: Vec::new(),
+            manager_objects: Some(manager_objects),
+            manager_array_bytes: Vec::new(),
+            serialized_object_graph: graph,
+        }
+    }
+
+    fn profiler_tag(name: &str) -> Vec<u8> {
+        let mut bytes = vec![0xfe];
+        write_unique_string(&mut bytes, name).expect("short test tag is encodable");
+        bytes
+    }
+
+    #[test]
+    fn locates_zone_and_prop_prefixes_between_manager_tags() {
+        let data = synthetic_manager_data();
+        let (zone, zone_end) = data.decode_zone_manager_prefix().unwrap();
+        let (props, prop_end) = data.decode_prop_manager_prefix().unwrap();
+
+        assert_eq!(zone.format_version(), 194);
+        assert_eq!(zone.blocks().len(), 0);
+        assert_eq!(zone.object_references().len(), 13);
+        assert!(
+            data.serialized_object_graph()[zone_end..].starts_with(&profiler_tag("PropManager"))
+        );
+        assert_eq!(props.format_version(), 194);
+        assert_eq!(props.flags().len(), 65_535);
+        assert!(props.prefab_names().is_empty());
+        assert!(
+            data.serialized_object_graph()[prop_end..].starts_with(&profiler_tag("TreeManager"))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_manager_boundary_tag() {
+        let mut data = synthetic_manager_data();
+        let tree_tag = profiler_tag("TreeManager");
+        let offset = data
+            .serialized_object_graph
+            .windows(tree_tag.len())
+            .position(|window| window == tree_tag)
+            .unwrap();
+        data.serialized_object_graph[offset] = 0xfd;
+        assert!(data.decode_prop_manager_prefix().is_err());
     }
 }
