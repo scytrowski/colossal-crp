@@ -853,8 +853,9 @@ impl SimulationManagerData {
     ///
     /// The type array must contain `DistrictManager+Data` at slot 20. The
     /// decoded prefix includes district and park policies, active district
-    /// records, and their fixed-size statistics through subculture data. It
-    /// returns the graph offset immediately after that prefix.
+    /// records, and their tourism, hotel, style, library-visitor, and airline
+    /// fields. It returns the graph offset immediately after the active district
+    /// records and before the park records.
     pub fn decode_district_manager_flags_prefix(
         &self,
     ) -> Result<(DistrictManagerFlagsPrefix, usize), CrpError> {

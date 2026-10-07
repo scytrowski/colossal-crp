@@ -41,10 +41,10 @@ pub use building_manager_data::{
 pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictDemographicBlock, DistrictDemographicKind,
-    DistrictManagerFlagsPrefix, DistrictPopulationRecord, DistrictPrivateDataBlock,
-    DistrictPrivateDataKind, DistrictSpecializationBlock, DistrictSpecializationKind,
-    DistrictStatisticsBlock, DistrictStatisticsKind, DistrictSubCultureBlock,
-    DistrictSubCultureKind, DistrictTourismBlock, DistrictTourismKind,
+    DistrictHotelBlock, DistrictManagerFlagsPrefix, DistrictPopulationRecord,
+    DistrictPrivateDataBlock, DistrictPrivateDataKind, DistrictSpecializationBlock,
+    DistrictSpecializationKind, DistrictStatisticsBlock, DistrictStatisticsKind,
+    DistrictSubCultureBlock, DistrictSubCultureKind, DistrictTourismBlock, DistrictTourismKind,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
@@ -3854,7 +3854,27 @@ mod tests {
                 .iter()
                 .zip(subculture_kinds)
                 .all(|(block, kind)| block.kind() == kind && block.as_bytes().len() == 11);
-        statistics_match && tourism_match && subcultures_match
+        let expected_hotel_size =
+            12 + if version >= 117_007 { 4 } else { 0 } + if version >= 117_008 { 9 } else { 0 };
+        let hotel_present = (117_004..117_009).contains(&version);
+        let hotel_match = record.hotel_data().map(|hotel| hotel.as_bytes().len())
+            == hotel_present.then_some(expected_hotel_size);
+        let style_match = record.district_style_present().is_some() == (version >= 217)
+            && record
+                .district_style_name()
+                .is_none_or(|_| record.district_style_present() == Some(true));
+        let library_match = record.library_visitor_data().is_some() == (version >= 112_006)
+            && record
+                .library_visitor_data()
+                .is_none_or(|age| age.category() == DistrictAgeCategory::LibraryVisitors);
+        let airline_match = record.airline().is_some() == (version >= 114_003);
+        statistics_match
+            && tourism_match
+            && subcultures_match
+            && hotel_match
+            && style_match
+            && library_match
+            && airline_match
     }
 
     #[test]

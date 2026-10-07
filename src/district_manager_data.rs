@@ -43,6 +43,13 @@ const DISTRICT_TOURIST_VERSION: u32 = 119;
 const DISTRICT_TOURIST_AVERAGE_VERSION: u32 = 122;
 const DISTRICT_TOURIST_COUNT_VERSION: u32 = 117_011;
 const DISTRICT_SUBCULTURE_VERSION: u32 = 207;
+const DISTRICT_HOTEL_START_VERSION: u32 = 117_004;
+const DISTRICT_HOTEL_END_VERSION: u32 = 117_009;
+const DISTRICT_HOTEL_COLOR_VERSION: u32 = 117_007;
+const DISTRICT_HOTEL_POPULARITY_VERSION: u32 = 117_008;
+const DISTRICT_STYLE_VERSION: u32 = 217;
+const DISTRICT_LIBRARY_VISITOR_VERSION: u32 = 112_006;
+const DISTRICT_AIRLINE_VERSION: u32 = 114_003;
 const POLICY_COUNT: usize = 32;
 const POPULATION_DELTA_COUNT: usize = 16;
 const PRIVATE_DATA_BASE_BYTES: usize = 21;
@@ -62,6 +69,7 @@ const DISTRICT_GROUND_BYTES: usize = 15;
 const DISTRICT_RESOURCE_BASE_BYTES: usize = 60;
 const DISTRICT_TOURIST_BASE_BYTES: usize = 6;
 const DISTRICT_SUBCULTURE_BYTES: usize = 11;
+const DISTRICT_HOTEL_BASE_BYTES: usize = 12;
 
 /// The initial known fields from `DistrictManager+Data`.
 ///
@@ -102,6 +110,11 @@ pub struct DistrictPopulationRecord {
     statistics: Vec<DistrictStatisticsBlock>,
     tourism: Vec<DistrictTourismBlock>,
     subcultures: Vec<DistrictSubCultureBlock>,
+    hotel_data: Option<DistrictHotelBlock>,
+    district_style_present: Option<bool>,
+    district_style_name: Option<String>,
+    library_visitor_data: Option<DistrictAgePopulation>,
+    airline: Option<i8>,
 }
 
 /// An opaque fixed-size production, consumption, or resource data block.
@@ -179,6 +192,19 @@ pub enum DistrictSubCultureKind {
 pub struct DistrictSubCultureBlock {
     kind: DistrictSubCultureKind,
     bytes: Vec<u8>,
+}
+
+/// Opaque legacy hotel statistics read from versions 117004–117008.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictHotelBlock {
+    bytes: Vec<u8>,
+}
+
+impl DistrictHotelBlock {
+    /// Returns the exact serialized bytes for this currently opaque block.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl DistrictSubCultureBlock {
@@ -292,7 +318,7 @@ pub enum DistrictPrivateDataKind {
     Player,
 }
 
-/// A named pair of temporary and final age-group counts in a district.
+/// A named pair of temporary and final district counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DistrictAgePopulation {
     category: DistrictAgeCategory,
@@ -301,7 +327,7 @@ pub struct DistrictAgePopulation {
 }
 
 impl DistrictAgePopulation {
-    /// Returns the age or health category represented by this pair.
+    /// Returns the age, health, or visitor category represented by this pair.
     pub fn category(&self) -> DistrictAgeCategory {
         self.category
     }
@@ -329,6 +355,7 @@ pub enum DistrictAgeCategory {
     ElementaryEligible,
     HighschoolEligible,
     UniversityEligible,
+    LibraryVisitors,
 }
 
 impl DistrictPopulationRecord {
@@ -401,16 +428,41 @@ impl DistrictPopulationRecord {
     pub fn subcultures(&self) -> &[DistrictSubCultureBlock] {
         &self.subcultures
     }
+
+    /// Returns the legacy hotel statistics block, present only in versions 117004–117008.
+    pub fn hotel_data(&self) -> Option<&DistrictHotelBlock> {
+        self.hotel_data.as_ref()
+    }
+
+    /// Returns whether the versioned district-style field is present and enabled.
+    pub fn district_style_present(&self) -> Option<bool> {
+        self.district_style_present
+    }
+
+    /// Returns the district-style name when the style field contains a name.
+    pub fn district_style_name(&self) -> Option<&str> {
+        self.district_style_name.as_deref()
+    }
+
+    /// Returns the library visitor age counters, when serialized.
+    pub fn library_visitor_data(&self) -> Option<&DistrictAgePopulation> {
+        self.library_visitor_data.as_ref()
+    }
+
+    /// Returns the signed airline value, when serialized.
+    pub fn airline(&self) -> Option<i8> {
+        self.airline
+    }
 }
 
 impl DistrictManagerFlagsPrefix {
     /// Decodes the opening fields and both known policy bool streams.
     ///
     /// This prefix supports inner versions 164 and newer. It decodes district
-    /// population, age, private, specialization, demographic, and fixed-size
-    /// statistics blocks, then stops before the next manager field. Opaque
-    /// blocks retain their exact serialized bytes. Truncated or malformed fields
-    /// return an error.
+    /// population, age, private, specialization, demographic, statistics,
+    /// tourism, hotel, style, library-visitor, and airline fields, then stops
+    /// before the park records. Opaque blocks retain their exact serialized
+    /// bytes. Truncated or malformed fields return an error.
     pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         if format_version < 164 {
             return Err(invalid_district_manager(
@@ -701,6 +753,40 @@ impl DistrictManagerFlagsPrefix {
                     )?);
                 }
             }
+            let hotel_data = if (DISTRICT_HOTEL_START_VERSION..DISTRICT_HOTEL_END_VERSION)
+                .contains(&format_version)
+            {
+                Some(DistrictHotelBlock {
+                    bytes: reader
+                        .read_bytes(district_hotel_data_size(format_version))?
+                        .to_vec(),
+                })
+            } else {
+                None
+            };
+            let district_style_present = if format_version >= DISTRICT_STYLE_VERSION {
+                Some(reader.read_u8()? == 1)
+            } else {
+                None
+            };
+            let district_style_name = if district_style_present == Some(true) {
+                reader.read_unique_string()?
+            } else {
+                None
+            };
+            let library_visitor_data = if format_version >= DISTRICT_LIBRARY_VISITOR_VERSION {
+                Some(read_district_age_population(
+                    &mut reader,
+                    DistrictAgeCategory::LibraryVisitors,
+                )?)
+            } else {
+                None
+            };
+            let airline = if format_version >= DISTRICT_AIRLINE_VERSION {
+                Some(reader.read_u8()? as i8)
+            } else {
+                None
+            };
             district_population_records.push(DistrictPopulationRecord {
                 district_index,
                 random_seed,
@@ -717,6 +803,11 @@ impl DistrictManagerFlagsPrefix {
                 statistics,
                 tourism,
                 subcultures,
+                hotel_data,
+                district_style_present,
+                district_style_name,
+                library_visitor_data,
+                airline,
             });
         }
         let consumed = reader.offset();
@@ -926,6 +1017,20 @@ fn district_tourist_data_size(format_version: u32) -> usize {
         }
 }
 
+fn district_hotel_data_size(format_version: u32) -> usize {
+    DISTRICT_HOTEL_BASE_BYTES
+        + if format_version >= DISTRICT_HOTEL_COLOR_VERSION {
+            4
+        } else {
+            0
+        }
+        + if format_version >= DISTRICT_HOTEL_POPULARITY_VERSION {
+            9
+        } else {
+            0
+        }
+}
+
 fn district_private_data_size(format_version: u32) -> usize {
     let mut size = PRIVATE_DATA_BASE_BYTES;
     if format_version >= DISTRICT_PRIVATE_LEVELS_VERSION {
@@ -1100,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn active_district_population_record_obeys_crime_rate_gate() {
+    fn active_district_population_record_obeys_versioned_field_layout() {
         for (version, crime_rate, expected_age_count) in [
             (164, None, 5),
             (194, None, 5),
@@ -1124,6 +1229,9 @@ mod tests {
             (117_010, Some(41), 14),
             (117_011, Some(41), 14),
             (117_012, Some(41), 14),
+            (117_007, Some(41), 14),
+            (117_008, Some(41), 14),
+            (117_009, Some(41), 14),
         ] {
             let mut bytes = Vec::new();
             if version >= super::AIRLINE_NAME_VERSION {
@@ -1198,6 +1306,30 @@ mod tests {
             let subculture_blocks = expected_subculture_blocks(version);
             for (index, (_, byte_count)) in subculture_blocks.iter().enumerate() {
                 bytes.extend(std::iter::repeat_n(index as u8 + 50, *byte_count));
+            }
+            let hotel_size = super::district_hotel_data_size(version);
+            let hotel_present = (super::DISTRICT_HOTEL_START_VERSION
+                ..super::DISTRICT_HOTEL_END_VERSION)
+                .contains(&version);
+            if hotel_present {
+                bytes.extend(std::iter::repeat_n(60, hotel_size));
+            }
+            let style_present =
+                (version >= super::DISTRICT_STYLE_VERSION).then_some(version >= 239);
+            let mut style_string_offset = None;
+            if let Some(present) = style_present {
+                bytes.push(u8::from(present));
+                if present {
+                    style_string_offset = Some(bytes.len());
+                    write_unique_string(&mut bytes, "District Style").unwrap();
+                }
+            }
+            if version >= super::DISTRICT_LIBRARY_VISITOR_VERSION {
+                append_age_pair(&mut bytes, 41);
+            }
+            let airline = (version >= super::DISTRICT_AIRLINE_VERSION).then_some(-3);
+            if let Some(value) = airline {
+                bytes.push(value as u8);
             }
 
             let (prefix, used) =
@@ -1278,11 +1410,35 @@ mod tests {
                 assert_eq!(block.kind(), expected_kind);
                 assert_eq!(block.as_bytes(), vec![index + 50; byte_count]);
             }
+            assert_eq!(
+                record.hotel_data().map(|block| block.as_bytes()),
+                hotel_present.then(|| vec![60; hotel_size]).as_deref()
+            );
+            assert_eq!(record.district_style_present(), style_present);
+            assert_eq!(
+                record.district_style_name(),
+                (style_present == Some(true)).then_some("District Style")
+            );
+            assert_eq!(
+                record
+                    .library_visitor_data()
+                    .map(|age| (age.category(), age.counts())),
+                (version >= super::DISTRICT_LIBRARY_VISITOR_VERSION)
+                    .then_some((super::DistrictAgeCategory::LibraryVisitors, (41, 141)))
+            );
+            assert_eq!(record.airline(), airline);
             assert_eq!(prefix.encode(), bytes);
 
             let mut truncated = bytes.clone();
             truncated.pop();
             assert!(DistrictManagerFlagsPrefix::decode_prefix(version, &truncated).is_err());
+            if let Some(string_offset) = style_string_offset {
+                let mut truncated_style = bytes.clone();
+                truncated_style.truncate(string_offset + 3);
+                assert!(
+                    DistrictManagerFlagsPrefix::decode_prefix(version, &truncated_style).is_err()
+                );
+            }
         }
     }
 
