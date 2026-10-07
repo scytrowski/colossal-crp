@@ -85,6 +85,9 @@ const TYPE_ZERO_PARK_BASE_TYPE_OFFSET: usize = 42;
 const DISTRICT_GRID_CELLS: usize = 262_144;
 const DISTRICT_GRID_PLANES: usize = 8;
 const DISTRICT_GRID_VALUES: usize = DISTRICT_GRID_CELLS * DISTRICT_GRID_PLANES;
+const INDUSTRY_RESOURCE_RECORDS: usize = 13;
+const INDUSTRY_RESOURCE_BASE_BYTES: usize = 40;
+const INDUSTRY_RESOURCE_EXPANDED_BYTES: usize = 56;
 
 /// The initial known fields from `DistrictManager+Data`.
 ///
@@ -107,13 +110,14 @@ pub struct DistrictManagerFlagsPrefix {
     serialized_prefix: Vec<u8>,
 }
 
-/// A park type 0 record from inner versions 110025–118011.
+/// A supported park record from inner versions 110025–118011.
 ///
 /// Only the leading scalar fields are interpreted. The exact record bytes are
 /// retained for unchanged writing, including fields not yet modeled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkRecord {
     park_index: usize,
+    park_type: u8,
     random_seed: u64,
     main_gate: u16,
     condition: u16,
@@ -308,6 +312,11 @@ impl DistrictParkRecord {
     /// Returns the index in the 128-entry park buffer.
     pub fn park_index(&self) -> usize {
         self.park_index
+    }
+
+    /// Returns the serialized park type (0–9 in the current reader).
+    pub fn park_type(&self) -> u8 {
+        self.park_type
     }
 
     /// Returns the serialized random seed.
@@ -1123,17 +1132,35 @@ impl DistrictManagerFlagsPrefix {
         &self.district_population_records
     }
 
-    /// Decodes park type 0 records in buffer order from the bytes after this prefix.
+    /// Decodes park types 0–9 in buffer order from the bytes after this prefix.
     ///
-    /// Active type-0 records are supported for inner versions 110025–118011.
+    /// Active records are supported for inner versions 110025–118011.
     /// An empty park buffer is supported from inner version 164 onward because
     /// it contains no record bytes. Other active versions or park types return
-    /// an error. Each record preserves its
-    /// original bytes for exact unchanged writing. The returned byte count
+    /// an error. Types 5–9 include thirteen versioned industry resource
+    /// records. Each record preserves its original bytes for exact unchanged writing. The returned byte count
     /// ends before the district grid.
+    pub fn decode_park_records(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(Vec<DistrictParkRecord>, usize), CrpError> {
+        self.decode_park_records_with_type_limit(bytes, 9)
+    }
+
+    /// Decodes only type-0 park records, retaining the previous strict scope.
+    ///
+    /// Empty park buffers are accepted from inner version 164 onward.
     pub fn decode_type_zero_park_records(
         &self,
         bytes: &[u8],
+    ) -> Result<(Vec<DistrictParkRecord>, usize), CrpError> {
+        self.decode_park_records_with_type_limit(bytes, 0)
+    }
+
+    fn decode_park_records_with_type_limit(
+        &self,
+        bytes: &[u8],
+        maximum_type: u8,
     ) -> Result<(Vec<DistrictParkRecord>, usize), CrpError> {
         if self.park_flags.iter().all(|flags| *flags == 0) {
             return Ok((Vec::new(), 0));
@@ -1144,7 +1171,7 @@ impl DistrictManagerFlagsPrefix {
             return Err(invalid_district_manager(
                 0,
                 format!(
-                    "park type 0 record layout is unsupported at inner version {}",
+                    "park record layout is unsupported at inner version {}",
                     self.format_version
                 ),
             ));
@@ -1166,7 +1193,7 @@ impl DistrictManagerFlagsPrefix {
                 invalid_district_manager(offset, format!("park {park_index} record: {error}"))
             })?;
             let park_type = fixed[type_offset];
-            if park_type != 0 {
+            if park_type > maximum_type {
                 return Err(invalid_district_manager(
                     offset + type_offset,
                     format!("park {park_index} has unsupported type {park_type}"),
@@ -1178,6 +1205,26 @@ impl DistrictManagerFlagsPrefix {
             let main_gate = u16::from_be_bytes([fixed[8], fixed[9]]);
             let condition = u16::from_be_bytes([fixed[10], fixed[11]]);
             let level = fixed[type_offset + 1];
+            if (5..=9).contains(&park_type)
+                && self.format_version >= TYPE_ZERO_PARK_PRODUCTION_VERSION
+            {
+                // DistrictPark.IsIndustryType is true for types 5–9. The
+                // industry branch writes thirteen DistrictAreaResourceData
+                // records before the campus and airport branches.
+                let resource_bytes = if self.format_version >= 111_010 {
+                    INDUSTRY_RESOURCE_EXPANDED_BYTES
+                } else {
+                    INDUSTRY_RESOURCE_BASE_BYTES
+                };
+                reader
+                    .read_bytes(INDUSTRY_RESOURCE_RECORDS * resource_bytes)
+                    .map_err(|error| {
+                        invalid_district_manager(
+                            offset + reader.offset(),
+                            format!("park {park_index} industry resources: {error}"),
+                        )
+                    })?;
+            }
             if self.format_version >= TYPE_ZERO_PARK_CAMPUS_VERSION && park_index == 0 {
                 skip_slot_zero_campus(&mut reader, self.format_version).map_err(|error| {
                     invalid_district_manager(
@@ -1193,6 +1240,7 @@ impl DistrictManagerFlagsPrefix {
                 ))?;
             records.push(DistrictParkRecord {
                 park_index,
+                park_type,
                 random_seed,
                 main_gate,
                 condition,
@@ -1678,6 +1726,85 @@ mod tests {
         let mut unknown_type = bytes.clone();
         unknown_type[42] = 15;
         assert!(prefix.decode_type_zero_park_records(&unknown_type).is_err());
+    }
+
+    #[test]
+    fn park_types_one_through_nine_follow_il_resource_branch() {
+        for (version, park_type, resource_bytes) in [
+            (110_025, 4, 0),
+            (111_009, 5, 13 * 40),
+            (111_010, 9, 13 * 56),
+            (112_004, 1, 0),
+        ] {
+            let mut prefix_bytes = Vec::new();
+            zero_flags(&mut prefix_bytes);
+            let mut park_flags = [0_u32; DISTRICT_COUNT];
+            park_flags[5] = 1;
+            write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+            zero_policy_bools(&mut prefix_bytes, version);
+            let (prefix, _) =
+                DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+            let scalar_bytes = super::park_scalar_bytes(version);
+            let mut record = vec![0; scalar_bytes + resource_bytes];
+            record[42] = park_type;
+            record[43] = 3;
+            if resource_bytes != 0 {
+                record[scalar_bytes] = 0x12;
+                record[scalar_bytes + resource_bytes - 1] = 0x34;
+            }
+            let mut bytes = record.clone();
+            bytes.push(0xff); // First district-grid control after the park.
+            let (parks, used) = prefix.decode_park_records(&bytes).unwrap();
+            assert_eq!(used, record.len());
+            assert_eq!(parks.len(), 1);
+            assert_eq!(parks[0].park_index(), 5);
+            assert_eq!(parks[0].park_type(), park_type);
+            assert_eq!(parks[0].level(), 3);
+            assert_eq!(parks[0].encode(), record);
+            assert_eq!(bytes[used], 0xff);
+            assert!(prefix.decode_type_zero_park_records(&bytes).is_err());
+            if resource_bytes != 0 {
+                assert!(
+                    prefix
+                        .decode_park_records(&record[..record.len() - 1])
+                        .is_err()
+                );
+            }
+            record[42] = 10;
+            assert!(prefix.decode_park_records(&record).is_err());
+        }
+    }
+
+    #[test]
+    fn industry_resources_precede_slot_zero_campus_compatibility_block() {
+        let version = 114_008;
+        let mut prefix_bytes = Vec::new();
+        write_unique_string(&mut prefix_bytes, "").unwrap();
+        prefix_bytes.push(0);
+        zero_flags(&mut prefix_bytes);
+        let mut park_flags = [0_u32; DISTRICT_COUNT];
+        park_flags[0] = 1;
+        write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+        zero_policy_bools(&mut prefix_bytes, version);
+        let (prefix, _) =
+            DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+
+        let mut bytes = vec![0; super::park_scalar_bytes(version)];
+        bytes[42] = 5;
+        bytes.extend(vec![0xa5; 13 * 56]);
+        bytes.extend_from_slice(&zero_slot_zero_campus());
+        let expected_len = bytes.len();
+        bytes.push(0xff);
+        let (records, used) = prefix.decode_park_records(&bytes).unwrap();
+        assert_eq!(used, expected_len);
+        assert_eq!(records[0].park_type(), 5);
+        assert_eq!(records[0].encode(), bytes[..used]);
+        assert_eq!(bytes[used], 0xff);
+        assert!(
+            prefix
+                .decode_park_records(&bytes[..expected_len - 1])
+                .is_err()
+        );
     }
 
     #[test]

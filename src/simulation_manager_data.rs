@@ -878,7 +878,7 @@ impl SimulationManagerData {
     /// Decodes the district and park grids after the park-record sequence.
     ///
     /// Empty park buffers need no record decoding from inner version 164 onward;
-    /// active parks require the type-0 decoder's supported version range.
+    /// active parks require the supported type-0–9 decoder's version range.
     /// The returned graph offset points after the grids, before the
     /// following versioned manager objects. Unchanged grid bytes are retained.
     pub fn decode_district_manager_grids(
@@ -886,7 +886,7 @@ impl SimulationManagerData {
     ) -> Result<(DistrictManagerGridData, usize), CrpError> {
         let (prefix, park_start) = self.decode_district_manager_flags_prefix()?;
         let graph = &self.serialized_object_graph;
-        let (_, park_len) = prefix.decode_type_zero_park_records(&graph[park_start..])?;
+        let (_, park_len) = prefix.decode_park_records(&graph[park_start..])?;
         let grid_start = park_start
             .checked_add(park_len)
             .ok_or(CrpError::ArithmeticOverflow("DistrictManager grid start"))?;
@@ -2126,6 +2126,36 @@ mod manager_boundary_tests {
         let (updated, end) = data.decode_district_manager_grids().unwrap();
         assert_eq!(end, data.serialized_object_graph.len());
         assert_eq!(updated.district_plane(7).unwrap(), plane);
+    }
+
+    #[test]
+    fn district_grid_lookup_crosses_an_industry_park_record() {
+        let mut data = synthetic_manager_data();
+        let tag = profiler_tag("DistrictManager");
+        let tag_start = data
+            .serialized_object_graph
+            .windows(tag.len())
+            .position(|window| window == tag)
+            .unwrap();
+        data.serialized_object_graph.truncate(tag_start + tag.len());
+        let graph = &mut data.serialized_object_graph;
+        write_unique_string(graph, "Airline").unwrap();
+        graph.push(1);
+        write_encoded_uint_array(graph, &[0; 128]);
+        let mut park_flags = [0_u32; 128];
+        park_flags[5] = 1;
+        write_encoded_uint_array(graph, &park_flags);
+        write_encoded_bool_array(graph, &vec![false; 16 * 32 * 128]);
+        let park_start = graph.len();
+        let mut park_record = vec![0; 94 + 13 * 56];
+        park_record[58] = 5; // Type byte after the v115022 happiness block.
+        graph.extend_from_slice(&park_record);
+        let grid_start = graph.len();
+        graph.extend(vec![0xff; 2 * 8 * 262_144 / 128]);
+        let (grids, end) = data.decode_district_manager_grids().unwrap();
+        assert_eq!(grid_start - park_start, park_record.len());
+        assert_eq!(end, data.serialized_object_graph.len());
+        assert_eq!(grids.district_plane(0).unwrap()[0], 0);
     }
 
     #[test]
