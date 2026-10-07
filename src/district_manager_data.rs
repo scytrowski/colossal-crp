@@ -2,7 +2,7 @@ use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
     read_encoded_bool_array, read_encoded_byte_array, read_encoded_uint_array,
-    read_encoded_ulong_array, write_encoded_byte_array,
+    read_encoded_ulong_array, skip_encoded_ushort_array, write_encoded_byte_array,
 };
 
 const DISTRICT_COUNT: usize = 128;
@@ -314,7 +314,7 @@ impl DistrictParkRecord {
         self.park_index
     }
 
-    /// Returns the serialized park type (0–14 in the current reader).
+    /// Returns the serialized park type (0–15 in the current reader).
     pub fn park_type(&self) -> u8 {
         self.park_type
     }
@@ -1132,7 +1132,7 @@ impl DistrictManagerFlagsPrefix {
         &self.district_population_records
     }
 
-    /// Decodes park types 0–14 in buffer order from the bytes after this prefix.
+    /// Decodes park types 0–15 in buffer order from the bytes after this prefix.
     ///
     /// Active records are supported for inner versions 110025–118011.
     /// An empty park buffer is supported from inner version 164 onward because
@@ -1144,7 +1144,7 @@ impl DistrictManagerFlagsPrefix {
         &self,
         bytes: &[u8],
     ) -> Result<(Vec<DistrictParkRecord>, usize), CrpError> {
-        self.decode_park_records_with_type_limit(bytes, 14)
+        self.decode_park_records_with_type_limit(bytes, 15)
     }
 
     /// Decodes only type-0 park records, retaining the previous strict scope.
@@ -1246,6 +1246,20 @@ impl DistrictManagerFlagsPrefix {
                         )
                     })?;
             }
+            if park_type == 15 {
+                skip_pedestrian_zone(
+                    &mut reader,
+                    self.format_version,
+                    fixed[type_offset + 4],
+                    fixed[type_offset + 5],
+                )
+                .map_err(|error| {
+                    invalid_district_manager(
+                        offset + reader.offset(),
+                        format!("park {park_index} pedestrian zone: {error}"),
+                    )
+                })?;
+            }
             let end = offset
                 .checked_add(reader.offset())
                 .ok_or(CrpError::ArithmeticOverflow(
@@ -1340,6 +1354,69 @@ fn skip_campus(reader: &mut Reader<'_>, format_version: u32) -> Result<(), CrpEr
     }
     if format_version >= 112_024 {
         reader.read_bytes(2)?; // Campus building count.
+    }
+    Ok(())
+}
+
+fn skip_pedestrian_zone(
+    reader: &mut Reader<'_>,
+    format_version: u32,
+    temp_gate_count: u8,
+    final_gate_count: u8,
+) -> Result<(), CrpError> {
+    let mut group_count = 0_usize;
+    if format_version >= 115_003 {
+        let count = reader.read_i32_be()?;
+        group_count = usize::try_from(count).map_err(|_| {
+            reader.invalid(format!("negative pedestrian material group count {count}"))
+        })?;
+        // Both tables need at least one reason byte and one i32 per group.
+        if group_count > reader.remaining_bytes().len() / 10 {
+            return Err(reader.invalid("pedestrian material group count exceeds remaining bytes"));
+        }
+        for _ in 0..2 {
+            for _ in 0..group_count {
+                reader.read_u8()?; // Reason, retained in the raw record.
+                let count = reader.read_i32_be()?;
+                let item_count = usize::try_from(count).map_err(|_| {
+                    reader.invalid(format!("negative pedestrian material item count {count}"))
+                })?;
+                skip_encoded_ushort_array(reader, item_count)?;
+            }
+        }
+    }
+    if format_version >= 115_013 {
+        skip_encoded_ushort_array(reader, usize::from(final_gate_count))?;
+        skip_encoded_ushort_array(reader, usize::from(temp_gate_count))?;
+        let count = reader.read_u8()? as i8;
+        let count = usize::try_from(count)
+            .map_err(|_| reader.invalid(format!("negative random service-point count {count}")))?;
+        reader.read_bytes(count * 10)?; // i64 vehicle category and u16 amount.
+    }
+    if format_version >= 115_007 {
+        let bytes_per_private = if format_version >= 115_015 { 46 } else { 42 };
+        reader.read_bytes(4 * bytes_per_private)?;
+    }
+    if format_version >= 115_015 {
+        reader.read_bytes(2)?; // Zone focus and dirty flag.
+    }
+    if format_version >= 115_016 {
+        if format_version < 115_021 {
+            reader.read_bytes(16)?; // Discarded legacy goods counters.
+        }
+        reader.read_bytes(8)?; // Temporary and final goods sold.
+    }
+    if format_version >= 115_021 {
+        // IL 0x2DC8 compares against the earlier 115003 group count, not 22.
+        let byte_count = group_count
+            .checked_mul(17)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "pedestrian reason record bytes",
+            ))?;
+        reader.read_bytes(byte_count)?;
+    }
+    if format_version >= 115_023 {
+        reader.read_bytes(2)?; // Cargo and garbage service-point flags.
     }
     Ok(())
 }
@@ -1607,6 +1684,43 @@ mod tests {
         bytes
     }
 
+    fn pedestrian_body(version: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if version >= 115_003 {
+            bytes.extend_from_slice(&1_i32.to_be_bytes());
+            for _ in 0..2 {
+                bytes.push(250); // Unknown reason must still be consumed.
+                bytes.extend_from_slice(&2_i32.to_be_bytes());
+                bytes.extend_from_slice(&[0x01, 0x00, 0x11, 0x00, 0x22]);
+            }
+        }
+        if version >= 115_013 {
+            bytes.extend_from_slice(&[0x00, 0x00, 0x11]); // One final gate value.
+            bytes.extend_from_slice(&[0x01, 0x00, 0x22, 0x00, 0x33]); // Two temporary.
+            bytes.push(1);
+            bytes.extend_from_slice(&[0x5a; 10]);
+        }
+        if version >= 115_007 {
+            bytes.extend(vec![0x5a; 4 * if version >= 115_015 { 46 } else { 42 }]);
+        }
+        if version >= 115_015 {
+            bytes.extend_from_slice(&[0, 1]);
+        }
+        if version >= 115_016 {
+            if version < 115_021 {
+                bytes.extend_from_slice(&[0x5a; 16]);
+            }
+            bytes.extend_from_slice(&[0x5a; 8]);
+        }
+        if version >= 115_021 {
+            bytes.extend_from_slice(&[0x5a; 17]); // One reason record, not 22.
+        }
+        if version >= 115_023 {
+            bytes.extend_from_slice(&[0, 1]);
+        }
+        bytes
+    }
+
     #[test]
     fn district_and_park_flags_follow_version_gate() {
         for (version, park_flags_present) in [(110_000, false), (110_001, true)] {
@@ -1818,7 +1932,7 @@ mod tests {
                         .is_err()
                 );
             }
-            record[42] = 15;
+            record[42] = 16;
             assert!(prefix.decode_park_records(&record).is_err());
         }
     }
@@ -1897,7 +2011,7 @@ mod tests {
                     .decode_park_records(&record[..record.len() - 1])
                     .is_err()
             );
-            for unsupported in [15] {
+            for unsupported in [16] {
                 record[42] = unsupported;
                 assert!(prefix.decode_park_records(&record).is_err());
             }
@@ -1980,6 +2094,92 @@ mod tests {
             }
             assert!(prefix.decode_type_zero_park_records(&record).is_err());
         }
+    }
+
+    #[test]
+    fn pedestrian_park_records_follow_list_and_private_data_gates() {
+        for (version, expected_body_bytes) in [
+            (115_002, 0),
+            (115_003, 24),
+            (115_007, 192),
+            (115_013, 211),
+            (115_015, 229),
+            (115_016, 253),
+            (115_020, 253),
+            (115_021, 254),
+            (115_023, 256),
+        ] {
+            let mut prefix_bytes = Vec::new();
+            write_unique_string(&mut prefix_bytes, "").unwrap();
+            prefix_bytes.push(0);
+            zero_flags(&mut prefix_bytes);
+            let mut park_flags = [0_u32; DISTRICT_COUNT];
+            park_flags[5] = 1;
+            write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+            zero_policy_bools(&mut prefix_bytes, version);
+            let (prefix, _) =
+                DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+            let body = pedestrian_body(version);
+            assert_eq!(body.len(), expected_body_bytes);
+            let scalar_bytes = super::park_scalar_bytes(version);
+            let type_offset = 42 + super::park_happiness_bytes(version);
+            let mut record = vec![0; scalar_bytes];
+            record[type_offset] = 15;
+            if version >= 115_013 {
+                record[type_offset + 4] = 2; // Temporary gate count.
+                record[type_offset + 5] = 1; // Final gate count.
+            }
+            record.extend_from_slice(&body);
+            let mut bytes = record.clone();
+            bytes.push(0xff);
+            let (parks, used) = prefix.decode_park_records(&bytes).unwrap();
+            assert_eq!(used, record.len());
+            assert_eq!(parks[0].park_type(), 15);
+            assert_eq!(parks[0].encode(), record);
+            assert_eq!(bytes[used], 0xff);
+            if expected_body_bytes != 0 {
+                assert!(
+                    prefix
+                        .decode_park_records(&record[..record.len() - 1])
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pedestrian_park_rejects_negative_and_unbounded_counts() {
+        let version = 115_023;
+        let mut prefix_bytes = Vec::new();
+        write_unique_string(&mut prefix_bytes, "").unwrap();
+        prefix_bytes.push(0);
+        zero_flags(&mut prefix_bytes);
+        let mut park_flags = [0_u32; DISTRICT_COUNT];
+        park_flags[5] = 1;
+        write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+        zero_policy_bools(&mut prefix_bytes, version);
+        let (prefix, _) =
+            DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+        let scalar_bytes = super::park_scalar_bytes(version);
+        let mut record = vec![0; scalar_bytes];
+        record[58] = 15;
+        record[62] = 2;
+        record[63] = 1;
+        record.extend_from_slice(&pedestrian_body(version));
+        assert!(prefix.decode_park_records(&record).is_ok());
+
+        for (offset, value) in [
+            (scalar_bytes, (-1_i32).to_be_bytes()),
+            (scalar_bytes, i32::MAX.to_be_bytes()),
+            (scalar_bytes + 5, (-1_i32).to_be_bytes()),
+        ] {
+            let mut malformed = record.clone();
+            malformed[offset..offset + 4].copy_from_slice(&value);
+            assert!(prefix.decode_park_records(&malformed).is_err());
+        }
+        let mut malformed = record;
+        malformed[scalar_bytes + 32] = 0xff; // Signed random service-point count.
+        assert!(prefix.decode_park_records(&malformed).is_err());
     }
 
     #[test]

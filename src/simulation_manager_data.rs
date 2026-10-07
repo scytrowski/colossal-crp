@@ -878,7 +878,7 @@ impl SimulationManagerData {
     /// Decodes the district and park grids after the park-record sequence.
     ///
     /// Empty park buffers need no record decoding from inner version 164 onward;
-    /// active parks require the supported type-0–14 decoder's version range.
+    /// active parks require the supported type-0–15 decoder's version range.
     /// The returned graph offset points after the grids, before the
     /// following versioned manager objects. Unchanged grid bytes are retained.
     pub fn decode_district_manager_grids(
@@ -2156,6 +2156,49 @@ mod manager_boundary_tests {
         assert_eq!(grid_start - park_start, park_record.len());
         assert_eq!(end, data.serialized_object_graph.len());
         assert_eq!(grids.district_plane(0).unwrap()[0], 0);
+    }
+
+    #[test]
+    fn district_grid_edit_preserves_a_pedestrian_park_record() {
+        let mut data = synthetic_manager_data();
+        let tag = profiler_tag("DistrictManager");
+        let tag_start = data
+            .serialized_object_graph
+            .windows(tag.len())
+            .position(|window| window == tag)
+            .unwrap();
+        data.serialized_object_graph.truncate(tag_start + tag.len());
+        let graph = &mut data.serialized_object_graph;
+        write_unique_string(graph, "Airline").unwrap();
+        graph.push(1);
+        write_encoded_uint_array(graph, &[0; 128]);
+        let mut park_flags = [0_u32; 128];
+        park_flags[5] = 1;
+        write_encoded_uint_array(graph, &park_flags);
+        write_encoded_bool_array(graph, &vec![false; 16 * 32 * 128]);
+        let park_start = graph.len();
+        let mut park_record = vec![0; 94];
+        park_record[58] = 15;
+        park_record.extend_from_slice(&0_i32.to_be_bytes()); // Zero material groups.
+        park_record.push(0); // Zero random service points.
+        park_record.extend([0x5a; 4 * 46]); // Four private-data blocks.
+        park_record.extend([0, 1]); // Zone focus and dirty flag.
+        park_record.extend([0x5a; 8]); // Goods sold.
+        park_record.extend([0, 1]); // Service-point flags.
+        graph.extend_from_slice(&park_record);
+        graph.extend(vec![0xff; 2 * 8 * 262_144 / 128]);
+        let (grids, _) = data.decode_district_manager_grids().unwrap();
+        let mut editor = grids.into_editor();
+        let mut plane = vec![0; 262_144];
+        plane[0] = 7;
+        editor.replace_district_plane(0, &plane).unwrap();
+        data.replace_district_manager_grids(&editor).unwrap();
+        assert_eq!(
+            &data.serialized_object_graph[park_start..park_start + park_record.len()],
+            park_record
+        );
+        let (updated, _) = data.decode_district_manager_grids().unwrap();
+        assert_eq!(updated.district_plane(0).unwrap()[0], 7);
     }
 
     #[test]

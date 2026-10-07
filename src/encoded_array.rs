@@ -142,6 +142,31 @@ pub(crate) fn read_encoded_ushort_array(
     Ok(values)
 }
 
+/// Consumes `EncodedArray.UShort` values without allocating a value buffer.
+///
+/// Each call represents one `BeginRead`/`EndRead` scope. A control run may
+/// extend past the requested count; only bytes for requested values are read.
+pub(crate) fn skip_encoded_ushort_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<(), CrpError> {
+    let mut remaining = count;
+    while remaining > 0 {
+        let control = reader.read_u8()?;
+        let (run, bytes_per_value) = if control >= 0x80 {
+            (usize::from(control - 0x7f), 0)
+        } else if control >= 0x40 {
+            (usize::from(control - 0x3f), 1)
+        } else {
+            (usize::from(control) + 1, 2)
+        };
+        let used = run.min(remaining);
+        reader.read_bytes(used * bytes_per_value)?;
+        remaining -= used;
+    }
+    Ok(())
+}
+
 /// Decodes `EncodedArray.UInt`; its close-delta adjustment is a signed i16.
 pub(crate) fn read_encoded_uint_array(
     reader: &mut Reader<'_>,
@@ -287,7 +312,8 @@ fn repeated_delta_run(values: &[u16], start: usize, previous: u16, delta: i16) -
 mod tests {
     use super::{
         read_encoded_bool_array, read_encoded_byte_array, read_encoded_uint_array,
-        read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_bool_array,
+        read_encoded_ulong_array, read_encoded_ushort_array, skip_encoded_ushort_array,
+        write_encoded_bool_array,
     };
     use crate::data_serializer::Reader;
 
@@ -306,6 +332,20 @@ mod tests {
             read_encoded_ushort_array(&mut reader, 2).expect("valid adjusted delta"),
             [0x1000, 0x2001]
         );
+    }
+
+    #[test]
+    fn ushort_skip_preserves_control_boundaries_without_allocating_values() {
+        let bytes = [0x01, 0x12, 0x34, 0xab, 0xcd, 0x40, 0xfe, 0x81, 0xee];
+        let mut reader = Reader::new(&bytes);
+        skip_encoded_ushort_array(&mut reader, 4).unwrap();
+        assert_eq!(reader.offset(), 8);
+        assert_eq!(reader.read_u8().unwrap(), 0xee);
+
+        let mut reader = Reader::new(&[0x3f, 0x12]);
+        assert!(skip_encoded_ushort_array(&mut reader, 1).is_err());
+        let mut reader = Reader::new(&[0x40]);
+        assert!(skip_encoded_ushort_array(&mut reader, 1).is_err());
     }
 
     #[test]
