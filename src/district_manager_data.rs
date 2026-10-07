@@ -39,6 +39,10 @@ const DISTRICT_RESOURCE_VERSION: u32 = 118;
 const DISTRICT_CONSUMPTION_EXPANSION_VERSION: u32 = 234;
 const DISTRICT_RESOURCE_ALIVE_VERSION: u32 = 111_014;
 const DISTRICT_RESOURCE_FIELDS_VERSION: u32 = 113_013;
+const DISTRICT_TOURIST_VERSION: u32 = 119;
+const DISTRICT_TOURIST_AVERAGE_VERSION: u32 = 122;
+const DISTRICT_TOURIST_COUNT_VERSION: u32 = 117_011;
+const DISTRICT_SUBCULTURE_VERSION: u32 = 207;
 const POLICY_COUNT: usize = 32;
 const POPULATION_DELTA_COUNT: usize = 16;
 const PRIVATE_DATA_BASE_BYTES: usize = 21;
@@ -56,6 +60,8 @@ const DISTRICT_CONSUMPTION_BASE_BYTES: usize = 72;
 const DISTRICT_USAGE_BYTES: usize = 24;
 const DISTRICT_GROUND_BYTES: usize = 15;
 const DISTRICT_RESOURCE_BASE_BYTES: usize = 60;
+const DISTRICT_TOURIST_BASE_BYTES: usize = 6;
+const DISTRICT_SUBCULTURE_BYTES: usize = 11;
 
 /// The initial known fields from `DistrictManager+Data`.
 ///
@@ -94,6 +100,8 @@ pub struct DistrictPopulationRecord {
     specializations: Vec<DistrictSpecializationBlock>,
     demographic_data: Vec<DistrictDemographicBlock>,
     statistics: Vec<DistrictStatisticsBlock>,
+    tourism: Vec<DistrictTourismBlock>,
+    subcultures: Vec<DistrictSubCultureBlock>,
 }
 
 /// An opaque fixed-size production, consumption, or resource data block.
@@ -128,6 +136,61 @@ pub enum DistrictStatisticsKind {
     Ground,
     ImportResources,
     ExportResources,
+}
+
+/// One of the three district tourist metric records in wire order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistrictTourismKind {
+    Tourist1,
+    Tourist2,
+    Tourist3,
+}
+
+/// An opaque district tourist metric record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictTourismBlock {
+    kind: DistrictTourismKind,
+    bytes: Vec<u8>,
+}
+
+impl DistrictTourismBlock {
+    /// Returns which tourist metric record this block represents.
+    pub fn kind(&self) -> DistrictTourismKind {
+        self.kind
+    }
+
+    /// Returns the exact serialized bytes for this currently opaque block.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// One of the district subculture records in wire order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistrictSubCultureKind {
+    Hippie,
+    Hipster,
+    Redneck,
+    Gangsta,
+}
+
+/// An opaque district subculture metric record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictSubCultureBlock {
+    kind: DistrictSubCultureKind,
+    bytes: Vec<u8>,
+}
+
+impl DistrictSubCultureBlock {
+    /// Returns which subculture this block represents.
+    pub fn kind(&self) -> DistrictSubCultureKind {
+        self.kind
+    }
+
+    /// Returns the exact serialized bytes for this currently opaque block.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// A version-bounded birth, education, or student counter block.
@@ -327,6 +390,16 @@ impl DistrictPopulationRecord {
     /// Returns the production, consumption, ground, and resource blocks in wire order.
     pub fn statistics(&self) -> &[DistrictStatisticsBlock] {
         &self.statistics
+    }
+
+    /// Returns the tourist metric records in wire order.
+    pub fn tourism(&self) -> &[DistrictTourismBlock] {
+        &self.tourism
+    }
+
+    /// Returns the subculture metric records in wire order.
+    pub fn subcultures(&self) -> &[DistrictSubCultureBlock] {
+        &self.subcultures
     }
 }
 
@@ -602,6 +675,32 @@ impl DistrictManagerFlagsPrefix {
                     resource_bytes,
                 )?);
             }
+            let mut tourism = Vec::new();
+            if format_version >= DISTRICT_TOURIST_VERSION {
+                let tourist_bytes = district_tourist_data_size(format_version);
+                for kind in [
+                    DistrictTourismKind::Tourist1,
+                    DistrictTourismKind::Tourist2,
+                    DistrictTourismKind::Tourist3,
+                ] {
+                    tourism.push(read_district_tourism(&mut reader, kind, tourist_bytes)?);
+                }
+            }
+            let mut subcultures = Vec::new();
+            if format_version >= DISTRICT_SUBCULTURE_VERSION {
+                for kind in [
+                    DistrictSubCultureKind::Hippie,
+                    DistrictSubCultureKind::Hipster,
+                    DistrictSubCultureKind::Redneck,
+                    DistrictSubCultureKind::Gangsta,
+                ] {
+                    subcultures.push(read_district_subculture(
+                        &mut reader,
+                        kind,
+                        DISTRICT_SUBCULTURE_BYTES,
+                    )?);
+                }
+            }
             district_population_records.push(DistrictPopulationRecord {
                 district_index,
                 random_seed,
@@ -616,6 +715,8 @@ impl DistrictManagerFlagsPrefix {
                 specializations,
                 demographic_data,
                 statistics,
+                tourism,
+                subcultures,
             });
         }
         let consumed = reader.offset();
@@ -748,6 +849,24 @@ fn read_district_statistics(
     Ok(DistrictStatisticsBlock { kind, bytes })
 }
 
+fn read_district_tourism(
+    reader: &mut Reader<'_>,
+    kind: DistrictTourismKind,
+    byte_count: usize,
+) -> Result<DistrictTourismBlock, CrpError> {
+    let bytes = reader.read_bytes(byte_count)?.to_vec();
+    Ok(DistrictTourismBlock { kind, bytes })
+}
+
+fn read_district_subculture(
+    reader: &mut Reader<'_>,
+    kind: DistrictSubCultureKind,
+    byte_count: usize,
+) -> Result<DistrictSubCultureBlock, CrpError> {
+    let bytes = reader.read_bytes(byte_count)?.to_vec();
+    Ok(DistrictSubCultureBlock { kind, bytes })
+}
+
 fn district_production_data_size(format_version: u32) -> usize {
     let mut size = DISTRICT_PRODUCTION_BASE_BYTES;
     for (gate, added_bytes) in [
@@ -788,6 +907,20 @@ fn district_resource_data_size(format_version: u32) -> usize {
         }
         + if format_version >= DISTRICT_RESOURCE_FIELDS_VERSION {
             12
+        } else {
+            0
+        }
+}
+
+fn district_tourist_data_size(format_version: u32) -> usize {
+    DISTRICT_TOURIST_BASE_BYTES
+        + if format_version >= DISTRICT_TOURIST_AVERAGE_VERSION {
+            3
+        } else {
+            0
+        }
+        + if format_version >= DISTRICT_TOURIST_COUNT_VERSION {
+            6
         } else {
             0
         }
@@ -972,6 +1105,8 @@ mod tests {
             (164, None, 5),
             (194, None, 5),
             (203, Some(41), 5),
+            (206, Some(41), 5),
+            (207, Some(41), 5),
             (234, Some(41), 5),
             (237, Some(41), 5),
             (239, Some(41), 5),
@@ -985,6 +1120,10 @@ mod tests {
             (113_006, Some(41), 14),
             (113_013, Some(41), 14),
             (116_011, Some(41), 14),
+            (117_004, Some(41), 14),
+            (117_010, Some(41), 14),
+            (117_011, Some(41), 14),
+            (117_012, Some(41), 14),
         ] {
             let mut bytes = Vec::new();
             if version >= super::AIRLINE_NAME_VERSION {
@@ -1052,6 +1191,14 @@ mod tests {
             for (index, (_, byte_count)) in statistics_blocks.iter().enumerate() {
                 bytes.extend(std::iter::repeat_n(index as u8 + 30, *byte_count));
             }
+            let tourism_blocks = expected_tourism_blocks(version);
+            for (index, (_, byte_count)) in tourism_blocks.iter().enumerate() {
+                bytes.extend(std::iter::repeat_n(index as u8 + 40, *byte_count));
+            }
+            let subculture_blocks = expected_subculture_blocks(version);
+            for (index, (_, byte_count)) in subculture_blocks.iter().enumerate() {
+                bytes.extend(std::iter::repeat_n(index as u8 + 50, *byte_count));
+            }
 
             let (prefix, used) =
                 DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
@@ -1113,6 +1260,23 @@ mod tests {
             {
                 assert_eq!(block.kind(), expected_kind);
                 assert_eq!(block.as_bytes(), vec![index + 30; byte_count]);
+            }
+            assert_eq!(record.tourism().len(), tourism_blocks.len());
+            for ((block, (expected_kind, byte_count)), index) in
+                record.tourism().iter().zip(tourism_blocks).zip(0_u8..)
+            {
+                assert_eq!(block.kind(), expected_kind);
+                assert_eq!(block.as_bytes(), vec![index + 40; byte_count]);
+            }
+            assert_eq!(record.subcultures().len(), subculture_blocks.len());
+            for ((block, (expected_kind, byte_count)), index) in record
+                .subcultures()
+                .iter()
+                .zip(subculture_blocks)
+                .zip(0_u8..)
+            {
+                assert_eq!(block.kind(), expected_kind);
+                assert_eq!(block.as_bytes(), vec![index + 50; byte_count]);
             }
             assert_eq!(prefix.encode(), bytes);
 
@@ -1193,6 +1357,29 @@ mod tests {
             blocks.push((Kind::ExportResources, resource_size));
         }
         blocks
+    }
+
+    fn expected_tourism_blocks(version: u32) -> Vec<(super::DistrictTourismKind, usize)> {
+        use super::DistrictTourismKind as Kind;
+
+        if version < super::DISTRICT_TOURIST_VERSION {
+            return Vec::new();
+        }
+        let byte_count = super::district_tourist_data_size(version);
+        [Kind::Tourist1, Kind::Tourist2, Kind::Tourist3]
+            .map(|kind| (kind, byte_count))
+            .to_vec()
+    }
+
+    fn expected_subculture_blocks(version: u32) -> Vec<(super::DistrictSubCultureKind, usize)> {
+        use super::DistrictSubCultureKind as Kind;
+
+        if version < super::DISTRICT_SUBCULTURE_VERSION {
+            return Vec::new();
+        }
+        [Kind::Hippie, Kind::Hipster, Kind::Redneck, Kind::Gangsta]
+            .map(|kind| (kind, super::DISTRICT_SUBCULTURE_BYTES))
+            .to_vec()
     }
 
     fn expected_specialization_kinds(version: u32) -> Vec<super::DistrictSpecializationKind> {

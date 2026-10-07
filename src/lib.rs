@@ -43,7 +43,8 @@ pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictDemographicBlock, DistrictDemographicKind,
     DistrictManagerFlagsPrefix, DistrictPopulationRecord, DistrictPrivateDataBlock,
     DistrictPrivateDataKind, DistrictSpecializationBlock, DistrictSpecializationKind,
-    DistrictStatisticsBlock, DistrictStatisticsKind,
+    DistrictStatisticsBlock, DistrictStatisticsKind, DistrictSubCultureBlock,
+    DistrictSubCultureKind, DistrictTourismBlock, DistrictTourismKind,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
@@ -3772,7 +3773,7 @@ mod tests {
         Ok(())
     }
 
-    fn district_statistics_match_version(record: &DistrictPopulationRecord, version: u32) -> bool {
+    fn district_records_match_version(record: &DistrictPopulationRecord, version: u32) -> bool {
         let mut expected = Vec::new();
         if version >= 92 {
             let mut production_bytes = 86;
@@ -3819,14 +3820,41 @@ mod tests {
             expected.push((DistrictStatisticsKind::ImportResources, resource_bytes));
             expected.push((DistrictStatisticsKind::ExportResources, resource_bytes));
         }
-        record.statistics().len() == expected.len()
+        let statistics_match = record.statistics().len() == expected.len()
             && record
                 .statistics()
                 .iter()
                 .zip(expected)
                 .all(|(actual, (kind, byte_count))| {
                     actual.kind() == kind && actual.as_bytes().len() == byte_count
-                })
+                });
+        let tourist_size =
+            6 + if version >= 122 { 3 } else { 0 } + if version >= 117_011 { 6 } else { 0 };
+        let expected_tourism_count = usize::from(version >= 119) * 3;
+        let tourism_match = record.tourism().len() == expected_tourism_count
+            && record.tourism().iter().enumerate().all(|(index, block)| {
+                block.kind()
+                    == [
+                        DistrictTourismKind::Tourist1,
+                        DistrictTourismKind::Tourist2,
+                        DistrictTourismKind::Tourist3,
+                    ][index]
+                    && block.as_bytes().len() == tourist_size
+            });
+        let subculture_kinds = [
+            DistrictSubCultureKind::Hippie,
+            DistrictSubCultureKind::Hipster,
+            DistrictSubCultureKind::Redneck,
+            DistrictSubCultureKind::Gangsta,
+        ];
+        let expected_subculture_count = usize::from(version >= 207) * 4;
+        let subcultures_match = record.subcultures().len() == expected_subculture_count
+            && record
+                .subcultures()
+                .iter()
+                .zip(subculture_kinds)
+                .all(|(block, kind)| block.kind() == kind && block.as_bytes().len() == 11);
+        statistics_match && tourism_match && subcultures_match
     }
 
     #[test]
@@ -4010,7 +4038,7 @@ mod tests {
                                                 + usize::from(districts.format_version() >= 67) * 4
                                                 + usize::from(districts.format_version() >= 113) * 3
                                                 + usize::from(districts.format_version() >= 143) * 3
-                                        && district_statistics_match_version(
+                                        && district_records_match_version(
                                             record,
                                             districts.format_version(),
                                         )

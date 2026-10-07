@@ -849,10 +849,12 @@ impl SimulationManagerData {
         Ok((trees, next_tag_start))
     }
 
-    /// Decodes DistrictManager's opening name and district/park flag arrays.
+    /// Decodes the known DistrictManager prefix for the requested inner version.
     ///
-    /// The type array must contain `DistrictManager+Data` at slot 20. Returns
-    /// the graph offset before the following versioned policy-boolean arrays.
+    /// The type array must contain `DistrictManager+Data` at slot 20. The
+    /// decoded prefix includes district and park policies, active district
+    /// records, and their fixed-size statistics through subculture data. It
+    /// returns the graph offset immediately after that prefix.
     pub fn decode_district_manager_flags_prefix(
         &self,
     ) -> Result<(DistrictManagerFlagsPrefix, usize), CrpError> {
