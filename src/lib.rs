@@ -40,9 +40,9 @@ pub use building_manager_data::{
 };
 pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
-    DistrictAgeCategory, DistrictAgePopulation, DistrictManagerFlagsPrefix,
-    DistrictPopulationRecord, DistrictPrivateDataBlock, DistrictPrivateDataKind,
-    DistrictSpecializationBlock, DistrictSpecializationKind,
+    DistrictAgeCategory, DistrictAgePopulation, DistrictDemographicBlock, DistrictDemographicKind,
+    DistrictManagerFlagsPrefix, DistrictPopulationRecord, DistrictPrivateDataBlock,
+    DistrictPrivateDataKind, DistrictSpecializationBlock, DistrictSpecializationKind,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
@@ -3947,6 +3947,11 @@ mod tests {
                                             .specializations()
                                             .iter()
                                             .all(|block| block.as_bytes().len() == 24)
+                                        && record.demographic_data().len()
+                                            == usize::from(districts.format_version() >= 167) * 2
+                                                + usize::from(districts.format_version() >= 67) * 4
+                                                + usize::from(districts.format_version() >= 113) * 3
+                                                + usize::from(districts.format_version() >= 143) * 3
                                 })
                         );
                         assert!(districts_end < manager_data.serialized_object_graph().len());

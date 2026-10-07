@@ -27,6 +27,11 @@ const DISTRICT_PRIVATE_COLLAPSED_COUNT_VERSION: u32 = 256;
 const DISTRICT_PLAYER_DATA_VERSION: u32 = 144;
 const DISTRICT_SPECIALIZATION_VERSION: u32 = 218;
 const DISTRICT_ADDITIONAL_SPECIALIZATION_VERSION: u32 = 109_006;
+const DISTRICT_BIRTH_DEATH_VERSION: u32 = 167;
+const DISTRICT_EDUCATION_DATA_VERSION: u32 = 67;
+const DISTRICT_EDUCATION_WORKER_VERSION: u32 = 140;
+const DISTRICT_EDUCATION_AGE_VERSION: u32 = 113;
+const DISTRICT_STUDENT_AGE_VERSION: u32 = 143;
 const POLICY_COUNT: usize = 32;
 const POPULATION_DELTA_COUNT: usize = 16;
 const PRIVATE_DATA_BASE_BYTES: usize = 21;
@@ -36,6 +41,9 @@ const PRIVATE_DATA_BUILDING_BYTES: usize = 18;
 const PRIVATE_DATA_ALIVE_BYTES: usize = 6;
 const PRIVATE_DATA_CRIME_BYTES: usize = 5;
 const PRIVATE_DATA_COLLAPSED_BYTES: usize = 4;
+const DISTRICT_AGE_PAIR_BYTES: usize = 6;
+const DISTRICT_EDUCATION_BASE_BYTES: usize = 18;
+const DISTRICT_EDUCATION_WORKER_BYTES: usize = 24;
 
 /// The initial known fields from `DistrictManager+Data`.
 ///
@@ -72,6 +80,43 @@ pub struct DistrictPopulationRecord {
     last_average_lifespan: Option<i8>,
     private_data: Vec<DistrictPrivateDataBlock>,
     specializations: Vec<DistrictSpecializationBlock>,
+    demographic_data: Vec<DistrictDemographicBlock>,
+}
+
+/// A version-bounded birth, education, or student counter block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictDemographicBlock {
+    kind: DistrictDemographicKind,
+    bytes: Vec<u8>,
+}
+
+impl DistrictDemographicBlock {
+    /// Returns the demographic category represented by this block.
+    pub fn kind(&self) -> DistrictDemographicKind {
+        self.kind
+    }
+
+    /// Returns the exact serialized bytes for this currently opaque block.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// A named district birth, death, education, or student-data block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistrictDemographicKind {
+    Births,
+    Deaths,
+    Educated0,
+    Educated1,
+    Educated2,
+    Educated3,
+    Education1,
+    Education2,
+    Education3,
+    Student1,
+    Student2,
+    Student3,
 }
 
 /// An opaque, fixed-size specialization counter block for one district.
@@ -225,6 +270,11 @@ impl DistrictPopulationRecord {
     /// Returns the specialization blocks in serialized order.
     pub fn specializations(&self) -> &[DistrictSpecializationBlock] {
         &self.specializations
+    }
+
+    /// Returns the birth, education, and student blocks in serialized order.
+    pub fn demographic_data(&self) -> &[DistrictDemographicBlock] {
+        &self.demographic_data
     }
 }
 
@@ -392,6 +442,64 @@ impl DistrictManagerFlagsPrefix {
                     specializations.push(read_district_specialization(&mut reader, kind)?);
                 }
             }
+            let mut demographic_data = Vec::new();
+            if format_version >= DISTRICT_BIRTH_DEATH_VERSION {
+                for kind in [
+                    DistrictDemographicKind::Births,
+                    DistrictDemographicKind::Deaths,
+                ] {
+                    demographic_data.push(read_district_demographic(
+                        &mut reader,
+                        kind,
+                        DISTRICT_AGE_PAIR_BYTES,
+                    )?);
+                }
+            }
+            if format_version >= DISTRICT_EDUCATION_DATA_VERSION {
+                let education_block_bytes = if format_version >= DISTRICT_EDUCATION_WORKER_VERSION {
+                    DISTRICT_EDUCATION_WORKER_BYTES
+                } else {
+                    DISTRICT_EDUCATION_BASE_BYTES
+                };
+                for kind in [
+                    DistrictDemographicKind::Educated0,
+                    DistrictDemographicKind::Educated1,
+                    DistrictDemographicKind::Educated2,
+                    DistrictDemographicKind::Educated3,
+                ] {
+                    demographic_data.push(read_district_demographic(
+                        &mut reader,
+                        kind,
+                        education_block_bytes,
+                    )?);
+                }
+            }
+            if format_version >= DISTRICT_EDUCATION_AGE_VERSION {
+                for kind in [
+                    DistrictDemographicKind::Education1,
+                    DistrictDemographicKind::Education2,
+                    DistrictDemographicKind::Education3,
+                ] {
+                    demographic_data.push(read_district_demographic(
+                        &mut reader,
+                        kind,
+                        DISTRICT_AGE_PAIR_BYTES,
+                    )?);
+                }
+            }
+            if format_version >= DISTRICT_STUDENT_AGE_VERSION {
+                for kind in [
+                    DistrictDemographicKind::Student1,
+                    DistrictDemographicKind::Student2,
+                    DistrictDemographicKind::Student3,
+                ] {
+                    demographic_data.push(read_district_demographic(
+                        &mut reader,
+                        kind,
+                        DISTRICT_AGE_PAIR_BYTES,
+                    )?);
+                }
+            }
             district_population_records.push(DistrictPopulationRecord {
                 district_index,
                 random_seed,
@@ -404,6 +512,7 @@ impl DistrictManagerFlagsPrefix {
                 last_average_lifespan,
                 private_data,
                 specializations,
+                demographic_data,
             });
         }
         let consumed = reader.offset();
@@ -516,6 +625,15 @@ fn read_district_specialization(
     const SPECIALIZATION_DATA_BYTES: usize = 8 * 3;
     let bytes = reader.read_bytes(SPECIALIZATION_DATA_BYTES)?.to_vec();
     Ok(DistrictSpecializationBlock { kind, bytes })
+}
+
+fn read_district_demographic(
+    reader: &mut Reader<'_>,
+    kind: DistrictDemographicKind,
+    byte_count: usize,
+) -> Result<DistrictDemographicBlock, CrpError> {
+    let bytes = reader.read_bytes(byte_count)?.to_vec();
+    Ok(DistrictDemographicBlock { kind, bytes })
 }
 
 fn district_private_data_size(format_version: u32) -> usize {
@@ -694,6 +812,7 @@ mod tests {
     #[test]
     fn active_district_population_record_obeys_crime_rate_gate() {
         for (version, crime_rate, expected_age_count) in [
+            (164, None, 5),
             (194, None, 5),
             (203, Some(41), 5),
             (237, Some(41), 5),
@@ -754,6 +873,10 @@ mod tests {
             for (index, _) in specialization_kinds.iter().enumerate() {
                 bytes.extend(std::iter::repeat_n(index as u8 + 10, 24));
             }
+            let demographic_blocks = expected_demographic_blocks(version);
+            for (index, (_, byte_count)) in demographic_blocks.iter().enumerate() {
+                bytes.extend(std::iter::repeat_n(index as u8 + 20, *byte_count));
+            }
 
             let (prefix, used) =
                 DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
@@ -795,6 +918,16 @@ mod tests {
             {
                 assert_eq!(block.kind(), expected_kind);
                 assert_eq!(block.as_bytes(), vec![index + 10; 24]);
+            }
+            assert_eq!(record.demographic_data().len(), demographic_blocks.len());
+            for ((block, (expected_kind, byte_count)), index) in record
+                .demographic_data()
+                .iter()
+                .zip(demographic_blocks)
+                .zip(0_u8..)
+            {
+                assert_eq!(block.kind(), expected_kind);
+                assert_eq!(block.as_bytes(), vec![index + 20; byte_count]);
             }
             assert_eq!(prefix.encode(), bytes);
 
@@ -861,5 +994,42 @@ mod tests {
             kinds.extend([Kind::Organic, Kind::SelfSufficient, Kind::HighTech]);
         }
         kinds
+    }
+
+    fn expected_demographic_blocks(version: u32) -> Vec<(super::DistrictDemographicKind, usize)> {
+        use super::DistrictDemographicKind as Kind;
+
+        let mut blocks = Vec::new();
+        if version >= super::DISTRICT_BIRTH_DEATH_VERSION {
+            blocks.extend([(Kind::Births, 6), (Kind::Deaths, 6)]);
+        }
+        if version >= super::DISTRICT_EDUCATION_DATA_VERSION {
+            let bytes = if version >= super::DISTRICT_EDUCATION_WORKER_VERSION {
+                24
+            } else {
+                18
+            };
+            blocks.extend([
+                (Kind::Educated0, bytes),
+                (Kind::Educated1, bytes),
+                (Kind::Educated2, bytes),
+                (Kind::Educated3, bytes),
+            ]);
+        }
+        if version >= super::DISTRICT_EDUCATION_AGE_VERSION {
+            blocks.extend([
+                (Kind::Education1, 6),
+                (Kind::Education2, 6),
+                (Kind::Education3, 6),
+            ]);
+        }
+        if version >= super::DISTRICT_STUDENT_AGE_VERSION {
+            blocks.extend([
+                (Kind::Student1, 6),
+                (Kind::Student2, 6),
+                (Kind::Student3, 6),
+            ]);
+        }
+        blocks
     }
 }
