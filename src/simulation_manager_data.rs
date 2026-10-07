@@ -878,7 +878,7 @@ impl SimulationManagerData {
     /// Decodes the district and park grids after the park-record sequence.
     ///
     /// Empty park buffers need no record decoding from inner version 164 onward;
-    /// active parks require the supported type-0–9 or type-14 decoder's version range.
+    /// active parks require the supported type-0–14 decoder's version range.
     /// The returned graph offset points after the grids, before the
     /// following versioned manager objects. Unchanged grid bytes are retained.
     pub fn decode_district_manager_grids(

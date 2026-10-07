@@ -314,7 +314,7 @@ impl DistrictParkRecord {
         self.park_index
     }
 
-    /// Returns the serialized park type (0–9 or 14 in the current reader).
+    /// Returns the serialized park type (0–14 in the current reader).
     pub fn park_type(&self) -> u8 {
         self.park_type
     }
@@ -1132,7 +1132,7 @@ impl DistrictManagerFlagsPrefix {
         &self.district_population_records
     }
 
-    /// Decodes park types 0–9 and 14 in buffer order from the bytes after this prefix.
+    /// Decodes park types 0–14 in buffer order from the bytes after this prefix.
     ///
     /// Active records are supported for inner versions 110025–118011.
     /// An empty park buffer is supported from inner version 164 onward because
@@ -1193,7 +1193,7 @@ impl DistrictManagerFlagsPrefix {
                 invalid_district_manager(offset, format!("park {park_index} record: {error}"))
             })?;
             let park_type = fixed[type_offset];
-            if park_type > maximum_type || (10..=13).contains(&park_type) {
+            if park_type > maximum_type {
                 return Err(invalid_district_manager(
                     offset + type_offset,
                     format!("park {park_index} has unsupported type {park_type}"),
@@ -1225,8 +1225,11 @@ impl DistrictManagerFlagsPrefix {
                         )
                     })?;
             }
-            if self.format_version >= TYPE_ZERO_PARK_CAMPUS_VERSION && park_index == 0 {
-                skip_slot_zero_campus(&mut reader, self.format_version).map_err(|error| {
+            if self.format_version >= 112_008
+                && ((10..=13).contains(&park_type)
+                    || (self.format_version >= TYPE_ZERO_PARK_CAMPUS_VERSION && park_index == 0))
+            {
+                skip_campus(&mut reader, self.format_version).map_err(|error| {
                     invalid_district_manager(
                         offset + reader.offset(),
                         format!("park {park_index} campus block: {error}"),
@@ -1310,22 +1313,34 @@ fn read_district_age_population(
     })
 }
 
-fn skip_slot_zero_campus(reader: &mut Reader<'_>, format_version: u32) -> Result<(), CrpError> {
-    // DistrictManager+Data.Deserialize reads this branch for slot 0 from 114005,
-    // even when its park type is zero. All supported versions here are past the
-    // nested 112026 field gates.
+fn skip_campus(reader: &mut Reader<'_>, format_version: u32) -> Result<(), CrpError> {
+    // DistrictManager+Data.Deserialize reads this for campus types from 112008
+    // and for slot 0 of any type from 114005.
     reader.read_bytes(6 + 16)?; // Student fields and AcademicWorksData.
-    for _ in 0..13 {
+    let report_count =
+        2 + usize::from(format_version >= 112_009) + if format_version >= 112_020 { 10 } else { 0 };
+    for _ in 0..report_count {
         skip_year_report(reader, format_version)?;
     }
-    reader.read_bytes(5 + 5)?; // Campus state, coach fields, academic staff.
+    reader.read_bytes(5)?; // Campus state, grant, coach, and cheerleading budget.
+    if format_version >= 112_025 {
+        reader.read_bytes(5)?; // Academic staff count and accumulation.
+    }
     // EncodedArray.Long has the ULong control layout and 64-bit wire width.
     read_encoded_ulong_array(reader, 25)?;
     reader.read_bytes(3)?; // Win probability and varsity identity.
     read_encoded_byte_array(reader, 3)?; // Varsity color.
-    reader.read_bytes(8)?; // Four versioned i16 varsity/sports fields.
-    read_encoded_bool_array(reader, 5)?; // Away matches.
-    reader.read_bytes(2)?; // Campus building count.
+    for gate in [112_009, 112_011, 112_012, 112_013] {
+        if format_version >= gate {
+            reader.read_bytes(2)?; // Versioned varsity or sports field.
+        }
+    }
+    if format_version >= 112_014 {
+        read_encoded_bool_array(reader, 5)?; // Away matches.
+    }
+    if format_version >= 112_024 {
+        reader.read_bytes(2)?; // Campus building count.
+    }
     Ok(())
 }
 
@@ -1556,24 +1571,39 @@ mod tests {
         }
     }
 
-    fn zero_slot_zero_campus() -> Vec<u8> {
+    fn zero_campus(version: u32) -> Vec<u8> {
         let mut bytes = vec![0; 22]; // Student fields and academic works.
-        for _ in 0..13 {
+        let report_count =
+            2 + usize::from(version >= 112_009) + if version >= 112_020 { 10 } else { 0 };
+        for _ in 0..report_count {
             bytes.extend_from_slice(&[0; 36]);
             bytes.extend_from_slice(&[0x84; 2]); // Two five-value ULong arrays.
             bytes.extend_from_slice(&[0x84; 3]); // Three five-value Byte arrays.
             bytes.push(0x80); // Five false bools in one packed byte.
             bytes.extend_from_slice(&[0; 25]);
             write_unique_string(&mut bytes, "").unwrap();
-            bytes.extend_from_slice(&[0; 2]);
+            if version >= 112_026 {
+                bytes.extend_from_slice(&[0; 2]);
+            }
         }
-        bytes.extend_from_slice(&[0; 10]);
+        bytes.extend_from_slice(&[0; 5]);
+        if version >= 112_025 {
+            bytes.extend_from_slice(&[0; 5]);
+        }
         bytes.push(0x98); // 25 zero Long values.
         bytes.extend_from_slice(&[0; 3]);
         bytes.push(0x82); // Three zero color bytes.
-        bytes.extend_from_slice(&[0; 8]);
-        bytes.push(0x80); // Five false bools.
-        bytes.extend_from_slice(&[0; 2]);
+        for gate in [112_009, 112_011, 112_012, 112_013] {
+            if version >= gate {
+                bytes.extend_from_slice(&[0; 2]);
+            }
+        }
+        if version >= 112_014 {
+            bytes.push(0x80); // Five false bools.
+        }
+        if version >= 112_024 {
+            bytes.extend_from_slice(&[0; 2]);
+        }
         bytes
     }
 
@@ -1788,7 +1818,7 @@ mod tests {
                         .is_err()
                 );
             }
-            record[42] = 10;
+            record[42] = 15;
             assert!(prefix.decode_park_records(&record).is_err());
         }
     }
@@ -1810,7 +1840,7 @@ mod tests {
         let mut bytes = vec![0; super::park_scalar_bytes(version)];
         bytes[42] = 5;
         bytes.extend(vec![0xa5; 13 * 56]);
-        bytes.extend_from_slice(&zero_slot_zero_campus());
+        bytes.extend_from_slice(&zero_campus(version));
         let expected_len = bytes.len();
         bytes.push(0xff);
         let (records, used) = prefix.decode_park_records(&bytes).unwrap();
@@ -1867,7 +1897,7 @@ mod tests {
                     .decode_park_records(&record[..record.len() - 1])
                     .is_err()
             );
-            for unsupported in [10, 11, 12, 13, 15] {
+            for unsupported in [15] {
                 record[42] = unsupported;
                 assert!(prefix.decode_park_records(&record).is_err());
             }
@@ -1889,7 +1919,7 @@ mod tests {
             DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
         let mut record = vec![0; super::park_scalar_bytes(version)];
         record[42] = 14;
-        record.extend_from_slice(&zero_slot_zero_campus());
+        record.extend_from_slice(&zero_campus(version));
         record.extend([0x5a; 31]);
         let (parks, used) = prefix.decode_park_records(&record).unwrap();
         assert_eq!(used, record.len());
@@ -1899,6 +1929,57 @@ mod tests {
                 .decode_park_records(&record[..record.len() - 1])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn campus_park_records_follow_versioned_report_and_sports_gates() {
+        for (version, park_type, expected_campus_bytes) in [
+            (112_007, 10, 0),
+            (112_008, 10, 172),
+            (112_009, 11, 244),
+            (112_011, 12, 246),
+            (112_012, 13, 248),
+            (112_013, 10, 250),
+            (112_014, 11, 251),
+            (112_020, 12, 951),
+            (112_024, 13, 953),
+            (112_025, 10, 958),
+            (112_026, 11, 984),
+            (114_005, 12, 984),
+        ] {
+            let mut prefix_bytes = Vec::new();
+            zero_flags(&mut prefix_bytes);
+            let mut park_flags = [0_u32; DISTRICT_COUNT];
+            park_flags[5] = 1;
+            write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+            zero_policy_bools(&mut prefix_bytes, version);
+            let (prefix, _) =
+                DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+            let campus = if version >= 112_008 {
+                zero_campus(version)
+            } else {
+                Vec::new()
+            };
+            assert_eq!(campus.len(), expected_campus_bytes);
+            let mut record = vec![0; super::park_scalar_bytes(version)];
+            record[42] = park_type;
+            record.extend_from_slice(&campus);
+            let mut bytes = record.clone();
+            bytes.push(0xff);
+            let (parks, used) = prefix.decode_park_records(&bytes).unwrap();
+            assert_eq!(used, record.len());
+            assert_eq!(parks[0].park_type(), park_type);
+            assert_eq!(parks[0].encode(), record);
+            assert_eq!(bytes[used], 0xff);
+            if expected_campus_bytes != 0 {
+                assert!(
+                    prefix
+                        .decode_park_records(&record[..record.len() - 1])
+                        .is_err()
+                );
+            }
+            assert!(prefix.decode_type_zero_park_records(&record).is_err());
+        }
     }
 
     #[test]
@@ -1956,7 +2037,7 @@ mod tests {
             record.extend(vec![0; happiness_bytes]);
             record.extend(vec![0; scalar_bytes - happiness_bytes - 16]);
             if version >= 114_005 {
-                record.extend_from_slice(&zero_slot_zero_campus());
+                record.extend_from_slice(&zero_campus(version));
             }
             let result = prefix.decode_type_zero_park_records(&record);
             if supported {
@@ -2020,7 +2101,7 @@ mod tests {
             record.extend(vec![0; 78 - 16]);
             let type_offset = 42 + happiness_bytes;
             record[type_offset + 1] = 3;
-            record.extend_from_slice(&zero_slot_zero_campus());
+            record.extend_from_slice(&zero_campus(version));
             let (records, consumed) = prefix.decode_type_zero_park_records(&record).unwrap();
             assert_eq!(consumed, record.len());
             assert_eq!(records[0].level(), 3);
@@ -2051,7 +2132,7 @@ mod tests {
             DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
 
         let mut park = vec![0; 78];
-        park.extend_from_slice(&zero_slot_zero_campus());
+        park.extend_from_slice(&zero_campus(version));
         let (records, used) = prefix.decode_type_zero_park_records(&park).unwrap();
         assert_eq!(used, park.len());
         assert_eq!(records[0].encode(), park);
