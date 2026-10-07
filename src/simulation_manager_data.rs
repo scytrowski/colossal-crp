@@ -13,8 +13,9 @@ use crate::{
     BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingMonumentEffectsEditor,
     BuildingMonumentEffectsPrefix, BuildingPopulationPrefix, BuildingPrefabPrefix,
-    BuildingProblemEditor, BuildingProblemPrefix, BuildingRaceTeamPresenceEditor,
-    BuildingRaceTeamPresencePrefix, BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
+    BuildingProblemEditor, BuildingProblemPrefix, BuildingRaceTeamReferencesEditor,
+    BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedEditor,
+    BuildingRaceTeamUnassignedPrefix, BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
 };
 use crate::{BuildingEconomicFieldsEditor, BuildingPopulationEditor, BuildingTimerGeometryEditor};
 use crate::{
@@ -984,19 +985,38 @@ impl SimulationManagerData {
         Ok((data, reader.offset()))
     }
 
-    /// Decodes race-team-presence bytes after faculty bonuses.
+    /// Decodes race-team-unassigned bytes after faculty bonuses.
     /// Queued race-team reference bodies begin after this prefix and remain opaque.
-    pub fn decode_building_race_team_presence_prefix(
+    pub fn decode_building_race_team_unassigned_prefix(
         &self,
         save_app_version: Option<u32>,
-    ) -> Result<(BuildingRaceTeamPresencePrefix, usize), CrpError> {
+    ) -> Result<(BuildingRaceTeamUnassignedPrefix, usize), CrpError> {
         let (_, faculty_end) = self.decode_building_faculty_bonuses_prefix(save_app_version)?;
         let (flags, _) = self.decode_building_flags_prefix(save_app_version)?;
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(faculty_end)?;
-        let (data, used) = BuildingRaceTeamPresencePrefix::decode_prefix(
+        let (data, used) = BuildingRaceTeamUnassignedPrefix::decode_prefix(
             self.format_version,
             &flags,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes the race-team prefab-reference scope after its unassigned flags.
+    /// The returned boundary includes the encoded indices and prefab-name table.
+    pub fn decode_building_race_team_references_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingRaceTeamReferencesPrefix, usize), CrpError> {
+        let (unassigned, unassigned_end) =
+            self.decode_building_race_team_unassigned_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(unassigned_end)?;
+        let (data, used) = BuildingRaceTeamReferencesPrefix::decode_after_unassigned(
+            self.format_version,
+            &unassigned,
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(used)?;
@@ -1250,41 +1270,111 @@ impl SimulationManagerData {
         Ok(())
     }
 
-    /// Replaces race-team-presence flags and preserves queued reference bytes.
-    pub fn replace_building_race_team_presence(
+    /// Rewrites unchanged race-team assignment flags while preserving references.
+    /// Changes that alter which buildings have a team are rejected; use
+    /// `replace_building_race_team` with both editors for paired changes.
+    pub fn replace_building_race_team_unassigned(
         &mut self,
-        edited: &BuildingRaceTeamPresenceEditor,
+        edited: &BuildingRaceTeamUnassignedEditor,
         save_app_version: Option<u32>,
     ) -> Result<(), CrpError> {
         if edited.format_version() != self.format_version {
             return Err(invalid(
                 0,
-                "edited race-team-presence version does not match this stream",
+                "edited race-team-unassigned version does not match this stream",
             ));
         }
         let (original, graph_end) =
-            self.decode_building_race_team_presence_prefix(save_app_version)?;
-        if edited.presence().len() != original.presence().len() {
+            self.decode_building_race_team_unassigned_prefix(save_app_version)?;
+        if edited.unassigned().len() != original.unassigned().len() {
             return Err(invalid(
                 0,
-                "edited race-team-presence count does not match this stream",
+                "edited race-team-unassigned count does not match this stream",
+            ));
+        }
+        if edited.unassigned() != original.unassigned() {
+            return Err(invalid(
+                0,
+                "changing race-team assignment flags requires rewriting the following prefab-reference scope",
             ));
         }
         let body_start =
             graph_end
                 .checked_sub(original.encode().len())
                 .ok_or(CrpError::ArithmeticOverflow(
-                    "BuildingManager race-team-presence start",
+                    "BuildingManager race-team-unassigned start",
                 ))?;
         let replacement = edited.encode()?;
         if graph_end > self.serialized_object_graph.len() {
             return Err(invalid(
                 body_start,
-                "race-team-presence bytes extend past manager graph",
+                "race-team-unassigned bytes extend past manager graph",
             ));
         }
         self.serialized_object_graph
             .splice(body_start..graph_end, replacement);
+        Ok(())
+    }
+
+    /// Replaces race-team assignment flags, prefab indices, and names together.
+    /// The paired edits keep the encoded index count consistent with assigned
+    /// buildings. The remaining manager graph bytes are preserved exactly.
+    pub fn replace_building_race_team(
+        &mut self,
+        unassigned: &BuildingRaceTeamUnassignedEditor,
+        references: &BuildingRaceTeamReferencesEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if unassigned.format_version() != self.format_version
+            || references.format_version() != self.format_version
+        {
+            return Err(invalid(
+                0,
+                "race-team editors do not match this stream's inner version",
+            ));
+        }
+        if self.format_version < 120_002 {
+            return Err(invalid(
+                0,
+                "race-team reference scope requires inner version 120002 or newer",
+            ));
+        }
+        let (original_unassigned, unassigned_end) =
+            self.decode_building_race_team_unassigned_prefix(save_app_version)?;
+        let (_, reference_end) =
+            self.decode_building_race_team_references_prefix(save_app_version)?;
+        if unassigned.unassigned().len() != original_unassigned.unassigned().len() {
+            return Err(invalid(
+                0,
+                "race-team assignment count does not match this stream",
+            ));
+        }
+        let expected_indices = unassigned
+            .unassigned()
+            .iter()
+            .filter(|is_unassigned| !**is_unassigned)
+            .count();
+        if references.indices().len() != expected_indices {
+            return Err(invalid(
+                0,
+                "race-team index count does not match assigned buildings",
+            ));
+        }
+        let start = unassigned_end
+            .checked_sub(original_unassigned.encode().len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "BuildingManager race-team assignment start",
+            ))?;
+        if reference_end < unassigned_end || reference_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                start,
+                "race-team reference scope extends past manager graph",
+            ));
+        }
+        let mut replacement = unassigned.encode()?;
+        replacement.extend_from_slice(&references.encode()?);
+        self.serialized_object_graph
+            .splice(start..reference_end, replacement);
         Ok(())
     }
 

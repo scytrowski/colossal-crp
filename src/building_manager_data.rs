@@ -1,5 +1,5 @@
 use crate::CrpError;
-use crate::data_serializer::Reader;
+use crate::data_serializer::{Reader, write_unique_string};
 use crate::encoded_array::{
     read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
     read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
@@ -16,7 +16,7 @@ const TWO_BUILDING_PROBLEMS_VERSION: u32 = 115_000;
 const SAVE_APP_PROBLEMS_VERSION: u32 = 146_809_088;
 const MONUMENT_EFFECTS_VERSION: u32 = 110_016;
 const FACULTY_BONUSES_VERSION: u32 = 112_001;
-const RACE_TEAM_PRESENCE_VERSION: u32 = 120_002;
+const RACE_TEAM_UNASSIGNED_VERSION: u32 = 120_002;
 const BUILDING_EFFECT_TABLE_LENGTH: usize = 16;
 
 /// Serialized flags for one one-based `Building` buffer position.
@@ -131,21 +131,39 @@ pub struct BuildingFacultyBonusesEditor {
     final_values: Vec<BuildingEffectValue>,
 }
 
-/// Race-team-presence booleans for active buildings from inner version 120002.
+/// Race-team-unassigned booleans for active buildings from inner version 120002.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildingRaceTeamPresencePrefix {
+pub struct BuildingRaceTeamUnassignedPrefix {
     format_version: u32,
-    presence: Vec<bool>,
+    unassigned: Vec<bool>,
     serialized_prefix: Vec<u8>,
 }
 
-/// Editable race-team-presence booleans that retain unchanged raw bytes.
+/// Editable race-team-unassigned booleans that retain unchanged raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildingRaceTeamPresenceEditor {
+pub struct BuildingRaceTeamUnassignedEditor {
     format_version: u32,
-    presence: Vec<bool>,
-    original_presence: Vec<bool>,
+    unassigned: Vec<bool>,
+    original_unassigned: Vec<bool>,
     original_bytes: Vec<u8>,
+}
+
+/// Race-team prefab indices and the `PrefabCollection<BuildingInfo>` name table.
+/// The decoded body retains its original bytes for exact rewriting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingRaceTeamReferencesPrefix {
+    format_version: u32,
+    indices: Vec<u16>,
+    prefab_names: Vec<Option<String>>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Editable race-team indices and prefab names from the reference scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingRaceTeamReferencesEditor {
+    format_version: u32,
+    indices: Vec<u16>,
+    prefab_names: Vec<Option<String>>,
 }
 
 /// Per-building buffer indices and byte fields following problem state.
@@ -2282,7 +2300,7 @@ fn invalid_building_effects(name: &str, reason: impl Into<String>) -> CrpError {
     }
 }
 
-impl BuildingRaceTeamPresencePrefix {
+impl BuildingRaceTeamUnassignedPrefix {
     /// Decodes one DataSerializer bool per active building from version 120002.
     /// The game treats only byte `01` as true; original bytes are retained.
     pub fn decode_prefix(
@@ -2291,11 +2309,11 @@ impl BuildingRaceTeamPresencePrefix {
         bytes: &[u8],
     ) -> Result<(Self, usize), CrpError> {
         if format_version < 164 || flags.format_version() != format_version {
-            return Err(invalid_building_race_team_presence(
+            return Err(invalid_building_race_team_unassigned(
                 "unsupported or mismatched inner version",
             ));
         }
-        let count = if format_version >= RACE_TEAM_PRESENCE_VERSION {
+        let count = if format_version >= RACE_TEAM_UNASSIGNED_VERSION {
             flags
                 .building_flags()
                 .iter()
@@ -2305,16 +2323,18 @@ impl BuildingRaceTeamPresencePrefix {
             0
         };
         if bytes.len() < count {
-            return Err(invalid_building_race_team_presence(
-                "truncated race-team-presence bytes",
+            return Err(invalid_building_race_team_unassigned(
+                "truncated race-team-unassigned bytes",
             ));
         }
         let original = &bytes[..count];
-        let presence = original.iter().map(|byte| *byte == 1).collect();
+        // The game writes `m_raceTeamIndex == 0xFFFF`, meaning no team is
+        // assigned. A false value is followed by an encoded prefab index.
+        let unassigned = original.iter().map(|byte| *byte == 1).collect();
         Ok((
             Self {
                 format_version,
-                presence,
+                unassigned,
                 serialized_prefix: original.to_vec(),
             },
             count,
@@ -2325,58 +2345,59 @@ impl BuildingRaceTeamPresencePrefix {
     pub fn format_version(&self) -> u32 {
         self.format_version
     }
-    /// Returns presence flags in active-building order.
-    pub fn presence(&self) -> &[bool] {
-        &self.presence
+    /// Returns `true` for buildings whose race-team index is `0xFFFF`.
+    /// Such buildings have no prefab reference in the following reference scope.
+    pub fn unassigned(&self) -> &[bool] {
+        &self.unassigned
     }
     /// Writes the original bool bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
     /// Creates an editor that preserves unchanged raw bool bytes.
-    pub fn into_editor(self) -> BuildingRaceTeamPresenceEditor {
-        BuildingRaceTeamPresenceEditor {
+    pub fn into_editor(self) -> BuildingRaceTeamUnassignedEditor {
+        BuildingRaceTeamUnassignedEditor {
             format_version: self.format_version,
-            original_presence: self.presence.clone(),
-            presence: self.presence,
+            original_unassigned: self.unassigned.clone(),
+            unassigned: self.unassigned,
             original_bytes: self.serialized_prefix,
         }
     }
 }
 
-impl BuildingRaceTeamPresenceEditor {
+impl BuildingRaceTeamUnassignedEditor {
     /// Returns the inner DataSerializer version associated with these flags.
     pub fn format_version(&self) -> u32 {
         self.format_version
     }
-    /// Returns editable presence flags in active-building order.
-    pub fn presence_mut(&mut self) -> &mut [bool] {
-        &mut self.presence
+    /// Returns editable unassigned flags in active-building order.
+    pub fn unassigned_mut(&mut self) -> &mut [bool] {
+        &mut self.unassigned
     }
-    /// Returns current presence flags in active-building order.
-    pub fn presence(&self) -> &[bool] {
-        &self.presence
+    /// Returns current unassigned flags in active-building order.
+    pub fn unassigned(&self) -> &[bool] {
+        &self.unassigned
     }
     /// Encodes changed bools as `00` or `01` and retains unchanged raw bytes.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
-        if self.format_version < RACE_TEAM_PRESENCE_VERSION
-            && (!self.presence.is_empty() || !self.original_bytes.is_empty())
+        if self.format_version < RACE_TEAM_UNASSIGNED_VERSION
+            && (!self.unassigned.is_empty() || !self.original_bytes.is_empty())
         {
-            return Err(invalid_building_race_team_presence(
-                "race-team-presence bytes are absent before inner version 120002",
+            return Err(invalid_building_race_team_unassigned(
+                "race-team-unassigned bytes are absent before inner version 120002",
             ));
         }
-        if self.presence.len() != self.original_presence.len()
-            || self.presence.len() != self.original_bytes.len()
+        if self.unassigned.len() != self.original_unassigned.len()
+            || self.unassigned.len() != self.original_bytes.len()
         {
-            return Err(invalid_building_race_team_presence(
-                "race-team-presence count changed",
+            return Err(invalid_building_race_team_unassigned(
+                "race-team-unassigned count changed",
             ));
         }
         Ok(self
-            .presence
+            .unassigned
             .iter()
-            .zip(&self.original_presence)
+            .zip(&self.original_unassigned)
             .zip(&self.original_bytes)
             .map(|((current, original), raw)| {
                 if current == original {
@@ -2391,9 +2412,137 @@ impl BuildingRaceTeamPresenceEditor {
     }
 }
 
-fn invalid_building_race_team_presence(reason: impl Into<String>) -> CrpError {
+impl BuildingRaceTeamReferencesPrefix {
+    /// Decodes the reference scope after the version-120002 unassigned flags.
+    /// One encoded UShort index is read for each active building marked
+    /// assigned, followed by the prefab-name count and unique-string table.
+    /// Returns the exact number of bytes consumed from `bytes`.
+    pub fn decode_after_unassigned(
+        format_version: u32,
+        unassigned: &BuildingRaceTeamUnassignedPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < RACE_TEAM_UNASSIGNED_VERSION
+            || unassigned.format_version() != format_version
+        {
+            return Err(invalid_building_race_team_references(
+                "race-team reference scope requires matching inner version 120002 or newer",
+            ));
+        }
+
+        let reference_count = unassigned
+            .unassigned()
+            .iter()
+            .filter(|is_unassigned| !**is_unassigned)
+            .count();
+        let mut reader = Reader::new(bytes);
+        let indices = read_encoded_ushort_array(&mut reader, reference_count)?;
+        let name_count = usize::from(reader.read_u16_be()?);
+        if name_count > reader.remaining() {
+            return Err(reader.invalid("race-team prefab-name table cannot fit in remaining bytes"));
+        }
+        let mut prefab_names = Vec::with_capacity(name_count);
+        for _ in 0..name_count {
+            prefab_names.push(reader.read_unique_string()?);
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                indices,
+                prefab_names,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns prefab-table indices in assigned active-building order.
+    pub fn indices(&self) -> &[u16] {
+        &self.indices
+    }
+
+    /// Returns the ordered prefab names; null entries are retained.
+    pub fn prefab_names(&self) -> &[Option<String>] {
+        &self.prefab_names
+    }
+
+    /// Writes the original reference scope byte for byte.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+
+    /// Creates an editor for the indices and names in this scope.
+    pub fn into_editor(self) -> BuildingRaceTeamReferencesEditor {
+        BuildingRaceTeamReferencesEditor {
+            format_version: self.format_version,
+            indices: self.indices,
+            prefab_names: self.prefab_names,
+        }
+    }
+}
+
+impl BuildingRaceTeamReferencesEditor {
+    /// Returns the inner DataSerializer version associated with this scope.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns mutable indices in assigned active-building order.
+    pub fn indices_mut(&mut self) -> &mut Vec<u16> {
+        &mut self.indices
+    }
+
+    /// Returns indices in assigned active-building order.
+    pub fn indices(&self) -> &[u16] {
+        &self.indices
+    }
+
+    /// Returns mutable names indexed by the prefab-reference values.
+    pub fn prefab_names_mut(&mut self) -> &mut Vec<Option<String>> {
+        &mut self.prefab_names
+    }
+
+    /// Encodes a canonical UShort index array and prefab-name table.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.format_version < RACE_TEAM_UNASSIGNED_VERSION {
+            return Err(invalid_building_race_team_references(
+                "race-team reference scope is absent before inner version 120002",
+            ));
+        }
+        let name_count = u16::try_from(self.prefab_names.len()).map_err(|_| {
+            invalid_building_race_team_references("prefab-name count exceeds the on-disk u16")
+        })?;
+        let mut output = Vec::new();
+        write_encoded_ushort_array(&mut output, &self.indices);
+        output.extend_from_slice(&name_count.to_be_bytes());
+        for name in &self.prefab_names {
+            if let Some(name) = name {
+                write_unique_string(&mut output, name)?;
+            } else {
+                output.push(0xff);
+            }
+        }
+        Ok(output)
+    }
+}
+
+fn invalid_building_race_team_unassigned(reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
-        name: "BuildingManager race-team presence".to_owned(),
+        name: "BuildingManager race-team unassigned flags".to_owned(),
+        offset: 0,
+        reason: reason.into(),
+    }
+}
+
+fn invalid_building_race_team_references(reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "BuildingManager race-team references".to_owned(),
         offset: 0,
         reason: reason.into(),
     }
@@ -2503,9 +2652,9 @@ mod tests {
     use super::{
         BuildingEconomicFieldsPrefix, BuildingFacultyBonusesPrefix, BuildingFlag,
         BuildingFlagsPrefix, BuildingInstanceRecordsPrefix, BuildingMonumentEffectsPrefix,
-        BuildingPopulationEditor, BuildingPopulationPrefix, BuildingRaceTeamPresencePrefix,
-        BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
-        fixed_object_header_count, timer_fields_for_version,
+        BuildingPopulationEditor, BuildingPopulationPrefix, BuildingRaceTeamReferencesPrefix,
+        BuildingRaceTeamUnassignedPrefix, BuildingServiceSelectionPrefix, BuildingTimerField,
+        BuildingTimerGeometryEditor, fixed_object_header_count, timer_fields_for_version,
     };
 
     fn expected_effect_table_bytes() -> Vec<u8> {
@@ -2565,7 +2714,7 @@ mod tests {
     }
 
     #[test]
-    fn building_race_team_presence_uses_one_bool_per_active_building() {
+    fn building_race_team_unassigned_uses_one_bool_per_active_building() {
         let flags = BuildingFlagsPrefix {
             format_version: 120_002,
             building_flags: vec![
@@ -2588,17 +2737,17 @@ mod tests {
             serialized_prefix: Vec::new(),
         };
         let (prefix, used) =
-            BuildingRaceTeamPresencePrefix::decode_prefix(120_002, &flags, &[1, 2])
+            BuildingRaceTeamUnassignedPrefix::decode_prefix(120_002, &flags, &[1, 2])
                 .expect("race-team bools decode");
         assert_eq!(used, 2);
-        assert_eq!(prefix.presence(), [true, false]);
+        assert_eq!(prefix.unassigned(), [true, false]);
         assert_eq!(prefix.encode(), [1, 2]);
         let mut editor = prefix.into_editor();
-        editor.presence_mut()[0] = false;
-        assert_eq!(editor.encode().expect("presence encodes"), [0, 2]);
-        editor.presence_mut()[1] = true;
-        assert_eq!(editor.encode().expect("presence encodes"), [0, 1]);
-        assert!(BuildingRaceTeamPresencePrefix::decode_prefix(120_002, &flags, &[1]).is_err());
+        editor.unassigned_mut()[0] = false;
+        assert_eq!(editor.encode().expect("unassigned flags encode"), [0, 2]);
+        editor.unassigned_mut()[1] = true;
+        assert_eq!(editor.encode().expect("unassigned flags encode"), [0, 1]);
+        assert!(BuildingRaceTeamUnassignedPrefix::decode_prefix(120_002, &flags, &[1]).is_err());
 
         let legacy_flags = BuildingFlagsPrefix {
             format_version: 120_001,
@@ -2606,10 +2755,84 @@ mod tests {
             serialized_prefix: Vec::new(),
         };
         let (legacy, used) =
-            BuildingRaceTeamPresencePrefix::decode_prefix(120_001, &legacy_flags, &[])
-                .expect("pre-gate race-team presence is absent");
+            BuildingRaceTeamUnassignedPrefix::decode_prefix(120_001, &legacy_flags, &[])
+                .expect("pre-gate race-team flags are absent");
         assert_eq!(used, 0);
-        assert!(legacy.presence().is_empty());
+        assert!(legacy.unassigned().is_empty());
+    }
+
+    #[test]
+    fn building_race_team_reference_scope_decodes_indices_and_names() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 120_002,
+            building_flags: vec![
+                BuildingFlag {
+                    index: 1,
+                    flags: 1,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 2,
+                    flags: 1,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 3,
+                    flags: 1,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 4,
+                    flags: 1,
+                    flags2: 0,
+                },
+            ],
+            serialized_prefix: Vec::new(),
+        };
+        let (unassigned, _) =
+            BuildingRaceTeamUnassignedPrefix::decode_prefix(120_002, &flags, &[1, 0, 2, 1])
+                .expect("unassigned flags decode");
+        let bytes = [
+            1, 0, 0, 0, 2, 0, 3, // two EncodedArray.UShort indices, then three names
+            0x80, 0, 4, 0xf4, 0xf1, 0xfc, 0x0c, // "team"
+            0x80, 0, 5, 0xef, 0x05, 0xf4, 0xfd, 0x0d, // "other"
+            0xff, // null prefab name
+        ];
+
+        let (references, used) =
+            BuildingRaceTeamReferencesPrefix::decode_after_unassigned(120_002, &unassigned, &bytes)
+                .expect("reference scope decodes");
+        assert_eq!(references.indices(), [0, 2]);
+        assert_eq!(
+            references.prefab_names(),
+            [Some("team".to_owned()), Some("other".to_owned()), None]
+        );
+        assert_eq!(used, bytes.len());
+        assert_eq!(references.encode(), bytes);
+        let editor = references.clone().into_editor();
+        assert_eq!(editor.encode().expect("reference scope encodes"), bytes);
+        let mut edited = editor;
+        edited.indices_mut()[0] = 1;
+        edited.prefab_names_mut()[0] = Some("new team".to_owned());
+        let edited_bytes = edited.encode().expect("edited references encode");
+        let (decoded_edit, edited_used) =
+            BuildingRaceTeamReferencesPrefix::decode_after_unassigned(
+                120_002,
+                &unassigned,
+                &edited_bytes,
+            )
+            .expect("edited references decode");
+        assert_eq!(edited_used, edited_bytes.len());
+        assert_eq!(decoded_edit.indices(), [1, 2]);
+        assert_eq!(decoded_edit.prefab_names()[0].as_deref(), Some("new team"));
+        assert!(
+            BuildingRaceTeamReferencesPrefix::decode_after_unassigned(
+                120_002,
+                &unassigned,
+                &bytes[..bytes.len() - 1],
+            )
+            .is_err()
+        );
     }
 
     #[test]

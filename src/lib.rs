@@ -29,7 +29,8 @@ pub use building_manager_data::{
     BuildingManagerObjectHeadersPrefix, BuildingMonumentEffectsEditor,
     BuildingMonumentEffectsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
     BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix, BuildingProblemWords,
-    BuildingRaceTeamPresenceEditor, BuildingRaceTeamPresencePrefix, BuildingServiceSelection,
+    BuildingRaceTeamReferencesEditor, BuildingRaceTeamReferencesPrefix,
+    BuildingRaceTeamUnassignedEditor, BuildingRaceTeamUnassignedPrefix, BuildingServiceSelection,
     BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
     BuildingTimerGeometryPrefix,
 };
@@ -3817,7 +3818,7 @@ mod tests {
         let mut checked_building_records_convenience = false;
         let mut checked_monument_effects_convenience = false;
         let mut checked_faculty_bonuses_convenience = false;
-        let mut checked_race_team_presence_convenience = false;
+        let mut checked_race_team_unassigned_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
@@ -4694,10 +4695,10 @@ mod tests {
                             );
                             checked_faculty_bonuses_convenience = true;
                         }
-                        if !checked_race_team_presence_convenience {
+                        if !checked_race_team_unassigned_convenience {
                             let race_start = net_reader.offset();
                             let (race_presence, race_presence_used) =
-                                BuildingRaceTeamPresencePrefix::decode_prefix(
+                                BuildingRaceTeamUnassignedPrefix::decode_prefix(
                                     version,
                                     &building_flags,
                                     net_reader.remaining_bytes(),
@@ -4709,7 +4710,7 @@ mod tests {
                                     [race_start..race_start + race_presence_used]
                             );
                             let (via_manager, graph_end) = manager_data
-                                .decode_building_race_team_presence_prefix(
+                                .decode_building_race_team_unassigned_prefix(
                                     metadata.save_app_version,
                                 )?;
                             assert_eq!(via_manager, race_presence);
@@ -4718,19 +4719,19 @@ mod tests {
                             let editor = race_presence.clone().into_editor();
                             let original_suffix =
                                 manager_data.serialized_object_graph()[graph_end..].to_vec();
-                            edited_manager.replace_building_race_team_presence(
+                            edited_manager.replace_building_race_team_unassigned(
                                 &editor,
                                 metadata.save_app_version,
                             )?;
                             let (_, rewritten_end) = edited_manager
-                                .decode_building_race_team_presence_prefix(
+                                .decode_building_race_team_unassigned_prefix(
                                     metadata.save_app_version,
                                 )?;
                             assert_eq!(
                                 &edited_manager.serialized_object_graph()[rewritten_end..],
                                 original_suffix
                             );
-                            checked_race_team_presence_convenience = true;
+                            checked_race_team_unassigned_convenience = true;
                         }
                         if std::env::var_os("CRP_EXTRACT_BUILDING_BYTE_STATE_FIXTURE").is_some()
                             && path
@@ -4831,7 +4832,7 @@ mod tests {
         assert!(checked_building_records_convenience);
         assert!(checked_monument_effects_convenience);
         assert!(checked_faculty_bonuses_convenience);
-        assert!(checked_race_team_presence_convenience);
+        assert!(checked_race_team_unassigned_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(
