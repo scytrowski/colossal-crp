@@ -1916,7 +1916,9 @@ fn find_unique_bytes(haystack: &[u8], needle: &[u8], description: &str) -> Resul
 mod manager_boundary_tests {
     use super::{ManagerObjectReference, SimulationManagerData};
     use crate::data_serializer::write_unique_string;
-    use crate::encoded_array::{write_encoded_uint_array, write_encoded_ushort_array};
+    use crate::encoded_array::{
+        write_encoded_bool_array, write_encoded_uint_array, write_encoded_ushort_array,
+    };
 
     fn synthetic_manager_data() -> SimulationManagerData {
         let mut graph = profiler_tag("ZoneManager");
@@ -1940,6 +1942,7 @@ mod manager_boundary_tests {
         graph.push(1);
         write_encoded_uint_array(&mut graph, &[0; 128]);
         write_encoded_uint_array(&mut graph, &[0; 128]);
+        write_encoded_bool_array(&mut graph, &vec![false; 16 * 32 * 128]);
 
         let names = [
             (13, "ZoneManager+Data"),

@@ -48,6 +48,31 @@ pub(crate) fn write_encoded_byte_array(output: &mut Vec<u8>, values: &[u8]) {
     }
 }
 
+pub(crate) fn read_encoded_bool_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<Vec<bool>, CrpError> {
+    let packed_byte_count = count
+        .checked_add(7)
+        .ok_or(CrpError::ArithmeticOverflow("EncodedArray.Bool bit count"))?
+        / 8;
+    let packed = read_encoded_byte_array(reader, packed_byte_count)?;
+    Ok((0..count)
+        .map(|index| packed[index / 8] & (1 << (index % 8)) != 0)
+        .collect())
+}
+
+#[cfg(test)]
+pub(crate) fn write_encoded_bool_array(output: &mut Vec<u8>, values: &[bool]) {
+    let mut packed = vec![0_u8; values.len().div_ceil(8)];
+    for (index, value) in values.iter().copied().enumerate() {
+        if value {
+            packed[index / 8] |= 1 << (index % 8);
+        }
+    }
+    write_encoded_byte_array(output, &packed);
+}
+
 /// Writes unsigned 32-bit values as canonical EncodedArray literal blocks.
 pub(crate) fn write_encoded_uint_array(output: &mut Vec<u8>, values: &[u32]) {
     for chunk in values.chunks(64) {
@@ -263,7 +288,10 @@ fn repeated_delta_run(values: &[u16], start: usize, previous: u16, delta: i16) -
 
 #[cfg(test)]
 mod tests {
-    use super::{read_encoded_uint_array, read_encoded_ulong_array, read_encoded_ushort_array};
+    use super::{
+        read_encoded_bool_array, read_encoded_uint_array, read_encoded_ulong_array,
+        read_encoded_ushort_array, write_encoded_bool_array,
+    };
     use crate::data_serializer::Reader;
 
     #[test]
@@ -323,5 +351,32 @@ mod tests {
     fn ulong_array_rejects_truncated_close_delta() {
         let mut reader = Reader::new(&[0, 0, 0, 0, 0, 0, 0, 0, 5, 0x40, 0]);
         assert!(read_encoded_ulong_array(&mut reader, 2).is_err());
+    }
+
+    #[test]
+    fn bool_array_uses_least_significant_bit_first_and_expected_byte_codec() {
+        let expected_values = [true, false, true, false, false, false, false, true, true];
+        let expected_bytes = [0x01, 0x85, 0x01];
+
+        let mut encoded = Vec::new();
+        write_encoded_bool_array(&mut encoded, &expected_values);
+        assert_eq!(encoded, expected_bytes);
+
+        let mut reader = Reader::new(&expected_bytes);
+        assert_eq!(
+            read_encoded_bool_array(&mut reader, expected_values.len()).unwrap(),
+            expected_values
+        );
+        assert_eq!(reader.offset(), expected_bytes.len());
+    }
+
+    #[test]
+    fn bool_array_rejects_truncated_packed_bytes_and_handles_empty_input() {
+        let mut truncated = Reader::new(&[0x01, 0x85]);
+        assert!(read_encoded_bool_array(&mut truncated, 9).is_err());
+
+        let mut empty = Reader::new(&[]);
+        assert!(read_encoded_bool_array(&mut empty, 0).unwrap().is_empty());
+        assert_eq!(empty.offset(), 0);
     }
 }

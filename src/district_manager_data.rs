@@ -1,16 +1,24 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::read_encoded_uint_array;
+use crate::encoded_array::{read_encoded_bool_array, read_encoded_uint_array};
 
 const DISTRICT_COUNT: usize = 128;
 const PARK_FLAGS_VERSION: u32 = 110_001;
 const AIRLINE_NAME_VERSION: u32 = 114_006;
 const AIRPORT_PANEL_VERSION: u32 = 114_007;
+const POLICY_FLAGS_VERSION: u32 = 70;
+const POLICY_EFFECTS_VERSION: u32 = 171;
+const DISTRICT_EVENT_POLICIES_VERSION: u32 = 248;
+const PARK_POLICIES_VERSION: u32 = 110_009;
+const PARK_EVENT_POLICIES_VERSION: u32 = 112_015;
+const PARK_SPECIALIZATION_POLICIES_VERSION: u32 = 115_012;
+const POLICY_COUNT: usize = 32;
 
 /// The initial known fields from `DistrictManager+Data`.
 ///
-/// This prefix ends after district and park flags, before the large sequence
-/// of versioned district and park policy booleans. Its original bytes are
+/// The policy bool values are retained in serialized order: category first,
+/// then policy bit 0–31, then district or park index 0–127. This prefix stops
+/// before the later separate park-policy bool stream. Original bytes are
 /// retained for exact unchanged writing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictManagerFlagsPrefix {
@@ -21,11 +29,12 @@ pub struct DistrictManagerFlagsPrefix {
     district_flags: Vec<u32>,
     park_flags_present: bool,
     park_flags: Vec<u32>,
+    policy_bools: Option<Vec<bool>>,
     serialized_prefix: Vec<u8>,
 }
 
 impl DistrictManagerFlagsPrefix {
-    /// Decodes the opening fields through the 128 park flags when present.
+    /// Decodes the opening fields through the first policy bool stream.
     ///
     /// This prefix supports inner versions 164 and newer. It stops before the
     /// policy-boolean arrays that follow district and park flags. Truncated or
@@ -57,6 +66,12 @@ impl DistrictManagerFlagsPrefix {
         } else {
             vec![0; DISTRICT_COUNT]
         };
+        let policy_bool_count = district_policy_bool_count(format_version)?;
+        let policy_bools = if policy_bool_count == 0 {
+            None
+        } else {
+            Some(read_encoded_bool_array(&mut reader, policy_bool_count)?)
+        };
         let consumed = reader.offset();
 
         Ok((
@@ -68,6 +83,7 @@ impl DistrictManagerFlagsPrefix {
                 district_flags,
                 park_flags_present,
                 park_flags,
+                policy_bools,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -109,10 +125,48 @@ impl DistrictManagerFlagsPrefix {
         &self.park_flags
     }
 
+    /// Returns the versioned packed district and park policy bools in wire order.
+    ///
+    /// Categories are district policies, district effects, district event
+    /// policies, park event/policy/effect tables, then park specialization
+    /// policies. Each category contains policy indices 0–31 across entries
+    /// 0–127 and is included only at its version gate.
+    pub fn policy_bools(&self) -> Option<&[bool]> {
+        self.policy_bools.as_deref()
+    }
+
     /// Writes the original known prefix exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
+}
+
+fn district_policy_bool_count(format_version: u32) -> Result<usize, CrpError> {
+    if format_version < POLICY_FLAGS_VERSION {
+        return Ok(0);
+    }
+    let mut categories = 5_usize;
+    if format_version >= POLICY_EFFECTS_VERSION {
+        categories += 5;
+    }
+    if format_version >= DISTRICT_EVENT_POLICIES_VERSION {
+        categories += 2;
+    }
+    if format_version >= PARK_POLICIES_VERSION {
+        categories += 2;
+    }
+    if format_version >= PARK_EVENT_POLICIES_VERSION {
+        categories += 1;
+    }
+    if format_version >= PARK_SPECIALIZATION_POLICIES_VERSION {
+        categories += 1;
+    }
+    categories
+        .checked_mul(POLICY_COUNT)
+        .and_then(|count| count.checked_mul(DISTRICT_COUNT))
+        .ok_or(CrpError::ArithmeticOverflow(
+            "DistrictManager policy bool count",
+        ))
 }
 
 fn invalid_district_manager(offset: usize, reason: impl Into<String>) -> CrpError {
@@ -125,12 +179,19 @@ fn invalid_district_manager(offset: usize, reason: impl Into<String>) -> CrpErro
 
 #[cfg(test)]
 mod tests {
-    use super::DistrictManagerFlagsPrefix;
+    use super::{DistrictManagerFlagsPrefix, POLICY_COUNT, district_policy_bool_count};
     use crate::data_serializer::write_unique_string;
-    use crate::encoded_array::write_encoded_uint_array;
+    use crate::encoded_array::{write_encoded_bool_array, write_encoded_uint_array};
 
     fn zero_flags(output: &mut Vec<u8>) {
         write_encoded_uint_array(output, &[0; 128]);
+    }
+
+    fn zero_policy_bools(output: &mut Vec<u8>, version: u32) {
+        let count = district_policy_bool_count(version).unwrap();
+        if count != 0 {
+            write_encoded_bool_array(output, &vec![false; count]);
+        }
     }
 
     #[test]
@@ -141,6 +202,7 @@ mod tests {
             if park_flags_present {
                 zero_flags(&mut bytes);
             }
+            zero_policy_bools(&mut bytes, version);
             let (prefix, used) =
                 DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
             assert_eq!(used, bytes.len());
@@ -167,6 +229,7 @@ mod tests {
             }
             zero_flags(&mut bytes);
             write_encoded_uint_array(&mut bytes, &[0; 128]);
+            zero_policy_bools(&mut bytes, version);
 
             let (prefix, used) =
                 DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
@@ -182,5 +245,39 @@ mod tests {
     fn district_prefix_rejects_unsupported_and_truncated_data() {
         assert!(DistrictManagerFlagsPrefix::decode_prefix(163, &[]).is_err());
         assert!(DistrictManagerFlagsPrefix::decode_prefix(194, &[0; 8]).is_err());
+    }
+
+    #[test]
+    fn policy_bool_count_follows_district_and_park_version_gates() {
+        for (version, categories) in [
+            (69, 0),
+            (70, 5),
+            (171, 10),
+            (248, 12),
+            (110_009, 14),
+            (112_015, 15),
+            (115_012, 16),
+        ] {
+            assert_eq!(
+                district_policy_bool_count(version).unwrap(),
+                categories * POLICY_COUNT * 128
+            );
+        }
+    }
+
+    #[test]
+    fn policy_bool_stream_preserves_field_major_bit_order() {
+        let version = 171;
+        let mut bytes = Vec::new();
+        zero_flags(&mut bytes);
+        let mut policies = vec![false; district_policy_bool_count(version).unwrap()];
+        let selected = POLICY_COUNT * 128 + 3 * 128 + 5;
+        policies[selected] = true;
+        write_encoded_bool_array(&mut bytes, &policies);
+
+        let (prefix, used) = DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(prefix.policy_bools().unwrap(), policies);
+        assert_eq!(prefix.encode(), bytes);
     }
 }
