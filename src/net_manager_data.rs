@@ -403,6 +403,37 @@ pub struct NetManagerTailPrefix {
     serialized_prefix: Vec<u8>,
 }
 
+/// One queued `NetNodeInstanceGuide` body decoded according to its version gates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeInstanceGuideBody {
+    format_version: u32,
+    save_app_version: Option<u32>,
+    next_repeat: u32,
+    activation_frame: u32,
+    activation_count: u8,
+    display_count: u8,
+    disabled: bool,
+    problems: u64,
+    build_index: u32,
+    node_id: u16,
+    serialized_body: Vec<u8>,
+}
+
+/// Editable fields for a queued `NetNodeInstanceGuide` body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeInstanceGuideEditor {
+    original: NetNodeInstanceGuideBody,
+    save_app_version: Option<u32>,
+    next_repeat: u32,
+    activation_frame: u32,
+    activation_count: u8,
+    display_count: u8,
+    disabled: bool,
+    problems: u64,
+    build_index: u32,
+    node_id: u16,
+}
+
 impl NetLanePrefix {
     /// Decodes lane flags, links, and reservations for inner versions 164+.
     /// Returns bytes consumed, excluding the loading-profiler opening tag.
@@ -1792,6 +1823,234 @@ pub(crate) fn read_net_object_header(reader: &mut Reader<'_>) -> Result<NetObjec
     }
 }
 
+impl NetNodeInstanceGuideBody {
+    /// Decodes one guide body for inner versions 164 and newer.
+    /// Versions 221+ require the save application version because it selects
+    /// the 32-bit or 64-bit problem-field representation.
+    pub fn decode(
+        format_version: u32,
+        save_app_version: Option<u32>,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 {
+            return Err(invalid_guide(
+                0,
+                "NetNodeInstanceGuide requires inner version 164 or newer",
+            ));
+        }
+        if format_version >= 221 && save_app_version.is_none() {
+            return Err(invalid_guide(
+                0,
+                "save application version is required for the guide problem-field gate",
+            ));
+        }
+        let mut reader = Reader::new(bytes);
+        let next_repeat = reader.read_u32_be()?;
+        let activation_frame = reader.read_u32_be()?;
+        let activation_count = reader.read_u8()?;
+        let display_count = reader.read_u8()?;
+        let disabled = reader.read_u8()? == 1;
+        let wide_problems = format_version >= 221
+            && save_app_version.is_some_and(|version| version >= SAVE_APP_PROBLEMS_VERSION);
+        let problems = if wide_problems {
+            reader.read_u64_be()?
+        } else {
+            legacy_guide_problems_to_u64(reader.read_u32_be()?)
+        };
+        let build_index = reader.read_u32_be()?;
+        let node_id = reader.read_u16_be()?;
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                save_app_version,
+                next_repeat,
+                activation_frame,
+                activation_count,
+                display_count,
+                disabled,
+                problems,
+                build_index,
+                node_id,
+                serialized_body: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns the next-repeat frame.
+    pub fn next_repeat(&self) -> u32 {
+        self.next_repeat
+    }
+
+    /// Returns the activation frame.
+    pub fn activation_frame(&self) -> u32 {
+        self.activation_frame
+    }
+
+    /// Returns the number of activations.
+    pub fn activation_count(&self) -> u8 {
+        self.activation_count
+    }
+
+    /// Returns the display count.
+    pub fn display_count(&self) -> u8 {
+        self.display_count
+    }
+
+    /// Returns whether the guide is disabled; only raw byte `01` decodes true.
+    pub fn disabled(&self) -> bool {
+        self.disabled
+    }
+
+    /// Returns the normalized 64-bit problem value.
+    pub fn problems(&self) -> u64 {
+        self.problems
+    }
+
+    /// Returns the guide's build index.
+    pub fn build_index(&self) -> u32 {
+        self.build_index
+    }
+
+    /// Returns the guide's node ID.
+    pub fn node_id(&self) -> u16 {
+        self.node_id
+    }
+
+    /// Returns the original serialized body byte for byte.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_body.clone()
+    }
+
+    /// Creates an editor that preserves original bytes when no field changes.
+    pub fn into_editor(self) -> NetNodeInstanceGuideEditor {
+        NetNodeInstanceGuideEditor {
+            next_repeat: self.next_repeat,
+            activation_frame: self.activation_frame,
+            activation_count: self.activation_count,
+            display_count: self.display_count,
+            disabled: self.disabled,
+            problems: self.problems,
+            build_index: self.build_index,
+            node_id: self.node_id,
+            save_app_version: self.save_app_version,
+            original: self,
+        }
+    }
+}
+
+impl NetNodeInstanceGuideEditor {
+    /// Returns mutable access to the next-repeat frame.
+    pub fn next_repeat_mut(&mut self) -> &mut u32 {
+        &mut self.next_repeat
+    }
+
+    /// Returns mutable access to the activation frame.
+    pub fn activation_frame_mut(&mut self) -> &mut u32 {
+        &mut self.activation_frame
+    }
+
+    /// Returns mutable access to the activation count.
+    pub fn activation_count_mut(&mut self) -> &mut u8 {
+        &mut self.activation_count
+    }
+
+    /// Returns mutable access to the display count.
+    pub fn display_count_mut(&mut self) -> &mut u8 {
+        &mut self.display_count
+    }
+
+    /// Returns mutable access to the disabled flag.
+    pub fn disabled_mut(&mut self) -> &mut bool {
+        &mut self.disabled
+    }
+
+    /// Returns mutable access to the normalized problem value.
+    pub fn problems_mut(&mut self) -> &mut u64 {
+        &mut self.problems
+    }
+
+    /// Returns mutable access to the build index.
+    pub fn build_index_mut(&mut self) -> &mut u32 {
+        &mut self.build_index
+    }
+
+    /// Returns mutable access to the node ID.
+    pub fn node_id_mut(&mut self) -> &mut u16 {
+        &mut self.node_id
+    }
+
+    /// Encodes using the compatibility layout selected by the reader gates.
+    /// Unchanged fields retain their original bytes, including unusual bool bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.next_repeat == self.original.next_repeat
+            && self.activation_frame == self.original.activation_frame
+            && self.activation_count == self.original.activation_count
+            && self.display_count == self.original.display_count
+            && self.disabled == self.original.disabled
+            && self.problems == self.original.problems
+            && self.build_index == self.original.build_index
+            && self.node_id == self.original.node_id
+        {
+            return Ok(self.original.encode());
+        }
+        let version = self.original.format_version;
+        if version >= 221 && self.save_app_version.is_none() {
+            return Err(invalid_guide(
+                0,
+                "save application version is required for the guide problem-field gate",
+            ));
+        }
+        let wide_problems = version >= 221
+            && self
+                .save_app_version
+                .is_some_and(|value| value >= SAVE_APP_PROBLEMS_VERSION);
+        let mut output = Vec::with_capacity(if wide_problems { 25 } else { 21 });
+        output.extend_from_slice(&self.next_repeat.to_be_bytes());
+        output.extend_from_slice(&self.activation_frame.to_be_bytes());
+        output.push(self.activation_count);
+        output.push(self.display_count);
+        output.push(u8::from(self.disabled));
+        if wide_problems {
+            output.extend_from_slice(&self.problems.to_be_bytes());
+        } else {
+            output.extend_from_slice(&legacy_guide_problems_from_u64(self.problems)?.to_be_bytes());
+        }
+        output.extend_from_slice(&self.build_index.to_be_bytes());
+        output.extend_from_slice(&self.node_id.to_be_bytes());
+        Ok(output)
+    }
+}
+
+fn legacy_guide_problems_to_u64(value: u32) -> u64 {
+    (u64::from(value & 0xc000_0000) << 32) | u64::from(value & 0x3fff_ffff)
+}
+
+fn legacy_guide_problems_from_u64(value: u64) -> Result<u32, CrpError> {
+    const LEGACY_MASK: u64 = 0xc000_0000_3fff_ffff;
+    if value & !LEGACY_MASK != 0 {
+        return Err(invalid_guide(
+            11,
+            "problem value does not fit the legacy 32-bit representation",
+        ));
+    }
+    Ok((value as u32 & 0x3fff_ffff) | ((value >> 32) as u32 & 0xc000_0000))
+}
+
+fn invalid_guide(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "NetNodeInstanceGuide".to_owned(),
+        offset,
+        reason: reason.into(),
+    }
+}
+
 fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, CrpError> {
     let name_count = usize::from(reader.read_u16_be()?);
     let mut names = Vec::with_capacity(name_count);
@@ -1811,5 +2070,77 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
         name: "NetManager+Data lane prefix".to_owned(),
         offset,
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod guide_tests {
+    use super::NetNodeInstanceGuideBody;
+
+    #[test]
+    fn net_node_instance_guide_decodes_legacy_problem_bits_and_preserves_raw_bool() {
+        let bytes = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 2, // base trigger fields; 02 is false
+            0xc0, 0, 0, 5, // legacy problem word
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, // build index and node ID
+        ];
+        let (guide, used) =
+            NetNodeInstanceGuideBody::decode(220, None, &bytes).expect("legacy guide body decodes");
+        assert_eq!(used, bytes.len());
+        assert_eq!(guide.next_repeat(), 0x0102_0304);
+        assert_eq!(guide.activation_frame(), 0x0506_0708);
+        assert_eq!(guide.activation_count(), 9);
+        assert_eq!(guide.display_count(), 10);
+        assert!(!guide.disabled());
+        assert_eq!(guide.problems(), 0xc000_0000_0000_0005);
+        assert_eq!(guide.build_index(), 0x1020_3040);
+        assert_eq!(guide.node_id(), 0x5060);
+        assert_eq!(guide.encode(), bytes);
+        assert!(NetNodeInstanceGuideBody::decode(220, None, &bytes[..bytes.len() - 1]).is_err());
+
+        let mut unchanged = guide.clone().into_editor();
+        assert_eq!(unchanged.encode().expect("no-op guide write"), bytes);
+        *unchanged.disabled_mut() = true;
+        let mut edited_bytes = bytes;
+        edited_bytes[10] = 1;
+        assert_eq!(
+            unchanged.encode().expect("edited guide write"),
+            edited_bytes
+        );
+
+        let mut invalid = guide.into_editor();
+        *invalid.problems_mut() = 1 << 31;
+        assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn net_node_instance_guide_problem_field_uses_app_version_gate() {
+        let mut legacy = vec![0; 11];
+        legacy.extend_from_slice(&0x8000_0006_u32.to_be_bytes());
+        legacy.extend_from_slice(&[0, 0, 0, 7, 0, 8]);
+        let (old, used) = NetNodeInstanceGuideBody::decode(
+            221,
+            Some(super::SAVE_APP_PROBLEMS_VERSION - 1),
+            &legacy,
+        )
+        .expect("old application keeps the u32 problem field");
+        assert_eq!(used, 21);
+        assert_eq!(old.problems(), 0x8000_0000_0000_0006);
+        assert!(NetNodeInstanceGuideBody::decode(221, None, &legacy).is_err());
+
+        let mut wide = vec![0; 11];
+        wide.extend_from_slice(&0xfedc_ba98_7654_3210_u64.to_be_bytes());
+        wide.extend_from_slice(&[0, 0, 0, 7, 0, 8]);
+        let (current, used) =
+            NetNodeInstanceGuideBody::decode(221, Some(super::SAVE_APP_PROBLEMS_VERSION), &wide)
+                .expect("new application uses the u64 problem field");
+        assert_eq!(used, 25);
+        assert_eq!(current.problems(), 0xfedc_ba98_7654_3210);
+        assert_eq!(current.encode(), wide);
+
+        let mut editor = current.into_editor();
+        *editor.problems_mut() = 0x0123_4567_89ab_cdef;
+        let encoded = editor.encode().expect("wide problem edits encode");
+        assert_eq!(&encoded[11..19], &0x0123_4567_89ab_cdef_u64.to_be_bytes());
     }
 }

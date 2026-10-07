@@ -41,11 +41,12 @@ pub use metadata::{MapMetaData, ModInfo};
 pub use net_manager_data::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLane, NetLanePrefix,
     NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
-    NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader,
-    NetSegmentCoverage, NetSegmentCoveragePrefix, NetSegmentEnvironment,
-    NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsPrefix, NetSegmentProblem,
-    NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsPrefix, NetSegmentTrafficLight,
-    NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
+    NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeProblem, NetNodeProblemsPrefix,
+    NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage,
+    NetSegmentCoveragePrefix, NetSegmentEnvironment, NetSegmentEnvironmentPrefix, NetSegmentFlag,
+    NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentRecord,
+    NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix,
+    NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use simulation_manager_data::{
