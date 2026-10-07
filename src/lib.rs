@@ -39,7 +39,7 @@ pub use building_manager_data::{
     BuildingTimerGeometryPrefix,
 };
 pub use data_serializer::DataSerializerStream;
-pub use district_manager_data::DistrictManagerFlagsPrefix;
+pub use district_manager_data::{DistrictManagerFlagsPrefix, DistrictPopulationRecord};
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{MapMetaData, ModInfo};
@@ -3913,6 +3913,15 @@ mod tests {
                         assert_eq!(districts.format_version(), manager_data.format_version());
                         assert_eq!(districts.district_flags().len(), 128);
                         assert_eq!(districts.park_flags().len(), 128);
+                        assert!(
+                            districts
+                                .district_population_records()
+                                .iter()
+                                .all(|record| {
+                                    record.final_crime_rate().is_some()
+                                        == (districts.format_version() >= 203)
+                                })
+                        );
                         assert!(districts_end < manager_data.serialized_object_graph().len());
                         checked_district_manager_convenience = true;
                         let (game_area, game_area_bytes) =

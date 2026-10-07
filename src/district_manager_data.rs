@@ -13,14 +13,16 @@ const PARK_POLICIES_VERSION: u32 = 110_009;
 const PARK_EVENT_POLICIES_VERSION: u32 = 112_015;
 const PARK_SPECIALIZATION_POLICIES_VERSION: u32 = 115_012;
 const LEGACY_POLICY_BOOL_VERSION: u32 = 43;
+const DISTRICT_CRIME_RATE_VERSION: u32 = 203;
 const POLICY_COUNT: usize = 32;
+const POPULATION_DELTA_COUNT: usize = 16;
 
 /// The initial known fields from `DistrictManager+Data`.
 ///
 /// The policy bool values are retained in serialized order: category first,
-/// then policy bit 0–31, then district or park index 0–127. This prefix stops
-/// before the district records. Original bytes are retained for exact
-/// unchanged writing.
+/// then policy bit 0–31, then district or park index 0–127. Active district
+/// population fields are decoded through final happiness and the versioned
+/// crime-rate byte. Original bytes are retained for exact unchanged writing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictManagerFlagsPrefix {
     format_version: u32,
@@ -32,7 +34,52 @@ pub struct DistrictManagerFlagsPrefix {
     park_flags: Vec<u32>,
     policy_bools: Option<Vec<bool>>,
     legacy_policy_bools: Option<Vec<bool>>,
+    district_population_records: Vec<DistrictPopulationRecord>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Population counters retained from one active district's data record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictPopulationRecord {
+    district_index: usize,
+    random_seed: u64,
+    temporary_population: u32,
+    final_population: u32,
+    population_deltas: [i16; POPULATION_DELTA_COUNT],
+    final_happiness: u8,
+    final_crime_rate: Option<u8>,
+}
+
+impl DistrictPopulationRecord {
+    /// Returns the district buffer index associated with this record.
+    pub fn district_index(&self) -> usize {
+        self.district_index
+    }
+
+    /// Returns the saved district randomizer seed.
+    pub fn random_seed(&self) -> u64 {
+        self.random_seed
+    }
+
+    /// Returns the temporary and final population counts.
+    pub fn population_counts(&self) -> (u32, u32) {
+        (self.temporary_population, self.final_population)
+    }
+
+    /// Returns the sixteen saved population deltas.
+    pub fn population_deltas(&self) -> &[i16] {
+        &self.population_deltas
+    }
+
+    /// Returns the saved final happiness value.
+    pub fn final_happiness(&self) -> u8 {
+        self.final_happiness
+    }
+
+    /// Returns the final crime-rate value from inner version 203 onward.
+    pub fn final_crime_rate(&self) -> Option<u8> {
+        self.final_crime_rate
+    }
 }
 
 impl DistrictManagerFlagsPrefix {
@@ -85,6 +132,34 @@ impl DistrictManagerFlagsPrefix {
         } else {
             None
         };
+        let mut district_population_records = Vec::new();
+        for (district_index, flags) in district_flags.iter().copied().enumerate() {
+            if flags == 0 {
+                continue;
+            }
+            let random_seed = reader.read_u64_be()?;
+            let temporary_population = reader.read_u24_be()?;
+            let final_population = reader.read_u24_be()?;
+            let mut population_deltas = [0_i16; POPULATION_DELTA_COUNT];
+            for delta in &mut population_deltas {
+                *delta = reader.read_i16_be()?;
+            }
+            let final_happiness = reader.read_u8()?;
+            let final_crime_rate = if format_version >= DISTRICT_CRIME_RATE_VERSION {
+                Some(reader.read_u8()?)
+            } else {
+                None
+            };
+            district_population_records.push(DistrictPopulationRecord {
+                district_index,
+                random_seed,
+                temporary_population,
+                final_population,
+                population_deltas,
+                final_happiness,
+                final_crime_rate,
+            });
+        }
         let consumed = reader.offset();
 
         Ok((
@@ -98,6 +173,7 @@ impl DistrictManagerFlagsPrefix {
                 park_flags,
                 policy_bools,
                 legacy_policy_bools,
+                district_population_records,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -154,6 +230,11 @@ impl DistrictManagerFlagsPrefix {
         self.legacy_policy_bools.as_deref()
     }
 
+    /// Returns decoded population fields for districts with nonzero flags.
+    pub fn district_population_records(&self) -> &[DistrictPopulationRecord] {
+        &self.district_population_records
+    }
+
     /// Writes the original known prefix exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
@@ -198,7 +279,9 @@ fn invalid_district_manager(offset: usize, reason: impl Into<String>) -> CrpErro
 
 #[cfg(test)]
 mod tests {
-    use super::{DistrictManagerFlagsPrefix, POLICY_COUNT, district_policy_bool_count};
+    use super::{
+        DISTRICT_COUNT, DistrictManagerFlagsPrefix, POLICY_COUNT, district_policy_bool_count,
+    };
     use crate::data_serializer::write_unique_string;
     use crate::encoded_array::{write_encoded_bool_array, write_encoded_uint_array};
 
@@ -306,5 +389,40 @@ mod tests {
             POLICY_COUNT * 128
         );
         assert_eq!(prefix.encode(), bytes);
+    }
+
+    #[test]
+    fn active_district_population_record_obeys_crime_rate_gate() {
+        for (version, crime_rate) in [(194, None), (203, Some(41))] {
+            let mut bytes = Vec::new();
+            let mut flags = [0_u32; DISTRICT_COUNT];
+            flags[17] = 1;
+            write_encoded_uint_array(&mut bytes, &flags);
+            zero_policy_bools(&mut bytes, version);
+
+            bytes.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
+            bytes.extend_from_slice(&[0x01, 0x02, 0x03]);
+            bytes.extend_from_slice(&[0x04, 0x05, 0x06]);
+            for delta in 0_i16..16 {
+                bytes.extend_from_slice(&(delta - 8).to_be_bytes());
+            }
+            bytes.push(77);
+            if let Some(value) = crime_rate {
+                bytes.push(value);
+            }
+
+            let (prefix, used) =
+                DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
+            assert_eq!(used, bytes.len());
+            assert_eq!(prefix.district_population_records().len(), 1);
+            let record = &prefix.district_population_records()[0];
+            assert_eq!(record.district_index(), 17);
+            assert_eq!(record.random_seed(), 0x0102_0304_0506_0708);
+            assert_eq!(record.population_counts(), (0x010203, 0x040506));
+            assert_eq!(record.population_deltas(), &(-8_i16..8).collect::<Vec<_>>());
+            assert_eq!(record.final_happiness(), 77);
+            assert_eq!(record.final_crime_rate(), crime_rate);
+            assert_eq!(prefix.encode(), bytes);
+        }
     }
 }
