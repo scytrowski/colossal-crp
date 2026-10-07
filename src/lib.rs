@@ -39,7 +39,10 @@ pub use building_manager_data::{
     BuildingTimerGeometryPrefix,
 };
 pub use data_serializer::DataSerializerStream;
-pub use district_manager_data::{DistrictManagerFlagsPrefix, DistrictPopulationRecord};
+pub use district_manager_data::{
+    DistrictAgeCategory, DistrictAgePopulation, DistrictManagerFlagsPrefix,
+    DistrictPopulationRecord,
+};
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{MapMetaData, ModInfo};

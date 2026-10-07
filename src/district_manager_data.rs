@@ -14,6 +14,9 @@ const PARK_EVENT_POLICIES_VERSION: u32 = 112_015;
 const PARK_SPECIALIZATION_POLICIES_VERSION: u32 = 115_012;
 const LEGACY_POLICY_BOOL_VERSION: u32 = 43;
 const DISTRICT_CRIME_RATE_VERSION: u32 = 203;
+const DISTRICT_ELIGIBLE_AGE_VERSION: u32 = 112_031;
+const DISTRICT_DETAILED_AGE_VERSION: u32 = 113_003;
+const DISTRICT_DEAD_SENIORS_VERSION: u32 = 113_006;
 const POLICY_COUNT: usize = 32;
 const POPULATION_DELTA_COUNT: usize = 16;
 
@@ -48,6 +51,47 @@ pub struct DistrictPopulationRecord {
     population_deltas: [i16; POPULATION_DELTA_COUNT],
     final_happiness: u8,
     final_crime_rate: Option<u8>,
+    age_populations: Vec<DistrictAgePopulation>,
+    last_average_lifespan: Option<i8>,
+}
+
+/// A named pair of temporary and final age-group counts in a district.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistrictAgePopulation {
+    category: DistrictAgeCategory,
+    temporary: u32,
+    final_count: u32,
+}
+
+impl DistrictAgePopulation {
+    /// Returns the age or health category represented by this pair.
+    pub fn category(&self) -> DistrictAgeCategory {
+        self.category
+    }
+
+    /// Returns the temporary and final counts.
+    pub fn counts(&self) -> (u32, u32) {
+        (self.temporary, self.final_count)
+    }
+}
+
+/// The serialized category associated with one `DistrictAgeData` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistrictAgeCategory {
+    Children,
+    Teens,
+    Young,
+    Adults,
+    Seniors,
+    ChildHealth,
+    ChildSickness,
+    SeniorHealth,
+    SeniorSickness,
+    AgeAtDeath,
+    DeadSeniors,
+    ElementaryEligible,
+    HighschoolEligible,
+    UniversityEligible,
 }
 
 impl DistrictPopulationRecord {
@@ -80,13 +124,23 @@ impl DistrictPopulationRecord {
     pub fn final_crime_rate(&self) -> Option<u8> {
         self.final_crime_rate
     }
+
+    /// Returns the age and eligibility counts in their serialized order.
+    pub fn age_populations(&self) -> &[DistrictAgePopulation] {
+        &self.age_populations
+    }
+
+    /// Returns the district's saved average lifespan from inner version 113006.
+    pub fn last_average_lifespan(&self) -> Option<i8> {
+        self.last_average_lifespan
+    }
 }
 
 impl DistrictManagerFlagsPrefix {
     /// Decodes the opening fields and both known policy bool streams.
     ///
     /// This prefix supports inner versions 164 and newer. It stops before the
-    /// district records that follow the policy bool streams. Truncated or
+    /// district private and service data that follow population fields. Truncated or
     /// malformed fields return an error.
     pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         if format_version < 164 {
@@ -150,6 +204,45 @@ impl DistrictManagerFlagsPrefix {
             } else {
                 None
             };
+            let mut age_populations = Vec::new();
+            for category in [
+                DistrictAgeCategory::Children,
+                DistrictAgeCategory::Teens,
+                DistrictAgeCategory::Young,
+                DistrictAgeCategory::Adults,
+                DistrictAgeCategory::Seniors,
+            ] {
+                age_populations.push(read_district_age_population(&mut reader, category)?);
+            }
+            if format_version >= DISTRICT_DETAILED_AGE_VERSION {
+                for category in [
+                    DistrictAgeCategory::ChildHealth,
+                    DistrictAgeCategory::ChildSickness,
+                    DistrictAgeCategory::SeniorHealth,
+                    DistrictAgeCategory::SeniorSickness,
+                    DistrictAgeCategory::AgeAtDeath,
+                ] {
+                    age_populations.push(read_district_age_population(&mut reader, category)?);
+                }
+            }
+            let last_average_lifespan = if format_version >= DISTRICT_DEAD_SENIORS_VERSION {
+                age_populations.push(read_district_age_population(
+                    &mut reader,
+                    DistrictAgeCategory::DeadSeniors,
+                )?);
+                Some(reader.read_u8()? as i8)
+            } else {
+                None
+            };
+            if format_version >= DISTRICT_ELIGIBLE_AGE_VERSION {
+                for category in [
+                    DistrictAgeCategory::ElementaryEligible,
+                    DistrictAgeCategory::HighschoolEligible,
+                    DistrictAgeCategory::UniversityEligible,
+                ] {
+                    age_populations.push(read_district_age_population(&mut reader, category)?);
+                }
+            }
             district_population_records.push(DistrictPopulationRecord {
                 district_index,
                 random_seed,
@@ -158,6 +251,8 @@ impl DistrictManagerFlagsPrefix {
                 population_deltas,
                 final_happiness,
                 final_crime_rate,
+                age_populations,
+                last_average_lifespan,
             });
         }
         let consumed = reader.offset();
@@ -239,6 +334,17 @@ impl DistrictManagerFlagsPrefix {
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
+}
+
+fn read_district_age_population(
+    reader: &mut Reader<'_>,
+    category: DistrictAgeCategory,
+) -> Result<DistrictAgePopulation, CrpError> {
+    Ok(DistrictAgePopulation {
+        category,
+        temporary: reader.read_u24_be()?,
+        final_count: reader.read_u24_be()?,
+    })
 }
 
 fn district_policy_bool_count(format_version: u32) -> Result<usize, CrpError> {
@@ -393,11 +499,20 @@ mod tests {
 
     #[test]
     fn active_district_population_record_obeys_crime_rate_gate() {
-        for (version, crime_rate) in [(194, None), (203, Some(41))] {
+        for (version, crime_rate, expected_age_count) in [
+            (194, None, 5),
+            (203, Some(41), 5),
+            (112_031, Some(41), 8),
+            (113_003, Some(41), 13),
+            (113_006, Some(41), 14),
+        ] {
             let mut bytes = Vec::new();
             let mut flags = [0_u32; DISTRICT_COUNT];
             flags[17] = 1;
             write_encoded_uint_array(&mut bytes, &flags);
+            if version >= super::PARK_FLAGS_VERSION {
+                write_encoded_uint_array(&mut bytes, &[0; DISTRICT_COUNT]);
+            }
             zero_policy_bools(&mut bytes, version);
 
             bytes.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
@@ -409,6 +524,23 @@ mod tests {
             bytes.push(77);
             if let Some(value) = crime_rate {
                 bytes.push(value);
+            }
+            for index in 0..5 {
+                append_age_pair(&mut bytes, index as u32 + 1);
+            }
+            if version >= super::DISTRICT_DETAILED_AGE_VERSION {
+                for index in 5..10 {
+                    append_age_pair(&mut bytes, index as u32 + 1);
+                }
+            }
+            if version >= super::DISTRICT_DEAD_SENIORS_VERSION {
+                append_age_pair(&mut bytes, 11);
+                bytes.push(0xF9);
+            }
+            if version >= super::DISTRICT_ELIGIBLE_AGE_VERSION {
+                for index in 11..14 {
+                    append_age_pair(&mut bytes, index as u32 + 1);
+                }
             }
 
             let (prefix, used) =
@@ -422,7 +554,58 @@ mod tests {
             assert_eq!(record.population_deltas(), &(-8_i16..8).collect::<Vec<_>>());
             assert_eq!(record.final_happiness(), 77);
             assert_eq!(record.final_crime_rate(), crime_rate);
+            assert_eq!(record.age_populations().len(), expected_age_count);
+            assert_eq!(
+                record
+                    .age_populations()
+                    .iter()
+                    .map(|age| age.category())
+                    .collect::<Vec<_>>(),
+                expected_age_categories(version)
+            );
+            assert_eq!(
+                record.last_average_lifespan(),
+                (version >= super::DISTRICT_DEAD_SENIORS_VERSION).then_some(-7)
+            );
             assert_eq!(prefix.encode(), bytes);
         }
+    }
+
+    fn append_age_pair(output: &mut Vec<u8>, value: u32) {
+        for count in [value, value + 100] {
+            output.extend_from_slice(&[(count >> 16) as u8, (count >> 8) as u8, count as u8]);
+        }
+    }
+
+    fn expected_age_categories(version: u32) -> Vec<super::DistrictAgeCategory> {
+        use super::DistrictAgeCategory as Category;
+
+        let mut categories = vec![
+            Category::Children,
+            Category::Teens,
+            Category::Young,
+            Category::Adults,
+            Category::Seniors,
+        ];
+        if version >= super::DISTRICT_DETAILED_AGE_VERSION {
+            categories.extend([
+                Category::ChildHealth,
+                Category::ChildSickness,
+                Category::SeniorHealth,
+                Category::SeniorSickness,
+                Category::AgeAtDeath,
+            ]);
+        }
+        if version >= super::DISTRICT_DEAD_SENIORS_VERSION {
+            categories.push(Category::DeadSeniors);
+        }
+        if version >= super::DISTRICT_ELIGIBLE_AGE_VERSION {
+            categories.extend([
+                Category::ElementaryEligible,
+                Category::HighschoolEligible,
+                Category::UniversityEligible,
+            ]);
+        }
+        categories
     }
 }
