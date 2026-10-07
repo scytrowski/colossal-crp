@@ -21,7 +21,10 @@ use crate::{
     BuildingRaceTeamUnassignedPrefix, BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
 };
 use crate::{BuildingEconomicFieldsEditor, BuildingPopulationEditor, BuildingTimerGeometryEditor};
-use crate::{DistrictManagerFlagsPrefix, DistrictManagerGridData, DistrictManagerTailData};
+use crate::{
+    DistrictManagerFlagsPrefix, DistrictManagerGridData, DistrictManagerTail,
+    DistrictManagerTailData,
+};
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
     NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
@@ -907,6 +910,25 @@ impl SimulationManagerData {
     ) -> Result<(DistrictManagerTailData, usize), CrpError> {
         let (_, grid_end) = self.decode_district_manager_grids()?;
         let (tail, tail_len) = DistrictManagerTailData::decode(
+            self.format_version,
+            &self.serialized_object_graph[grid_end..],
+        )?;
+        let tail_end = grid_end
+            .checked_add(tail_len)
+            .ok_or(CrpError::ArithmeticOverflow("DistrictManager tail end"))?;
+        Ok((tail, tail_end))
+    }
+
+    /// Finds the DistrictManager tail boundary, preserving an observed opaque layout.
+    ///
+    /// DLL-derived tails expose typed fields. The MP23/MP27 sample layout stays
+    /// opaque and can be written back byte for byte. Unknown layouts return an
+    /// error; the returned offset follows the profiler end reference.
+    pub fn decode_district_manager_tail_preserving(
+        &self,
+    ) -> Result<(DistrictManagerTail, usize), CrpError> {
+        let (_, grid_end) = self.decode_district_manager_grids()?;
+        let (tail, tail_len) = DistrictManagerTail::decode_preserving(
             self.format_version,
             &self.serialized_object_graph[grid_end..],
         )?;

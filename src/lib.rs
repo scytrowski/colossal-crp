@@ -42,7 +42,7 @@ pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictDemographicBlock, DistrictDemographicKind,
     DistrictHotelBlock, DistrictManagerFlagsPrefix, DistrictManagerGridData,
-    DistrictManagerGridEditor, DistrictManagerTailData, DistrictParkRecord,
+    DistrictManagerGridEditor, DistrictManagerTail, DistrictManagerTailData, DistrictParkRecord,
     DistrictPopulationRecord, DistrictPrivateDataBlock, DistrictPrivateDataKind,
     DistrictSpecializationBlock, DistrictSpecializationKind, DistrictStatisticsBlock,
     DistrictStatisticsKind, DistrictSubCultureBlock, DistrictSubCultureKind, DistrictTourismBlock,
@@ -3895,6 +3895,7 @@ mod tests {
         let mut active_parks = 0_usize;
         let mut empty_park_assets = 0_usize;
         let mut matching_tails = 0_usize;
+        let mut preserving_tails = 0_usize;
         let mut differing_tails = Vec::new();
         for path in &paths {
             let package = Package::read_from(&mut File::open(path)?)?;
@@ -3936,17 +3937,23 @@ mod tests {
                         ));
                     }
                 }
+                if let Ok((tail, tail_end)) = manager.decode_district_manager_tail_preserving() {
+                    assert!(tail_end > grid_end && tail_end <= graph.len());
+                    assert_eq!(&graph[grid_end..tail_end], tail.encode());
+                    preserving_tails += 1;
+                }
                 manager_assets += 1;
             }
         }
         assert!(manager_assets > 0);
         eprintln!(
-            "DistrictManager corpus: {} maps, {} manager assets, {} active parks, {} empty-park assets, {} matching tails, {} differing tails",
+            "DistrictManager corpus: {} maps, {} manager assets, {} active parks, {} empty-park assets, {} matching typed tails, {} preserving tails, {} differing typed tails",
             paths.len(),
             manager_assets,
             active_parks,
             empty_park_assets,
             matching_tails,
+            preserving_tails,
             differing_tails.len()
         );
         for (path, version, nulls, error) in differing_tails.iter().take(10) {

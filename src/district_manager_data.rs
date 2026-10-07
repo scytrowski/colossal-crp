@@ -161,12 +161,74 @@ pub struct DistrictManagerTailData {
     serialized: Vec<u8>,
 }
 
+/// A DistrictManager tail with either DLL-derived fields or an observed opaque layout.
+///
+/// The opaque layout is recognized only for the exact signatures found in the
+/// local MP23 and MP27 map samples. Both variants retain their original bytes
+/// for unchanged writing; opaque bytes have no inferred field meanings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DistrictManagerTail {
+    /// The field layout implemented by the examined game DLL.
+    Typed(DistrictManagerTailData),
+    /// A recognized 44-byte tail whose internal field boundaries are unknown.
+    OpaqueObserved(Vec<u8>),
+}
+
+impl DistrictManagerTail {
+    /// Decodes a DLL-derived tail or a narrowly recognized MP23/MP27 sample layout.
+    ///
+    /// Returns an error for truncated input and unrecognized layouts. The byte
+    /// count includes the profiler end reference but excludes following objects.
+    pub fn decode_preserving(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
+        match DistrictManagerTailData::decode(format_version, bytes) {
+            Ok((tail, used)) => Ok((Self::Typed(tail), used)),
+            Err(strict_error) => {
+                const OPAQUE_PREFIX: [u8; 42] = [0xff; 42];
+                const OPAQUE_BYTES: usize = 44;
+                let shared_reference = bytes.get(42..OPAQUE_BYTES);
+                let observed_reference = match format_version {
+                    117_013 => shared_reference == Some(&[0x00, 0x19][..]),
+                    118_011 => {
+                        shared_reference == Some(&[0x00, 0x19][..])
+                            || shared_reference == Some(&[0x00, 0x1c][..])
+                    }
+                    _ => false,
+                };
+                if bytes.starts_with(&OPAQUE_PREFIX) && observed_reference {
+                    Ok((
+                        Self::OpaqueObserved(bytes[..OPAQUE_BYTES].to_vec()),
+                        OPAQUE_BYTES,
+                    ))
+                } else {
+                    Err(strict_error)
+                }
+            }
+        }
+    }
+
+    /// Returns the DLL-derived fields when this tail uses that layout.
+    pub fn typed(&self) -> Option<&DistrictManagerTailData> {
+        match self {
+            Self::Typed(tail) => Some(tail),
+            Self::OpaqueObserved(_) => None,
+        }
+    }
+
+    /// Returns the original tail bytes without interpreting opaque fields.
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::Typed(tail) => tail.encode(),
+            Self::OpaqueObserved(bytes) => bytes.clone(),
+        }
+    }
+}
+
 impl DistrictManagerTailData {
     /// Decodes the tail for inner versions 164 and newer.
     ///
     /// The returned byte count includes the DistrictManager profiler end tag.
     /// This follows the examined DLL layout. Files with additional opaque tail
-    /// bytes, including the observed MP23 variant, return an error. Truncated
+    /// bytes, including the observed MP23/MP27 variants, return an error. Truncated
     /// headers, scalars, or tags also return an error.
     pub fn decode(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         if format_version < 164 {
@@ -1730,7 +1792,8 @@ mod tests {
     use super::{
         AIRLINE_NAME_VERSION, AIRPORT_PANEL_VERSION, DISTRICT_COUNT, DISTRICT_GRID_CELLS,
         DISTRICT_GRID_VALUES, DistrictManagerFlagsPrefix, DistrictManagerGridData,
-        DistrictManagerTailData, PARK_FLAGS_VERSION, POLICY_COUNT, district_policy_bool_count,
+        DistrictManagerTail, DistrictManagerTailData, PARK_FLAGS_VERSION, POLICY_COUNT,
+        district_policy_bool_count,
     };
     use crate::data_serializer::write_unique_string;
     use crate::encoded_array::{
@@ -2614,6 +2677,50 @@ mod tests {
         assert!(mp27[..42].iter().all(|byte| *byte == 0xff));
         assert_eq!(&mp27[42..], &[0x00, 0x1c]);
         assert!(DistrictManagerTailData::decode(118_011, mp27).is_err());
+    }
+
+    #[test]
+    fn preserving_tail_reader_recognizes_only_observed_opaque_signatures() {
+        let desert = include_bytes!("../tests/fixtures/district-tail-v116020-desert.bin");
+        let (typed, used) = DistrictManagerTail::decode_preserving(116_020, desert).unwrap();
+        assert_eq!(used, desert.len());
+        assert_eq!(typed.typed().unwrap().object_headers().len(), 19);
+        assert_eq!(typed.encode(), desert);
+
+        for (version, fixture) in [
+            (
+                117_013,
+                &include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin")[..],
+            ),
+            (
+                118_011,
+                &include_bytes!("../tests/fixtures/district-tail-v118011-mp27-map04.bin")[..],
+            ),
+        ] {
+            let mut with_following = fixture.to_vec();
+            with_following.extend_from_slice(&[0x12, 0x34]);
+            let (tail, used) =
+                DistrictManagerTail::decode_preserving(version, &with_following).unwrap();
+            assert!(tail.typed().is_none());
+            assert_eq!(used, 44);
+            assert_eq!(tail.encode(), fixture);
+            assert_eq!(&with_following[used..], &[0x12, 0x34]);
+            assert!(DistrictManagerTail::decode_preserving(version, &fixture[..43]).is_err());
+
+            let mut bad_prefix = fixture.to_vec();
+            bad_prefix[0] = 0x00;
+            assert!(DistrictManagerTail::decode_preserving(version, &bad_prefix).is_err());
+            let mut bad_reference = fixture.to_vec();
+            bad_reference[43] = 0x20;
+            assert!(DistrictManagerTail::decode_preserving(version, &bad_reference).is_err());
+            assert!(DistrictManagerTail::decode_preserving(116_020, fixture).is_err());
+        }
+
+        let mut mp27_first = vec![0xff; 42];
+        mp27_first.extend_from_slice(&[0x00, 0x19]);
+        let (tail, used) = DistrictManagerTail::decode_preserving(118_011, &mp27_first).unwrap();
+        assert_eq!(used, 44);
+        assert_eq!(tail.encode(), mp27_first);
     }
 
     #[test]
