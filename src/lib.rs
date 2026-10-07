@@ -42,6 +42,7 @@ pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictManagerFlagsPrefix,
     DistrictPopulationRecord, DistrictPrivateDataBlock, DistrictPrivateDataKind,
+    DistrictSpecializationBlock, DistrictSpecializationKind,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
@@ -3934,6 +3935,18 @@ mod tests {
                                                     75
                                                 }
                                         })
+                                        && record.specializations().len()
+                                            == if districts.format_version() >= 109_006 {
+                                                9
+                                            } else if districts.format_version() >= 218 {
+                                                6
+                                            } else {
+                                                0
+                                            }
+                                        && record
+                                            .specializations()
+                                            .iter()
+                                            .all(|block| block.as_bytes().len() == 24)
                                 })
                         );
                         assert!(districts_end < manager_data.serialized_object_graph().len());

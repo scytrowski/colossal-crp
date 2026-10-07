@@ -25,6 +25,8 @@ const DISTRICT_PRIVATE_ALIVE_COUNT_VERSION: u32 = 145;
 const DISTRICT_PRIVATE_CRIME_RATE_VERSION: u32 = 181;
 const DISTRICT_PRIVATE_COLLAPSED_COUNT_VERSION: u32 = 256;
 const DISTRICT_PLAYER_DATA_VERSION: u32 = 144;
+const DISTRICT_SPECIALIZATION_VERSION: u32 = 218;
+const DISTRICT_ADDITIONAL_SPECIALIZATION_VERSION: u32 = 109_006;
 const POLICY_COUNT: usize = 32;
 const POPULATION_DELTA_COUNT: usize = 16;
 const PRIVATE_DATA_BASE_BYTES: usize = 21;
@@ -69,6 +71,40 @@ pub struct DistrictPopulationRecord {
     age_populations: Vec<DistrictAgePopulation>,
     last_average_lifespan: Option<i8>,
     private_data: Vec<DistrictPrivateDataBlock>,
+    specializations: Vec<DistrictSpecializationBlock>,
+}
+
+/// An opaque, fixed-size specialization counter block for one district.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictSpecializationBlock {
+    kind: DistrictSpecializationKind,
+    bytes: Vec<u8>,
+}
+
+impl DistrictSpecializationBlock {
+    /// Returns which specialization this block represents.
+    pub fn kind(&self) -> DistrictSpecializationKind {
+        self.kind
+    }
+
+    /// Returns the exact serialized bytes for this block.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// A district specialization with a serialized `DistrictSpecializationData` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistrictSpecializationKind {
+    Farming,
+    Forestry,
+    Ore,
+    Oil,
+    Leisure,
+    Tourist,
+    Organic,
+    SelfSufficient,
+    HighTech,
 }
 
 /// A raw, version-bounded `DistrictPrivateData` block for one district.
@@ -184,6 +220,11 @@ impl DistrictPopulationRecord {
     /// Returns the exact private-data blocks in serialized category order.
     pub fn private_data(&self) -> &[DistrictPrivateDataBlock] {
         &self.private_data
+    }
+
+    /// Returns the specialization blocks in serialized order.
+    pub fn specializations(&self) -> &[DistrictSpecializationBlock] {
+        &self.specializations
     }
 }
 
@@ -329,6 +370,28 @@ impl DistrictManagerFlagsPrefix {
                     DistrictPrivateDataKind::Player,
                 )?);
             }
+            let mut specializations = Vec::new();
+            if format_version >= DISTRICT_SPECIALIZATION_VERSION {
+                for kind in [
+                    DistrictSpecializationKind::Farming,
+                    DistrictSpecializationKind::Forestry,
+                    DistrictSpecializationKind::Ore,
+                    DistrictSpecializationKind::Oil,
+                    DistrictSpecializationKind::Leisure,
+                    DistrictSpecializationKind::Tourist,
+                ] {
+                    specializations.push(read_district_specialization(&mut reader, kind)?);
+                }
+            }
+            if format_version >= DISTRICT_ADDITIONAL_SPECIALIZATION_VERSION {
+                for kind in [
+                    DistrictSpecializationKind::Organic,
+                    DistrictSpecializationKind::SelfSufficient,
+                    DistrictSpecializationKind::HighTech,
+                ] {
+                    specializations.push(read_district_specialization(&mut reader, kind)?);
+                }
+            }
             district_population_records.push(DistrictPopulationRecord {
                 district_index,
                 random_seed,
@@ -340,6 +403,7 @@ impl DistrictManagerFlagsPrefix {
                 age_populations,
                 last_average_lifespan,
                 private_data,
+                specializations,
             });
         }
         let consumed = reader.offset();
@@ -443,6 +507,15 @@ fn read_district_private_data(
         .read_bytes(district_private_data_size(format_version))?
         .to_vec();
     Ok(DistrictPrivateDataBlock { kind, bytes })
+}
+
+fn read_district_specialization(
+    reader: &mut Reader<'_>,
+    kind: DistrictSpecializationKind,
+) -> Result<DistrictSpecializationBlock, CrpError> {
+    const SPECIALIZATION_DATA_BYTES: usize = 8 * 3;
+    let bytes = reader.read_bytes(SPECIALIZATION_DATA_BYTES)?.to_vec();
+    Ok(DistrictSpecializationBlock { kind, bytes })
 }
 
 fn district_private_data_size(format_version: u32) -> usize {
@@ -623,6 +696,8 @@ mod tests {
         for (version, crime_rate, expected_age_count) in [
             (194, None, 5),
             (203, Some(41), 5),
+            (237, Some(41), 5),
+            (109_006, Some(41), 5),
             (112_031, Some(41), 8),
             (113_003, Some(41), 13),
             (113_006, Some(41), 14),
@@ -675,6 +750,10 @@ mod tests {
             for (index, _) in private_kinds.iter().enumerate() {
                 bytes.extend(std::iter::repeat_n(index as u8 + 1, private_size));
             }
+            let specialization_kinds = expected_specialization_kinds(version);
+            for (index, _) in specialization_kinds.iter().enumerate() {
+                bytes.extend(std::iter::repeat_n(index as u8 + 10, 24));
+            }
 
             let (prefix, used) =
                 DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
@@ -706,6 +785,16 @@ mod tests {
             {
                 assert_eq!(block.kind(), expected_kind);
                 assert_eq!(block.as_bytes(), vec![index + 1; private_size]);
+            }
+            assert_eq!(record.specializations().len(), specialization_kinds.len());
+            for ((block, expected_kind), index) in record
+                .specializations()
+                .iter()
+                .zip(specialization_kinds)
+                .zip(0_u8..)
+            {
+                assert_eq!(block.kind(), expected_kind);
+                assert_eq!(block.as_bytes(), vec![index + 10; 24]);
             }
             assert_eq!(prefix.encode(), bytes);
 
@@ -751,5 +840,26 @@ mod tests {
             ]);
         }
         categories
+    }
+
+    fn expected_specialization_kinds(version: u32) -> Vec<super::DistrictSpecializationKind> {
+        use super::DistrictSpecializationKind as Kind;
+
+        let mut kinds = if version >= super::DISTRICT_SPECIALIZATION_VERSION {
+            vec![
+                Kind::Farming,
+                Kind::Forestry,
+                Kind::Ore,
+                Kind::Oil,
+                Kind::Leisure,
+                Kind::Tourist,
+            ]
+        } else {
+            Vec::new()
+        };
+        if version >= super::DISTRICT_ADDITIONAL_SPECIALIZATION_VERSION {
+            kinds.extend([Kind::Organic, Kind::SelfSufficient, Kind::HighTech]);
+        }
+        kinds
     }
 }
