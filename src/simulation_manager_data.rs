@@ -5,6 +5,7 @@ use crate::InstanceManagerEditor;
 use crate::PathManagerData;
 use crate::PropManagerDataPrefix;
 use crate::TerrainManagerData;
+use crate::TreeManagerDataPrefix;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
@@ -793,6 +794,58 @@ impl SimulationManagerData {
             ));
         }
         Ok((props, tree_tag_start))
+    }
+
+    /// Decodes TreeManager and locates the following queued manager by type.
+    ///
+    /// The type array must contain `TreeManager+Data` at slot 15 and a
+    /// non-null manager reference at slot 16. Returns the graph offset after
+    /// TreeManager's closing profiler reference and before the next manager.
+    pub fn decode_tree_manager_prefix(&self) -> Result<(TreeManagerDataPrefix, usize), CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 15, "TreeManager+Data")?;
+        let next_reference = self
+            .manager_objects
+            .as_deref()
+            .and_then(|objects| objects.get(16))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| invalid(16, "missing manager reference after TreeManager+Data"))?;
+        let next_type = next_reference
+            .type_name
+            .split(',')
+            .next()
+            .unwrap_or_default()
+            .strip_suffix("+Data")
+            .ok_or_else(|| invalid(16, "following manager type has no +Data suffix"))?;
+
+        let graph = &self.serialized_object_graph;
+        let tree_tag = new_profiler_tag_bytes("TreeManager")?;
+        let tree_body_start = find_unique_bytes(graph, &tree_tag, "TreeManager profiler tag")?
+            .checked_add(tree_tag.len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TreeManager profiler tag offset",
+            ))?;
+        let (trees, body_len) =
+            TreeManagerDataPrefix::decode_prefix(self.format_version, &graph[tree_body_start..])?;
+        let end_tag_start = tree_body_start
+            .checked_add(body_len)
+            .ok_or(CrpError::ArithmeticOverflow("TreeManager body end"))?;
+        let next_tag = new_profiler_tag_bytes(next_type)?;
+        let next_tag_start = end_tag_start
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow("TreeManager end tag"))?;
+        if graph
+            .get(end_tag_start)
+            .is_none_or(|marker| *marker >= 0xfe)
+            || !graph
+                .get(next_tag_start..)
+                .is_some_and(|tail| tail.starts_with(&next_tag))
+        {
+            return Err(invalid(
+                end_tag_start,
+                format!("TreeManager fields are not followed by its closing tag and {next_type}"),
+            ));
+        }
+        Ok((trees, next_tag_start))
     }
 
     /// Decodes the first two BuildingManager flag arrays after the NetManager body.
@@ -1852,13 +1905,18 @@ mod manager_boundary_tests {
         graph.extend_from_slice(&[0, 0]); // Empty PropInfo name table.
         graph.extend_from_slice(&[0, 15]);
         graph.extend(profiler_tag("TreeManager"));
+        write_encoded_ushort_array(&mut graph, &vec![0; 262_143]);
+        graph.extend_from_slice(&[0, 0]); // Empty TreeInfo name table.
+        graph.extend_from_slice(&[0, 16]);
+        graph.extend(profiler_tag("DistrictManager"));
 
         let names = [
             (13, "ZoneManager+Data"),
             (14, "PropManager+Data"),
             (15, "TreeManager+Data"),
+            (16, "DistrictManager+Data"),
         ];
-        let mut manager_objects = vec![None; 16];
+        let mut manager_objects = vec![None; 17];
         for (slot, type_name) in names {
             manager_objects[slot] = Some(ManagerObjectReference {
                 object_id: slot as u32,
@@ -1895,6 +1953,7 @@ mod manager_boundary_tests {
         let data = synthetic_manager_data();
         let (zone, zone_end) = data.decode_zone_manager_prefix().unwrap();
         let (props, prop_end) = data.decode_prop_manager_prefix().unwrap();
+        let (trees, tree_end) = data.decode_tree_manager_prefix().unwrap();
 
         assert_eq!(zone.format_version(), 194);
         assert_eq!(zone.blocks().len(), 0);
@@ -1907,6 +1966,12 @@ mod manager_boundary_tests {
         assert!(props.prefab_names().is_empty());
         assert!(
             data.serialized_object_graph()[prop_end..].starts_with(&profiler_tag("TreeManager"))
+        );
+        assert_eq!(trees.flags().len(), 262_143);
+        assert!(trees.trees().is_empty());
+        assert!(
+            data.serialized_object_graph()[tree_end..]
+                .starts_with(&profiler_tag("DistrictManager"))
         );
     }
 

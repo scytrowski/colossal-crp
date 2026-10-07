@@ -20,6 +20,7 @@ mod simulation_manager_data;
 mod simulation_metadata;
 mod terrain_manager_data;
 mod texture;
+mod tree_manager_data;
 mod water_simulation_data;
 mod zone_manager_data;
 
@@ -58,6 +59,7 @@ pub use simulation_manager_data::{
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use terrain_manager_data::TerrainManagerData;
 pub use texture::TextureAsset;
+pub use tree_manager_data::{BurningTreeRecord, TreeInstanceRecord, TreeManagerDataPrefix};
 pub use water_simulation_data::{
     WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
 };
@@ -3812,6 +3814,7 @@ mod tests {
         let mut checked_net_tail_convenience = false;
         let mut checked_zone_manager_convenience = false;
         let mut checked_prop_manager_convenience = false;
+        let mut checked_tree_manager_convenience = false;
         let mut checked_building_flags_convenience = false;
         let mut checked_building_prefab_convenience = false;
         let mut checked_building_object_convenience = false;
@@ -3897,6 +3900,11 @@ mod tests {
                         assert_eq!(props.flags().len(), 65_535);
                         assert!(prop_end < manager_data.serialized_object_graph().len());
                         checked_prop_manager_convenience = true;
+                        let (trees, trees_end) = manager_data.decode_tree_manager_prefix()?;
+                        assert_eq!(trees.format_version(), manager_data.format_version());
+                        assert_eq!(trees.flags().len(), 262_143);
+                        assert!(trees_end < manager_data.serialized_object_graph().len());
+                        checked_tree_manager_convenience = true;
                         let (game_area, game_area_bytes) =
                             manager_data.decode_game_area_prefix()?;
                         assert_eq!(game_area.area_grid().len(), 25);
@@ -4838,6 +4846,7 @@ mod tests {
         assert!(checked_net_tail_convenience);
         assert!(checked_zone_manager_convenience);
         assert!(checked_prop_manager_convenience);
+        assert!(checked_tree_manager_convenience);
         assert!(checked_building_flags_convenience);
         assert!(checked_building_prefab_convenience);
         assert!(checked_building_object_convenience);
