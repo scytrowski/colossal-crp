@@ -9,10 +9,12 @@ use crate::WaterSimulationEditor;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
-    BuildingFlagsPrefix, BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
-    BuildingManagerObjectHeadersPrefix, BuildingPopulationPrefix, BuildingPrefabPrefix,
-    BuildingProblemEditor, BuildingProblemPrefix, BuildingServiceSelectionPrefix,
-    BuildingTimerGeometryPrefix,
+    BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlagsPrefix,
+    BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
+    BuildingManagerObjectHeadersPrefix, BuildingMonumentEffectsEditor,
+    BuildingMonumentEffectsPrefix, BuildingPopulationPrefix, BuildingPrefabPrefix,
+    BuildingProblemEditor, BuildingProblemPrefix, BuildingRaceTeamPresenceEditor,
+    BuildingRaceTeamPresencePrefix, BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
 };
 use crate::{BuildingEconomicFieldsEditor, BuildingPopulationEditor, BuildingTimerGeometryEditor};
 use crate::{
@@ -950,6 +952,57 @@ impl SimulationManagerData {
         Ok((data, reader.offset()))
     }
 
+    /// Decodes the fixed monument-effect tables following direct building records.
+    pub fn decode_building_monument_effects_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingMonumentEffectsPrefix, usize), CrpError> {
+        let (_, records_end) = self.decode_building_instance_records_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(records_end)?;
+        let (data, used) = BuildingMonumentEffectsPrefix::decode_prefix(
+            self.format_version,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes the fixed faculty-bonus tables after monument effects.
+    pub fn decode_building_faculty_bonuses_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingFacultyBonusesPrefix, usize), CrpError> {
+        let (_, monument_end) = self.decode_building_monument_effects_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(monument_end)?;
+        let (data, used) = BuildingFacultyBonusesPrefix::decode_prefix(
+            self.format_version,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Decodes race-team-presence bytes after faculty bonuses.
+    /// Queued race-team reference bodies begin after this prefix and remain opaque.
+    pub fn decode_building_race_team_presence_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingRaceTeamPresencePrefix, usize), CrpError> {
+        let (_, faculty_end) = self.decode_building_faculty_bonuses_prefix(save_app_version)?;
+        let (flags, _) = self.decode_building_flags_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(faculty_end)?;
+        let (data, used) = BuildingRaceTeamPresencePrefix::decode_prefix(
+            self.format_version,
+            &flags,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
     fn building_manager_shared_strings(
         &self,
         save_app_version: Option<u32>,
@@ -1110,6 +1163,124 @@ impl SimulationManagerData {
             return Err(invalid(
                 body_start,
                 "BuildingManager instance records extend past manager graph",
+            ));
+        }
+        self.serialized_object_graph
+            .splice(body_start..graph_end, replacement);
+        Ok(())
+    }
+
+    /// Replaces monument-effect tables while preserving later BuildingManager bytes.
+    pub fn replace_building_monument_effects(
+        &mut self,
+        edited: &BuildingMonumentEffectsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited monument-effect version does not match this stream",
+            ));
+        }
+        let (original, graph_end) =
+            self.decode_building_monument_effects_prefix(save_app_version)?;
+        if edited.temporary().len() != original.temporary().len()
+            || edited.final_values().len() != original.final_values().len()
+        {
+            return Err(invalid(
+                0,
+                "edited monument-effect table lengths do not match this stream",
+            ));
+        }
+        let body_start =
+            graph_end
+                .checked_sub(original.encode().len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager monument-effect start",
+                ))?;
+        let replacement = edited.encode()?;
+        if graph_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "monument-effect tables extend past manager graph",
+            ));
+        }
+        self.serialized_object_graph
+            .splice(body_start..graph_end, replacement);
+        Ok(())
+    }
+
+    /// Replaces faculty-bonus tables while preserving later BuildingManager bytes.
+    pub fn replace_building_faculty_bonuses(
+        &mut self,
+        edited: &BuildingFacultyBonusesEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited faculty-bonus version does not match this stream",
+            ));
+        }
+        let (original, graph_end) =
+            self.decode_building_faculty_bonuses_prefix(save_app_version)?;
+        if edited.temporary().len() != original.temporary().len()
+            || edited.final_values().len() != original.final_values().len()
+        {
+            return Err(invalid(
+                0,
+                "edited faculty-bonus table lengths do not match this stream",
+            ));
+        }
+        let body_start =
+            graph_end
+                .checked_sub(original.encode().len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager faculty-bonus start",
+                ))?;
+        let replacement = edited.encode()?;
+        if graph_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "faculty-bonus tables extend past manager graph",
+            ));
+        }
+        self.serialized_object_graph
+            .splice(body_start..graph_end, replacement);
+        Ok(())
+    }
+
+    /// Replaces race-team-presence flags and preserves queued reference bytes.
+    pub fn replace_building_race_team_presence(
+        &mut self,
+        edited: &BuildingRaceTeamPresenceEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited race-team-presence version does not match this stream",
+            ));
+        }
+        let (original, graph_end) =
+            self.decode_building_race_team_presence_prefix(save_app_version)?;
+        if edited.presence().len() != original.presence().len() {
+            return Err(invalid(
+                0,
+                "edited race-team-presence count does not match this stream",
+            ));
+        }
+        let body_start =
+            graph_end
+                .checked_sub(original.encode().len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager race-team-presence start",
+                ))?;
+        let replacement = edited.encode()?;
+        if graph_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "race-team-presence bytes extend past manager graph",
             ));
         }
         self.serialized_object_graph

@@ -14,6 +14,10 @@ const FULL_BUILDING_COUNT_VERSION: u32 = 222;
 const SECONDARY_BUILDING_FLAGS_VERSION: u32 = 112_030;
 const TWO_BUILDING_PROBLEMS_VERSION: u32 = 115_000;
 const SAVE_APP_PROBLEMS_VERSION: u32 = 146_809_088;
+const MONUMENT_EFFECTS_VERSION: u32 = 110_016;
+const FACULTY_BONUSES_VERSION: u32 = 112_001;
+const RACE_TEAM_PRESENCE_VERSION: u32 = 120_002;
+const BUILDING_EFFECT_TABLE_LENGTH: usize = 16;
 
 /// Serialized flags for one one-based `Building` buffer position.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +86,66 @@ pub struct BuildingProblemEditor {
     format_version: u32,
     active_indices: Vec<u16>,
     problems: Vec<BuildingProblemWords>,
+}
+
+/// One serialized monument or faculty effect factor and position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildingEffectValue {
+    /// Signed effect factor.
+    pub factor: i32,
+    /// IEEE-754 bit patterns for the x, y, and z position components.
+    pub position_bits: [u32; 3],
+}
+
+/// The two fixed BuildingManager monument-effect tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingMonumentEffectsPrefix {
+    format_version: u32,
+    temporary: Vec<BuildingEffectValue>,
+    final_values: Vec<BuildingEffectValue>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Editable temporary and final monument-effect tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingMonumentEffectsEditor {
+    format_version: u32,
+    temporary: Vec<BuildingEffectValue>,
+    final_values: Vec<BuildingEffectValue>,
+}
+
+/// The two fixed BuildingManager faculty-bonus tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingFacultyBonusesPrefix {
+    format_version: u32,
+    temporary: Vec<BuildingEffectValue>,
+    final_values: Vec<BuildingEffectValue>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Editable temporary and final faculty-bonus tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingFacultyBonusesEditor {
+    format_version: u32,
+    temporary: Vec<BuildingEffectValue>,
+    final_values: Vec<BuildingEffectValue>,
+}
+
+/// Race-team-presence booleans for active buildings from inner version 120002.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingRaceTeamPresencePrefix {
+    format_version: u32,
+    presence: Vec<bool>,
+    serialized_prefix: Vec<u8>,
+}
+
+/// Editable race-team-presence booleans that retain unchanged raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingRaceTeamPresenceEditor {
+    format_version: u32,
+    presence: Vec<bool>,
+    original_presence: Vec<bool>,
+    original_bytes: Vec<u8>,
 }
 
 /// Per-building buffer indices and byte fields following problem state.
@@ -1960,6 +2024,381 @@ fn invalid_building_problems(reason: impl Into<String>) -> CrpError {
     }
 }
 
+impl BuildingMonumentEffectsPrefix {
+    /// Decodes both sixteen-entry monument-effect tables from inner version 110016.
+    pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
+        let (temporary, final_values, serialized_prefix, consumed) = read_effect_tables(
+            format_version,
+            MONUMENT_EFFECTS_VERSION,
+            "BuildingManager monument effects",
+            bytes,
+        )?;
+        Ok((
+            Self {
+                format_version,
+                temporary,
+                final_values,
+                serialized_prefix,
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns the temporary monument-effect entries in serialized order.
+    pub fn temporary(&self) -> &[BuildingEffectValue] {
+        &self.temporary
+    }
+    /// Returns the final monument-effect entries in serialized order.
+    pub fn final_values(&self) -> &[BuildingEffectValue] {
+        &self.final_values
+    }
+    /// Writes the original encoded tables exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+    /// Creates an editor for both tables.
+    pub fn into_editor(self) -> BuildingMonumentEffectsEditor {
+        BuildingMonumentEffectsEditor {
+            format_version: self.format_version,
+            temporary: self.temporary,
+            final_values: self.final_values,
+        }
+    }
+}
+
+impl BuildingMonumentEffectsEditor {
+    /// Returns the inner DataSerializer version associated with these tables.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns the temporary monument-effect entries.
+    pub fn temporary(&self) -> &[BuildingEffectValue] {
+        &self.temporary
+    }
+    /// Returns the editable temporary monument-effect entries.
+    pub fn temporary_mut(&mut self) -> &mut [BuildingEffectValue] {
+        &mut self.temporary
+    }
+    /// Returns the editable final monument-effect entries.
+    pub fn final_values_mut(&mut self) -> &mut [BuildingEffectValue] {
+        &mut self.final_values
+    }
+    /// Returns the final monument-effect entries.
+    pub fn final_values(&self) -> &[BuildingEffectValue] {
+        &self.final_values
+    }
+    /// Encodes both fixed tables in the game's field order.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        write_effect_tables(
+            self.format_version,
+            MONUMENT_EFFECTS_VERSION,
+            "BuildingManager monument effects",
+            &self.temporary,
+            &self.final_values,
+        )
+    }
+}
+
+impl BuildingFacultyBonusesPrefix {
+    /// Decodes both sixteen-entry faculty-bonus tables from inner version 112001.
+    pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
+        let (temporary, final_values, serialized_prefix, consumed) = read_effect_tables(
+            format_version,
+            FACULTY_BONUSES_VERSION,
+            "BuildingManager faculty bonuses",
+            bytes,
+        )?;
+        Ok((
+            Self {
+                format_version,
+                temporary,
+                final_values,
+                serialized_prefix,
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns the temporary faculty-bonus entries in serialized order.
+    pub fn temporary(&self) -> &[BuildingEffectValue] {
+        &self.temporary
+    }
+    /// Returns the final faculty-bonus entries in serialized order.
+    pub fn final_values(&self) -> &[BuildingEffectValue] {
+        &self.final_values
+    }
+    /// Writes the original encoded tables exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+    /// Creates an editor for both tables.
+    pub fn into_editor(self) -> BuildingFacultyBonusesEditor {
+        BuildingFacultyBonusesEditor {
+            format_version: self.format_version,
+            temporary: self.temporary,
+            final_values: self.final_values,
+        }
+    }
+}
+
+impl BuildingFacultyBonusesEditor {
+    /// Returns the inner DataSerializer version associated with these tables.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns the temporary faculty-bonus entries.
+    pub fn temporary(&self) -> &[BuildingEffectValue] {
+        &self.temporary
+    }
+    /// Returns the editable temporary faculty-bonus entries.
+    pub fn temporary_mut(&mut self) -> &mut [BuildingEffectValue] {
+        &mut self.temporary
+    }
+    /// Returns the editable final faculty-bonus entries.
+    pub fn final_values_mut(&mut self) -> &mut [BuildingEffectValue] {
+        &mut self.final_values
+    }
+    /// Returns the final faculty-bonus entries.
+    pub fn final_values(&self) -> &[BuildingEffectValue] {
+        &self.final_values
+    }
+    /// Encodes both fixed tables in the game's field order.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        write_effect_tables(
+            self.format_version,
+            FACULTY_BONUSES_VERSION,
+            "BuildingManager faculty bonuses",
+            &self.temporary,
+            &self.final_values,
+        )
+    }
+}
+
+fn read_effect_tables(
+    format_version: u32,
+    since_version: u32,
+    name: &str,
+    bytes: &[u8],
+) -> Result<
+    (
+        Vec<BuildingEffectValue>,
+        Vec<BuildingEffectValue>,
+        Vec<u8>,
+        usize,
+    ),
+    CrpError,
+> {
+    if format_version < 164 {
+        return Err(invalid_building_effects(name, "unsupported inner version"));
+    }
+    let expected_count = if format_version >= since_version {
+        BUILDING_EFFECT_TABLE_LENGTH
+    } else {
+        0
+    };
+    let expected_bytes = expected_count
+        .checked_mul(2)
+        .and_then(|count| count.checked_mul(16))
+        .ok_or(CrpError::ArithmeticOverflow(
+            "BuildingManager effect table size",
+        ))?;
+    if bytes.len() < expected_bytes {
+        return Err(invalid_building_effects(name, "truncated effect tables"));
+    }
+    let mut reader = Reader::new(bytes);
+    let temporary = read_effect_table(&mut reader, expected_count)?;
+    let final_values = read_effect_table(&mut reader, expected_count)?;
+    let consumed = reader.offset();
+    Ok((
+        temporary,
+        final_values,
+        bytes[..consumed].to_vec(),
+        consumed,
+    ))
+}
+
+fn read_effect_table(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<Vec<BuildingEffectValue>, CrpError> {
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(BuildingEffectValue {
+            factor: reader.read_i32_be()?,
+            position_bits: [
+                reader.read_u32_be()?,
+                reader.read_u32_be()?,
+                reader.read_u32_be()?,
+            ],
+        });
+    }
+    Ok(values)
+}
+
+fn write_effect_tables(
+    format_version: u32,
+    since_version: u32,
+    name: &str,
+    temporary: &[BuildingEffectValue],
+    final_values: &[BuildingEffectValue],
+) -> Result<Vec<u8>, CrpError> {
+    if format_version < 164 {
+        return Err(invalid_building_effects(name, "unsupported inner version"));
+    }
+    let expected_count = if format_version >= since_version {
+        BUILDING_EFFECT_TABLE_LENGTH
+    } else {
+        0
+    };
+    if temporary.len() != expected_count || final_values.len() != expected_count {
+        return Err(invalid_building_effects(
+            name,
+            "effect-table entry count does not match the inner version",
+        ));
+    }
+    let mut output = Vec::with_capacity(expected_count * 32);
+    for value in temporary.iter().chain(final_values) {
+        output.extend_from_slice(&value.factor.to_be_bytes());
+        for position in value.position_bits {
+            output.extend_from_slice(&position.to_be_bytes());
+        }
+    }
+    Ok(output)
+}
+
+fn invalid_building_effects(name: &str, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: name.to_owned(),
+        offset: 0,
+        reason: reason.into(),
+    }
+}
+
+impl BuildingRaceTeamPresencePrefix {
+    /// Decodes one DataSerializer bool per active building from version 120002.
+    /// The game treats only byte `01` as true; original bytes are retained.
+    pub fn decode_prefix(
+        format_version: u32,
+        flags: &BuildingFlagsPrefix,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 || flags.format_version() != format_version {
+            return Err(invalid_building_race_team_presence(
+                "unsupported or mismatched inner version",
+            ));
+        }
+        let count = if format_version >= RACE_TEAM_PRESENCE_VERSION {
+            flags
+                .building_flags()
+                .iter()
+                .filter(|building| building.flags != 0)
+                .count()
+        } else {
+            0
+        };
+        if bytes.len() < count {
+            return Err(invalid_building_race_team_presence(
+                "truncated race-team-presence bytes",
+            ));
+        }
+        let original = &bytes[..count];
+        let presence = original.iter().map(|byte| *byte == 1).collect();
+        Ok((
+            Self {
+                format_version,
+                presence,
+                serialized_prefix: original.to_vec(),
+            },
+            count,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns presence flags in active-building order.
+    pub fn presence(&self) -> &[bool] {
+        &self.presence
+    }
+    /// Writes the original bool bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+    /// Creates an editor that preserves unchanged raw bool bytes.
+    pub fn into_editor(self) -> BuildingRaceTeamPresenceEditor {
+        BuildingRaceTeamPresenceEditor {
+            format_version: self.format_version,
+            original_presence: self.presence.clone(),
+            presence: self.presence,
+            original_bytes: self.serialized_prefix,
+        }
+    }
+}
+
+impl BuildingRaceTeamPresenceEditor {
+    /// Returns the inner DataSerializer version associated with these flags.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+    /// Returns editable presence flags in active-building order.
+    pub fn presence_mut(&mut self) -> &mut [bool] {
+        &mut self.presence
+    }
+    /// Returns current presence flags in active-building order.
+    pub fn presence(&self) -> &[bool] {
+        &self.presence
+    }
+    /// Encodes changed bools as `00` or `01` and retains unchanged raw bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.format_version < RACE_TEAM_PRESENCE_VERSION
+            && (!self.presence.is_empty() || !self.original_bytes.is_empty())
+        {
+            return Err(invalid_building_race_team_presence(
+                "race-team-presence bytes are absent before inner version 120002",
+            ));
+        }
+        if self.presence.len() != self.original_presence.len()
+            || self.presence.len() != self.original_bytes.len()
+        {
+            return Err(invalid_building_race_team_presence(
+                "race-team-presence count changed",
+            ));
+        }
+        Ok(self
+            .presence
+            .iter()
+            .zip(&self.original_presence)
+            .zip(&self.original_bytes)
+            .map(|((current, original), raw)| {
+                if current == original {
+                    *raw
+                } else if *current {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect())
+    }
+}
+
+fn invalid_building_race_team_presence(reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "BuildingManager race-team presence".to_owned(),
+        offset: 0,
+        reason: reason.into(),
+    }
+}
+
 fn fixed_object_header_count(format_version: u32) -> usize {
     let mut count = 3 * usize::from(format_version >= 82)
         + usize::from(format_version >= 198)
@@ -2062,11 +2501,116 @@ impl BuildingManagerObjectHeadersPrefix {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildingEconomicFieldsPrefix, BuildingFlag, BuildingFlagsPrefix,
-        BuildingInstanceRecordsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
+        BuildingEconomicFieldsPrefix, BuildingFacultyBonusesPrefix, BuildingFlag,
+        BuildingFlagsPrefix, BuildingInstanceRecordsPrefix, BuildingMonumentEffectsPrefix,
+        BuildingPopulationEditor, BuildingPopulationPrefix, BuildingRaceTeamPresencePrefix,
         BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
         fixed_object_header_count, timer_fields_for_version,
     };
+
+    fn expected_effect_table_bytes() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(512);
+        for index in 0..32_i32 {
+            bytes.extend_from_slice(&(index - 16).to_be_bytes());
+            for bits in [
+                0x3f80_0000_u32.wrapping_add(index as u32),
+                0xc000_0000_u32.wrapping_add(index as u32),
+                0x4040_0000_u32.wrapping_add(index as u32),
+            ] {
+                bytes.extend_from_slice(&bits.to_be_bytes());
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn building_effect_tables_follow_version_gates_and_field_order() {
+        let bytes = expected_effect_table_bytes();
+        let (monuments, used) = BuildingMonumentEffectsPrefix::decode_prefix(110_016, &bytes)
+            .expect("monument tables decode");
+        assert_eq!(used, 512);
+        assert_eq!(monuments.encode(), bytes);
+        assert_eq!(monuments.temporary().len(), 16);
+        assert_eq!(monuments.final_values().len(), 16);
+        assert_eq!(monuments.temporary()[0].factor, -16);
+        assert_eq!(
+            monuments.temporary()[0].position_bits,
+            [0x3f80_0000, 0xc000_0000, 0x4040_0000]
+        );
+        assert_eq!(monuments.final_values()[0].factor, 0);
+        let mut editor = monuments.into_editor();
+        editor.temporary_mut()[0].factor = 17;
+        let edited = editor.encode().expect("monument tables encode");
+        assert_eq!(&edited[..4], &[0, 0, 0, 17]);
+        assert_eq!(&edited[4..16], &bytes[4..16]);
+        assert_eq!(edited.len(), 512);
+
+        let (before_monument_gate, used) =
+            BuildingMonumentEffectsPrefix::decode_prefix(110_015, &[])
+                .expect("pre-gate monument tables are absent");
+        assert_eq!(used, 0);
+        assert!(before_monument_gate.temporary().is_empty());
+        assert!(BuildingMonumentEffectsPrefix::decode_prefix(110_016, &bytes[..511]).is_err());
+
+        let (before_faculty_gate, used) = BuildingFacultyBonusesPrefix::decode_prefix(112_000, &[])
+            .expect("pre-gate faculty tables are absent");
+        assert_eq!(used, 0);
+        assert!(before_faculty_gate.final_values().is_empty());
+        let (faculty, used) = BuildingFacultyBonusesPrefix::decode_prefix(112_001, &bytes)
+            .expect("faculty tables decode");
+        assert_eq!(used, 512);
+        assert_eq!(faculty.encode(), bytes);
+        assert_eq!(faculty.temporary()[15].factor, -1);
+        assert_eq!(faculty.final_values()[15].factor, 15);
+    }
+
+    #[test]
+    fn building_race_team_presence_uses_one_bool_per_active_building() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 120_002,
+            building_flags: vec![
+                BuildingFlag {
+                    index: 1,
+                    flags: 1,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 2,
+                    flags: 0,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 3,
+                    flags: 2,
+                    flags2: 0,
+                },
+            ],
+            serialized_prefix: Vec::new(),
+        };
+        let (prefix, used) =
+            BuildingRaceTeamPresencePrefix::decode_prefix(120_002, &flags, &[1, 2])
+                .expect("race-team bools decode");
+        assert_eq!(used, 2);
+        assert_eq!(prefix.presence(), [true, false]);
+        assert_eq!(prefix.encode(), [1, 2]);
+        let mut editor = prefix.into_editor();
+        editor.presence_mut()[0] = false;
+        assert_eq!(editor.encode().expect("presence encodes"), [0, 2]);
+        editor.presence_mut()[1] = true;
+        assert_eq!(editor.encode().expect("presence encodes"), [0, 1]);
+        assert!(BuildingRaceTeamPresencePrefix::decode_prefix(120_002, &flags, &[1]).is_err());
+
+        let legacy_flags = BuildingFlagsPrefix {
+            format_version: 120_001,
+            building_flags: flags.building_flags.clone(),
+            serialized_prefix: Vec::new(),
+        };
+        let (legacy, used) =
+            BuildingRaceTeamPresencePrefix::decode_prefix(120_001, &legacy_flags, &[])
+                .expect("pre-gate race-team presence is absent");
+        assert_eq!(used, 0);
+        assert!(legacy.presence().is_empty());
+    }
 
     #[test]
     fn building_instance_records_decode_and_encode_exact_big_endian_fields() {

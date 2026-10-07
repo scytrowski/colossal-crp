@@ -23,12 +23,15 @@ mod water_simulation_data;
 
 pub use building_manager_data::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsEditor,
-    BuildingEconomicFieldsPrefix, BuildingFlag, BuildingFlagsPrefix, BuildingInstanceRecord,
+    BuildingEconomicFieldsPrefix, BuildingEffectValue, BuildingFacultyBonusesEditor,
+    BuildingFacultyBonusesPrefix, BuildingFlag, BuildingFlagsPrefix, BuildingInstanceRecord,
     BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
-    BuildingManagerObjectHeadersPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
+    BuildingManagerObjectHeadersPrefix, BuildingMonumentEffectsEditor,
+    BuildingMonumentEffectsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
     BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix, BuildingProblemWords,
-    BuildingServiceSelection, BuildingServiceSelectionPrefix, BuildingTimerField,
-    BuildingTimerGeometryEditor, BuildingTimerGeometryPrefix,
+    BuildingRaceTeamPresenceEditor, BuildingRaceTeamPresencePrefix, BuildingServiceSelection,
+    BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
+    BuildingTimerGeometryPrefix,
 };
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
@@ -3812,6 +3815,9 @@ mod tests {
         let mut checked_building_economic_convenience = false;
         let mut checked_building_selection_convenience = false;
         let mut checked_building_records_convenience = false;
+        let mut checked_monument_effects_convenience = false;
+        let mut checked_faculty_bonuses_convenience = false;
+        let mut checked_race_team_presence_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
@@ -4599,6 +4605,133 @@ mod tests {
                             );
                             checked_building_records_convenience = true;
                         }
+                        let monument_effects_start = net_reader.offset();
+                        let (monument_effects, monument_effects_used) =
+                            BuildingMonumentEffectsPrefix::decode_prefix(
+                                version,
+                                net_reader.remaining_bytes(),
+                            )?;
+                        net_reader.read_bytes(monument_effects_used)?;
+                        assert_eq!(
+                            monument_effects.encode(),
+                            &net_reader.consumed_bytes()[monument_effects_start
+                                ..monument_effects_start + monument_effects_used]
+                        );
+                        if !checked_monument_effects_convenience
+                            && !monument_effects.temporary().is_empty()
+                        {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_monument_effects_prefix(
+                                    metadata.save_app_version,
+                                )?;
+                            assert_eq!(via_manager, monument_effects);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            let mut edited_manager = manager_data.clone();
+                            let mut editor = monument_effects.clone().into_editor();
+                            editor.temporary_mut()[0].factor ^= 1;
+                            let original_suffix =
+                                manager_data.serialized_object_graph()[graph_end..].to_vec();
+                            edited_manager.replace_building_monument_effects(
+                                &editor,
+                                metadata.save_app_version,
+                            )?;
+                            let (rewritten, rewritten_end) = edited_manager
+                                .decode_building_monument_effects_prefix(
+                                    metadata.save_app_version,
+                                )?;
+                            assert_eq!(
+                                rewritten.temporary()[0].factor,
+                                editor.temporary()[0].factor
+                            );
+                            assert_eq!(
+                                &edited_manager.serialized_object_graph()[rewritten_end..],
+                                original_suffix
+                            );
+                            checked_monument_effects_convenience = true;
+                        }
+
+                        let faculty_bonuses_start = net_reader.offset();
+                        let (faculty_bonuses, faculty_bonuses_used) =
+                            BuildingFacultyBonusesPrefix::decode_prefix(
+                                version,
+                                net_reader.remaining_bytes(),
+                            )?;
+                        net_reader.read_bytes(faculty_bonuses_used)?;
+                        assert_eq!(
+                            faculty_bonuses.encode(),
+                            &net_reader.consumed_bytes()[faculty_bonuses_start
+                                ..faculty_bonuses_start + faculty_bonuses_used]
+                        );
+                        if !checked_faculty_bonuses_convenience
+                            && !faculty_bonuses.temporary().is_empty()
+                        {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_faculty_bonuses_prefix(
+                                    metadata.save_app_version,
+                                )?;
+                            assert_eq!(via_manager, faculty_bonuses);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            let mut edited_manager = manager_data.clone();
+                            let mut editor = faculty_bonuses.clone().into_editor();
+                            editor.final_values_mut()[0].factor ^= 1;
+                            let original_suffix =
+                                manager_data.serialized_object_graph()[graph_end..].to_vec();
+                            edited_manager.replace_building_faculty_bonuses(
+                                &editor,
+                                metadata.save_app_version,
+                            )?;
+                            let (rewritten, rewritten_end) = edited_manager
+                                .decode_building_faculty_bonuses_prefix(
+                                    metadata.save_app_version,
+                                )?;
+                            assert_eq!(
+                                rewritten.final_values()[0].factor,
+                                editor.final_values()[0].factor
+                            );
+                            assert_eq!(
+                                &edited_manager.serialized_object_graph()[rewritten_end..],
+                                original_suffix
+                            );
+                            checked_faculty_bonuses_convenience = true;
+                        }
+                        if !checked_race_team_presence_convenience {
+                            let race_start = net_reader.offset();
+                            let (race_presence, race_presence_used) =
+                                BuildingRaceTeamPresencePrefix::decode_prefix(
+                                    version,
+                                    &building_flags,
+                                    net_reader.remaining_bytes(),
+                                )?;
+                            net_reader.read_bytes(race_presence_used)?;
+                            assert_eq!(
+                                race_presence.encode(),
+                                &net_reader.consumed_bytes()
+                                    [race_start..race_start + race_presence_used]
+                            );
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_race_team_presence_prefix(
+                                    metadata.save_app_version,
+                                )?;
+                            assert_eq!(via_manager, race_presence);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+                            let mut edited_manager = manager_data.clone();
+                            let editor = race_presence.clone().into_editor();
+                            let original_suffix =
+                                manager_data.serialized_object_graph()[graph_end..].to_vec();
+                            edited_manager.replace_building_race_team_presence(
+                                &editor,
+                                metadata.save_app_version,
+                            )?;
+                            let (_, rewritten_end) = edited_manager
+                                .decode_building_race_team_presence_prefix(
+                                    metadata.save_app_version,
+                                )?;
+                            assert_eq!(
+                                &edited_manager.serialized_object_graph()[rewritten_end..],
+                                original_suffix
+                            );
+                            checked_race_team_presence_convenience = true;
+                        }
                         if std::env::var_os("CRP_EXTRACT_BUILDING_BYTE_STATE_FIXTURE").is_some()
                             && path
                                 .file_name()
@@ -4696,6 +4829,9 @@ mod tests {
         assert!(checked_building_economic_convenience);
         assert!(checked_building_selection_convenience);
         assert!(checked_building_records_convenience);
+        assert!(checked_monument_effects_convenience);
+        assert!(checked_faculty_bonuses_convenience);
+        assert!(checked_race_team_presence_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(
