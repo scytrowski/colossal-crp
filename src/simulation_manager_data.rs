@@ -1,3 +1,4 @@
+use crate::BuildingTimerGeometryEditor;
 use crate::CrpError;
 use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
@@ -10,6 +11,7 @@ use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_u
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingFlagsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix, BuildingProblemPrefix,
+    BuildingTimerGeometryPrefix,
 };
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
@@ -817,6 +819,68 @@ impl SimulationManagerData {
         )?;
         reader.read_bytes(used)?;
         Ok((data, reader.offset()))
+    }
+
+    /// Decodes timer, level-up, width, and length arrays after BuildingManager byte state.
+    ///
+    /// Returns the decoded prefix and its end offset in the serialized object
+    /// graph. The optional save-app version is required by earlier versioned
+    /// BuildingManager problem encodings.
+    pub fn decode_building_timer_geometry_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(BuildingTimerGeometryPrefix, usize), CrpError> {
+        let (_, byte_state_end) = self.decode_building_byte_state_prefix(save_app_version)?;
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        reader.read_bytes(byte_state_end)?;
+        let (data, used) = BuildingTimerGeometryPrefix::decode_prefix(
+            self.format_version,
+            &self.decode_building_flags_prefix(save_app_version)?.0,
+            reader.remaining_bytes(),
+        )?;
+        reader.read_bytes(used)?;
+        Ok((data, reader.offset()))
+    }
+
+    /// Replaces timer and building-dimension arrays, preserving the rest of the graph.
+    ///
+    /// The editor must come from this stream's BuildingManager body. Edited
+    /// arrays use canonical literal controls; validation failures leave the
+    /// serialized object graph unchanged.
+    pub fn replace_building_timer_geometry(
+        &mut self,
+        edited: &BuildingTimerGeometryEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited BuildingManager timer version does not match this stream",
+            ));
+        }
+        let (original, graph_end) = self.decode_building_timer_geometry_prefix(save_app_version)?;
+        if edited.active_building_count() != original.active_building_count() {
+            return Err(invalid(
+                0,
+                "edited BuildingManager active-building count does not match this stream",
+            ));
+        }
+        let body_start =
+            graph_end
+                .checked_sub(original.encoded_len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager timer body start",
+                ))?;
+        let replacement = edited.encode()?;
+        if graph_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager timer body extends past manager graph",
+            ));
+        }
+        self.serialized_object_graph
+            .splice(body_start..graph_end, replacement);
+        Ok(())
     }
 
     /// Replaces only the InstanceManager body; group references and all other

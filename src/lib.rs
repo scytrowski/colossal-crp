@@ -24,7 +24,8 @@ mod water_simulation_data;
 pub use building_manager_data::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingFlag, BuildingFlagsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingPrefabPrefix, BuildingProblemPrefix,
-    BuildingProblemWords,
+    BuildingProblemWords, BuildingTimerField, BuildingTimerGeometryEditor,
+    BuildingTimerGeometryPrefix,
 };
 pub use data_serializer::DataSerializerStream;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
@@ -2819,25 +2820,72 @@ mod tests {
         // This fixture begins immediately after the thirteen byte-state arrays
         // in the version-114007 BuildingManager body. The DLL reads all eleven
         // timer fields through one EncodedArray.Byte instance, field by field.
+        let mut flags_bytes = Vec::new();
+        let mut flags = vec![0_u32; 49_151];
+        flags[..554].fill(1);
+        for chunk in flags.chunks(64) {
+            flags_bytes.push(u8::try_from(chunk.len() - 1).map_err(|_| {
+                CrpError::ArithmeticOverflow("test BuildingManager flag block length")
+            })?);
+            for value in chunk {
+                flags_bytes.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        flags_bytes.extend(std::iter::repeat_n(0xff, 383));
+        flags_bytes.push(0xfe);
+        flags_bytes.extend(std::iter::repeat_n(0xff, 383));
+        flags_bytes.push(0xfe);
+        let (flags, _) = BuildingFlagsPrefix::decode_prefix(114_007, &flags_bytes)?;
         let bytes = include_bytes!("../tests/fixtures/building-timer-geometry-v114007-asanu.bin");
-        let mut reader = crate::data_serializer::Reader::new(bytes);
-        let timers = crate::encoded_array::read_encoded_byte_array(&mut reader, 554 * 11)?;
-        assert_eq!(reader.offset(), 48);
-        assert!(timers.iter().all(|value| *value == 0));
+        let (decoded, used) = BuildingTimerGeometryPrefix::decode_prefix(114_007, &flags, bytes)?;
+        assert_eq!(used, bytes.len());
+        assert_eq!(decoded.active_building_count(), 554);
+        assert_eq!(decoded.timer_fields().len(), 11);
+        assert!(
+            decoded
+                .timer(BuildingTimerField::Electricity)
+                .is_some_and(|values| values.iter().all(|value| *value == 0))
+        );
+        assert!(
+            decoded
+                .timer(BuildingTimerField::Heating)
+                .is_some_and(|values| values.iter().all(|value| *value == 0))
+        );
+        assert!(decoded.timer(BuildingTimerField::Tax).is_some());
+        assert!(decoded.timer(BuildingTimerField::Major).is_some());
+        assert_eq!(decoded.level_up_progress().len(), 554);
+        assert!(decoded.level_up_progress().iter().all(|value| *value == 0));
+        assert_eq!(&decoded.width()[..10], &[6, 2, 7, 8, 8, 8, 6, 2, 16, 2]);
+        assert!(decoded.width().iter().all(|value| (1..=16).contains(value)));
+        assert_eq!(&decoded.length()[..10], &[6, 6, 7, 8, 8, 8, 6, 1, 8, 1]);
+        assert!(
+            decoded
+                .length()
+                .iter()
+                .all(|value| (1..=16).contains(value))
+        );
+        assert_eq!(decoded.encode(), bytes);
+        assert!(
+            BuildingTimerGeometryPrefix::decode_prefix(114_007, &flags, &bytes[..used - 1])
+                .is_err()
+        );
+        assert!(BuildingTimerGeometryPrefix::decode_prefix(114_008, &flags, bytes).is_err());
 
-        let level_up = crate::encoded_array::read_encoded_byte_array(&mut reader, 554)?;
-        assert_eq!(reader.offset(), 53);
-        assert!(level_up.iter().all(|value| *value == 0));
-
-        let width = crate::encoded_array::read_encoded_byte_array(&mut reader, 554)?;
-        assert_eq!(reader.offset(), 608);
-        assert_eq!(&width[..10], &[6, 2, 7, 8, 8, 8, 6, 2, 16, 2]);
-        assert!(width.iter().all(|value| (1..=16).contains(value)));
-
-        let length = crate::encoded_array::read_encoded_byte_array(&mut reader, 554)?;
-        assert_eq!(reader.offset(), bytes.len());
-        assert_eq!(&length[..10], &[6, 6, 7, 8, 8, 8, 6, 1, 8, 1]);
-        assert!(length.iter().all(|value| (1..=16).contains(value)));
+        let mut editor = decoded.into_editor();
+        editor.width_mut()[0] = 15;
+        let major = editor
+            .timer_mut(BuildingTimerField::Major)
+            .ok_or(CrpError::InvalidAssetCount)?;
+        major[0] = 1;
+        let encoded = editor.encode()?;
+        let (rewritten, rewritten_used) =
+            BuildingTimerGeometryPrefix::decode_prefix(114_007, &flags, &encoded)?;
+        assert_eq!(rewritten_used, encoded.len());
+        assert_eq!(rewritten.width()[0], 15);
+        assert_eq!(
+            rewritten.timer(BuildingTimerField::Major).unwrap_or(&[])[0],
+            1
+        );
         Ok(())
     }
 
@@ -3722,6 +3770,7 @@ mod tests {
         let mut checked_building_problem_convenience = false;
         let mut checked_building_buffer_convenience = false;
         let mut checked_building_byte_state_convenience = false;
+        let mut checked_building_timer_convenience = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
@@ -4271,35 +4320,46 @@ mod tests {
                             assert_eq!(graph_end, net_prefix_end + net_reader.offset());
                             checked_building_byte_state_convenience = true;
                         }
-                        let timer_field_count =
-                            9 + usize::from(version >= 231) + usize::from(version >= 172);
-                        let timer_count =
-                            active_building_count.checked_mul(timer_field_count).ok_or(
-                                CrpError::ArithmeticOverflow("BuildingManager timer value count"),
+                        let timer_start = net_reader.offset();
+                        let (timer_geometry, timer_geometry_used) =
+                            BuildingTimerGeometryPrefix::decode_prefix(
+                                version,
+                                &building_flags,
+                                net_reader.remaining_bytes(),
                             )?;
-                        let timers = crate::encoded_array::read_encoded_byte_array(
-                            &mut net_reader,
-                            timer_count,
-                        )?;
-                        assert_eq!(timers.len(), timer_count);
-                        if version >= 170 {
-                            let level_up = crate::encoded_array::read_encoded_byte_array(
-                                &mut net_reader,
-                                active_building_count,
+                        net_reader.read_bytes(timer_geometry_used)?;
+                        assert_eq!(
+                            timer_geometry.encode(),
+                            &net_reader.consumed_bytes()
+                                [timer_start..timer_start + timer_geometry_used]
+                        );
+                        assert_eq!(timer_geometry.width().len(), active_building_count);
+                        assert_eq!(timer_geometry.length().len(), active_building_count);
+                        if !checked_building_timer_convenience && active_building_count > 0 {
+                            let (via_manager, graph_end) = manager_data
+                                .decode_building_timer_geometry_prefix(metadata.save_app_version)?;
+                            assert_eq!(via_manager, timer_geometry);
+                            assert_eq!(graph_end, net_prefix_end + net_reader.offset());
+
+                            let mut edited_manager = manager_data.clone();
+                            let original_width = timer_geometry.width()[0];
+                            let mut editor = timer_geometry.into_editor();
+                            let edited_width = original_width.wrapping_add(1);
+                            editor.width_mut()[0] = edited_width;
+                            let original_suffix =
+                                manager_data.serialized_object_graph()[graph_end..].to_vec();
+                            edited_manager.replace_building_timer_geometry(
+                                &editor,
+                                metadata.save_app_version,
                             )?;
-                            assert_eq!(level_up.len(), active_building_count);
-                        }
-                        for field in ["width", "length"] {
-                            let values = crate::encoded_array::read_encoded_byte_array(
-                                &mut net_reader,
-                                active_building_count,
-                            )?;
+                            let (rewritten, rewritten_end) = edited_manager
+                                .decode_building_timer_geometry_prefix(metadata.save_app_version)?;
+                            assert_eq!(rewritten.width()[0], edited_width);
                             assert_eq!(
-                                values.len(),
-                                active_building_count,
-                                "{field} in {}",
-                                path.display()
+                                &edited_manager.serialized_object_graph()[rewritten_end..],
+                                original_suffix
                             );
+                            checked_building_timer_convenience = true;
                         }
                         if std::env::var_os("CRP_EXTRACT_BUILDING_BYTE_STATE_FIXTURE").is_some()
                             && path
@@ -4393,6 +4453,7 @@ mod tests {
         assert!(checked_building_problem_convenience);
         assert!(checked_building_buffer_convenience);
         assert!(checked_building_byte_state_convenience);
+        assert!(checked_building_timer_convenience);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(

@@ -36,6 +36,18 @@ pub(crate) fn read_encoded_byte_array(
     Ok(values)
 }
 
+/// Writes byte values as literal blocks of at most 128 items.
+///
+/// This is a valid, deterministic encoding; it does not reproduce the game's
+/// choice between literal and repeated-delta blocks.
+pub(crate) fn write_encoded_byte_array(output: &mut Vec<u8>, values: &[u8]) {
+    for chunk in values.chunks(128) {
+        // `chunks(128)` guarantees a nonempty block of at most 128 values.
+        output.push((chunk.len() - 1) as u8);
+        output.extend_from_slice(chunk);
+    }
+}
+
 // The encoded UShort and Short controls share the same 16-bit bit pattern.
 pub(crate) fn read_encoded_ushort_array(
     reader: &mut Reader<'_>,
