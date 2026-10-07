@@ -12,7 +12,6 @@ const DISTRICT_EVENT_POLICIES_VERSION: u32 = 248;
 const PARK_POLICIES_VERSION: u32 = 110_009;
 const PARK_EVENT_POLICIES_VERSION: u32 = 112_015;
 const PARK_SPECIALIZATION_POLICIES_VERSION: u32 = 115_012;
-const LEGACY_POLICY_BOOL_VERSION: u32 = 43;
 const DISTRICT_CRIME_RATE_VERSION: u32 = 203;
 const DISTRICT_ELIGIBLE_AGE_VERSION: u32 = 112_031;
 const DISTRICT_DETAILED_AGE_VERSION: u32 = 113_003;
@@ -496,17 +495,9 @@ impl DistrictManagerFlagsPrefix {
         } else {
             Some(read_encoded_bool_array(&mut reader, policy_bool_count)?)
         };
-        let legacy_bool_count =
-            DISTRICT_COUNT
-                .checked_mul(POLICY_COUNT)
-                .ok_or(CrpError::ArithmeticOverflow(
-                    "DistrictManager legacy policy bool count",
-                ))?;
-        let legacy_policy_bools = if format_version >= LEGACY_POLICY_BOOL_VERSION {
-            Some(read_encoded_bool_array(&mut reader, legacy_bool_count)?)
-        } else {
-            None
-        };
+        // The discarded 32 x 128 bool table is read only for versions 43..70.
+        // This decoder supports 164+, so that compatibility branch is unreachable.
+        let legacy_policy_bools = None;
         let mut district_population_records = Vec::new();
         for (district_index, flags) in district_flags.iter().copied().enumerate() {
             if flags == 0 {
@@ -1096,7 +1087,9 @@ mod tests {
         DISTRICT_COUNT, DistrictManagerFlagsPrefix, POLICY_COUNT, district_policy_bool_count,
     };
     use crate::data_serializer::write_unique_string;
-    use crate::encoded_array::{write_encoded_bool_array, write_encoded_uint_array};
+    use crate::encoded_array::{
+        read_encoded_byte_array, write_encoded_bool_array, write_encoded_uint_array,
+    };
 
     fn zero_flags(output: &mut Vec<u8>) {
         write_encoded_uint_array(output, &[0; 128]);
@@ -1106,9 +1099,6 @@ mod tests {
         let count = district_policy_bool_count(version).unwrap();
         if count != 0 {
             write_encoded_bool_array(output, &vec![false; count]);
-        }
-        if version >= super::LEGACY_POLICY_BOOL_VERSION {
-            write_encoded_bool_array(output, &vec![false; POLICY_COUNT * 128]);
         }
     }
 
@@ -1192,16 +1182,33 @@ mod tests {
         let selected = POLICY_COUNT * 128 + 3 * 128 + 5;
         policies[selected] = true;
         write_encoded_bool_array(&mut bytes, &policies);
-        write_encoded_bool_array(&mut bytes, &vec![false; POLICY_COUNT * 128]);
 
         let (prefix, used) = DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
         assert_eq!(used, bytes.len());
         assert_eq!(prefix.policy_bools().unwrap(), policies);
-        assert_eq!(
-            prefix.legacy_policy_bools().unwrap().len(),
-            POLICY_COUNT * 128
-        );
+        assert_eq!(prefix.legacy_policy_bools(), None);
         assert_eq!(prefix.encode(), bytes);
+    }
+
+    #[test]
+    fn game_produced_prefix_stops_before_park_record() {
+        let bytes =
+            include_bytes!("../tests/fixtures/district-manager-prefix-v112004-wolf-creek.bin");
+        let (prefix, used) = DistrictManagerFlagsPrefix::decode_prefix(112_004, bytes).unwrap();
+
+        // The game IL consumes 78 bytes for this version's non-industry park
+        // record, followed by the first district-grid byte plane.
+        assert_eq!(used, 1809);
+        assert_eq!(prefix.park_flags()[0], 1);
+        assert_eq!(prefix.legacy_policy_bools(), None);
+        assert_eq!(bytes[used + 42], 0); // Park type.
+        let mut grid = crate::data_serializer::Reader::new(&bytes[used + 78..]);
+        assert_eq!(
+            read_encoded_byte_array(&mut grid, 262_144).unwrap(),
+            vec![0; 262_144]
+        );
+        assert_eq!(grid.offset(), 2048);
+        assert_eq!(prefix.encode(), bytes[..used]);
     }
 
     #[test]

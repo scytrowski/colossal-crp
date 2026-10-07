@@ -1946,7 +1946,6 @@ mod manager_boundary_tests {
         write_encoded_uint_array(&mut graph, &[0; 128]);
         write_encoded_uint_array(&mut graph, &[0; 128]);
         write_encoded_bool_array(&mut graph, &vec![false; 16 * 32 * 128]);
-        write_encoded_bool_array(&mut graph, &vec![false; 32 * 128]);
 
         let names = [
             (13, "ZoneManager+Data"),
