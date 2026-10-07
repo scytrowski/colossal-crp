@@ -4066,6 +4066,15 @@ mod tests {
                                 })
                         );
                         assert!(districts_end < manager_data.serialized_object_graph().len());
+                        let (district_grids, district_grid_end) =
+                            manager_data.decode_district_manager_grids()?;
+                        assert!(district_grid_end > districts_end);
+                        assert!(district_grid_end <= manager_data.serialized_object_graph().len());
+                        assert_eq!(district_grids.district_plane(0).unwrap().len(), 262_144);
+                        assert_eq!(
+                            district_grids.park_grid_present(),
+                            districts.format_version() >= 110_001
+                        );
                         checked_district_manager_convenience = true;
                         let (game_area, game_area_bytes) =
                             manager_data.decode_game_area_prefix()?;
