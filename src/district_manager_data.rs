@@ -2594,7 +2594,7 @@ mod tests {
     }
 
     #[test]
-    fn game_tail_fixture_confirms_standard_headers_and_exposes_mp23_difference() {
+    fn game_tail_fixtures_confirm_standard_headers_and_expose_opaque_differences() {
         let desert = include_bytes!("../tests/fixtures/district-tail-v116020-desert.bin");
         let (tail, used) = DistrictManagerTailData::decode(116_020, desert).unwrap();
         assert_eq!(used, 71);
@@ -2608,6 +2608,12 @@ mod tests {
         assert!(mp23[..42].iter().all(|byte| *byte == 0xff));
         assert_eq!(&mp23[42..], &[0x00, 0x19]);
         assert!(DistrictManagerTailData::decode(117_013, mp23).is_err());
+
+        let mp27 = include_bytes!("../tests/fixtures/district-tail-v118011-mp27-map04.bin");
+        assert_eq!(mp27.len(), 44);
+        assert!(mp27[..42].iter().all(|byte| *byte == 0xff));
+        assert_eq!(&mp27[42..], &[0x00, 0x1c]);
+        assert!(DistrictManagerTailData::decode(118_011, mp27).is_err());
     }
 
     #[test]
