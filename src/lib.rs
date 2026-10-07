@@ -9,6 +9,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 mod asset_io;
 mod building_manager_data;
 mod data_serializer;
+mod district_manager_data;
 mod encoded_array;
 mod game_area_data;
 mod instance_manager_data;
@@ -38,6 +39,7 @@ pub use building_manager_data::{
     BuildingTimerGeometryPrefix,
 };
 pub use data_serializer::DataSerializerStream;
+pub use district_manager_data::DistrictManagerFlagsPrefix;
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{MapMetaData, ModInfo};
@@ -3815,6 +3817,7 @@ mod tests {
         let mut checked_zone_manager_convenience = false;
         let mut checked_prop_manager_convenience = false;
         let mut checked_tree_manager_convenience = false;
+        let mut checked_district_manager_convenience = false;
         let mut checked_building_flags_convenience = false;
         let mut checked_building_prefab_convenience = false;
         let mut checked_building_object_convenience = false;
@@ -3905,6 +3908,13 @@ mod tests {
                         assert_eq!(trees.flags().len(), 262_143);
                         assert!(trees_end < manager_data.serialized_object_graph().len());
                         checked_tree_manager_convenience = true;
+                        let (districts, districts_end) =
+                            manager_data.decode_district_manager_flags_prefix()?;
+                        assert_eq!(districts.format_version(), manager_data.format_version());
+                        assert_eq!(districts.district_flags().len(), 128);
+                        assert_eq!(districts.park_flags().len(), 128);
+                        assert!(districts_end < manager_data.serialized_object_graph().len());
+                        checked_district_manager_convenience = true;
                         let (game_area, game_area_bytes) =
                             manager_data.decode_game_area_prefix()?;
                         assert_eq!(game_area.area_grid().len(), 25);
@@ -4847,6 +4857,7 @@ mod tests {
         assert!(checked_zone_manager_convenience);
         assert!(checked_prop_manager_convenience);
         assert!(checked_tree_manager_convenience);
+        assert!(checked_district_manager_convenience);
         assert!(checked_building_flags_convenience);
         assert!(checked_building_prefab_convenience);
         assert!(checked_building_object_convenience);

@@ -1,4 +1,5 @@
 use crate::CrpError;
+use crate::DistrictManagerFlagsPrefix;
 use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
 use crate::InstanceManagerEditor;
@@ -846,6 +847,29 @@ impl SimulationManagerData {
             ));
         }
         Ok((trees, next_tag_start))
+    }
+
+    /// Decodes DistrictManager's opening name and district/park flag arrays.
+    ///
+    /// The type array must contain `DistrictManager+Data` at slot 20. Returns
+    /// the graph offset before the following versioned policy-boolean arrays.
+    pub fn decode_district_manager_flags_prefix(
+        &self,
+    ) -> Result<(DistrictManagerFlagsPrefix, usize), CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 20, "DistrictManager+Data")?;
+        let graph = &self.serialized_object_graph;
+        let tag = new_profiler_tag_bytes("DistrictManager")?;
+        let body_start = find_unique_bytes(graph, &tag, "DistrictManager profiler tag")?
+            .checked_add(tag.len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "DistrictManager profiler tag offset",
+            ))?;
+        let (districts, body_len) =
+            DistrictManagerFlagsPrefix::decode_prefix(self.format_version, &graph[body_start..])?;
+        let end = body_start
+            .checked_add(body_len)
+            .ok_or(CrpError::ArithmeticOverflow("DistrictManager prefix end"))?;
+        Ok((districts, end))
     }
 
     /// Decodes the first two BuildingManager flag arrays after the NetManager body.
@@ -1896,7 +1920,7 @@ mod manager_boundary_tests {
 
     fn synthetic_manager_data() -> SimulationManagerData {
         let mut graph = profiler_tag("ZoneManager");
-        write_encoded_uint_array(&mut graph, &vec![0; 16_383]);
+        write_encoded_uint_array(&mut graph, &vec![0; 49_151]);
         graph.extend_from_slice(&[0; 3 + 3 + 16]);
         graph.extend_from_slice(&[0xff; 13]);
         graph.extend_from_slice(&[0, 14]);
@@ -1907,16 +1931,24 @@ mod manager_boundary_tests {
         graph.extend(profiler_tag("TreeManager"));
         write_encoded_ushort_array(&mut graph, &vec![0; 262_143]);
         graph.extend_from_slice(&[0, 0]); // Empty TreeInfo name table.
+        graph.extend_from_slice(&[0, 0, 0]); // Empty burning-tree list.
         graph.extend_from_slice(&[0, 16]);
+        graph.extend(profiler_tag("WeatherManager"));
+        graph.extend_from_slice(&[0, 20]);
         graph.extend(profiler_tag("DistrictManager"));
+        write_unique_string(&mut graph, "Airline").expect("short test name is encodable");
+        graph.push(1);
+        write_encoded_uint_array(&mut graph, &[0; 128]);
+        write_encoded_uint_array(&mut graph, &[0; 128]);
 
         let names = [
             (13, "ZoneManager+Data"),
             (14, "PropManager+Data"),
             (15, "TreeManager+Data"),
-            (16, "DistrictManager+Data"),
+            (16, "WeatherManager+Data"),
+            (20, "DistrictManager+Data"),
         ];
-        let mut manager_objects = vec![None; 17];
+        let mut manager_objects = vec![None; 21];
         for (slot, type_name) in names {
             manager_objects[slot] = Some(ManagerObjectReference {
                 object_id: slot as u32,
@@ -1925,7 +1957,7 @@ mod manager_boundary_tests {
         }
 
         SimulationManagerData {
-            format_version: 194,
+            format_version: 116_020,
             current_tick_index: 0,
             current_frame_index: 0,
             current_build_index: 0,
@@ -1954,14 +1986,15 @@ mod manager_boundary_tests {
         let (zone, zone_end) = data.decode_zone_manager_prefix().unwrap();
         let (props, prop_end) = data.decode_prop_manager_prefix().unwrap();
         let (trees, tree_end) = data.decode_tree_manager_prefix().unwrap();
+        let (districts, district_end) = data.decode_district_manager_flags_prefix().unwrap();
 
-        assert_eq!(zone.format_version(), 194);
+        assert_eq!(zone.format_version(), 116_020);
         assert_eq!(zone.blocks().len(), 0);
         assert_eq!(zone.object_references().len(), 13);
         assert!(
             data.serialized_object_graph()[zone_end..].starts_with(&profiler_tag("PropManager"))
         );
-        assert_eq!(props.format_version(), 194);
+        assert_eq!(props.format_version(), 116_020);
         assert_eq!(props.flags().len(), 65_535);
         assert!(props.prefab_names().is_empty());
         assert!(
@@ -1970,9 +2003,13 @@ mod manager_boundary_tests {
         assert_eq!(trees.flags().len(), 262_143);
         assert!(trees.trees().is_empty());
         assert!(
-            data.serialized_object_graph()[tree_end..]
-                .starts_with(&profiler_tag("DistrictManager"))
+            data.serialized_object_graph()[tree_end..].starts_with(&profiler_tag("WeatherManager"))
         );
+        assert_eq!(districts.airline_name(), Some("Airline"));
+        assert_eq!(districts.airport_panel_opened(), Some(true));
+        assert_eq!(districts.district_flags(), &[0; 128]);
+        assert_eq!(districts.park_flags(), &[0; 128]);
+        assert_eq!(district_end, data.serialized_object_graph().len());
     }
 
     #[test]
