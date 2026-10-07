@@ -24,6 +24,7 @@ const DISTRICT_PRIVATE_BUILDING_COUNTS_VERSION: u32 = 143;
 const DISTRICT_PRIVATE_ALIVE_COUNT_VERSION: u32 = 145;
 const DISTRICT_PRIVATE_CRIME_RATE_VERSION: u32 = 181;
 const DISTRICT_PRIVATE_COLLAPSED_COUNT_VERSION: u32 = 256;
+const DISTRICT_PLAYER_DATA_VERSION: u32 = 144;
 const POLICY_COUNT: usize = 32;
 const POPULATION_DELTA_COUNT: usize = 16;
 const PRIVATE_DATA_BASE_BYTES: usize = 21;
@@ -97,6 +98,7 @@ pub enum DistrictPrivateDataKind {
     Visitor,
     Industrial,
     Office,
+    Player,
 }
 
 /// A named pair of temporary and final age-group counts in a district.
@@ -292,7 +294,7 @@ impl DistrictManagerFlagsPrefix {
                     age_populations.push(read_district_age_population(&mut reader, category)?);
                 }
             }
-            let mut private_data = Vec::with_capacity(5);
+            let mut private_data = Vec::with_capacity(6);
             for kind in [
                 DistrictPrivateDataKind::Residential,
                 DistrictPrivateDataKind::Commercial,
@@ -318,6 +320,13 @@ impl DistrictManagerFlagsPrefix {
                     &mut reader,
                     format_version,
                     kind,
+                )?);
+            }
+            if format_version >= DISTRICT_PLAYER_DATA_VERSION {
+                private_data.push(read_district_private_data(
+                    &mut reader,
+                    format_version,
+                    DistrictPrivateDataKind::Player,
                 )?);
             }
             district_population_records.push(DistrictPopulationRecord {
@@ -660,6 +669,7 @@ mod tests {
                 super::DistrictPrivateDataKind::Visitor,
                 super::DistrictPrivateDataKind::Industrial,
                 super::DistrictPrivateDataKind::Office,
+                super::DistrictPrivateDataKind::Player,
             ];
             let private_size = super::district_private_data_size(version);
             for (index, _) in private_kinds.iter().enumerate() {

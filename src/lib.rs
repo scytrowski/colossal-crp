@@ -3925,7 +3925,7 @@ mod tests {
                                         == (districts.format_version() >= 203)
                                         && record.last_average_lifespan().is_some()
                                             == (districts.format_version() >= 113_006)
-                                        && record.private_data().len() == 5
+                                        && record.private_data().len() == 6
                                         && record.private_data().iter().all(|block| {
                                             block.as_bytes().len()
                                                 == if districts.format_version() >= 256 {
