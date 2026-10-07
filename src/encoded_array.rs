@@ -12,12 +12,9 @@ pub(crate) fn read_encoded_byte_array(
         let control = reader.read_u8()?;
         if control < 0x80 {
             let run_length = usize::from(control) + 1;
-            if run_length > count - values.len() {
-                return Err(
-                    reader.invalid("EncodedArray.Byte literal run exceeds the array length")
-                );
-            }
-            for _ in 0..run_length {
+            // The game stops reading when the preallocated array is full,
+            // even if this literal control advertises additional values.
+            for _ in 0..run_length.min(count - values.len()) {
                 let value = reader.read_u8()?;
                 previous_delta = value.wrapping_sub(previous_value) as i8;
                 previous_value = value;
@@ -289,8 +286,8 @@ fn repeated_delta_run(values: &[u16], start: usize, previous: u16, delta: i16) -
 #[cfg(test)]
 mod tests {
     use super::{
-        read_encoded_bool_array, read_encoded_uint_array, read_encoded_ulong_array,
-        read_encoded_ushort_array, write_encoded_bool_array,
+        read_encoded_bool_array, read_encoded_byte_array, read_encoded_uint_array,
+        read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_bool_array,
     };
     use crate::data_serializer::Reader;
 
@@ -378,5 +375,18 @@ mod tests {
         let mut empty = Reader::new(&[]);
         assert!(read_encoded_bool_array(&mut empty, 0).unwrap().is_empty());
         assert_eq!(empty.offset(), 0);
+    }
+
+    #[test]
+    fn byte_array_stops_at_requested_count_inside_literal_run() {
+        let bytes = [0x02, 0x11, 0x22, 0x33];
+        let mut reader = Reader::new(&bytes);
+
+        assert_eq!(
+            read_encoded_byte_array(&mut reader, 2).unwrap(),
+            [0x11, 0x22]
+        );
+        assert_eq!(reader.offset(), 3);
+        assert_eq!(reader.read_u8().unwrap(), 0x33);
     }
 }

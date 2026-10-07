@@ -12,14 +12,15 @@ const DISTRICT_EVENT_POLICIES_VERSION: u32 = 248;
 const PARK_POLICIES_VERSION: u32 = 110_009;
 const PARK_EVENT_POLICIES_VERSION: u32 = 112_015;
 const PARK_SPECIALIZATION_POLICIES_VERSION: u32 = 115_012;
+const LEGACY_POLICY_BOOL_VERSION: u32 = 43;
 const POLICY_COUNT: usize = 32;
 
 /// The initial known fields from `DistrictManager+Data`.
 ///
 /// The policy bool values are retained in serialized order: category first,
 /// then policy bit 0–31, then district or park index 0–127. This prefix stops
-/// before the later separate park-policy bool stream. Original bytes are
-/// retained for exact unchanged writing.
+/// before the district records. Original bytes are retained for exact
+/// unchanged writing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictManagerFlagsPrefix {
     format_version: u32,
@@ -30,14 +31,15 @@ pub struct DistrictManagerFlagsPrefix {
     park_flags_present: bool,
     park_flags: Vec<u32>,
     policy_bools: Option<Vec<bool>>,
+    legacy_policy_bools: Option<Vec<bool>>,
     serialized_prefix: Vec<u8>,
 }
 
 impl DistrictManagerFlagsPrefix {
-    /// Decodes the opening fields through the first policy bool stream.
+    /// Decodes the opening fields and both known policy bool streams.
     ///
     /// This prefix supports inner versions 164 and newer. It stops before the
-    /// policy-boolean arrays that follow district and park flags. Truncated or
+    /// district records that follow the policy bool streams. Truncated or
     /// malformed fields return an error.
     pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         if format_version < 164 {
@@ -72,6 +74,17 @@ impl DistrictManagerFlagsPrefix {
         } else {
             Some(read_encoded_bool_array(&mut reader, policy_bool_count)?)
         };
+        let legacy_bool_count =
+            DISTRICT_COUNT
+                .checked_mul(POLICY_COUNT)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "DistrictManager legacy policy bool count",
+                ))?;
+        let legacy_policy_bools = if format_version >= LEGACY_POLICY_BOOL_VERSION {
+            Some(read_encoded_bool_array(&mut reader, legacy_bool_count)?)
+        } else {
+            None
+        };
         let consumed = reader.offset();
 
         Ok((
@@ -84,6 +97,7 @@ impl DistrictManagerFlagsPrefix {
                 park_flags_present,
                 park_flags,
                 policy_bools,
+                legacy_policy_bools,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -133,6 +147,11 @@ impl DistrictManagerFlagsPrefix {
     /// 0–127 and is included only at its version gate.
     pub fn policy_bools(&self) -> Option<&[bool]> {
         self.policy_bools.as_deref()
+    }
+
+    /// Returns a later 32-by-128 bool table that `Deserialize` reads and discards.
+    pub fn legacy_policy_bools(&self) -> Option<&[bool]> {
+        self.legacy_policy_bools.as_deref()
     }
 
     /// Writes the original known prefix exactly.
@@ -191,6 +210,9 @@ mod tests {
         let count = district_policy_bool_count(version).unwrap();
         if count != 0 {
             write_encoded_bool_array(output, &vec![false; count]);
+        }
+        if version >= super::LEGACY_POLICY_BOOL_VERSION {
+            write_encoded_bool_array(output, &vec![false; POLICY_COUNT * 128]);
         }
     }
 
@@ -274,10 +296,15 @@ mod tests {
         let selected = POLICY_COUNT * 128 + 3 * 128 + 5;
         policies[selected] = true;
         write_encoded_bool_array(&mut bytes, &policies);
+        write_encoded_bool_array(&mut bytes, &vec![false; POLICY_COUNT * 128]);
 
         let (prefix, used) = DistrictManagerFlagsPrefix::decode_prefix(version, &bytes).unwrap();
         assert_eq!(used, bytes.len());
         assert_eq!(prefix.policy_bools().unwrap(), policies);
+        assert_eq!(
+            prefix.legacy_policy_bools().unwrap().len(),
+            POLICY_COUNT * 128
+        );
         assert_eq!(prefix.encode(), bytes);
     }
 }
