@@ -15,6 +15,7 @@ mod instance_manager_data;
 mod metadata;
 mod net_manager_data;
 mod path_manager_data;
+mod prop_manager_data;
 mod simulation_manager_data;
 mod simulation_metadata;
 mod terrain_manager_data;
@@ -50,6 +51,7 @@ pub use net_manager_data::{
     NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
+pub use prop_manager_data::PropManagerDataPrefix;
 pub use simulation_manager_data::{
     ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
 };
