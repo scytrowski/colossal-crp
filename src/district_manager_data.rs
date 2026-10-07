@@ -4,6 +4,7 @@ use crate::encoded_array::{
     read_encoded_bool_array, read_encoded_byte_array, read_encoded_uint_array,
     read_encoded_ulong_array, skip_encoded_ushort_array, write_encoded_byte_array,
 };
+use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 
 const DISTRICT_COUNT: usize = 128;
 const PARK_FLAGS_VERSION: u32 = 110_001;
@@ -146,6 +147,103 @@ pub struct DistrictManagerGridEditor {
     original: DistrictManagerGridData,
     district_dirty: bool,
     park_dirty: bool,
+}
+
+/// Versioned object headers and scalar fields after the DistrictManager grids.
+///
+/// Queued object bodies remain opaque. The exact header and profiler-tag bytes
+/// are retained for unchanged writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictManagerTailData {
+    object_headers: Vec<NetObjectHeader>,
+    next_policy_message_frames: [u32; 2],
+    district_policies_set: Option<u32>,
+    serialized: Vec<u8>,
+}
+
+impl DistrictManagerTailData {
+    /// Decodes the tail for inner versions 164 and newer.
+    ///
+    /// The returned byte count includes the DistrictManager profiler end tag.
+    /// Truncated headers, scalars, or tags return an error.
+    pub fn decode(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
+        if format_version < 164 {
+            return Err(invalid_district_manager(
+                0,
+                "DistrictManager tail requires inner version 164 or newer",
+            ));
+        }
+        let mut reader = Reader::new(bytes);
+        let mut object_headers = Vec::new();
+        for _ in 0..district_tail_object_header_count(format_version) {
+            object_headers.push(read_net_object_header(&mut reader)?);
+        }
+        let next_policy_message_frames = [reader.read_u32_be()?, reader.read_u32_be()?];
+        let district_policies_set = if format_version >= 178 {
+            Some(reader.read_u32_be()?)
+        } else {
+            None
+        };
+        match reader.read_u8()? {
+            0xff => {
+                return Err(invalid_district_manager(
+                    reader.offset(),
+                    "DistrictManager profiler end tag is null",
+                ));
+            }
+            0xfe => {
+                let name = reader.read_unique_string()?;
+                if name.as_deref() != Some("DistrictManager") {
+                    return Err(invalid_district_manager(
+                        reader.offset(),
+                        "wrong DistrictManager profiler end tag",
+                    ));
+                }
+            }
+            _high => {
+                reader.read_u8()?; // Existing shared-string index.
+            }
+        }
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                object_headers,
+                next_policy_message_frames,
+                district_policies_set,
+                serialized: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the queued object headers in serialized order.
+    pub fn object_headers(&self) -> &[NetObjectHeader] {
+        &self.object_headers
+    }
+
+    /// Returns the two saved policy-message frame counters.
+    pub fn next_policy_message_frames(&self) -> [u32; 2] {
+        self.next_policy_message_frames
+    }
+
+    /// Returns the saved district-policy bit set from inner version 178.
+    pub fn district_policies_set(&self) -> Option<u32> {
+        self.district_policies_set
+    }
+
+    /// Writes the original bytes exactly, including unknown object references.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized.clone()
+    }
+}
+
+fn district_tail_object_header_count(format_version: u32) -> usize {
+    2 + 2 * usize::from(format_version >= 110_022)
+        + 2 * usize::from(format_version >= 111_008)
+        + 8 * usize::from(format_version >= 112_016)
+        + 2 * usize::from(format_version >= 114_009)
+        + 2 * usize::from(format_version >= 115_024)
+        + usize::from(format_version >= 116_016)
 }
 
 impl DistrictManagerGridData {
@@ -1630,7 +1728,7 @@ mod tests {
     use super::{
         AIRLINE_NAME_VERSION, AIRPORT_PANEL_VERSION, DISTRICT_COUNT, DISTRICT_GRID_CELLS,
         DISTRICT_GRID_VALUES, DistrictManagerFlagsPrefix, DistrictManagerGridData,
-        PARK_FLAGS_VERSION, POLICY_COUNT, district_policy_bool_count,
+        DistrictManagerTailData, PARK_FLAGS_VERSION, POLICY_COUNT, district_policy_bool_count,
     };
     use crate::data_serializer::write_unique_string;
     use crate::encoded_array::{
@@ -2433,6 +2531,81 @@ mod tests {
             assert!(DistrictManagerGridData::decode(version, &bytes[..used - 1]).is_err());
         }
         assert!(DistrictManagerGridData::decode(163, &[]).is_err());
+    }
+
+    #[test]
+    fn district_tail_headers_follow_version_gates_and_preserve_wire_bytes() {
+        for (version, header_count) in [
+            (164, 2),
+            (110_021, 2),
+            (110_022, 4),
+            (111_007, 4),
+            (111_008, 6),
+            (112_015, 6),
+            (112_016, 14),
+            (114_008, 14),
+            (114_009, 16),
+            (115_023, 16),
+            (115_024, 18),
+            (116_015, 18),
+            (116_016, 19),
+        ] {
+            assert_eq!(
+                super::district_tail_object_header_count(version),
+                header_count
+            );
+            let mut bytes = vec![0xff; header_count];
+            bytes.extend_from_slice(&0x0102_0304_u32.to_be_bytes());
+            bytes.extend_from_slice(&0xaabb_ccdd_u32.to_be_bytes());
+            if version >= 178 {
+                bytes.extend_from_slice(&0x1020_3040_u32.to_be_bytes());
+            }
+            bytes.push(0xfe);
+            write_unique_string(&mut bytes, "DistrictManager").unwrap();
+            let used = bytes.len();
+            bytes.push(0xaa);
+            let (tail, consumed) = DistrictManagerTailData::decode(version, &bytes).unwrap();
+            assert_eq!(consumed, used);
+            assert_eq!(tail.object_headers().len(), header_count);
+            assert!(
+                tail.object_headers()
+                    .iter()
+                    .all(|header| matches!(header, crate::NetObjectHeader::Null))
+            );
+            assert_eq!(
+                tail.next_policy_message_frames(),
+                [0x0102_0304, 0xaabb_ccdd]
+            );
+            assert_eq!(
+                tail.district_policies_set(),
+                (version >= 178).then_some(0x1020_3040)
+            );
+            assert_eq!(tail.encode(), bytes[..used]);
+            assert_eq!(bytes[used], 0xaa);
+            assert!(DistrictManagerTailData::decode(version, &bytes[..used - 1]).is_err());
+            let mut wrong = bytes[..used].to_vec();
+            wrong[header_count] = 0xff; // Truncates a frame, changing the tail boundary.
+            wrong.truncate(header_count + 7);
+            assert!(DistrictManagerTailData::decode(version, &wrong).is_err());
+        }
+        assert!(DistrictManagerTailData::decode(163, &[]).is_err());
+    }
+
+    #[test]
+    fn game_tail_fixture_confirms_standard_headers_and_exposes_mp23_difference() {
+        let desert = include_bytes!("../tests/fixtures/district-tail-v116020-desert.bin");
+        let (tail, used) = DistrictManagerTailData::decode(116_020, desert).unwrap();
+        assert_eq!(used, 71);
+        assert_eq!(tail.object_headers().len(), 19);
+        assert_eq!(tail.next_policy_message_frames(), [0, 0]);
+        assert_eq!(tail.district_policies_set(), Some(0));
+        assert_eq!(tail.encode(), desert);
+
+        let mp23 = include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin");
+        assert_eq!(mp23.len(), 44);
+        assert!(mp23[..42].iter().all(|byte| *byte == 0xff));
+        assert_eq!(&mp23[42..], &[0x00, 0x19]);
+        assert!(DistrictManagerTailData::decode(117_013, mp23).is_err());
     }
 
     #[test]

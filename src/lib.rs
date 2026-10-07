@@ -42,10 +42,11 @@ pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictDemographicBlock, DistrictDemographicKind,
     DistrictHotelBlock, DistrictManagerFlagsPrefix, DistrictManagerGridData,
-    DistrictManagerGridEditor, DistrictParkRecord, DistrictPopulationRecord,
-    DistrictPrivateDataBlock, DistrictPrivateDataKind, DistrictSpecializationBlock,
-    DistrictSpecializationKind, DistrictStatisticsBlock, DistrictStatisticsKind,
-    DistrictSubCultureBlock, DistrictSubCultureKind, DistrictTourismBlock, DistrictTourismKind,
+    DistrictManagerGridEditor, DistrictManagerTailData, DistrictParkRecord,
+    DistrictPopulationRecord, DistrictPrivateDataBlock, DistrictPrivateDataKind,
+    DistrictSpecializationBlock, DistrictSpecializationKind, DistrictStatisticsBlock,
+    DistrictStatisticsKind, DistrictSubCultureBlock, DistrictSubCultureKind, DistrictTourismBlock,
+    DistrictTourismKind,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
@@ -3876,6 +3877,84 @@ mod tests {
             && style_match
             && library_match
             && airline_match
+    }
+
+    #[test]
+    #[ignore = "set CRP_CORPUS_DIR and run explicitly to check local DistrictManager grids"]
+    fn validates_optional_district_grid_corpus() -> Result<(), Box<dyn std::error::Error>> {
+        let maps_dir = std::env::var_os("CRP_CORPUS_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| std::io::Error::other("CRP_CORPUS_DIR is not set"))?;
+        let mut paths = fs::read_dir(maps_dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.retain(|path| path.extension().is_some_and(|extension| extension == "crp"));
+        paths.sort();
+        assert!(!paths.is_empty(), "external corpus contains no .crp files");
+        let mut manager_assets = 0_usize;
+        let mut active_parks = 0_usize;
+        let mut empty_park_assets = 0_usize;
+        let mut matching_tails = 0_usize;
+        let mut differing_tails = Vec::new();
+        for path in &paths {
+            let package = Package::read_from(&mut File::open(path)?)?;
+            for asset in package.assets.iter().filter(|asset| asset.asset_type == 52) {
+                let (_, metadata_bytes) = SimulationMetaData::decode_from(&asset.data)?;
+                let manager = SimulationManagerData::decode(&asset.data[metadata_bytes..])?;
+                let (prefix, park_start) = manager.decode_district_manager_flags_prefix()?;
+                let graph = manager.serialized_object_graph();
+                let (records, park_bytes) = prefix.decode_park_records(&graph[park_start..])?;
+                let flagged = prefix
+                    .park_flags()
+                    .iter()
+                    .filter(|flag| **flag != 0)
+                    .count();
+                assert_eq!(records.len(), flagged, "{}", path.display());
+                active_parks += flagged;
+                empty_park_assets += usize::from(flagged == 0);
+                let (grids, grid_end) = manager.decode_district_manager_grids()?;
+                let grid_start = park_start + park_bytes;
+                assert_eq!(grid_end - grid_start, grids.encode().len());
+                assert_eq!(&graph[grid_start..grid_end], grids.encode());
+                assert!(grid_end < graph.len(), "{}", path.display());
+                match manager.decode_district_manager_tail() {
+                    Ok((tail, tail_end)) => {
+                        assert!(tail_end > grid_end && tail_end <= graph.len());
+                        assert_eq!(&graph[grid_end..tail_end], tail.encode());
+                        matching_tails += 1;
+                    }
+                    Err(error) => {
+                        let leading_nulls = graph[grid_end..]
+                            .iter()
+                            .take_while(|byte| **byte == 0xff)
+                            .count();
+                        differing_tails.push((
+                            path.display().to_string(),
+                            manager.format_version(),
+                            leading_nulls,
+                            error.to_string(),
+                        ));
+                    }
+                }
+                manager_assets += 1;
+            }
+        }
+        assert!(manager_assets > 0);
+        eprintln!(
+            "DistrictManager corpus: {} maps, {} manager assets, {} active parks, {} empty-park assets, {} matching tails, {} differing tails",
+            paths.len(),
+            manager_assets,
+            active_parks,
+            empty_park_assets,
+            matching_tails,
+            differing_tails.len()
+        );
+        for (path, version, nulls, error) in differing_tails.iter().take(10) {
+            eprintln!(
+                "tail difference: {path}, version {version}, {nulls} initial FF bytes: {error}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

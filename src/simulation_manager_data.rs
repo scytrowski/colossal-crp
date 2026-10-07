@@ -21,7 +21,7 @@ use crate::{
     BuildingRaceTeamUnassignedPrefix, BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
 };
 use crate::{BuildingEconomicFieldsEditor, BuildingPopulationEditor, BuildingTimerGeometryEditor};
-use crate::{DistrictManagerFlagsPrefix, DistrictManagerGridData};
+use crate::{DistrictManagerFlagsPrefix, DistrictManagerGridData, DistrictManagerTailData};
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
     NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
@@ -896,6 +896,24 @@ impl SimulationManagerData {
             .checked_add(grid_len)
             .ok_or(CrpError::ArithmeticOverflow("DistrictManager grid end"))?;
         Ok((grids, grid_end))
+    }
+
+    /// Decodes DistrictManager object headers and scalars after the grids.
+    ///
+    /// The returned graph offset follows the manager's profiler end tag.
+    /// Queued object bodies remain opaque and available in the original graph.
+    pub fn decode_district_manager_tail(
+        &self,
+    ) -> Result<(DistrictManagerTailData, usize), CrpError> {
+        let (_, grid_end) = self.decode_district_manager_grids()?;
+        let (tail, tail_len) = DistrictManagerTailData::decode(
+            self.format_version,
+            &self.serialized_object_graph[grid_end..],
+        )?;
+        let tail_end = grid_end
+            .checked_add(tail_len)
+            .ok_or(CrpError::ArithmeticOverflow("DistrictManager tail end"))?;
+        Ok((tail, tail_end))
     }
 
     /// Replaces district and park grid streams in the manager graph.
