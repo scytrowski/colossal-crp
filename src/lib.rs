@@ -42,11 +42,12 @@ pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictDemographicBlock, DistrictDemographicKind,
     DistrictHotelBlock, DistrictManagerFlagsPrefix, DistrictManagerGridData,
-    DistrictManagerGridEditor, DistrictManagerTailData, DistrictParkEditor, DistrictParkRecord,
-    DistrictPopulationRecord, DistrictPrivateDataBlock, DistrictPrivateDataKind,
-    DistrictSpecializationBlock, DistrictSpecializationKind, DistrictStatisticsBlock,
-    DistrictStatisticsKind, DistrictSubCultureBlock, DistrictSubCultureKind, DistrictTourismBlock,
-    DistrictTourismKind,
+    DistrictManagerGridEditor, DistrictManagerTailData, DistrictParkAttractiveness,
+    DistrictParkCapacities, DistrictParkEditor, DistrictParkGateData, DistrictParkRecord,
+    DistrictParkVisitorData, DistrictPopulationRecord, DistrictPrivateDataBlock,
+    DistrictPrivateDataKind, DistrictSpecializationBlock, DistrictSpecializationKind,
+    DistrictStatisticsBlock, DistrictStatisticsKind, DistrictSubCultureBlock,
+    DistrictSubCultureKind, DistrictTourismBlock, DistrictTourismKind,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};

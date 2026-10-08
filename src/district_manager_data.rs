@@ -83,6 +83,8 @@ const TYPE_ZERO_PARK_HAPPINESS_U16_VERSION: u32 = 115_011;
 const TYPE_ZERO_PARK_HAPPINESS_U32_VERSION: u32 = 115_022;
 const TYPE_ZERO_PARK_EARLY_BYTES: usize = 62;
 const TYPE_ZERO_PARK_BASE_TYPE_OFFSET: usize = 42;
+const PARK_VISITOR_BLOCK_BYTES: usize = 22;
+const PARK_LAST_VISITOR_COUNT_BYTES: usize = 4;
 const DISTRICT_GRID_CELLS: usize = 262_144;
 const DISTRICT_GRID_PLANES: usize = 8;
 const DISTRICT_GRID_VALUES: usize = DISTRICT_GRID_CELLS * DISTRICT_GRID_PLANES;
@@ -124,13 +126,90 @@ pub struct DistrictParkRecord {
     condition: u16,
     level: u8,
     level_offset: usize,
+    visitor_data: Option<DistrictParkVisitorData>,
+    gate_data: Option<DistrictParkGateData>,
+    capacities: Option<DistrictParkCapacities>,
+    day_night_count: Option<u8>,
+    attractiveness: Option<DistrictParkAttractiveness>,
+    area_factor: Option<u8>,
+    post_level_offsets: ParkPostLevelFieldOffsets,
     serialized: Vec<u8>,
+}
+
+/// Ticket and visitor fields stored in an active park record from inner version 110008.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictParkVisitorData {
+    total_visitors: u32,
+    temporary_ticket_income: u32,
+    final_ticket_income: u32,
+    ticket_price: u16,
+    temporary_residents: u16,
+    final_residents: u16,
+    temporary_tourists: u16,
+    final_tourists: u16,
+    last_visitor_count: Option<u32>,
+    field_offsets: ParkVisitorFieldOffsets,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParkVisitorFieldOffsets {
+    total_visitors: usize,
+    temporary_ticket_income: usize,
+    final_ticket_income: usize,
+    ticket_price: usize,
+    temporary_residents: usize,
+    final_residents: usize,
+    temporary_tourists: usize,
+    final_tourists: usize,
+    last_visitor_count: Option<usize>,
+}
+
+/// Random and temporary/final gate values stored from inner version 110012.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistrictParkGateData {
+    /// Serialized random gate index.
+    pub random_gate: u16,
+    /// Temporary gate count.
+    pub temporary_count: u8,
+    /// Final gate count.
+    pub final_count: u8,
+}
+
+/// Temporary and final capacities stored from inner version 110018.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistrictParkCapacities {
+    /// Temporary visitor capacity.
+    pub temporary_visitors: u16,
+    /// Final visitor capacity.
+    pub final_visitors: u16,
+    /// Temporary main-building capacity.
+    pub temporary_main: u16,
+    /// Final main-building capacity.
+    pub final_main: u16,
+}
+
+/// Temporary and final attractiveness accumulators stored from inner version 110020.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistrictParkAttractiveness {
+    /// Temporary attractiveness accumulation.
+    pub temporary: u16,
+    /// Final attractiveness accumulation.
+    pub final_value: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParkPostLevelFieldOffsets {
+    gates: Option<usize>,
+    capacities: Option<usize>,
+    day_night_count: Option<usize>,
+    attractiveness: Option<usize>,
+    area_factor: Option<usize>,
 }
 
 /// Editor for the common scalar fields of one active DistrictManager park.
 ///
-/// All unmodeled fields remain byte-for-byte intact. Only the random seed,
-/// main gate, condition, and level can be changed.
+/// All unmodeled fields remain byte-for-byte intact. Common scalar fields and
+/// versioned ticket and visitor fields can be changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkEditor {
     original_serialized: Vec<u8>,
@@ -449,6 +528,36 @@ impl DistrictParkRecord {
         self.level
     }
 
+    /// Returns ticket and visitor counters when serialized by this version.
+    pub fn visitor_data(&self) -> Option<&DistrictParkVisitorData> {
+        self.visitor_data.as_ref()
+    }
+
+    /// Returns gate values when serialized by this version.
+    pub fn gate_data(&self) -> Option<DistrictParkGateData> {
+        self.gate_data
+    }
+
+    /// Returns visitor and main-building capacities when serialized by this version.
+    pub fn capacities(&self) -> Option<DistrictParkCapacities> {
+        self.capacities
+    }
+
+    /// Returns the day/night counter when serialized by this version.
+    pub fn day_night_count(&self) -> Option<u8> {
+        self.day_night_count
+    }
+
+    /// Returns attractiveness accumulators when serialized by this version.
+    pub fn attractiveness(&self) -> Option<DistrictParkAttractiveness> {
+        self.attractiveness
+    }
+
+    /// Returns the park area factor when serialized by this version.
+    pub fn area_factor(&self) -> Option<u8> {
+        self.area_factor
+    }
+
     /// Creates an editor that preserves all unmodeled bytes in this record.
     pub fn into_editor(self) -> DistrictParkEditor {
         DistrictParkEditor {
@@ -460,6 +569,53 @@ impl DistrictParkRecord {
     /// Writes the exact record bytes, including fields not yet modeled.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized.clone()
+    }
+}
+
+impl DistrictParkVisitorData {
+    /// Returns the total visitor count.
+    pub fn total_visitors(&self) -> u32 {
+        self.total_visitors
+    }
+
+    /// Returns temporary ticket income.
+    pub fn temporary_ticket_income(&self) -> u32 {
+        self.temporary_ticket_income
+    }
+
+    /// Returns final ticket income.
+    pub fn final_ticket_income(&self) -> u32 {
+        self.final_ticket_income
+    }
+
+    /// Returns the ticket price.
+    pub fn ticket_price(&self) -> u16 {
+        self.ticket_price
+    }
+
+    /// Returns the temporary resident count.
+    pub fn temporary_residents(&self) -> u16 {
+        self.temporary_residents
+    }
+
+    /// Returns the final resident count.
+    pub fn final_residents(&self) -> u16 {
+        self.final_residents
+    }
+
+    /// Returns the temporary tourist count.
+    pub fn temporary_tourists(&self) -> u16 {
+        self.temporary_tourists
+    }
+
+    /// Returns the final tourist count.
+    pub fn final_tourists(&self) -> u16 {
+        self.final_tourists
+    }
+
+    /// Returns the last visitor count from inner version 110014.
+    pub fn last_visitor_count(&self) -> Option<u32> {
+        self.last_visitor_count
     }
 }
 
@@ -517,6 +673,196 @@ impl DistrictParkEditor {
         Ok(())
     }
 
+    /// Returns ticket and visitor fields when serialized by this version.
+    pub fn visitor_data(&self) -> Option<&DistrictParkVisitorData> {
+        self.record.visitor_data()
+    }
+
+    /// Returns gate values when serialized by this version.
+    pub fn gate_data(&self) -> Option<DistrictParkGateData> {
+        self.record.gate_data()
+    }
+
+    /// Replaces the random gate and temporary/final gate counts.
+    pub fn set_gate_data(&mut self, value: DistrictParkGateData) -> Result<(), CrpError> {
+        let offset = self
+            .record
+            .post_level_offsets
+            .gates
+            .ok_or_else(|| invalid_district_manager(0, "park gate fields are absent"))?;
+        self.write_field(offset, &value.random_gate.to_be_bytes(), "random gate")?;
+        self.write_field(offset + 2, &[value.temporary_count], "temporary gate count")?;
+        self.write_field(offset + 3, &[value.final_count], "final gate count")?;
+        self.record.gate_data = Some(value);
+        Ok(())
+    }
+
+    /// Returns visitor and main-building capacities when serialized by this version.
+    pub fn capacities(&self) -> Option<DistrictParkCapacities> {
+        self.record.capacities()
+    }
+
+    /// Replaces all four temporary/final visitor and main-building capacities.
+    pub fn set_capacities(&mut self, value: DistrictParkCapacities) -> Result<(), CrpError> {
+        let offset = self
+            .record
+            .post_level_offsets
+            .capacities
+            .ok_or_else(|| invalid_district_manager(0, "park capacities are absent"))?;
+        for (field_offset, field_value, name) in [
+            (
+                offset,
+                value.temporary_visitors,
+                "temporary visitor capacity",
+            ),
+            (offset + 2, value.final_visitors, "final visitor capacity"),
+            (offset + 4, value.temporary_main, "temporary main capacity"),
+            (offset + 6, value.final_main, "final main capacity"),
+        ] {
+            self.write_field(field_offset, &field_value.to_be_bytes(), name)?;
+        }
+        self.record.capacities = Some(value);
+        Ok(())
+    }
+
+    /// Returns the day/night counter when serialized by this version.
+    pub fn day_night_count(&self) -> Option<u8> {
+        self.record.day_night_count()
+    }
+
+    /// Replaces the day/night counter.
+    pub fn set_day_night_count(&mut self, value: u8) -> Result<(), CrpError> {
+        let offset = self
+            .record
+            .post_level_offsets
+            .day_night_count
+            .ok_or_else(|| invalid_district_manager(0, "day/night field is absent"))?;
+        self.write_field(offset, &[value], "day/night counter")?;
+        self.record.day_night_count = Some(value);
+        Ok(())
+    }
+
+    /// Returns attractiveness accumulators when serialized by this version.
+    pub fn attractiveness(&self) -> Option<DistrictParkAttractiveness> {
+        self.record.attractiveness()
+    }
+
+    /// Replaces temporary and final attractiveness accumulators.
+    pub fn set_attractiveness(
+        &mut self,
+        value: DistrictParkAttractiveness,
+    ) -> Result<(), CrpError> {
+        let offset = self
+            .record
+            .post_level_offsets
+            .attractiveness
+            .ok_or_else(|| invalid_district_manager(0, "park attractiveness fields are absent"))?;
+        self.write_field(
+            offset,
+            &value.temporary.to_be_bytes(),
+            "temporary attractiveness",
+        )?;
+        self.write_field(
+            offset + 2,
+            &value.final_value.to_be_bytes(),
+            "final attractiveness",
+        )?;
+        self.record.attractiveness = Some(value);
+        Ok(())
+    }
+
+    /// Returns the park area factor when serialized by this version.
+    pub fn area_factor(&self) -> Option<u8> {
+        self.record.area_factor()
+    }
+
+    /// Replaces the park area factor.
+    pub fn set_area_factor(&mut self, value: u8) -> Result<(), CrpError> {
+        let offset = self
+            .record
+            .post_level_offsets
+            .area_factor
+            .ok_or_else(|| invalid_district_manager(0, "park area factor is absent"))?;
+        self.write_field(offset, &[value], "park area factor")?;
+        self.record.area_factor = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the total visitor count.
+    pub fn set_total_visitors(&mut self, value: u32) -> Result<(), CrpError> {
+        let offset = self.visitor_offsets()?.total_visitors;
+        self.write_field(offset, &value.to_be_bytes(), "total visitor count")?;
+        self.visitor_data_mut()?.total_visitors = value;
+        Ok(())
+    }
+
+    /// Replaces temporary ticket income.
+    pub fn set_temporary_ticket_income(&mut self, value: u32) -> Result<(), CrpError> {
+        let offset = self.visitor_offsets()?.temporary_ticket_income;
+        self.write_field(offset, &value.to_be_bytes(), "temporary ticket income")?;
+        self.visitor_data_mut()?.temporary_ticket_income = value;
+        Ok(())
+    }
+
+    /// Replaces final ticket income.
+    pub fn set_final_ticket_income(&mut self, value: u32) -> Result<(), CrpError> {
+        let offset = self.visitor_offsets()?.final_ticket_income;
+        self.write_field(offset, &value.to_be_bytes(), "final ticket income")?;
+        self.visitor_data_mut()?.final_ticket_income = value;
+        Ok(())
+    }
+
+    /// Replaces the ticket price.
+    pub fn set_ticket_price(&mut self, value: u16) -> Result<(), CrpError> {
+        let offset = self.visitor_offsets()?.ticket_price;
+        self.write_field(offset, &value.to_be_bytes(), "ticket price")?;
+        self.visitor_data_mut()?.ticket_price = value;
+        Ok(())
+    }
+
+    /// Replaces the temporary resident count.
+    pub fn set_temporary_residents(&mut self, value: u16) -> Result<(), CrpError> {
+        let offset = self.visitor_offsets()?.temporary_residents;
+        self.write_field(offset, &value.to_be_bytes(), "temporary resident count")?;
+        self.visitor_data_mut()?.temporary_residents = value;
+        Ok(())
+    }
+
+    /// Replaces the final resident count.
+    pub fn set_final_residents(&mut self, value: u16) -> Result<(), CrpError> {
+        let offset = self.visitor_offsets()?.final_residents;
+        self.write_field(offset, &value.to_be_bytes(), "final resident count")?;
+        self.visitor_data_mut()?.final_residents = value;
+        Ok(())
+    }
+
+    /// Replaces the temporary tourist count.
+    pub fn set_temporary_tourists(&mut self, value: u16) -> Result<(), CrpError> {
+        let offset = self.visitor_offsets()?.temporary_tourists;
+        self.write_field(offset, &value.to_be_bytes(), "temporary tourist count")?;
+        self.visitor_data_mut()?.temporary_tourists = value;
+        Ok(())
+    }
+
+    /// Replaces the final tourist count.
+    pub fn set_final_tourists(&mut self, value: u16) -> Result<(), CrpError> {
+        let offset = self.visitor_offsets()?.final_tourists;
+        self.write_field(offset, &value.to_be_bytes(), "final tourist count")?;
+        self.visitor_data_mut()?.final_tourists = value;
+        Ok(())
+    }
+
+    /// Replaces the last visitor count from inner version 110014.
+    pub fn set_last_visitor_count(&mut self, value: u32) -> Result<(), CrpError> {
+        let offset = self
+            .visitor_offsets()?
+            .last_visitor_count
+            .ok_or_else(|| invalid_district_manager(0, "last visitor count is absent"))?;
+        self.write_field(offset, &value.to_be_bytes(), "last visitor count")?;
+        self.visitor_data_mut()?.last_visitor_count = Some(value);
+        Ok(())
+    }
+
     /// Writes the edited record while retaining every unmodeled byte.
     pub fn encode(&self) -> Vec<u8> {
         self.record.serialized.clone()
@@ -537,6 +883,21 @@ impl DistrictParkEditor {
         })?;
         destination.copy_from_slice(value);
         Ok(())
+    }
+
+    fn visitor_offsets(&self) -> Result<ParkVisitorFieldOffsets, CrpError> {
+        self.record
+            .visitor_data
+            .as_ref()
+            .map(|data| data.field_offsets)
+            .ok_or_else(|| invalid_district_manager(0, "visitor fields are absent"))
+    }
+
+    fn visitor_data_mut(&mut self) -> Result<&mut DistrictParkVisitorData, CrpError> {
+        self.record
+            .visitor_data
+            .as_mut()
+            .ok_or_else(|| invalid_district_manager(0, "visitor fields are absent"))
     }
 }
 
@@ -1413,6 +1774,15 @@ impl DistrictManagerFlagsPrefix {
             let main_gate = u16::from_be_bytes([fixed[8], fixed[9]]);
             let condition = u16::from_be_bytes([fixed[10], fixed[11]]);
             let level = fixed[type_offset + 1];
+            let visitor_data = decode_park_visitor_data(self.format_version, type_offset, fixed)?;
+            let (
+                gate_data,
+                capacities,
+                day_night_count,
+                attractiveness,
+                area_factor,
+                post_level_offsets,
+            ) = decode_park_post_level_data(self.format_version, type_offset, fixed)?;
             if (5..=9).contains(&park_type)
                 && self.format_version >= TYPE_ZERO_PARK_PRODUCTION_VERSION
             {
@@ -1486,6 +1856,13 @@ impl DistrictManagerFlagsPrefix {
                 condition,
                 level,
                 level_offset: type_offset + 1,
+                visitor_data,
+                gate_data,
+                capacities,
+                day_night_count,
+                attractiveness,
+                area_factor,
+                post_level_offsets,
                 serialized: bytes[offset..end].to_vec(),
             });
             offset = end;
@@ -1520,6 +1897,173 @@ fn park_scalar_bytes(format_version: u32) -> usize {
         bytes += 8; // u32 production and two u16 worker counts.
     }
     bytes
+}
+
+fn park_visitor_field_offsets(
+    format_version: u32,
+    type_offset: usize,
+) -> Option<ParkVisitorFieldOffsets> {
+    if format_version < 110_008 {
+        return None;
+    }
+    let block_start = type_offset.checked_sub(PARK_VISITOR_BLOCK_BYTES)?;
+    let last_visitor_count = (format_version >= 110_014)
+        .then(|| block_start.checked_sub(PARK_LAST_VISITOR_COUNT_BYTES))
+        .flatten();
+    Some(ParkVisitorFieldOffsets {
+        total_visitors: block_start,
+        temporary_ticket_income: block_start + 4,
+        final_ticket_income: block_start + 8,
+        ticket_price: block_start + 12,
+        temporary_residents: block_start + 14,
+        final_residents: block_start + 16,
+        temporary_tourists: block_start + 18,
+        final_tourists: block_start + 20,
+        last_visitor_count,
+    })
+}
+
+fn park_post_level_field_offsets(
+    format_version: u32,
+    type_offset: usize,
+) -> Result<ParkPostLevelFieldOffsets, CrpError> {
+    let mut cursor = type_offset
+        .checked_add(2)
+        .ok_or(CrpError::ArithmeticOverflow("park type and level end"))?;
+    let mut take = |gate: u32, size: usize| -> Result<Option<usize>, CrpError> {
+        if format_version < gate {
+            return Ok(None);
+        }
+        let offset = cursor;
+        cursor = cursor
+            .checked_add(size)
+            .ok_or(CrpError::ArithmeticOverflow("park scalar field end"))?;
+        Ok(Some(offset))
+    };
+    Ok(ParkPostLevelFieldOffsets {
+        gates: take(110_012, 4)?,
+        capacities: take(110_018, 8)?,
+        day_night_count: take(110_019, 1)?,
+        attractiveness: take(110_020, 4)?,
+        area_factor: take(110_024, 1)?,
+    })
+}
+
+fn read_park_u16(bytes: &[u8], offset: usize) -> Result<u16, CrpError> {
+    let mut reader = Reader::new(bytes.get(offset..).ok_or_else(|| {
+        invalid_district_manager(offset, "park visitor field offset is outside the record")
+    })?);
+    reader
+        .read_u16_be()
+        .map_err(|error| invalid_district_manager(offset, format!("park visitor field: {error}")))
+}
+
+fn read_park_u8(bytes: &[u8], offset: usize) -> Result<u8, CrpError> {
+    let mut reader = Reader::new(bytes.get(offset..).ok_or_else(|| {
+        invalid_district_manager(offset, "park scalar field offset is outside the record")
+    })?);
+    reader
+        .read_u8()
+        .map_err(|error| invalid_district_manager(offset, format!("park scalar field: {error}")))
+}
+
+fn read_park_u32(bytes: &[u8], offset: usize) -> Result<u32, CrpError> {
+    let mut reader = Reader::new(bytes.get(offset..).ok_or_else(|| {
+        invalid_district_manager(offset, "park visitor field offset is outside the record")
+    })?);
+    reader
+        .read_u32_be()
+        .map_err(|error| invalid_district_manager(offset, format!("park visitor field: {error}")))
+}
+
+fn decode_park_visitor_data(
+    format_version: u32,
+    type_offset: usize,
+    record: &[u8],
+) -> Result<Option<DistrictParkVisitorData>, CrpError> {
+    let Some(field_offsets) = park_visitor_field_offsets(format_version, type_offset) else {
+        return Ok(None);
+    };
+    let last_visitor_count = field_offsets
+        .last_visitor_count
+        .map(|offset| read_park_u32(record, offset))
+        .transpose()?;
+    Ok(Some(DistrictParkVisitorData {
+        total_visitors: read_park_u32(record, field_offsets.total_visitors)?,
+        temporary_ticket_income: read_park_u32(record, field_offsets.temporary_ticket_income)?,
+        final_ticket_income: read_park_u32(record, field_offsets.final_ticket_income)?,
+        ticket_price: read_park_u16(record, field_offsets.ticket_price)?,
+        temporary_residents: read_park_u16(record, field_offsets.temporary_residents)?,
+        final_residents: read_park_u16(record, field_offsets.final_residents)?,
+        temporary_tourists: read_park_u16(record, field_offsets.temporary_tourists)?,
+        final_tourists: read_park_u16(record, field_offsets.final_tourists)?,
+        last_visitor_count,
+        field_offsets,
+    }))
+}
+
+fn decode_park_post_level_data(
+    format_version: u32,
+    type_offset: usize,
+    record: &[u8],
+) -> Result<
+    (
+        Option<DistrictParkGateData>,
+        Option<DistrictParkCapacities>,
+        Option<u8>,
+        Option<DistrictParkAttractiveness>,
+        Option<u8>,
+        ParkPostLevelFieldOffsets,
+    ),
+    CrpError,
+> {
+    let offsets = park_post_level_field_offsets(format_version, type_offset)?;
+    let gates = offsets
+        .gates
+        .map(|offset| -> Result<DistrictParkGateData, CrpError> {
+            Ok(DistrictParkGateData {
+                random_gate: read_park_u16(record, offset)?,
+                temporary_count: read_park_u8(record, offset + 2)?,
+                final_count: read_park_u8(record, offset + 3)?,
+            })
+        })
+        .transpose()?;
+    let capacities = offsets
+        .capacities
+        .map(|offset| -> Result<DistrictParkCapacities, CrpError> {
+            Ok(DistrictParkCapacities {
+                temporary_visitors: read_park_u16(record, offset)?,
+                final_visitors: read_park_u16(record, offset + 2)?,
+                temporary_main: read_park_u16(record, offset + 4)?,
+                final_main: read_park_u16(record, offset + 6)?,
+            })
+        })
+        .transpose()?;
+    let day_night_count = offsets
+        .day_night_count
+        .map(|offset| read_park_u8(record, offset))
+        .transpose()?;
+    let attractiveness = offsets
+        .attractiveness
+        .map(|offset| -> Result<DistrictParkAttractiveness, CrpError> {
+            Ok(DistrictParkAttractiveness {
+                temporary: read_park_u16(record, offset)?,
+                final_value: read_park_u16(record, offset + 2)?,
+            })
+        })
+        .transpose()?;
+    let area_factor = offsets
+        .area_factor
+        .map(|offset| read_park_u8(record, offset))
+        .transpose()?;
+    Ok((
+        gates,
+        capacities,
+        day_night_count,
+        attractiveness,
+        area_factor,
+        offsets,
+    ))
 }
 
 fn airport_park_bytes(format_version: u32) -> usize {
@@ -1853,7 +2397,8 @@ mod tests {
     use super::{
         AIRLINE_NAME_VERSION, AIRPORT_PANEL_VERSION, DISTRICT_COUNT, DISTRICT_GRID_CELLS,
         DISTRICT_GRID_VALUES, DistrictManagerFlagsPrefix, DistrictManagerGridData,
-        DistrictManagerTailData, PARK_FLAGS_VERSION, POLICY_COUNT, district_policy_bool_count,
+        DistrictManagerTailData, DistrictParkAttractiveness, DistrictParkCapacities,
+        DistrictParkGateData, PARK_FLAGS_VERSION, POLICY_COUNT, district_policy_bool_count,
     };
     use crate::data_serializer::{Reader, write_unique_string};
     use crate::encoded_array::{
@@ -2562,6 +3107,281 @@ mod tests {
     }
 
     #[test]
+    fn park_ticket_and_visitor_fields_follow_versioned_offsets() {
+        assert!(super::park_visitor_field_offsets(110_007, 42).is_none());
+        assert_eq!(
+            super::park_visitor_field_offsets(110_008, 42)
+                .unwrap()
+                .last_visitor_count,
+            None
+        );
+        assert_eq!(
+            super::park_visitor_field_offsets(110_014, 42)
+                .unwrap()
+                .last_visitor_count,
+            Some(16)
+        );
+
+        for (version, happiness_bytes) in [(110_025, 0), (115_011, 4), (115_022, 16)] {
+            let mut prefix_bytes = Vec::new();
+            if version >= 114_006 {
+                write_unique_string(&mut prefix_bytes, "").unwrap();
+            }
+            if version >= 114_007 {
+                prefix_bytes.push(0);
+            }
+            zero_flags(&mut prefix_bytes);
+            let mut park_flags = [0_u32; DISTRICT_COUNT];
+            park_flags[5] = 1;
+            write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+            zero_policy_bools(&mut prefix_bytes, version);
+            let (prefix, _) =
+                DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+
+            let type_offset = super::TYPE_ZERO_PARK_BASE_TYPE_OFFSET + happiness_bytes;
+            let offsets = super::park_visitor_field_offsets(version, type_offset).unwrap();
+            let (visitor_start, last_visitor_count) = match version {
+                110_025 => (20, Some(16)),
+                115_011 => (24, Some(20)),
+                115_022 => (36, Some(32)),
+                _ => unreachable!("test version is enumerated above"),
+            };
+            assert_eq!(
+                offsets,
+                super::ParkVisitorFieldOffsets {
+                    total_visitors: visitor_start,
+                    temporary_ticket_income: visitor_start + 4,
+                    final_ticket_income: visitor_start + 8,
+                    ticket_price: visitor_start + 12,
+                    temporary_residents: visitor_start + 14,
+                    final_residents: visitor_start + 16,
+                    temporary_tourists: visitor_start + 18,
+                    final_tourists: visitor_start + 20,
+                    last_visitor_count,
+                }
+            );
+            let mut record = vec![0; super::park_scalar_bytes(version)];
+            record[type_offset + 1] = 3;
+            for (offset, value) in [
+                (
+                    offsets.total_visitors,
+                    0x0102_0304_u32.to_be_bytes().to_vec(),
+                ),
+                (
+                    offsets.temporary_ticket_income,
+                    0x1112_1314_u32.to_be_bytes().to_vec(),
+                ),
+                (
+                    offsets.final_ticket_income,
+                    0x2122_2324_u32.to_be_bytes().to_vec(),
+                ),
+                (offsets.ticket_price, 0x3132_u16.to_be_bytes().to_vec()),
+                (
+                    offsets.temporary_residents,
+                    0x4142_u16.to_be_bytes().to_vec(),
+                ),
+                (offsets.final_residents, 0x5152_u16.to_be_bytes().to_vec()),
+                (
+                    offsets.temporary_tourists,
+                    0x6162_u16.to_be_bytes().to_vec(),
+                ),
+                (offsets.final_tourists, 0x7172_u16.to_be_bytes().to_vec()),
+            ] {
+                record[offset..offset + value.len()].copy_from_slice(&value);
+            }
+            if let Some(offset) = offsets.last_visitor_count {
+                record[offset..offset + 4].copy_from_slice(&0x3132_3334_u32.to_be_bytes());
+            }
+
+            let (records, used) = prefix.decode_type_zero_park_records(&record).unwrap();
+            assert_eq!(used, record.len());
+            let visitor_data = records[0].visitor_data().unwrap();
+            assert_eq!(visitor_data.total_visitors(), 0x0102_0304);
+            assert_eq!(visitor_data.temporary_ticket_income(), 0x1112_1314);
+            assert_eq!(visitor_data.final_ticket_income(), 0x2122_2324);
+            assert_eq!(visitor_data.ticket_price(), 0x3132);
+            assert_eq!(visitor_data.temporary_residents(), 0x4142);
+            assert_eq!(visitor_data.final_residents(), 0x5152);
+            assert_eq!(visitor_data.temporary_tourists(), 0x6162);
+            assert_eq!(visitor_data.final_tourists(), 0x7172);
+            assert_eq!(
+                visitor_data.last_visitor_count(),
+                offsets.last_visitor_count.map(|_| 0x3132_3334)
+            );
+
+            let mut editor = records[0].clone().into_editor();
+            editor.set_total_visitors(0xa1a2_a3a4).unwrap();
+            editor.set_temporary_ticket_income(0xb1b2_b3b4).unwrap();
+            editor.set_final_ticket_income(0xc1c2_c3c4).unwrap();
+            editor.set_ticket_price(0xd1d2).unwrap();
+            editor.set_temporary_residents(0xe1e2).unwrap();
+            editor.set_final_residents(0xf1f2).unwrap();
+            editor.set_temporary_tourists(0x0304).unwrap();
+            editor.set_final_tourists(0x0506).unwrap();
+            if offsets.last_visitor_count.is_some() {
+                editor.set_last_visitor_count(0x0708_090a).unwrap();
+            } else {
+                assert!(editor.set_last_visitor_count(1).is_err());
+            }
+            let mut expected = record;
+            for (offset, value) in [
+                (
+                    offsets.total_visitors,
+                    0xa1a2_a3a4_u32.to_be_bytes().to_vec(),
+                ),
+                (
+                    offsets.temporary_ticket_income,
+                    0xb1b2_b3b4_u32.to_be_bytes().to_vec(),
+                ),
+                (
+                    offsets.final_ticket_income,
+                    0xc1c2_c3c4_u32.to_be_bytes().to_vec(),
+                ),
+                (offsets.ticket_price, 0xd1d2_u16.to_be_bytes().to_vec()),
+                (
+                    offsets.temporary_residents,
+                    0xe1e2_u16.to_be_bytes().to_vec(),
+                ),
+                (offsets.final_residents, 0xf1f2_u16.to_be_bytes().to_vec()),
+                (
+                    offsets.temporary_tourists,
+                    0x0304_u16.to_be_bytes().to_vec(),
+                ),
+                (offsets.final_tourists, 0x0506_u16.to_be_bytes().to_vec()),
+            ] {
+                expected[offset..offset + value.len()].copy_from_slice(&value);
+            }
+            if let Some(offset) = offsets.last_visitor_count {
+                expected[offset..offset + 4].copy_from_slice(&0x0708_090a_u32.to_be_bytes());
+            }
+            assert_eq!(editor.encode(), expected);
+        }
+    }
+
+    #[test]
+    fn park_gate_capacity_and_attractiveness_fields_follow_version_gates() {
+        for (version, happiness_bytes, expected_offsets) in [
+            (110_025, 0, (44, 48, 56, 57, 61)),
+            (115_011, 4, (48, 52, 60, 61, 65)),
+            (115_022, 16, (60, 64, 72, 73, 77)),
+        ] {
+            let type_offset = super::TYPE_ZERO_PARK_BASE_TYPE_OFFSET + happiness_bytes;
+            let offsets = super::park_post_level_field_offsets(version, type_offset).unwrap();
+            assert_eq!(
+                offsets,
+                super::ParkPostLevelFieldOffsets {
+                    gates: Some(expected_offsets.0),
+                    capacities: Some(expected_offsets.1),
+                    day_night_count: Some(expected_offsets.2),
+                    attractiveness: Some(expected_offsets.3),
+                    area_factor: Some(expected_offsets.4),
+                }
+            );
+            let mut record = vec![0; super::park_scalar_bytes(version)];
+            record[type_offset + 1] = 3;
+            let gate = expected_offsets.0;
+            record[gate..gate + 2].copy_from_slice(&0x8182_u16.to_be_bytes());
+            record[gate + 2] = 0x83;
+            record[gate + 3] = 0x84;
+            let capacity = expected_offsets.1;
+            for (index, value) in [0x9192_u16, 0xa1a2, 0xb1b2, 0xc1c2].into_iter().enumerate() {
+                let offset = capacity + index * 2;
+                record[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+            }
+            record[expected_offsets.2] = 0xd3;
+            record[expected_offsets.3..expected_offsets.3 + 2]
+                .copy_from_slice(&0xe1e2_u16.to_be_bytes());
+            record[expected_offsets.3 + 2..expected_offsets.3 + 4]
+                .copy_from_slice(&0xf1f2_u16.to_be_bytes());
+            record[expected_offsets.4] = 0x03;
+
+            let mut prefix_bytes = Vec::new();
+            if version >= 114_006 {
+                write_unique_string(&mut prefix_bytes, "").unwrap();
+            }
+            if version >= 114_007 {
+                prefix_bytes.push(0);
+            }
+            zero_flags(&mut prefix_bytes);
+            let mut park_flags = [0_u32; DISTRICT_COUNT];
+            park_flags[5] = 1;
+            write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+            zero_policy_bools(&mut prefix_bytes, version);
+            let (prefix, _) =
+                DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+            let (records, consumed) = prefix.decode_type_zero_park_records(&record).unwrap();
+            assert_eq!(consumed, record.len());
+            assert_eq!(
+                records[0].gate_data(),
+                Some(DistrictParkGateData {
+                    random_gate: 0x8182,
+                    temporary_count: 0x83,
+                    final_count: 0x84,
+                })
+            );
+            assert_eq!(
+                records[0].capacities(),
+                Some(DistrictParkCapacities {
+                    temporary_visitors: 0x9192,
+                    final_visitors: 0xa1a2,
+                    temporary_main: 0xb1b2,
+                    final_main: 0xc1c2,
+                })
+            );
+            assert_eq!(records[0].day_night_count(), Some(0xd3));
+            assert_eq!(
+                records[0].attractiveness(),
+                Some(DistrictParkAttractiveness {
+                    temporary: 0xe1e2,
+                    final_value: 0xf1f2,
+                })
+            );
+            assert_eq!(records[0].area_factor(), Some(0x03));
+
+            let mut editor = records[0].clone().into_editor();
+            editor
+                .set_gate_data(DistrictParkGateData {
+                    random_gate: 0x1122,
+                    temporary_count: 0x33,
+                    final_count: 0x44,
+                })
+                .unwrap();
+            editor
+                .set_capacities(DistrictParkCapacities {
+                    temporary_visitors: 0x5566,
+                    final_visitors: 0x7788,
+                    temporary_main: 0x99aa,
+                    final_main: 0xbbcc,
+                })
+                .unwrap();
+            editor.set_day_night_count(0xdd).unwrap();
+            editor
+                .set_attractiveness(DistrictParkAttractiveness {
+                    temporary: 0x1234,
+                    final_value: 0x5678,
+                })
+                .unwrap();
+            editor.set_area_factor(0xef).unwrap();
+
+            let mut expected = record;
+            expected[gate..gate + 2].copy_from_slice(&0x1122_u16.to_be_bytes());
+            expected[gate + 2] = 0x33;
+            expected[gate + 3] = 0x44;
+            for (index, value) in [0x5566_u16, 0x7788, 0x99aa, 0xbbcc].into_iter().enumerate() {
+                let offset = capacity + index * 2;
+                expected[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+            }
+            expected[expected_offsets.2] = 0xdd;
+            expected[expected_offsets.3..expected_offsets.3 + 2]
+                .copy_from_slice(&0x1234_u16.to_be_bytes());
+            expected[expected_offsets.3 + 2..expected_offsets.3 + 4]
+                .copy_from_slice(&0x5678_u16.to_be_bytes());
+            expected[expected_offsets.4] = 0xef;
+            assert_eq!(editor.encode(), expected);
+        }
+    }
+
+    #[test]
     fn slot_zero_campus_rejects_truncation_and_preserves_wire_bytes() {
         let version = 114_008;
         let mut prefix_bytes = Vec::new();
@@ -2591,30 +3411,40 @@ mod tests {
 
     #[test]
     fn game_produced_park_records_stop_before_grid_across_version_gates() {
-        for (version, park_bytes, bytes) in [
+        for (version, park_bytes, visitor_start, last_visitor_offset, bytes) in [
             (
                 110_025,
                 62,
+                20,
+                16,
                 &include_bytes!("../tests/fixtures/district-park-v110025-windfield.bin")[..],
             ),
             (
                 111_013,
                 74,
+                20,
+                16,
                 &include_bytes!("../tests/fixtures/district-park-v111013-marble-canyon.bin")[..],
             ),
             (
                 114_011,
                 1039,
+                20,
+                16,
                 &include_bytes!("../tests/fixtures/district-park-v114011-ccp-map1.bin")[..],
             ),
             (
                 115_014,
                 1043,
+                24,
+                20,
                 &include_bytes!("../tests/fixtures/district-park-v115014-cape-apple.bin")[..],
             ),
             (
                 116_019,
                 1055,
+                36,
+                32,
                 &include_bytes!("../tests/fixtures/district-park-v116019-boreal-map1.bin")[..],
             ),
         ] {
@@ -2638,6 +3468,43 @@ mod tests {
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].park_index(), 0);
             assert_eq!(records[0].encode(), bytes[..used]);
+            let visitor_data = records[0].visitor_data().unwrap();
+            assert_eq!(
+                visitor_data.total_visitors(),
+                u32::from_be_bytes(bytes[visitor_start..visitor_start + 4].try_into().unwrap())
+            );
+            assert_eq!(
+                visitor_data.temporary_ticket_income(),
+                u32::from_be_bytes(
+                    bytes[visitor_start + 4..visitor_start + 8]
+                        .try_into()
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                visitor_data.final_ticket_income(),
+                u32::from_be_bytes(
+                    bytes[visitor_start + 8..visitor_start + 12]
+                        .try_into()
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                visitor_data.ticket_price(),
+                u16::from_be_bytes(
+                    bytes[visitor_start + 12..visitor_start + 14]
+                        .try_into()
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                visitor_data.last_visitor_count(),
+                Some(u32::from_be_bytes(
+                    bytes[last_visitor_offset..last_visitor_offset + 4]
+                        .try_into()
+                        .unwrap()
+                ))
+            );
             let mut grid = crate::data_serializer::Reader::new(&bytes[used..]);
             assert_eq!(
                 read_encoded_byte_array(&mut grid, 262_144).unwrap(),
