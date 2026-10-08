@@ -4183,6 +4183,8 @@ mod tests {
         const STATISTIC_INT32_TYPE_INDEX: u16 = 40;
         const CHILDREN_START: usize = 4_202_391;
         const CHILDREN_END: usize = 4_204_993;
+        const NESTED_CHILDREN_START: usize = 4_204_997;
+        const NESTED_CHILDREN_END: usize = 4_211_673;
 
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
         let mut file = File::open(path)?;
@@ -4207,6 +4209,7 @@ mod tests {
         let (references, _) = StatisticArrayReferences::decode(references_fixture)?;
         let graph = manager.serialized_object_graph();
         let mut offset = CHILDREN_START;
+        let mut nested_references = Vec::new();
 
         for (index, header) in references.references().iter().enumerate() {
             let bytes = graph
@@ -4214,7 +4217,9 @@ mod tests {
                 .ok_or_else(|| std::io::Error::other("statistic body offset exceeds graph"))?;
             let consumed = match header {
                 NetObjectHeader::NewSharedType(STATISTIC_ARRAY_TYPE_INDEX) => {
-                    StatisticArrayReferences::decode(bytes)?.1
+                    let (array, consumed) = StatisticArrayReferences::decode(bytes)?;
+                    nested_references.extend_from_slice(array.references());
+                    consumed
                 }
                 NetObjectHeader::NewSharedType(STATISTIC_INT64_TYPE_INDEX) => {
                     StatisticInt64Data::decode(manager.format_version(), bytes)?.1
@@ -4247,6 +4252,38 @@ mod tests {
 
         assert_eq!(references.references().len(), 60);
         assert_eq!(offset, CHILDREN_END);
+        assert_eq!(nested_references.len(), 159);
+
+        let mut offset = NESTED_CHILDREN_START;
+        let mut int64_count = 0;
+        let mut int32_count = 0;
+        for (index, header) in nested_references.iter().enumerate() {
+            let bytes = graph.get(offset..).ok_or_else(|| {
+                std::io::Error::other("nested statistic body offset exceeds graph")
+            })?;
+            let consumed = match header {
+                NetObjectHeader::NewSharedType(STATISTIC_INT64_TYPE_INDEX) => {
+                    int64_count += 1;
+                    StatisticInt64Data::decode(manager.format_version(), bytes)?.1
+                }
+                NetObjectHeader::NewSharedType(STATISTIC_INT32_TYPE_INDEX) => {
+                    int32_count += 1;
+                    StatisticInt32Data::decode(manager.format_version(), bytes)?.1
+                }
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected nested statistic reference {index}: {other:?}"
+                    ))
+                    .into());
+                }
+            };
+            offset += consumed;
+        }
+
+        assert_eq!(int64_count, 44);
+        assert_eq!(int32_count, 115);
+        assert_eq!(offset, NESTED_CHILDREN_END);
+        assert_eq!(graph.len() - offset, 60);
         Ok(())
     }
 
