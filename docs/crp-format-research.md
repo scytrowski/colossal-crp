@@ -410,6 +410,12 @@ The PropManager manager reference is at zero-based slot 14 in the `SimulationMan
 
 From inner version 266, `Deserialize` reads a 24-bit burning-tree count followed by that many five-byte records: 24-bit tree index, fire-intensity byte, and fire-damage byte. The inspected `Serialize` method writes this list without a version branch, while `Deserialize` gates it at 266; old-version canonical output therefore is not established as compatible. `TreeManagerDataPrefix` models the sparse records and the >=266 burning list and retains the original bytes for unchanged writing. Synthetic tests cover the 262,143-slot flags, sparse records, runtime fire-bit clearing, the 265/266 gate, 24-bit values, and truncation. `SimulationManagerData::decode_tree_manager_prefix` locates the `TreeManager` tag, uses manager slot 16's resolved type to identify the following tag, and verifies the closing profiler reference and adjacent boundary. A dedicated corpus pass validated this convenience decoder across all 110 type-52 assets in 105 maps (inner versions 194–118011). These samples cover only the pre-266 branch; no game-produced sample in this corpus validates burning-tree records.
 
+### CitizenManager data fields
+
+`CitizenManager.Awake` (Assembly-CSharp.dll RVA `0xED9A8`) allocates 1,048,576 citizen slots, 524,288 citizen-unit slots, and 65,536 citizen-instance slots. `CitizenManager+Data.Deserialize` (RVA `0xF0144`) begins with the citizen flags for indices 1 through 1,048,575. It reads them as `EncodedArray.Byte` before inner version 30 and `EncodedArray.UInt` from version 30; the supplied writer (`CitizenManager+Data.Serialize`, RVA `0xEFA54`, IL `0x004F`–`0x0083`) always writes the UInt form. Following columns are visited in the same citizen-index order and consume one value only for entries whose flags are nonzero: health and wellbeing bytes from version 65, age from version 157, family bytes from version 190, job-title-index bytes from 112007, and tourist-type bytes from 117002. The age stream is a Byte array from versions 157–113006 and a UShort array from 113007 onward (`Deserialize` IL `0x0379`–`0x0430`). The writer has no `get_version` branches and emits these columns unconditionally; it always emits age as UShort (IL `0x0121`–`0x0167`), matching that newer gate but not the Byte layout or absence in older versions if this current writer is invoked with an old version value. These writer/read differences are DLL-derived; no CitizenManager prefix has yet been decoded against the local map corpus.
+
+After the citizen columns, `Deserialize` continues into the fixed-capacity citizen-unit and citizen-instance arrays and ends with version-gated oldest-resident and education counters before its profiler end tag. Those later blocks and the full manager boundary remain unmodeled.
+
 ### DistrictManager data fields
 
 `DistrictManager.Awake` in Assembly-CSharp.dll (RVA `0x106074`) allocates 128 district entries, 128 park entries, and two 262,144-cell grids. `DistrictManager+Data.Deserialize` (RVA `0x112C50`) begins with an airline name from inner version 114006 and a bool for the auto-opened airport panel from 114007, then reads an `EncodedArray.UInt` of 128 district flags. A second 128-entry park flag array is read from version 110001; older versions clear the park entries instead. The corresponding `Serialize` method (RVA `0x11110C`) writes these fields and arrays without matching version branches, so canonical old-version output is not established as compatible. The prefix encoder therefore retains the original bytes unchanged.
@@ -509,13 +515,13 @@ The previously reported 42 `FF` bytes and `00 19`/`00 1C` references occur after
 ## Open questions
 
 - Historical writer behavior for old inner serializer versions; the supplied DLL writes several current layouts without the reader's old-version gates, but older writer DLLs are unavailable.
-- The remaining manager-specific data field sequences, especially CitizenManager and graph entries after the decoded managers.
+- The remaining manager-specific data field sequences, including CitizenManager unit/instance records and graph entries after the decoded managers.
 - Whether type-53 nested packages occur in other `.crp` families and how their parent-asset ranges are intended to be bounded; no such entry appears in the map corpus.
 - Payload-level differences across outer package versions 4–10 and package families beyond the map types in the corpus. The index field layout itself is unchanged in these versions.
 
 ## Next research steps
 
-1. Continue the Type-52 manager graph after the decoded DistrictManager sections, including CitizenManager and later manager entries.
+1. Continue CitizenManager from the unit and instance arrays through its manager boundary, then follow the later Type-52 manager entries.
 2. Inspect representative non-map packages for type-53 nested packages and additional asset types.
 3. Compare payload-level behavior across outer package versions 4–10 and observed inner serializer versions where game-produced samples are available.
 
