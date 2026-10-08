@@ -449,6 +449,18 @@ The area-resource section uses one `EncodedArray.UInt`: from version 111 it cont
 
 A read-only field walk checked all 110 type-52 assets in the 105-map corpus (inner versions 194–118011). It used the forest count to bound the sparse tree and fertility columns, followed the shore and burned/destroyed gates, consumed the versioned area-resource arrays and scalars, and reached the two-byte end-reference position immediately before the unique `ImmaterialResourceManager` tag for every sample. The parsed bodies span 14,377–582,166 bytes. Four assets exercise the pre-223 shore fallback and 16 exercise the pre-265 burned/destroyed fallback. All available maps are at least version 194, so the pre-22/pre-27 gates and the early area-resource gates have no game-produced sample coverage. Pollution bytes are zero in every sample; burned and destroyed bytes are zero where present and default to zero in older samples. These are observations about this corpus, not format guarantees. The parser confirms these sample boundaries but the Rust library still preserves this manager as opaque data.
 
+### ImmaterialResourceManager data fields
+
+`ImmaterialResourceManager.Awake` (Assembly-CSharp.dll RVA `0x2265B8`) allocates two local-resource arrays of `0x230000` unsigned 16-bit entries each. The `ImmaterialResourceManager+Data.Deserialize` method (RVA `0x22999C`, IL `0x001B`–`0x03C7`) treats each array as 65,536 cells with a stride of 35 resource slots. For each cell it reads only the version-supported resource count, then initializes the remaining slots to zero. The final-resource and temporary-resource streams are `EncodedArray.UShort` and occur in that order.
+
+The reader's resource-slot count is 17 below inner version 112; 18 at 112–132; 19 at 133–135; 20 at 136–266; 21 at 267; 22 at 268–284; 23 at 285–304; 24 at 305–110003; 25 at 110004–111012; 26 at 111013–112004; 27 at 112005–113001; 29 at 113002–116003; 31 at 116004–116999; and 35 from 117000. The code skips slot counts 28 and 30 in its version table. These ranges come from the sequence of `DataSerializer.get_version` branches at IL `0x001B`–`0x014D`.
+
+Five per-resource totals follow, in order: total final (`i32`), total temporary (`i32`), total temporary multiplier (`i64` from version 242, otherwise `i32`), global final (`i32`), and global temporary (`i32`). From version 147 the reader consumes all five values for the version-supported resource count and zeroes the remaining slots. Below 147 it reads only the first 17 entries of the first three arrays; global totals and later entries remain zero. Thus the local and aggregate sections both use the version-derived slot count, but have different gates and scalar widths.
+
+The matching writer, `ImmaterialResourceManager+Data.Serialize` (RVA `0x229868`, IL `0x0000`–`0x0124`), has no `get_version` branch. It writes both complete 35-by-65,536 local arrays and all 35 entries of each of the five scalar arrays, with the multiplier as `i64`. Pairing this current writer with an older reader layout would leave version-gated fields unread; this is behavior of the supplied DLL, not evidence about historical writers.
+
+A read-only field walk checked all 110 type-52 assets in the 105-map corpus (inner versions 194–118011). It resolved `ImmaterialResourceManager+Data` at manager-reference slot 10 and `ElectricityManager+Data` at slot 11, consumed both local arrays using the version-derived slot count, then consumed the corresponding aggregate section. In every asset the computed field end is followed by the two-byte end-profiler field and the unique `ElectricityManager` profiler tag. Sampled slot counts were 20 (16 assets), 23 (3), 24 (11), 25 (5), 26 (12), 27 (1), 29 (21), 31 (16), and 35 (25); field bodies span 124,105–984,289 bytes. The corpus does not cover slot counts 17–19, 21–22, 28, or 30, nor the pre-147 aggregate branch. These boundary checks validate the observed sample layouts, not resource-value semantics or every possible version. The Rust library still preserves this manager as opaque data.
+
 ### DistrictManager data fields
 
 `DistrictManager.Awake` in Assembly-CSharp.dll (RVA `0x106074`) allocates 128 district entries, 128 park entries, and two 262,144-cell grids. `DistrictManager+Data.Deserialize` (RVA `0x112C50`) begins with an airline name from inner version 114006 and a bool for the auto-opened airport panel from 114007, then reads an `EncodedArray.UInt` of 128 district flags. A second 128-entry park flag array is read from version 110001; older versions clear the park entries instead. The corresponding `Serialize` method (RVA `0x11110C`) writes these fields and arrays without matching version branches, so canonical old-version output is not established as compatible. The prefix encoder therefore retains the original bytes unchanged.
@@ -548,13 +560,13 @@ The previously reported 42 `FF` bytes and `00 19`/`00 1C` references occur after
 ## Open questions
 
 - Historical writer behavior for old inner serializer versions; the supplied DLL writes several current layouts without the reader's old-version gates, but older writer DLLs are unavailable.
-- CitizenManager's unit/instance field sequence has DLL-derived gates but is not field-decoded against map samples; the map corpus also has no sample at the 120004/120005 writer boundary. TransferManager and NaturalResourceManager reader walks align against the corpus, but their values are not modeled semantically in Rust. ImmaterialResourceManager and later manager bodies remain unmapped.
+- CitizenManager's unit/instance field sequence has DLL-derived gates but is not field-decoded against map samples; the map corpus also has no sample at the 120004/120005 writer boundary. TransferManager, NaturalResourceManager, and ImmaterialResourceManager reader walks align against the corpus, but their values are not modeled semantically in Rust. ElectricityManager and later manager bodies remain unmapped.
 - Whether type-53 nested packages occur in other `.crp` families and how their parent-asset ranges are intended to be bounded; no such entry appears in the map corpus.
 - Payload-level differences across outer package versions 4–10 and package families beyond the map types in the corpus. The index field layout itself is unchanged in these versions.
 
 ## Next research steps
 
-1. Decode CitizenManager unit and instance fields against representative map bytes, then continue with ImmaterialResourceManager and the later Type-52 manager entries.
+1. Decode CitizenManager unit and instance fields against representative map bytes, then continue with ElectricityManager and the later Type-52 manager entries.
 2. Inspect representative non-map packages for type-53 nested packages and additional asset types.
 3. Compare payload-level behavior across outer package versions 4–10 and observed inner serializer versions where game-produced samples are available.
 
