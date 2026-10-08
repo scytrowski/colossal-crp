@@ -59,7 +59,6 @@ pub(crate) fn read_encoded_bool_array(
         .collect())
 }
 
-#[cfg(test)]
 pub(crate) fn write_encoded_bool_array(output: &mut Vec<u8>, values: &[bool]) {
     let mut packed = vec![0_u8; values.len().div_ceil(8)];
     for (index, value) in values.iter().copied().enumerate() {

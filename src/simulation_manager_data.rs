@@ -914,9 +914,11 @@ impl SimulationManagerData {
             .map(|(records, _)| records)
     }
 
-    /// Replaces one park's common scalar fields, preserving its unmodeled bytes.
+    /// Replaces one park record while preserving its unmodeled bytes.
     ///
-    /// The editor must originate from this manager's current park record.
+    /// The editor must originate from this manager's current park record. The
+    /// replacement may change length; the resulting park, grid, tail, and next
+    /// manager boundaries are validated before the edit is accepted.
     pub fn replace_district_park_record(
         &mut self,
         edited: &DistrictParkEditor,
@@ -949,12 +951,6 @@ impl SimulationManagerData {
             ));
         }
         let replacement = edited.encode();
-        if replacement.len() != original.len() {
-            return Err(invalid(
-                start,
-                "edited park record changed its serialized length",
-            ));
-        }
         let end = start
             .checked_add(original.len())
             .ok_or(CrpError::ArithmeticOverflow("park record end"))?;
@@ -964,7 +960,20 @@ impl SimulationManagerData {
                 "park record extends past its validated boundary",
             ));
         }
-        self.serialized_object_graph.splice(start..end, replacement);
+        if replacement.len() == original.len() {
+            self.serialized_object_graph.splice(start..end, replacement);
+            return Ok(());
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(start..end, replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        if let Err(error) = self.decode_district_manager_park_records() {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                start,
+                format!("edited park record failed manager-boundary validation: {error}"),
+            ));
+        }
         Ok(())
     }
 
@@ -2352,6 +2361,56 @@ mod manager_boundary_tests {
             stale_editor.random_seed(),
             u64::from_be_bytes(park[..8].try_into().unwrap())
         );
+    }
+
+    #[test]
+    fn campus_array_edit_can_resize_park_and_preserve_following_manager_data() {
+        let park = include_bytes!("../tests/fixtures/district-park-v117013-mp23-map01.bin");
+        let grids = include_bytes!("../tests/fixtures/district-grids-v117013-mp23-map01.bin");
+        let tail = include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin");
+        let next = include_bytes!("../tests/fixtures/district-next-v117013-event.bin");
+        let mut data = manager_with_park_boundary(117_013, park, grids, tail, next);
+        let (prefix, park_start) = data.decode_district_manager_flags_prefix().unwrap();
+        let records = data.decode_district_manager_park_records().unwrap();
+        assert_eq!(records.len(), 1);
+        let (_, original_grid_end) = data.decode_district_manager_grids().unwrap();
+        let original_grid_start = original_grid_end - grids.len();
+
+        let mut editor = records[0].clone().into_editor();
+        editor
+            .campus_sports_mut()
+            .unwrap()
+            .set_away_matches_done([true, false, true, false, true])
+            .unwrap();
+        assert_eq!(editor.encode().len(), park.len() + 1);
+        data.replace_district_park_record(&editor).unwrap();
+
+        let updated_records = data.decode_district_manager_park_records().unwrap();
+        assert_eq!(updated_records[0].encode(), editor.encode());
+        assert_eq!(
+            updated_records[0]
+                .campus_sports_data()
+                .unwrap()
+                .away_matches_done(),
+            Some([true, false, true, false, true])
+        );
+        let (_, updated_grid_end) = data.decode_district_manager_grids().unwrap();
+        assert_eq!(updated_grid_end, original_grid_end + 1);
+        assert_eq!(
+            &data.serialized_object_graph()[original_grid_start + 1..updated_grid_end],
+            grids
+        );
+        assert_eq!(
+            &data.serialized_object_graph()
+                [updated_grid_end..updated_grid_end + tail.len() + next.len()],
+            &[tail.as_slice(), next.as_slice()].concat()
+        );
+        assert_eq!(
+            data.decode_district_manager_tail().unwrap().1,
+            updated_grid_end + tail.len()
+        );
+        assert_eq!(prefix.park_flags()[0], 1);
+        assert_eq!(park_start + records[0].encode().len(), original_grid_start);
     }
 
     #[test]
