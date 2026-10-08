@@ -83,6 +83,10 @@ const TYPE_ZERO_PARK_HAPPINESS_U16_VERSION: u32 = 115_011;
 const TYPE_ZERO_PARK_HAPPINESS_U32_VERSION: u32 = 115_022;
 const TYPE_ZERO_PARK_EARLY_BYTES: usize = 62;
 const TYPE_ZERO_PARK_BASE_TYPE_OFFSET: usize = 42;
+const PARK_WORK_STORAGE_DELTAS_BYTES: usize = 4;
+const PARK_PRODUCTION_U32_BYTES: usize = 4;
+const PARK_PRODUCTION_U64_BYTES: usize = 8;
+const PARK_WORKER_COUNT_BYTES: usize = 2;
 const PARK_VISITOR_BLOCK_BYTES: usize = 22;
 const PARK_LAST_VISITOR_COUNT_BYTES: usize = 4;
 const DISTRICT_GRID_CELLS: usize = 262_144;
@@ -115,8 +119,8 @@ pub struct DistrictManagerFlagsPrefix {
 
 /// A supported park record from inner versions 110025–118011.
 ///
-/// Only the leading scalar fields are interpreted. The exact record bytes are
-/// retained for unchanged writing, including fields not yet modeled.
+/// Modeled scalar fields are interpreted. The exact record bytes are retained
+/// for unchanged writing, including fields not yet modeled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkRecord {
     park_index: usize,
@@ -132,6 +136,8 @@ pub struct DistrictParkRecord {
     day_night_count: Option<u8>,
     attractiveness: Option<DistrictParkAttractiveness>,
     area_factor: Option<u8>,
+    work_storage_deltas: Option<DistrictParkWorkStorageDeltas>,
+    production_data: Option<DistrictParkProductionData>,
     post_level_offsets: ParkPostLevelFieldOffsets,
     serialized: Vec<u8>,
 }
@@ -197,6 +203,30 @@ pub struct DistrictParkAttractiveness {
     pub final_value: u16,
 }
 
+/// Temporary and final work-efficiency and storage deltas from inner version 111011.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistrictParkWorkStorageDeltas {
+    /// Temporary work-efficiency delta byte.
+    pub temporary_work_efficiency: u8,
+    /// Temporary storage delta byte.
+    pub temporary_storage: u8,
+    /// Final work-efficiency delta byte.
+    pub final_work_efficiency: u8,
+    /// Final storage delta byte.
+    pub final_storage: u8,
+}
+
+/// Production and worker counters stored from inner version 111009.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistrictParkProductionData {
+    /// Total production, serialized as `u32` before inner version 111015 and `u64` from it.
+    pub total_production: u64,
+    /// Temporary worker count.
+    pub temporary_workers: u16,
+    /// Final worker count.
+    pub final_workers: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParkPostLevelFieldOffsets {
     gates: Option<usize>,
@@ -204,12 +234,34 @@ struct ParkPostLevelFieldOffsets {
     day_night_count: Option<usize>,
     attractiveness: Option<usize>,
     area_factor: Option<usize>,
+    work_storage_deltas: Option<usize>,
+    production: Option<ParkProductionFieldOffsets>,
 }
 
-/// Editor for the common scalar fields of one active DistrictManager park.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParkProductionFieldOffsets {
+    total_production: usize,
+    total_production_bytes: usize,
+    temporary_workers: usize,
+    final_workers: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodedParkPostLevelData {
+    gates: Option<DistrictParkGateData>,
+    capacities: Option<DistrictParkCapacities>,
+    day_night_count: Option<u8>,
+    attractiveness: Option<DistrictParkAttractiveness>,
+    area_factor: Option<u8>,
+    work_storage_deltas: Option<DistrictParkWorkStorageDeltas>,
+    production_data: Option<DistrictParkProductionData>,
+    offsets: ParkPostLevelFieldOffsets,
+}
+
+/// Editor for modeled scalar fields of one active DistrictManager park.
 ///
 /// All unmodeled fields remain byte-for-byte intact. Common scalar fields and
-/// versioned ticket and visitor fields can be changed.
+/// ticket, visitor, work, storage, and production fields can be changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkEditor {
     original_serialized: Vec<u8>,
@@ -558,6 +610,16 @@ impl DistrictParkRecord {
         self.area_factor
     }
 
+    /// Returns work and storage deltas when serialized by this version.
+    pub fn work_storage_deltas(&self) -> Option<DistrictParkWorkStorageDeltas> {
+        self.work_storage_deltas
+    }
+
+    /// Returns production and worker counters when serialized by this version.
+    pub fn production_data(&self) -> Option<DistrictParkProductionData> {
+        self.production_data
+    }
+
     /// Creates an editor that preserves all unmodeled bytes in this record.
     pub fn into_editor(self) -> DistrictParkEditor {
         DistrictParkEditor {
@@ -785,6 +847,85 @@ impl DistrictParkEditor {
             .ok_or_else(|| invalid_district_manager(0, "park area factor is absent"))?;
         self.write_field(offset, &[value], "park area factor")?;
         self.record.area_factor = Some(value);
+        Ok(())
+    }
+
+    /// Returns work and storage deltas when serialized by this version.
+    pub fn work_storage_deltas(&self) -> Option<DistrictParkWorkStorageDeltas> {
+        self.record.work_storage_deltas()
+    }
+
+    /// Replaces temporary/final work-efficiency and storage delta bytes.
+    pub fn set_work_storage_deltas(
+        &mut self,
+        value: DistrictParkWorkStorageDeltas,
+    ) -> Result<(), CrpError> {
+        let offset = self
+            .record
+            .post_level_offsets
+            .work_storage_deltas
+            .ok_or_else(|| invalid_district_manager(0, "park work/storage fields are absent"))?;
+        self.write_field(
+            offset,
+            &[
+                value.temporary_work_efficiency,
+                value.temporary_storage,
+                value.final_work_efficiency,
+                value.final_storage,
+            ],
+            "park work/storage deltas",
+        )?;
+        self.record.work_storage_deltas = Some(value);
+        Ok(())
+    }
+
+    /// Returns production and worker counters when serialized by this version.
+    pub fn production_data(&self) -> Option<DistrictParkProductionData> {
+        self.record.production_data()
+    }
+
+    /// Replaces total production and temporary/final worker counters.
+    ///
+    /// Production must fit in `u32` before inner version 111015.
+    pub fn set_production_data(
+        &mut self,
+        value: DistrictParkProductionData,
+    ) -> Result<(), CrpError> {
+        let offsets = self
+            .record
+            .post_level_offsets
+            .production
+            .ok_or_else(|| invalid_district_manager(0, "park production fields are absent"))?;
+        if offsets.total_production_bytes == PARK_PRODUCTION_U32_BYTES {
+            let production = u32::try_from(value.total_production).map_err(|_| {
+                invalid_district_manager(
+                    offsets.total_production,
+                    "park production does not fit the u32 field in this inner version",
+                )
+            })?;
+            self.write_field(
+                offsets.total_production,
+                &production.to_be_bytes(),
+                "park total production",
+            )?;
+        } else {
+            self.write_field(
+                offsets.total_production,
+                &value.total_production.to_be_bytes(),
+                "park total production",
+            )?;
+        }
+        self.write_field(
+            offsets.temporary_workers,
+            &value.temporary_workers.to_be_bytes(),
+            "temporary park workers",
+        )?;
+        self.write_field(
+            offsets.final_workers,
+            &value.final_workers.to_be_bytes(),
+            "final park workers",
+        )?;
+        self.record.production_data = Some(value);
         Ok(())
     }
 
@@ -1775,14 +1916,8 @@ impl DistrictManagerFlagsPrefix {
             let condition = u16::from_be_bytes([fixed[10], fixed[11]]);
             let level = fixed[type_offset + 1];
             let visitor_data = decode_park_visitor_data(self.format_version, type_offset, fixed)?;
-            let (
-                gate_data,
-                capacities,
-                day_night_count,
-                attractiveness,
-                area_factor,
-                post_level_offsets,
-            ) = decode_park_post_level_data(self.format_version, type_offset, fixed)?;
+            let post_level_data =
+                decode_park_post_level_data(self.format_version, type_offset, fixed)?;
             if (5..=9).contains(&park_type)
                 && self.format_version >= TYPE_ZERO_PARK_PRODUCTION_VERSION
             {
@@ -1857,12 +1992,14 @@ impl DistrictManagerFlagsPrefix {
                 level,
                 level_offset: type_offset + 1,
                 visitor_data,
-                gate_data,
-                capacities,
-                day_night_count,
-                attractiveness,
-                area_factor,
-                post_level_offsets,
+                gate_data: post_level_data.gates,
+                capacities: post_level_data.capacities,
+                day_night_count: post_level_data.day_night_count,
+                attractiveness: post_level_data.attractiveness,
+                area_factor: post_level_data.area_factor,
+                work_storage_deltas: post_level_data.work_storage_deltas,
+                production_data: post_level_data.production_data,
+                post_level_offsets: post_level_data.offsets,
                 serialized: bytes[offset..end].to_vec(),
             });
             offset = end;
@@ -1940,22 +2077,58 @@ fn park_post_level_field_offsets(
             .ok_or(CrpError::ArithmeticOverflow("park scalar field end"))?;
         Ok(Some(offset))
     };
+    let gates = take(110_012, 4)?;
+    let capacities = take(110_018, 8)?;
+    let day_night_count = take(110_019, 1)?;
+    let attractiveness = take(110_020, 4)?;
+    let area_factor = take(110_024, 1)?;
+    let work_storage_deltas = take(
+        TYPE_ZERO_PARK_WORK_STORAGE_VERSION,
+        PARK_WORK_STORAGE_DELTAS_BYTES,
+    )?;
+    let production = if format_version >= TYPE_ZERO_PARK_PRODUCTION_VERSION {
+        let total_production_bytes = if format_version >= TYPE_ZERO_PARK_WIDE_PRODUCTION_VERSION {
+            PARK_PRODUCTION_U64_BYTES
+        } else {
+            PARK_PRODUCTION_U32_BYTES
+        };
+        let total_production = cursor;
+        let temporary_workers = total_production
+            .checked_add(total_production_bytes)
+            .ok_or(CrpError::ArithmeticOverflow("park production field end"))?;
+        let final_workers = temporary_workers
+            .checked_add(PARK_WORKER_COUNT_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow("park worker field end"))?;
+        let _production_end = final_workers
+            .checked_add(PARK_WORKER_COUNT_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow("park worker field end"))?;
+        Some(ParkProductionFieldOffsets {
+            total_production,
+            total_production_bytes,
+            temporary_workers,
+            final_workers,
+        })
+    } else {
+        None
+    };
     Ok(ParkPostLevelFieldOffsets {
-        gates: take(110_012, 4)?,
-        capacities: take(110_018, 8)?,
-        day_night_count: take(110_019, 1)?,
-        attractiveness: take(110_020, 4)?,
-        area_factor: take(110_024, 1)?,
+        gates,
+        capacities,
+        day_night_count,
+        attractiveness,
+        area_factor,
+        work_storage_deltas,
+        production,
     })
 }
 
 fn read_park_u16(bytes: &[u8], offset: usize) -> Result<u16, CrpError> {
     let mut reader = Reader::new(bytes.get(offset..).ok_or_else(|| {
-        invalid_district_manager(offset, "park visitor field offset is outside the record")
+        invalid_district_manager(offset, "park u16 field offset is outside the record")
     })?);
     reader
         .read_u16_be()
-        .map_err(|error| invalid_district_manager(offset, format!("park visitor field: {error}")))
+        .map_err(|error| invalid_district_manager(offset, format!("park u16 field: {error}")))
 }
 
 fn read_park_u8(bytes: &[u8], offset: usize) -> Result<u8, CrpError> {
@@ -1969,11 +2142,20 @@ fn read_park_u8(bytes: &[u8], offset: usize) -> Result<u8, CrpError> {
 
 fn read_park_u32(bytes: &[u8], offset: usize) -> Result<u32, CrpError> {
     let mut reader = Reader::new(bytes.get(offset..).ok_or_else(|| {
-        invalid_district_manager(offset, "park visitor field offset is outside the record")
+        invalid_district_manager(offset, "park u32 field offset is outside the record")
     })?);
     reader
         .read_u32_be()
-        .map_err(|error| invalid_district_manager(offset, format!("park visitor field: {error}")))
+        .map_err(|error| invalid_district_manager(offset, format!("park u32 field: {error}")))
+}
+
+fn read_park_u64(bytes: &[u8], offset: usize) -> Result<u64, CrpError> {
+    let mut reader = Reader::new(bytes.get(offset..).ok_or_else(|| {
+        invalid_district_manager(offset, "park production field offset is outside the record")
+    })?);
+    reader.read_u64_be().map_err(|error| {
+        invalid_district_manager(offset, format!("park production field: {error}"))
+    })
 }
 
 fn decode_park_visitor_data(
@@ -2006,17 +2188,7 @@ fn decode_park_post_level_data(
     format_version: u32,
     type_offset: usize,
     record: &[u8],
-) -> Result<
-    (
-        Option<DistrictParkGateData>,
-        Option<DistrictParkCapacities>,
-        Option<u8>,
-        Option<DistrictParkAttractiveness>,
-        Option<u8>,
-        ParkPostLevelFieldOffsets,
-    ),
-    CrpError,
-> {
+) -> Result<DecodedParkPostLevelData, CrpError> {
     let offsets = park_post_level_field_offsets(format_version, type_offset)?;
     let gates = offsets
         .gates
@@ -2056,14 +2228,47 @@ fn decode_park_post_level_data(
         .area_factor
         .map(|offset| read_park_u8(record, offset))
         .transpose()?;
-    Ok((
+    let work_storage_deltas = offsets
+        .work_storage_deltas
+        .map(
+            |offset| -> Result<DistrictParkWorkStorageDeltas, CrpError> {
+                Ok(DistrictParkWorkStorageDeltas {
+                    temporary_work_efficiency: read_park_u8(record, offset)?,
+                    temporary_storage: read_park_u8(record, offset + 1)?,
+                    final_work_efficiency: read_park_u8(record, offset + 2)?,
+                    final_storage: read_park_u8(record, offset + 3)?,
+                })
+            },
+        )
+        .transpose()?;
+    let production_data = offsets
+        .production
+        .map(
+            |production| -> Result<DistrictParkProductionData, CrpError> {
+                let total_production =
+                    if production.total_production_bytes == PARK_PRODUCTION_U32_BYTES {
+                        u64::from(read_park_u32(record, production.total_production)?)
+                    } else {
+                        read_park_u64(record, production.total_production)?
+                    };
+                Ok(DistrictParkProductionData {
+                    total_production,
+                    temporary_workers: read_park_u16(record, production.temporary_workers)?,
+                    final_workers: read_park_u16(record, production.final_workers)?,
+                })
+            },
+        )
+        .transpose()?;
+    Ok(DecodedParkPostLevelData {
         gates,
         capacities,
         day_night_count,
         attractiveness,
         area_factor,
+        work_storage_deltas,
+        production_data,
         offsets,
-    ))
+    })
 }
 
 fn airport_park_bytes(format_version: u32) -> usize {
@@ -2398,7 +2603,8 @@ mod tests {
         AIRLINE_NAME_VERSION, AIRPORT_PANEL_VERSION, DISTRICT_COUNT, DISTRICT_GRID_CELLS,
         DISTRICT_GRID_VALUES, DistrictManagerFlagsPrefix, DistrictManagerGridData,
         DistrictManagerTailData, DistrictParkAttractiveness, DistrictParkCapacities,
-        DistrictParkGateData, PARK_FLAGS_VERSION, POLICY_COUNT, district_policy_bool_count,
+        DistrictParkGateData, DistrictParkProductionData, DistrictParkWorkStorageDeltas,
+        PARK_FLAGS_VERSION, POLICY_COUNT, district_policy_bool_count,
     };
     use crate::data_serializer::{Reader, write_unique_string};
     use crate::encoded_array::{
@@ -3275,6 +3481,28 @@ mod tests {
                     day_night_count: Some(expected_offsets.2),
                     attractiveness: Some(expected_offsets.3),
                     area_factor: Some(expected_offsets.4),
+                    work_storage_deltas: match version {
+                        110_025 => None,
+                        115_011 => Some(66),
+                        115_022 => Some(78),
+                        _ => unreachable!("test version is enumerated above"),
+                    },
+                    production: match version {
+                        110_025 => None,
+                        115_011 => Some(super::ParkProductionFieldOffsets {
+                            total_production: 70,
+                            total_production_bytes: 8,
+                            temporary_workers: 78,
+                            final_workers: 80,
+                        }),
+                        115_022 => Some(super::ParkProductionFieldOffsets {
+                            total_production: 82,
+                            total_production_bytes: 8,
+                            temporary_workers: 90,
+                            final_workers: 92,
+                        }),
+                        _ => unreachable!("test version is enumerated above"),
+                    },
                 }
             );
             let mut record = vec![0; super::park_scalar_bytes(version)];
@@ -3337,6 +3565,30 @@ mod tests {
                 })
             );
             assert_eq!(records[0].area_factor(), Some(0x03));
+            if version == 110_025 {
+                assert_eq!(records[0].work_storage_deltas(), None);
+                assert_eq!(records[0].production_data(), None);
+                let mut editor = records[0].clone().into_editor();
+                assert!(
+                    editor
+                        .set_work_storage_deltas(DistrictParkWorkStorageDeltas {
+                            temporary_work_efficiency: 1,
+                            temporary_storage: 2,
+                            final_work_efficiency: 3,
+                            final_storage: 4,
+                        })
+                        .is_err()
+                );
+                assert!(
+                    editor
+                        .set_production_data(DistrictParkProductionData {
+                            total_production: 1,
+                            temporary_workers: 2,
+                            final_workers: 3,
+                        })
+                        .is_err()
+                );
+            }
 
             let mut editor = records[0].clone().into_editor();
             editor
@@ -3378,6 +3630,174 @@ mod tests {
                 .copy_from_slice(&0x5678_u16.to_be_bytes());
             expected[expected_offsets.4] = 0xef;
             assert_eq!(editor.encode(), expected);
+        }
+    }
+
+    #[test]
+    fn park_work_storage_production_and_worker_fields_follow_version_gates() {
+        for (
+            version,
+            happiness_bytes,
+            work_offset,
+            production_offset,
+            production_bytes,
+            record_len,
+        ) in [
+            (111_009, 0, None, 62, 4, 70),
+            (111_011, 0, Some(62), 66, 4, 74),
+            (111_015, 0, Some(62), 66, 8, 78),
+            (115_011, 4, Some(66), 70, 8, 82),
+            (115_022, 16, Some(78), 82, 8, 94),
+        ] {
+            let type_offset = super::TYPE_ZERO_PARK_BASE_TYPE_OFFSET + happiness_bytes;
+            let expected_offsets = super::ParkPostLevelFieldOffsets {
+                gates: Some(44 + happiness_bytes),
+                capacities: Some(48 + happiness_bytes),
+                day_night_count: Some(56 + happiness_bytes),
+                attractiveness: Some(57 + happiness_bytes),
+                area_factor: Some(61 + happiness_bytes),
+                work_storage_deltas: work_offset,
+                production: Some(super::ParkProductionFieldOffsets {
+                    total_production: production_offset,
+                    total_production_bytes: production_bytes,
+                    temporary_workers: production_offset + production_bytes,
+                    final_workers: production_offset + production_bytes + 2,
+                }),
+            };
+            assert_eq!(
+                super::park_post_level_field_offsets(version, type_offset).unwrap(),
+                expected_offsets
+            );
+            assert_eq!(super::park_scalar_bytes(version), record_len);
+
+            let mut prefix_bytes = Vec::new();
+            if version >= 114_006 {
+                write_unique_string(&mut prefix_bytes, "").unwrap();
+            }
+            if version >= 114_007 {
+                prefix_bytes.push(0);
+            }
+            zero_flags(&mut prefix_bytes);
+            let mut park_flags = [0_u32; DISTRICT_COUNT];
+            park_flags[5] = 1;
+            write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+            zero_policy_bools(&mut prefix_bytes, version);
+            let (prefix, _) =
+                DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+
+            let mut record = vec![0; record_len];
+            let initial_production = if production_bytes == 4 {
+                record[production_offset..production_offset + 4]
+                    .copy_from_slice(&0x0102_0304_u32.to_be_bytes());
+                0x0102_0304_u64
+            } else {
+                record[production_offset..production_offset + 8]
+                    .copy_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
+                0x0102_0304_0506_0708_u64
+            };
+            let temporary_workers = production_offset + production_bytes;
+            record[temporary_workers..temporary_workers + 2]
+                .copy_from_slice(&0x1112_u16.to_be_bytes());
+            let final_workers = temporary_workers + 2;
+            record[final_workers..final_workers + 2].copy_from_slice(&0x2122_u16.to_be_bytes());
+            if let Some(offset) = work_offset {
+                record[offset..offset + 4].copy_from_slice(&[0x31, 0x42, 0x53, 0x64]);
+            }
+
+            assert!(
+                prefix
+                    .decode_type_zero_park_records(&record[..record_len - 1])
+                    .is_err()
+            );
+            let (records, consumed) = prefix.decode_type_zero_park_records(&record).unwrap();
+            assert_eq!(consumed, record_len);
+            assert_eq!(
+                records[0].work_storage_deltas().is_some(),
+                work_offset.is_some()
+            );
+            assert_eq!(
+                records[0].production_data(),
+                Some(DistrictParkProductionData {
+                    total_production: initial_production,
+                    temporary_workers: 0x1112,
+                    final_workers: 0x2122,
+                })
+            );
+            if work_offset.is_some() {
+                assert_eq!(
+                    records[0].work_storage_deltas(),
+                    Some(DistrictParkWorkStorageDeltas {
+                        temporary_work_efficiency: 0x31,
+                        temporary_storage: 0x42,
+                        final_work_efficiency: 0x53,
+                        final_storage: 0x64,
+                    })
+                );
+            }
+
+            let replacement_production = if production_bytes == 4 {
+                0xa1b2_c3d4_u64
+            } else {
+                0xa1a2_a3a4_a5a6_a7a8_u64
+            };
+            let mut editor = records[0].clone().into_editor();
+            editor
+                .set_production_data(DistrictParkProductionData {
+                    total_production: replacement_production,
+                    temporary_workers: 0x3132,
+                    final_workers: 0x4142,
+                })
+                .unwrap();
+            if work_offset.is_some() {
+                editor
+                    .set_work_storage_deltas(DistrictParkWorkStorageDeltas {
+                        temporary_work_efficiency: 0xd1,
+                        temporary_storage: 0xd2,
+                        final_work_efficiency: 0xd3,
+                        final_storage: 0xd4,
+                    })
+                    .unwrap();
+            } else {
+                assert!(
+                    editor
+                        .set_work_storage_deltas(DistrictParkWorkStorageDeltas {
+                            temporary_work_efficiency: 1,
+                            temporary_storage: 2,
+                            final_work_efficiency: 3,
+                            final_storage: 4,
+                        })
+                        .is_err()
+                );
+            }
+
+            let mut expected = record;
+            if production_bytes == 4 {
+                expected[production_offset..production_offset + 4]
+                    .copy_from_slice(&(replacement_production as u32).to_be_bytes());
+            } else {
+                expected[production_offset..production_offset + 8]
+                    .copy_from_slice(&replacement_production.to_be_bytes());
+            }
+            expected[temporary_workers..temporary_workers + 2]
+                .copy_from_slice(&0x3132_u16.to_be_bytes());
+            expected[final_workers..final_workers + 2].copy_from_slice(&0x4142_u16.to_be_bytes());
+            if let Some(offset) = work_offset {
+                expected[offset..offset + 4].copy_from_slice(&[0xd1, 0xd2, 0xd3, 0xd4]);
+            }
+            assert_eq!(editor.encode(), expected);
+
+            if production_bytes == 4 {
+                assert!(
+                    editor
+                        .set_production_data(DistrictParkProductionData {
+                            total_production: u64::from(u32::MAX) + 1,
+                            temporary_workers: 1,
+                            final_workers: 2,
+                        })
+                        .is_err()
+                );
+                assert_eq!(editor.encode(), expected);
+            }
         }
     }
 
