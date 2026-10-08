@@ -42,7 +42,7 @@ pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictDemographicBlock, DistrictDemographicKind,
     DistrictHotelBlock, DistrictManagerFlagsPrefix, DistrictManagerGridData,
-    DistrictManagerGridEditor, DistrictManagerTailData, DistrictParkRecord,
+    DistrictManagerGridEditor, DistrictManagerTailData, DistrictParkEditor, DistrictParkRecord,
     DistrictPopulationRecord, DistrictPrivateDataBlock, DistrictPrivateDataKind,
     DistrictSpecializationBlock, DistrictSpecializationKind, DistrictStatisticsBlock,
     DistrictStatisticsKind, DistrictSubCultureBlock, DistrictSubCultureKind, DistrictTourismBlock,

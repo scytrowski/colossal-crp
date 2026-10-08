@@ -21,7 +21,10 @@ use crate::{
     BuildingRaceTeamUnassignedPrefix, BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
 };
 use crate::{BuildingEconomicFieldsEditor, BuildingPopulationEditor, BuildingTimerGeometryEditor};
-use crate::{DistrictManagerFlagsPrefix, DistrictManagerGridData, DistrictManagerTailData};
+use crate::{
+    DistrictManagerFlagsPrefix, DistrictManagerGridData, DistrictManagerTailData,
+    DistrictParkEditor, DistrictParkRecord,
+};
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
     NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
@@ -889,6 +892,87 @@ impl SimulationManagerData {
         &self,
     ) -> Result<(DistrictManagerGridData, usize), CrpError> {
         let (prefix, park_start) = self.decode_district_manager_flags_prefix()?;
+        let (_, park_end) = self.decode_district_park_records_layout(&prefix, park_start)?;
+        let graph = &self.serialized_object_graph;
+        let (grids, grid_len) =
+            DistrictManagerGridData::decode(self.format_version, &graph[park_end..])?;
+        let grid_end = park_end
+            .checked_add(grid_len)
+            .ok_or(CrpError::ArithmeticOverflow("DistrictManager grid end"))?;
+        Ok((grids, grid_end))
+    }
+
+    /// Decodes active park records using the enclosing graph when available.
+    ///
+    /// For the ten- and thirteen-report variants, the full manager graph is
+    /// used to validate the following grids, tail, and manager boundary.
+    pub fn decode_district_manager_park_records(
+        &self,
+    ) -> Result<Vec<DistrictParkRecord>, CrpError> {
+        let (prefix, park_start) = self.decode_district_manager_flags_prefix()?;
+        self.decode_district_park_records_layout(&prefix, park_start)
+            .map(|(records, _)| records)
+    }
+
+    /// Replaces one park's common scalar fields, preserving its unmodeled bytes.
+    ///
+    /// The editor must originate from this manager's current park record.
+    pub fn replace_district_park_record(
+        &mut self,
+        edited: &DistrictParkEditor,
+    ) -> Result<(), CrpError> {
+        let (prefix, park_start) = self.decode_district_manager_flags_prefix()?;
+        let (records, park_end) = self.decode_district_park_records_layout(&prefix, park_start)?;
+        let Some(record_index) = records
+            .iter()
+            .position(|record| record.park_index() == edited.park_index())
+        else {
+            return Err(invalid(
+                park_start,
+                format!("park {} is not active", edited.park_index()),
+            ));
+        };
+        let mut relative_start = 0_usize;
+        for record in records.iter().take(record_index) {
+            relative_start = relative_start
+                .checked_add(record.encode().len())
+                .ok_or(CrpError::ArithmeticOverflow("park record offset"))?;
+        }
+        let start = park_start
+            .checked_add(relative_start)
+            .ok_or(CrpError::ArithmeticOverflow("park record start"))?;
+        let original = records[record_index].encode();
+        if original != edited.original_bytes() {
+            return Err(invalid(
+                start,
+                "park editor does not match this manager graph",
+            ));
+        }
+        let replacement = edited.encode();
+        if replacement.len() != original.len() {
+            return Err(invalid(
+                start,
+                "edited park record changed its serialized length",
+            ));
+        }
+        let end = start
+            .checked_add(original.len())
+            .ok_or(CrpError::ArithmeticOverflow("park record end"))?;
+        if end > park_end {
+            return Err(invalid(
+                start,
+                "park record extends past its validated boundary",
+            ));
+        }
+        self.serialized_object_graph.splice(start..end, replacement);
+        Ok(())
+    }
+
+    fn decode_district_park_records_layout(
+        &self,
+        prefix: &DistrictManagerFlagsPrefix,
+        park_start: usize,
+    ) -> Result<(Vec<DistrictParkRecord>, usize), CrpError> {
         let graph = &self.serialized_object_graph;
         let next_manager = self
             .manager_objects
@@ -896,16 +980,11 @@ impl SimulationManagerData {
             .and_then(|objects| objects.get(21))
             .and_then(Option::as_ref);
         let Some(next_manager) = next_manager else {
-            let (_, park_len) = prefix.decode_park_records(&graph[park_start..])?;
-            let grid_start = park_start
+            let (records, park_len) = prefix.decode_park_records(&graph[park_start..])?;
+            let park_end = park_start
                 .checked_add(park_len)
-                .ok_or(CrpError::ArithmeticOverflow("DistrictManager grid start"))?;
-            let (grids, grid_len) =
-                DistrictManagerGridData::decode(self.format_version, &graph[grid_start..])?;
-            let grid_end = grid_start
-                .checked_add(grid_len)
-                .ok_or(CrpError::ArithmeticOverflow("DistrictManager grid end"))?;
-            return Ok((grids, grid_end));
+                .ok_or(CrpError::ArithmeticOverflow("DistrictManager park end"))?;
+            return Ok((records, park_end));
         };
         let next_name = next_manager
             .type_name
@@ -922,17 +1001,17 @@ impl SimulationManagerData {
         let mut selected = None;
         for &use_ten_reports in report_layouts {
             let candidate = (|| {
-                let (_, park_len) = prefix.decode_park_records_with_ten_reports(
+                let (records, park_len) = prefix.decode_park_records_with_ten_reports(
                     &graph[park_start..],
                     15,
                     use_ten_reports,
                 )?;
-                let grid_start = park_start
+                let park_end = park_start
                     .checked_add(park_len)
-                    .ok_or(CrpError::ArithmeticOverflow("DistrictManager grid start"))?;
-                let (grids, grid_len) =
-                    DistrictManagerGridData::decode(self.format_version, &graph[grid_start..])?;
-                let grid_end = grid_start
+                    .ok_or(CrpError::ArithmeticOverflow("DistrictManager park end"))?;
+                let (_, grid_len) =
+                    DistrictManagerGridData::decode(self.format_version, &graph[park_end..])?;
+                let grid_end = park_end
                     .checked_add(grid_len)
                     .ok_or(CrpError::ArithmeticOverflow("DistrictManager grid end"))?;
                 let (_, tail_len) =
@@ -946,27 +1025,29 @@ impl SimulationManagerData {
                         format!("expected {next_name} tag after DistrictManager"),
                     ));
                 }
-                Ok((grid_start, grids, grid_end))
+                Ok((park_end, records))
             })();
-            if let Ok((grid_start, grids, grid_end)) = candidate {
+            if let Ok((park_end, records)) = candidate {
                 if selected
                     .as_ref()
-                    .is_some_and(|(start, _, _)| *start != grid_start)
+                    .is_some_and(|(start, _)| *start != park_end)
                 {
                     return Err(invalid(
                         park_start,
                         "ambiguous DistrictManager report layout",
                     ));
                 }
-                selected = Some((grid_start, grids, grid_end));
+                selected = Some((park_end, records));
             }
         }
-        selected.map(|(_, grids, end)| (grids, end)).ok_or_else(|| {
-            invalid(
-                park_start,
-                "no DistrictManager report layout matches grids, tail, and next manager tag",
-            )
-        })
+        selected
+            .map(|(park_end, records)| (records, park_end))
+            .ok_or_else(|| {
+                invalid(
+                    park_start,
+                    "no DistrictManager report layout matches grids, tail, and next manager tag",
+                )
+            })
     }
 
     /// Decodes DistrictManager object headers and scalars after the grids.
@@ -2222,6 +2303,51 @@ mod manager_boundary_tests {
         let malformed =
             manager_with_park_boundary(117_013, ten, &grids[..grids.len() - 1], tail, next);
         assert!(malformed.decode_district_manager_grids().is_err());
+    }
+
+    #[test]
+    fn park_editor_updates_common_scalars_and_preserves_neighboring_bytes() {
+        let park = include_bytes!("../tests/fixtures/district-park-v117013-mp23-map01.bin");
+        let grids = include_bytes!("../tests/fixtures/district-grids-v117013-mp23-map01.bin");
+        let tail = include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin");
+        let next = include_bytes!("../tests/fixtures/district-next-v117013-event.bin");
+        let mut data = manager_with_park_boundary(117_013, park, grids, tail, next);
+        let records = data.decode_district_manager_park_records().unwrap();
+        assert_eq!(records.len(), 1);
+        let stale_editor = records[0].clone().into_editor();
+        let mut editor = records[0].clone().into_editor();
+        editor.set_random_seed(0x0102_0304_0506_0708).unwrap();
+        editor.set_main_gate(0x1122).unwrap();
+        editor.set_condition(0x3344).unwrap();
+        editor.set_level(0x55).unwrap();
+        data.replace_district_park_record(&editor).unwrap();
+
+        let mut expected = park.to_vec();
+        expected[0..8].copy_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
+        expected[8..10].copy_from_slice(&0x1122_u16.to_be_bytes());
+        expected[10..12].copy_from_slice(&0x3344_u16.to_be_bytes());
+        expected[59] = 0x55;
+        assert_eq!(
+            data.decode_district_manager_park_records().unwrap()[0].encode(),
+            expected
+        );
+        assert!(data.replace_district_park_record(&stale_editor).is_err());
+
+        let (_, park_start) = data.decode_district_manager_flags_prefix().unwrap();
+        assert_eq!(
+            &data.serialized_object_graph()
+                [park_start + expected.len()..park_start + expected.len() + grids.len()],
+            grids
+        );
+        let (_, grid_end) = data.decode_district_manager_grids().unwrap();
+        assert_eq!(
+            &data.serialized_object_graph()[grid_end..grid_end + tail.len() + next.len()],
+            &[tail.as_slice(), next.as_slice()].concat()
+        );
+        assert_eq!(
+            stale_editor.random_seed(),
+            u64::from_be_bytes(park[..8].try_into().unwrap())
+        );
     }
 
     #[test]

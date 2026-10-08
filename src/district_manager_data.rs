@@ -123,7 +123,18 @@ pub struct DistrictParkRecord {
     main_gate: u16,
     condition: u16,
     level: u8,
+    level_offset: usize,
     serialized: Vec<u8>,
+}
+
+/// Editor for the common scalar fields of one active DistrictManager park.
+///
+/// All unmodeled fields remain byte-for-byte intact. Only the random seed,
+/// main gate, condition, and level can be changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictParkEditor {
+    original_serialized: Vec<u8>,
+    record: DistrictParkRecord,
 }
 
 /// The decoded district and optional park grid planes from `DistrictManager+Data`.
@@ -438,9 +449,94 @@ impl DistrictParkRecord {
         self.level
     }
 
+    /// Creates an editor that preserves all unmodeled bytes in this record.
+    pub fn into_editor(self) -> DistrictParkEditor {
+        DistrictParkEditor {
+            original_serialized: self.serialized.clone(),
+            record: self,
+        }
+    }
+
     /// Writes the exact record bytes, including fields not yet modeled.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized.clone()
+    }
+}
+
+impl DistrictParkEditor {
+    /// Returns the index in the 128-entry park buffer.
+    pub fn park_index(&self) -> usize {
+        self.record.park_index
+    }
+
+    /// Returns the current random seed.
+    pub fn random_seed(&self) -> u64 {
+        self.record.random_seed
+    }
+
+    /// Replaces the random seed in its big-endian on-disk field.
+    pub fn set_random_seed(&mut self, value: u64) -> Result<(), CrpError> {
+        self.write_field(0, &value.to_be_bytes(), "park random seed")?;
+        self.record.random_seed = value;
+        Ok(())
+    }
+
+    /// Returns the current main-gate building index.
+    pub fn main_gate(&self) -> u16 {
+        self.record.main_gate
+    }
+
+    /// Replaces the main-gate building index in big-endian form.
+    pub fn set_main_gate(&mut self, value: u16) -> Result<(), CrpError> {
+        self.write_field(8, &value.to_be_bytes(), "park main gate")?;
+        self.record.main_gate = value;
+        Ok(())
+    }
+
+    /// Returns the current park condition.
+    pub fn condition(&self) -> u16 {
+        self.record.condition
+    }
+
+    /// Replaces the park condition in big-endian form.
+    pub fn set_condition(&mut self, value: u16) -> Result<(), CrpError> {
+        self.write_field(10, &value.to_be_bytes(), "park condition")?;
+        self.record.condition = value;
+        Ok(())
+    }
+
+    /// Returns the current park level.
+    pub fn level(&self) -> u8 {
+        self.record.level
+    }
+
+    /// Replaces the park level byte.
+    pub fn set_level(&mut self, value: u8) -> Result<(), CrpError> {
+        self.write_field(self.record.level_offset, &[value], "park level")?;
+        self.record.level = value;
+        Ok(())
+    }
+
+    /// Writes the edited record while retaining every unmodeled byte.
+    pub fn encode(&self) -> Vec<u8> {
+        self.record.serialized.clone()
+    }
+
+    pub(crate) fn original_bytes(&self) -> &[u8] {
+        &self.original_serialized
+    }
+
+    fn write_field(&mut self, offset: usize, value: &[u8], field: &str) -> Result<(), CrpError> {
+        let end = offset
+            .checked_add(value.len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "DistrictManager park field end",
+            ))?;
+        let destination = self.record.serialized.get_mut(offset..end).ok_or_else(|| {
+            invalid_district_manager(offset, format!("{field} is outside the park record"))
+        })?;
+        destination.copy_from_slice(value);
+        Ok(())
     }
 }
 
@@ -1389,6 +1485,7 @@ impl DistrictManagerFlagsPrefix {
                 main_gate,
                 condition,
                 level,
+                level_offset: type_offset + 1,
                 serialized: bytes[offset..end].to_vec(),
             });
             offset = end;
@@ -2448,6 +2545,11 @@ mod tests {
             assert_eq!(consumed, record.len());
             assert_eq!(records[0].level(), 3);
             assert_eq!(records[0].encode(), record);
+            let mut editor = records[0].clone().into_editor();
+            editor.set_level(9).unwrap();
+            let mut edited = record.clone();
+            edited[type_offset + 1] = 9;
+            assert_eq!(editor.encode(), edited);
 
             record[type_offset] = 15;
             assert!(prefix.decode_type_zero_park_records(&record).is_err());
