@@ -161,75 +161,12 @@ pub struct DistrictManagerTailData {
     serialized: Vec<u8>,
 }
 
-/// Bytes after the DistrictManager grids with either DLL-derived fields or an opaque layout.
-///
-/// The opaque layout is recognized only for the exact signatures found in the
-/// local MP23 and MP27 map samples. Both variants retain their original bytes
-/// for unchanged writing; opaque bytes have no inferred field meanings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DistrictManagerTail {
-    /// The field layout implemented by the examined game DLL.
-    Typed(DistrictManagerTailData),
-    /// A recognized 44-byte span whose field and object boundaries are unknown.
-    OpaqueObserved(Vec<u8>),
-}
-
-impl DistrictManagerTail {
-    /// Decodes a DLL-derived tail or a narrowly recognized MP23/MP27 sample layout.
-    ///
-    /// Returns an error for truncated input and unrecognized layouts. The byte
-    /// count includes the typed profiler end or observed two-byte reference.
-    pub fn decode_preserving(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
-        match DistrictManagerTailData::decode(format_version, bytes) {
-            Ok((tail, used)) => Ok((Self::Typed(tail), used)),
-            Err(strict_error) => {
-                const OPAQUE_PREFIX: [u8; 42] = [0xff; 42];
-                const OPAQUE_BYTES: usize = 44;
-                let shared_reference = bytes.get(42..OPAQUE_BYTES);
-                let observed_reference = match format_version {
-                    117_013 => shared_reference == Some(&[0x00, 0x19][..]),
-                    118_011 => {
-                        shared_reference == Some(&[0x00, 0x19][..])
-                            || shared_reference == Some(&[0x00, 0x1c][..])
-                    }
-                    _ => false,
-                };
-                if bytes.starts_with(&OPAQUE_PREFIX) && observed_reference {
-                    Ok((
-                        Self::OpaqueObserved(bytes[..OPAQUE_BYTES].to_vec()),
-                        OPAQUE_BYTES,
-                    ))
-                } else {
-                    Err(strict_error)
-                }
-            }
-        }
-    }
-
-    /// Returns the DLL-derived fields when this tail uses that layout.
-    pub fn typed(&self) -> Option<&DistrictManagerTailData> {
-        match self {
-            Self::Typed(tail) => Some(tail),
-            Self::OpaqueObserved(_) => None,
-        }
-    }
-
-    /// Returns the original tail bytes without interpreting opaque fields.
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            Self::Typed(tail) => tail.encode(),
-            Self::OpaqueObserved(bytes) => bytes.clone(),
-        }
-    }
-}
-
 impl DistrictManagerTailData {
     /// Decodes the tail for inner versions 164 and newer.
     ///
     /// The returned byte count includes the DistrictManager profiler end tag.
-    /// This follows the examined DLL layout. Files with additional opaque tail
-    /// bytes, including the observed MP23/MP27 variants, return an error. Truncated
-    /// headers, scalars, or tags also return an error.
+    /// This follows the examined DLL layout. Truncated headers, scalars, or
+    /// tags return an error.
     pub fn decode(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         if format_version < 164 {
             return Err(invalid_district_manager(
@@ -1298,10 +1235,13 @@ impl DistrictManagerFlagsPrefix {
     ///
     /// Active records are supported for inner versions 110025–118011.
     /// An empty park buffer is supported from inner version 164 onward because
-    /// it contains no record bytes. Other active versions or park types return
-    /// an error. Types 5–9 include thirteen versioned industry resource
-    /// records. Each record preserves its original bytes for exact unchanged writing. The returned byte count
-    /// ends before the district grid.
+    /// it contains no record bytes. Type-0 slot-0 records at inner versions
+    /// 117013 and 118011 use the ten-report layout observed in the available
+    /// MP23/MP27 maps; other supported records follow the examined DLL's
+    /// thirteen-report layout from version 112020. Other active versions or
+    /// park types return an error. Types 5–9 include thirteen versioned
+    /// industry resource records. Each record preserves its original bytes for
+    /// exact unchanged writing. The returned byte count ends before the grid.
     pub fn decode_park_records(
         &self,
         bytes: &[u8],
@@ -1391,12 +1331,19 @@ impl DistrictManagerFlagsPrefix {
                 && ((10..=13).contains(&park_type)
                     || (self.format_version >= TYPE_ZERO_PARK_CAMPUS_VERSION && park_index == 0))
             {
-                skip_campus(&mut reader, self.format_version).map_err(|error| {
-                    invalid_district_manager(
-                        offset + reader.offset(),
-                        format!("park {park_index} campus block: {error}"),
-                    )
-                })?;
+                // The supplied MP23/MP27 type-0 slot-0 records contain ten
+                // report records in total. The examined DLL reads thirteen.
+                let observed_ten_reports = park_index == 0
+                    && park_type == 0
+                    && matches!(self.format_version, 117_013 | 118_011);
+                skip_campus(&mut reader, self.format_version, observed_ten_reports).map_err(
+                    |error| {
+                        invalid_district_manager(
+                            offset + reader.offset(),
+                            format!("park {park_index} campus block: {error}"),
+                        )
+                    },
+                )?;
             }
             if park_type == 14 {
                 reader
@@ -1489,12 +1436,21 @@ fn read_district_age_population(
     })
 }
 
-fn skip_campus(reader: &mut Reader<'_>, format_version: u32) -> Result<(), CrpError> {
+fn skip_campus(
+    reader: &mut Reader<'_>,
+    format_version: u32,
+    observed_ten_reports: bool,
+) -> Result<(), CrpError> {
     // DistrictManager+Data.Deserialize reads this for campus types from 112008
     // and for slot 0 of any type from 114005.
     reader.read_bytes(6 + 16)?; // Student fields and AcademicWorksData.
     let report_count =
         2 + usize::from(format_version >= 112_009) + if format_version >= 112_020 { 10 } else { 0 };
+    let report_count = if observed_ten_reports {
+        10
+    } else {
+        report_count
+    };
     for _ in 0..report_count {
         skip_year_report(reader, format_version)?;
     }
@@ -1792,8 +1748,7 @@ mod tests {
     use super::{
         AIRLINE_NAME_VERSION, AIRPORT_PANEL_VERSION, DISTRICT_COUNT, DISTRICT_GRID_CELLS,
         DISTRICT_GRID_VALUES, DistrictManagerFlagsPrefix, DistrictManagerGridData,
-        DistrictManagerTail, DistrictManagerTailData, PARK_FLAGS_VERSION, POLICY_COUNT,
-        district_policy_bool_count,
+        DistrictManagerTailData, PARK_FLAGS_VERSION, POLICY_COUNT, district_policy_bool_count,
     };
     use crate::data_serializer::{Reader, write_unique_string};
     use crate::encoded_array::{
@@ -1811,10 +1766,8 @@ mod tests {
         }
     }
 
-    fn zero_campus(version: u32) -> Vec<u8> {
+    fn zero_campus_with_reports(version: u32, report_count: usize) -> Vec<u8> {
         let mut bytes = vec![0; 22]; // Student fields and academic works.
-        let report_count =
-            2 + usize::from(version >= 112_009) + if version >= 112_020 { 10 } else { 0 };
         for _ in 0..report_count {
             bytes.extend_from_slice(&[0; 36]);
             bytes.extend_from_slice(&[0x84; 2]); // Two five-value ULong arrays.
@@ -1845,6 +1798,12 @@ mod tests {
             bytes.extend_from_slice(&[0; 2]);
         }
         bytes
+    }
+
+    fn zero_campus(version: u32) -> Vec<u8> {
+        let report_count =
+            2 + usize::from(version >= 112_009) + if version >= 112_020 { 10 } else { 0 };
+        zero_campus_with_reports(version, report_count)
     }
 
     fn pedestrian_body(version: u32) -> Vec<u8> {
@@ -2223,8 +2182,15 @@ mod tests {
             (112_025, 10, 958),
             (112_026, 11, 984),
             (114_005, 12, 984),
+            (118_011, 10, 984),
         ] {
             let mut prefix_bytes = Vec::new();
+            if version >= AIRLINE_NAME_VERSION {
+                write_unique_string(&mut prefix_bytes, "").unwrap();
+            }
+            if version >= AIRPORT_PANEL_VERSION {
+                prefix_bytes.push(0);
+            }
             zero_flags(&mut prefix_bytes);
             let mut park_flags = [0_u32; DISTRICT_COUNT];
             park_flags[5] = 1;
@@ -2239,7 +2205,7 @@ mod tests {
             };
             assert_eq!(campus.len(), expected_campus_bytes);
             let mut record = vec![0; super::park_scalar_bytes(version)];
-            record[42] = park_type;
+            record[42 + super::park_happiness_bytes(version)] = park_type;
             record.extend_from_slice(&campus);
             let mut bytes = record.clone();
             bytes.push(0xff);
@@ -2400,7 +2366,12 @@ mod tests {
             record.extend(vec![0; happiness_bytes]);
             record.extend(vec![0; scalar_bytes - happiness_bytes - 16]);
             if version >= 114_005 {
-                record.extend_from_slice(&zero_campus(version));
+                let campus = if version == 118_011 {
+                    zero_campus_with_reports(version, 10)
+                } else {
+                    zero_campus(version)
+                };
+                record.extend_from_slice(&campus);
             }
             let result = prefix.decode_type_zero_park_records(&record);
             if supported {
@@ -2657,37 +2628,12 @@ mod tests {
     }
 
     #[test]
-    fn game_tail_fixtures_confirm_standard_headers_and_expose_opaque_differences() {
-        let desert = include_bytes!("../tests/fixtures/district-tail-v116020-desert.bin");
-        let (tail, used) = DistrictManagerTailData::decode(116_020, desert).unwrap();
-        assert_eq!(used, 71);
-        assert_eq!(tail.object_headers().len(), 19);
-        assert_eq!(tail.next_policy_message_frames(), [0, 0]);
-        assert_eq!(tail.district_policies_set(), Some(0));
-        assert_eq!(tail.encode(), desert);
-
-        let mp23 = include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin");
-        assert_eq!(mp23.len(), 44);
-        assert!(mp23[..42].iter().all(|byte| *byte == 0xff));
-        assert_eq!(&mp23[42..], &[0x00, 0x19]);
-        assert!(DistrictManagerTailData::decode(117_013, mp23).is_err());
-
-        let mp27 = include_bytes!("../tests/fixtures/district-tail-v118011-mp27-map04.bin");
-        assert_eq!(mp27.len(), 44);
-        assert!(mp27[..42].iter().all(|byte| *byte == 0xff));
-        assert_eq!(&mp27[42..], &[0x00, 0x1c]);
-        assert!(DistrictManagerTailData::decode(118_011, mp27).is_err());
-    }
-
-    #[test]
-    fn preserving_tail_reader_recognizes_only_observed_opaque_signatures() {
-        let desert = include_bytes!("../tests/fixtures/district-tail-v116020-desert.bin");
-        let (typed, used) = DistrictManagerTail::decode_preserving(116_020, desert).unwrap();
-        assert_eq!(used, desert.len());
-        assert_eq!(typed.typed().unwrap().object_headers().len(), 19);
-        assert_eq!(typed.encode(), desert);
-
+    fn game_tail_fixtures_confirm_standard_headers_across_versions() {
         for (version, fixture) in [
+            (
+                116_020,
+                &include_bytes!("../tests/fixtures/district-tail-v116020-desert.bin")[..],
+            ),
             (
                 117_013,
                 &include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin")[..],
@@ -2697,75 +2643,112 @@ mod tests {
                 &include_bytes!("../tests/fixtures/district-tail-v118011-mp27-map04.bin")[..],
             ),
         ] {
-            let mut with_following = fixture.to_vec();
-            with_following.extend_from_slice(&[0x12, 0x34]);
-            let (tail, used) =
-                DistrictManagerTail::decode_preserving(version, &with_following).unwrap();
-            assert!(tail.typed().is_none());
-            assert_eq!(used, 44);
+            let (tail, used) = DistrictManagerTailData::decode(version, fixture).unwrap();
+            assert_eq!(used, 71);
+            assert_eq!(tail.object_headers().len(), 19);
+            assert_eq!(tail.next_policy_message_frames(), [0, 0]);
+            assert_eq!(tail.district_policies_set(), Some(0));
             assert_eq!(tail.encode(), fixture);
-            assert_eq!(&with_following[used..], &[0x12, 0x34]);
-            assert!(DistrictManagerTail::decode_preserving(version, &fixture[..43]).is_err());
-
-            let mut bad_prefix = fixture.to_vec();
-            bad_prefix[0] = 0x00;
-            assert!(DistrictManagerTail::decode_preserving(version, &bad_prefix).is_err());
-            let mut bad_reference = fixture.to_vec();
-            bad_reference[43] = 0x20;
-            assert!(DistrictManagerTail::decode_preserving(version, &bad_reference).is_err());
-            assert!(DistrictManagerTail::decode_preserving(116_020, fixture).is_err());
         }
-
-        let mut mp27_first = vec![0xff; 42];
-        mp27_first.extend_from_slice(&[0x00, 0x19]);
-        let (tail, used) = DistrictManagerTail::decode_preserving(118_011, &mp27_first).unwrap();
-        assert_eq!(used, 44);
-        assert_eq!(tail.encode(), mp27_first);
     }
 
     #[test]
     fn game_excerpts_confirm_following_manager_boundaries() {
-        for (version, tail, next, expected_name, typed) in [
+        for (version, tail, next, expected_name) in [
             (
                 194,
                 &include_bytes!("../tests/fixtures/district-tail-v194-co.bin")[..],
                 &include_bytes!("../tests/fixtures/district-next-v194-info.bin")[..],
                 "InfoManager",
-                true,
             ),
             (
                 116_020,
                 &include_bytes!("../tests/fixtures/district-tail-v116020-desert.bin")[..],
                 &include_bytes!("../tests/fixtures/district-next-v116020-event.bin")[..],
                 "EventManager",
-                true,
             ),
             (
                 117_013,
                 &include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin")[..],
-                &include_bytes!("../tests/fixtures/district-next-v117013-statistics.bin")[..],
-                "StatisticsManager",
-                false,
+                &include_bytes!("../tests/fixtures/district-next-v117013-event.bin")[..],
+                "EventManager",
             ),
             (
                 118_011,
                 &include_bytes!("../tests/fixtures/district-tail-v118011-mp27-map04.bin")[..],
-                &include_bytes!("../tests/fixtures/district-next-v118011-statistics.bin")[..],
-                "StatisticsManager",
-                false,
+                &include_bytes!("../tests/fixtures/district-next-v118011-event.bin")[..],
+                "EventManager",
             ),
         ] {
             let mut combined = tail.to_vec();
             combined.extend_from_slice(next);
-            let (decoded, used) =
-                DistrictManagerTail::decode_preserving(version, &combined).unwrap();
+            let (decoded, used) = DistrictManagerTailData::decode(version, &combined).unwrap();
             assert_eq!(used, tail.len());
-            assert_eq!(decoded.typed().is_some(), typed);
             assert_eq!(decoded.encode(), tail);
             let mut reader = Reader::new(&combined[used..]);
             let actual_name = reader.read_shared_string(&mut Vec::new()).unwrap();
             assert_eq!(actual_name.as_deref(), Some(expected_name));
             assert_eq!(reader.offset(), next.len());
+        }
+    }
+
+    #[test]
+    fn mp23_and_mp27_park_records_stop_before_both_grids_and_dll_tail() {
+        for (version, park, grids, tail, next) in [
+            (
+                117_013,
+                &include_bytes!("../tests/fixtures/district-park-v117013-mp23-map01.bin")[..],
+                &include_bytes!("../tests/fixtures/district-grids-v117013-mp23-map01.bin")[..],
+                &include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin")[..],
+                &include_bytes!("../tests/fixtures/district-next-v117013-event.bin")[..],
+            ),
+            (
+                118_011,
+                &include_bytes!("../tests/fixtures/district-park-v118011-mp27-map04.bin")[..],
+                &include_bytes!("../tests/fixtures/district-grids-v118011-mp27-map04.bin")[..],
+                &include_bytes!("../tests/fixtures/district-tail-v118011-mp27-map04.bin")[..],
+                &include_bytes!("../tests/fixtures/district-next-v118011-event.bin")[..],
+            ),
+        ] {
+            let mut prefix_bytes = Vec::new();
+            write_unique_string(&mut prefix_bytes, "").unwrap();
+            prefix_bytes.push(0); // Airport panel state.
+            zero_flags(&mut prefix_bytes);
+            let mut park_flags = [0_u32; DISTRICT_COUNT];
+            park_flags[0] = 1;
+            write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+            zero_policy_bools(&mut prefix_bytes, version);
+            let (prefix, _) =
+                DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+
+            let mut following = park.to_vec();
+            following.extend_from_slice(grids);
+            following.extend_from_slice(tail);
+            following.extend_from_slice(next);
+            let (records, park_used) = prefix.decode_park_records(&following).unwrap();
+            assert_eq!(park_used, 1_088);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].encode(), park);
+            assert!(prefix.decode_park_records(&park[..park.len() - 1]).is_err());
+
+            let (decoded_grids, grid_used) =
+                DistrictManagerGridData::decode(version, &following[park_used..]).unwrap();
+            assert_eq!(grid_used, 32_798);
+            assert_eq!(decoded_grids.encode(), grids);
+            let (decoded_tail, tail_used) =
+                DistrictManagerTailData::decode(version, &following[park_used + grid_used..])
+                    .unwrap();
+            assert_eq!(tail_used, 71);
+            assert_eq!(decoded_tail.encode(), tail);
+            let mut next_reader = Reader::new(&following[park_used + grid_used + tail_used..]);
+            assert_eq!(
+                next_reader
+                    .read_shared_string(&mut Vec::new())
+                    .unwrap()
+                    .as_deref(),
+                Some("EventManager")
+            );
+            assert_eq!(next_reader.offset(), next.len());
         }
     }
 
@@ -2832,7 +2815,7 @@ mod tests {
     }
 
     #[test]
-    fn game_produced_grid_streams_preserve_default_and_nondefault_planes() {
+    fn game_produced_grid_streams_have_expected_default_planes() {
         for (version, bytes, expected_len) in [
             (
                 112_004,
@@ -2842,7 +2825,7 @@ mod tests {
             (
                 117_013,
                 &include_bytes!("../tests/fixtures/district-grids-v117013-mp23-map04.bin")[..],
-                32_999,
+                32_798,
             ),
         ] {
             let (grids, used) = DistrictManagerGridData::decode(version, bytes).unwrap();
@@ -2853,40 +2836,14 @@ mod tests {
                 let park = grids.park_plane(index).unwrap();
                 assert_eq!(district.len(), DISTRICT_GRID_CELLS);
                 assert_eq!(park.len(), DISTRICT_GRID_CELLS);
-                if version == 112_004 {
-                    assert!(district.iter().all(|value| *value == default_value));
-                    assert!(park.iter().all(|value| *value == default_value));
-                }
-            }
-            if version == 117_013 {
-                assert_eq!(
-                    grids
-                        .district_plane(0)
-                        .unwrap()
-                        .iter()
-                        .filter(|value| **value == 1)
-                        .count(),
-                    26_496
-                );
-                assert_eq!(
-                    grids
-                        .park_plane(7)
-                        .unwrap()
-                        .iter()
-                        .filter(|value| **value != 0)
-                        .count(),
-                    3_940
-                );
-                assert_eq!(
-                    &grids.park_plane(7).unwrap()[235_775..235_778],
-                    &[30, 60, 90]
-                );
+                assert!(district.iter().all(|value| *value == default_value));
+                assert!(park.iter().all(|value| *value == default_value));
             }
         }
     }
 
     #[test]
-    fn edited_game_grid_retains_untouched_nondefault_park_stream() {
+    fn edited_game_grid_retains_untouched_park_stream() {
         let bytes = include_bytes!("../tests/fixtures/district-grids-v117013-mp23-map04.bin");
         let (grids, _) = DistrictManagerGridData::decode(117_013, bytes).unwrap();
         let original_park = &bytes[grids.district_encoded_len..];
@@ -2899,9 +2856,12 @@ mod tests {
         assert_eq!(used, encoded.len());
         assert_eq!(decoded.district_plane(0).unwrap(), plane);
         assert_eq!(&encoded[decoded.district_encoded_len..], original_park);
-        assert_eq!(
-            &decoded.park_plane(7).unwrap()[235_775..235_778],
-            &[30, 60, 90]
+        assert!(
+            decoded
+                .park_plane(7)
+                .unwrap()
+                .iter()
+                .all(|value| *value == 0)
         );
     }
 
