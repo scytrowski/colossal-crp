@@ -422,6 +422,25 @@ The supplied `CitizenManager+Data.Serialize` (RVA `0xEFA54`, IL `0x004F`–`0x06
 
 A focused read-only scan checked ten type-52 assets from `CO.crp`, `CL Wolf Creek.crp`, `CCMP2 Desert Map 1.crp`, `MP23_Map01.crp`, and `MP27_Map04.crp` (inner versions 194–118011). Each manager-reference array has `CitizenManager+Data` at slot 7 and `TransferManager+Data` at slot 8. Each graph has a unique new shared-string marker for both names and a two-byte non-marker reference immediately before the TransferManager marker; the resulting candidate CitizenManager spans are 12,582–18,062 bytes. This confirms the manager ordering and candidate tag boundaries in these samples, not the CitizenManager field layout or the identity of each closing reference. The local corpus ends below version 120004, so it cannot validate that writer/reader boundary.
 
+### TransferManager data fields
+
+`TransferManager+Data.Deserialize` (Assembly-CSharp.dll RVA `0x235B7C`, IL `0x001C`–`0x0BD3`) reads the modern body from inner version 37. It chooses the number of transfer-reason amount entries from the inner version:
+
+| Inner version | Entries in each incoming/outgoing amount array |
+| --- | ---: |
+| 37–224 | 64 |
+| 225–268 | 72 |
+| 269–285 | 80 |
+| 286–110014 | 88 |
+| 110015–111003 | 96 |
+| 111004 onward | 128 |
+
+The two direct `i32` amount arrays are followed by one `EncodedArray.UShort` containing 16 counts per reason entry: eight incoming and eight outgoing categories. Their sum gives the number of offer records in the subsequent columns. The reader consumes active flags as `EncodedArray.Bool`, exclude flags as another Bool array from version 111001, then per-offer priority, amount, X position, Z position, and instance-type `EncodedArray.Byte` columns, an instance-index `EncodedArray.UInt`, and a local-park Byte column from version 115001. The manager's end-profiler reference follows. Versions below 37 take a separate reader path that skips this modern field sequence.
+
+The supplied writer (`TransferManager+Data.Serialize`, RVA `0x23518C`, IL `0x0021`–`0x09E1`) uses `BuildConfig.get_SAVE_DATA_FORMAT_VERSION` rather than `DataSerializer.get_version`. In this DLL that getter (RVA `0x34BA`) returns 120010, so the writer emits 128 reason entries and the exclude Bool array. It writes the local-park column unconditionally. This save-data version is distinct from `BuildConfig.DATA_FORMAT_VERSION` 121034. Thus, if this writer is paired with an older reader layout, its 128-entry arrays, exclude flags, or local-park column can extend beyond fields consumed by that reader. This describes the supplied build's code, not historical writer output.
+
+A count-derived read-only walk checked all 110 type-52 assets in the 105-map corpus (inner versions 194–118011). It resolved each asset's manager references as `TransferManager+Data` at slot 8 and `NaturalResourceManager+Data` at slot 9, decoded the UShort counts, used their sum to consume the offer columns, and reached the two-byte end-reference position immediately before the unique `NaturalResourceManager` tag in every sample. The corpus exercised amount-array lengths 64 (4 assets), 72 (12), 88 (14), 96 (5), and 128 (75); it has no samples for the 80-entry version range. Nineteen assets contain 86 offers in total. The field walk confirms these sample boundaries but does not decode offer values into a semantic Rust model or validate the closing shared-string index itself.
+
 ### DistrictManager data fields
 
 `DistrictManager.Awake` in Assembly-CSharp.dll (RVA `0x106074`) allocates 128 district entries, 128 park entries, and two 262,144-cell grids. `DistrictManager+Data.Deserialize` (RVA `0x112C50`) begins with an airline name from inner version 114006 and a bool for the auto-opened airport panel from 114007, then reads an `EncodedArray.UInt` of 128 district flags. A second 128-entry park flag array is read from version 110001; older versions clear the park entries instead. The corresponding `Serialize` method (RVA `0x11110C`) writes these fields and arrays without matching version branches, so canonical old-version output is not established as compatible. The prefix encoder therefore retains the original bytes unchanged.
@@ -521,13 +540,13 @@ The previously reported 42 `FF` bytes and `00 19`/`00 1C` references occur after
 ## Open questions
 
 - Historical writer behavior for old inner serializer versions; the supplied DLL writes several current layouts without the reader's old-version gates, but older writer DLLs are unavailable.
-- CitizenManager's unit/instance field sequence has DLL-derived gates but is not field-decoded against map samples; the map corpus also has no sample at the 120004/120005 writer boundary. TransferManager and later manager bodies remain unmapped.
+- CitizenManager's unit/instance field sequence has DLL-derived gates but is not field-decoded against map samples; the map corpus also has no sample at the 120004/120005 writer boundary. TransferManager's count-derived reader layout now aligns against the corpus, but offer values are not modeled semantically in Rust. NaturalResourceManager and later manager bodies remain unmapped.
 - Whether type-53 nested packages occur in other `.crp` families and how their parent-asset ranges are intended to be bounded; no such entry appears in the map corpus.
 - Payload-level differences across outer package versions 4–10 and package families beyond the map types in the corpus. The index field layout itself is unchanged in these versions.
 
 ## Next research steps
 
-1. Decode CitizenManager unit and instance fields against representative map bytes, then continue with TransferManager and the later Type-52 manager entries.
+1. Decode CitizenManager unit and instance fields against representative map bytes, then continue with NaturalResourceManager and the later Type-52 manager entries.
 2. Inspect representative non-map packages for type-53 nested packages and additional asset types.
 3. Compare payload-level behavior across outer package versions 4–10 and observed inner serializer versions where game-produced samples are available.
 
