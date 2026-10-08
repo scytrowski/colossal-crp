@@ -82,6 +82,11 @@ const TYPE_ZERO_PARK_WORK_STORAGE_VERSION: u32 = 111_011;
 const TYPE_ZERO_PARK_WIDE_PRODUCTION_VERSION: u32 = 111_015;
 const TYPE_ZERO_PARK_HAPPINESS_U16_VERSION: u32 = 115_011;
 const TYPE_ZERO_PARK_HAPPINESS_U32_VERSION: u32 = 115_022;
+const AIRPORT_TERRAIN_VERSION: u32 = 114_000;
+const AIRPORT_PASSENGER_TOTALS_VERSION: u32 = 114_004;
+const AIRPORT_FLAGS_VERSION: u32 = 114_008;
+const AIRPORT_WEEKLY_CAPACITY_VERSION: u32 = 114_010;
+const AIRPORT_INCOMING_PASSENGERS_VERSION: u32 = 114_011;
 const TYPE_ZERO_PARK_EARLY_BYTES: usize = 62;
 const TYPE_ZERO_PARK_BASE_TYPE_OFFSET: usize = 42;
 const PARK_WORK_STORAGE_DELTAS_BYTES: usize = 4;
@@ -128,9 +133,9 @@ pub struct DistrictManagerFlagsPrefix {
 
 /// A supported park record from inner versions 110025–118011.
 ///
-/// Modeled scalar, industry-resource, campus-summary, and campus-report fields
-/// are interpreted. The exact record bytes are retained for unchanged writing,
-/// including fields not yet modeled.
+/// Modeled scalar, industry-resource, campus-summary, campus-report, and
+/// airport fields are interpreted. The exact record bytes are retained for
+/// unchanged writing, including fields not yet modeled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkRecord {
     park_index: usize,
@@ -153,6 +158,7 @@ pub struct DistrictParkRecord {
     campus_data_offset: Option<usize>,
     campus_year_reports: Option<Vec<DistrictCampusYearReportData>>,
     campus_sports_data: Option<DistrictCampusSportsData>,
+    airport_data: Option<DistrictAirportData>,
     post_level_offsets: ParkPostLevelFieldOffsets,
     industry_resource_offsets: Option<ParkIndustryResourceOffsets>,
     serialized: Vec<u8>,
@@ -208,6 +214,30 @@ pub struct DistrictParkCapacities {
     pub temporary_main: u16,
     /// Final main-building capacity.
     pub final_main: u16,
+}
+
+/// Versioned airport fields stored in park type 14 records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistrictAirportData {
+    terrain_height_bits: Option<u32>,
+    passenger_totals: Option<[u32; 2]>,
+    aircraft_stand: Option<bool>,
+    runway: Option<bool>,
+    terminal: Option<bool>,
+    weekly_capacities: Option<[u32; 2]>,
+    incoming_passenger_counts: Option<[u32; 2]>,
+    field_offsets: DistrictAirportFieldOffsets,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DistrictAirportFieldOffsets {
+    terrain_height: Option<usize>,
+    passenger_totals: Option<usize>,
+    aircraft_stand: Option<usize>,
+    runway: Option<usize>,
+    terminal: Option<usize>,
+    weekly_capacities: Option<usize>,
+    incoming_passenger_counts: Option<usize>,
 }
 
 /// Temporary and final attractiveness accumulators stored from inner version 110020.
@@ -517,7 +547,7 @@ struct DecodedParkPostLevelData {
 /// production, industry-resource, campus-summary, and fixed-width campus-report
 /// fields can be changed. Modeled campus report and sports arrays and report
 /// milestone text can also be explicitly re-encoded, which may change this
-/// record's length.
+/// record's length. Versioned airport fields can be edited in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkEditor {
     original_serialized: Vec<u8>,
@@ -539,6 +569,13 @@ pub struct DistrictCampusYearReportEditor<'a> {
 pub struct DistrictCampusSportsEditor<'a> {
     serialized: &'a mut Vec<u8>,
     data: &'a mut DistrictCampusSportsData,
+}
+
+/// Edits versioned fixed-width airport fields in one park type 14 record.
+#[derive(Debug)]
+pub struct DistrictAirportEditor<'a> {
+    serialized: &'a mut Vec<u8>,
+    data: &'a mut DistrictAirportData,
 }
 
 /// The decoded district and optional park grid planes from `DistrictManager+Data`.
@@ -917,6 +954,11 @@ impl DistrictParkRecord {
         self.campus_sports_data.as_ref()
     }
 
+    /// Returns versioned airport fields for park type 14.
+    pub fn airport_data(&self) -> Option<&DistrictAirportData> {
+        self.airport_data.as_ref()
+    }
+
     /// Creates an editor that preserves all unmodeled bytes in this record.
     pub fn into_editor(self) -> DistrictParkEditor {
         DistrictParkEditor {
@@ -928,6 +970,43 @@ impl DistrictParkRecord {
     /// Writes the exact record bytes, including fields not yet modeled.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized.clone()
+    }
+}
+
+impl DistrictAirportData {
+    /// Returns terrain height from inner version 114000.
+    pub fn terrain_height(&self) -> Option<f32> {
+        self.terrain_height_bits.map(f32::from_bits)
+    }
+
+    /// Returns total passenger counts from inner version 114004.
+    pub fn passenger_totals(&self) -> Option<[u32; 2]> {
+        self.passenger_totals
+    }
+
+    /// Returns the aircraft-stand flag from inner version 114008.
+    pub fn has_aircraft_stand(&self) -> Option<bool> {
+        self.aircraft_stand
+    }
+
+    /// Returns the runway flag from inner version 114008.
+    pub fn has_runway(&self) -> Option<bool> {
+        self.runway
+    }
+
+    /// Returns the terminal flag from inner version 114008.
+    pub fn has_terminal(&self) -> Option<bool> {
+        self.terminal
+    }
+
+    /// Returns weekly passenger capacities from inner version 114010.
+    pub fn weekly_capacities(&self) -> Option<[u32; 2]> {
+        self.weekly_capacities
+    }
+
+    /// Returns incoming passenger counts from inner version 114011.
+    pub fn incoming_passenger_counts(&self) -> Option<[u32; 2]> {
+        self.incoming_passenger_counts
     }
 }
 
@@ -1607,6 +1686,19 @@ impl DistrictParkEditor {
         Ok(DistrictCampusSportsEditor { serialized, data })
     }
 
+    /// Returns an editor for the versioned airport fields when this is park type 14.
+    pub fn airport_data_mut(&mut self) -> Result<DistrictAirportEditor<'_>, CrpError> {
+        let DistrictParkRecord {
+            serialized,
+            airport_data,
+            ..
+        } = &mut self.record;
+        let data = airport_data
+            .as_mut()
+            .ok_or_else(|| invalid_district_manager(0, "airport fields are absent"))?;
+        Ok(DistrictAirportEditor { serialized, data })
+    }
+
     /// Writes the edited record while retaining every unmodeled byte.
     pub fn encode(&self) -> Vec<u8> {
         self.record.serialized.clone()
@@ -1617,16 +1709,7 @@ impl DistrictParkEditor {
     }
 
     fn write_field(&mut self, offset: usize, value: &[u8], field: &str) -> Result<(), CrpError> {
-        let end = offset
-            .checked_add(value.len())
-            .ok_or(CrpError::ArithmeticOverflow(
-                "DistrictManager park field end",
-            ))?;
-        let destination = self.record.serialized.get_mut(offset..end).ok_or_else(|| {
-            invalid_district_manager(offset, format!("{field} is outside the park record"))
-        })?;
-        destination.copy_from_slice(value);
-        Ok(())
+        write_park_record_field(&mut self.record.serialized, offset, value, field)
     }
 
     fn visitor_offsets(&self) -> Result<ParkVisitorFieldOffsets, CrpError> {
@@ -1642,6 +1725,120 @@ impl DistrictParkEditor {
             .visitor_data
             .as_mut()
             .ok_or_else(|| invalid_district_manager(0, "visitor fields are absent"))
+    }
+}
+
+impl DistrictAirportEditor<'_> {
+    /// Returns the current decoded airport values.
+    pub fn data(&self) -> &DistrictAirportData {
+        self.data
+    }
+
+    /// Replaces terrain height from inner version 114000.
+    pub fn set_terrain_height(&mut self, value: f32) -> Result<(), CrpError> {
+        let offset = self
+            .data
+            .field_offsets
+            .terrain_height
+            .ok_or_else(|| invalid_district_manager(0, "airport terrain height is absent"))?;
+        write_park_record_field(
+            self.serialized,
+            offset,
+            &value.to_bits().to_be_bytes(),
+            "airport terrain height",
+        )?;
+        self.data.terrain_height_bits = Some(value.to_bits());
+        Ok(())
+    }
+
+    /// Replaces passenger totals from inner version 114004.
+    pub fn set_passenger_totals(&mut self, value: [u32; 2]) -> Result<(), CrpError> {
+        let offset =
+            self.data.field_offsets.passenger_totals.ok_or_else(|| {
+                invalid_district_manager(0, "airport passenger totals are absent")
+            })?;
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&value[0].to_be_bytes());
+        bytes[4..].copy_from_slice(&value[1].to_be_bytes());
+        write_park_record_field(self.serialized, offset, &bytes, "airport passenger totals")?;
+        self.data.passenger_totals = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the aircraft-stand presence flag from inner version 114008.
+    pub fn set_aircraft_stand(&mut self, value: bool) -> Result<(), CrpError> {
+        self.set_bool_field(
+            self.data.field_offsets.aircraft_stand,
+            value,
+            "airport aircraft-stand flag",
+        )?;
+        self.data.aircraft_stand = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the runway presence flag from inner version 114008.
+    pub fn set_runway(&mut self, value: bool) -> Result<(), CrpError> {
+        self.set_bool_field(self.data.field_offsets.runway, value, "airport runway flag")?;
+        self.data.runway = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the terminal presence flag from inner version 114008.
+    pub fn set_terminal(&mut self, value: bool) -> Result<(), CrpError> {
+        self.set_bool_field(
+            self.data.field_offsets.terminal,
+            value,
+            "airport terminal flag",
+        )?;
+        self.data.terminal = Some(value);
+        Ok(())
+    }
+
+    /// Replaces weekly passenger capacities from inner version 114010.
+    pub fn set_weekly_capacities(&mut self, value: [u32; 2]) -> Result<(), CrpError> {
+        let offset =
+            self.data.field_offsets.weekly_capacities.ok_or_else(|| {
+                invalid_district_manager(0, "airport weekly capacities are absent")
+            })?;
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&value[0].to_be_bytes());
+        bytes[4..].copy_from_slice(&value[1].to_be_bytes());
+        write_park_record_field(self.serialized, offset, &bytes, "airport weekly capacities")?;
+        self.data.weekly_capacities = Some(value);
+        Ok(())
+    }
+
+    /// Replaces incoming passenger counts from inner version 114011.
+    pub fn set_incoming_passenger_counts(&mut self, value: [u32; 2]) -> Result<(), CrpError> {
+        let offset = self
+            .data
+            .field_offsets
+            .incoming_passenger_counts
+            .ok_or_else(|| {
+                invalid_district_manager(0, "airport incoming passenger counts are absent")
+            })?;
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&value[0].to_be_bytes());
+        bytes[4..].copy_from_slice(&value[1].to_be_bytes());
+        write_park_record_field(
+            self.serialized,
+            offset,
+            &bytes,
+            "airport incoming passenger counts",
+        )?;
+        self.data.incoming_passenger_counts = Some(value);
+        Ok(())
+    }
+
+    fn set_bool_field(
+        &mut self,
+        offset: Option<usize>,
+        value: bool,
+        field: &str,
+    ) -> Result<(), CrpError> {
+        let offset =
+            offset.ok_or_else(|| invalid_district_manager(0, format!("{field} is absent")))?;
+        write_park_record_field(self.serialized, offset, &[u8::from(value)], field)
     }
 }
 
@@ -2297,6 +2494,24 @@ fn replace_serialized_range(
         ));
     }
     serialized.splice(range.start..range.end, replacement);
+    Ok(())
+}
+
+fn write_park_record_field(
+    serialized: &mut Vec<u8>,
+    offset: usize,
+    value: &[u8],
+    field: &str,
+) -> Result<(), CrpError> {
+    let end = offset
+        .checked_add(value.len())
+        .ok_or(CrpError::ArithmeticOverflow(
+            "DistrictManager park field end",
+        ))?;
+    let destination = serialized.get_mut(offset..end).ok_or_else(|| {
+        invalid_district_manager(offset, format!("{field} is outside the park record"))
+    })?;
+    destination.copy_from_slice(value);
     Ok(())
 }
 
@@ -3282,16 +3497,18 @@ impl DistrictManagerFlagsPrefix {
                 } else {
                     (None, None, None, None)
                 };
-            if park_type == 14 {
-                reader
-                    .read_bytes(airport_park_bytes(self.format_version))
-                    .map_err(|error| {
+            let airport_data = if park_type == 14 {
+                Some(
+                    read_airport_data(&mut reader, self.format_version).map_err(|error| {
                         invalid_district_manager(
                             offset + reader.offset(),
                             format!("park {park_index} airport fields: {error}"),
                         )
-                    })?;
-            }
+                    })?,
+                )
+            } else {
+                None
+            };
             if park_type == 15 {
                 skip_pedestrian_zone(
                     &mut reader,
@@ -3332,6 +3549,7 @@ impl DistrictManagerFlagsPrefix {
                 campus_data_offset,
                 campus_year_reports,
                 campus_sports_data,
+                airport_data,
                 post_level_offsets: post_level_data.offsets,
                 industry_resource_offsets,
                 serialized: bytes[offset..end].to_vec(),
@@ -3757,12 +3975,56 @@ fn encode_industry_resource(
     Ok(bytes)
 }
 
-fn airport_park_bytes(format_version: u32) -> usize {
-    usize::from(format_version >= 114_000) * 4
-        + usize::from(format_version >= 114_004) * 8
-        + usize::from(format_version >= 114_008) * 3
-        + usize::from(format_version >= 114_010) * 8
-        + usize::from(format_version >= 114_011) * 8
+fn read_airport_data(
+    reader: &mut Reader<'_>,
+    format_version: u32,
+) -> Result<DistrictAirportData, CrpError> {
+    let mut field_offsets = DistrictAirportFieldOffsets::default();
+    let terrain_height_bits = if format_version >= AIRPORT_TERRAIN_VERSION {
+        field_offsets.terrain_height = Some(reader.offset());
+        Some(reader.read_u32_be()?)
+    } else {
+        None
+    };
+    let passenger_totals = if format_version >= AIRPORT_PASSENGER_TOTALS_VERSION {
+        field_offsets.passenger_totals = Some(reader.offset());
+        Some([reader.read_u32_be()?, reader.read_u32_be()?])
+    } else {
+        None
+    };
+    let (aircraft_stand, runway, terminal) = if format_version >= AIRPORT_FLAGS_VERSION {
+        field_offsets.aircraft_stand = Some(reader.offset());
+        let aircraft_stand = Some(reader.read_u8()? == 1);
+        field_offsets.runway = Some(reader.offset());
+        let runway = Some(reader.read_u8()? == 1);
+        field_offsets.terminal = Some(reader.offset());
+        let terminal = Some(reader.read_u8()? == 1);
+        (aircraft_stand, runway, terminal)
+    } else {
+        (None, None, None)
+    };
+    let weekly_capacities = if format_version >= AIRPORT_WEEKLY_CAPACITY_VERSION {
+        field_offsets.weekly_capacities = Some(reader.offset());
+        Some([reader.read_u32_be()?, reader.read_u32_be()?])
+    } else {
+        None
+    };
+    let incoming_passenger_counts = if format_version >= AIRPORT_INCOMING_PASSENGERS_VERSION {
+        field_offsets.incoming_passenger_counts = Some(reader.offset());
+        Some([reader.read_u32_be()?, reader.read_u32_be()?])
+    } else {
+        None
+    };
+    Ok(DistrictAirportData {
+        terrain_height_bits,
+        passenger_totals,
+        aircraft_stand,
+        runway,
+        terminal,
+        weekly_capacities,
+        incoming_passenger_counts,
+        field_offsets,
+    })
 }
 
 fn read_district_age_population(
@@ -4600,6 +4862,9 @@ mod tests {
         assert_eq!(records[0].condition(), 0xabcd);
         assert_eq!(records[0].level(), 4);
         assert_eq!(records[1].level(), 2);
+        assert!(records[0].airport_data().is_none());
+        assert!(records[1].airport_data().is_none());
+        assert!(records[0].clone().into_editor().airport_data_mut().is_err());
         assert_eq!(records[0].encode(), first);
         assert_eq!(records[1].encode(), second);
         assert_eq!(bytes[consumed], 0xff);
@@ -4881,6 +5146,7 @@ mod tests {
     #[test]
     fn airport_park_fields_follow_each_version_gate() {
         for (version, airport_bytes) in [
+            (113_999, 0),
             (114_000, 4),
             (114_003, 4),
             (114_004, 12),
@@ -4890,7 +5156,6 @@ mod tests {
             (114_010, 23),
             (114_011, 31),
         ] {
-            assert_eq!(super::airport_park_bytes(version), airport_bytes);
             let mut prefix_bytes = Vec::new();
             if version >= AIRLINE_NAME_VERSION {
                 write_unique_string(&mut prefix_bytes, "").unwrap();
@@ -4907,18 +5172,165 @@ mod tests {
                 DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
             let mut record = vec![0; super::park_scalar_bytes(version)];
             record[42] = 14;
-            record.extend(vec![0x5a; airport_bytes]);
+            let airport_start = record.len();
+            if version >= super::AIRPORT_TERRAIN_VERSION {
+                record.extend_from_slice(&0x42a0_0000_u32.to_be_bytes());
+            }
+            if version >= super::AIRPORT_PASSENGER_TOTALS_VERSION {
+                record.extend_from_slice(&0x0102_0304_u32.to_be_bytes());
+                record.extend_from_slice(&0xa1b2_c3d4_u32.to_be_bytes());
+            }
+            if version >= super::AIRPORT_FLAGS_VERSION {
+                record.extend_from_slice(&[1, 2, 0x7f]);
+            }
+            if version >= super::AIRPORT_WEEKLY_CAPACITY_VERSION {
+                record.extend_from_slice(&0x1122_3344_u32.to_be_bytes());
+                record.extend_from_slice(&0x5566_7788_u32.to_be_bytes());
+            }
+            if version >= super::AIRPORT_INCOMING_PASSENGERS_VERSION {
+                record.extend_from_slice(&0xdead_beef_u32.to_be_bytes());
+                record.extend_from_slice(&0x0123_4567_u32.to_be_bytes());
+            }
+            assert_eq!(record.len() - airport_start, airport_bytes);
             let mut bytes = record.clone();
             bytes.push(0xff);
             let (parks, used) = prefix.decode_park_records(&bytes).unwrap();
             assert_eq!(used, record.len());
             assert_eq!(parks[0].park_type(), 14);
+            let airport = parks[0].airport_data().unwrap();
+            assert_eq!(
+                airport.terrain_height().map(f32::to_bits),
+                (version >= super::AIRPORT_TERRAIN_VERSION).then_some(0x42a0_0000)
+            );
+            assert_eq!(
+                airport.passenger_totals(),
+                (version >= super::AIRPORT_PASSENGER_TOTALS_VERSION)
+                    .then_some([0x0102_0304, 0xa1b2_c3d4])
+            );
+            assert_eq!(
+                airport.has_aircraft_stand(),
+                (version >= super::AIRPORT_FLAGS_VERSION).then_some(true)
+            );
+            assert_eq!(
+                airport.has_runway(),
+                (version >= super::AIRPORT_FLAGS_VERSION).then_some(false)
+            );
+            assert_eq!(
+                airport.has_terminal(),
+                (version >= super::AIRPORT_FLAGS_VERSION).then_some(false)
+            );
+            assert_eq!(
+                airport.weekly_capacities(),
+                (version >= super::AIRPORT_WEEKLY_CAPACITY_VERSION)
+                    .then_some([0x1122_3344, 0x5566_7788])
+            );
+            assert_eq!(
+                airport.incoming_passenger_counts(),
+                (version >= super::AIRPORT_INCOMING_PASSENGERS_VERSION)
+                    .then_some([0xdead_beef, 0x0123_4567])
+            );
             assert_eq!(parks[0].encode(), record);
             assert_eq!(bytes[used], 0xff);
             assert!(
                 prefix
                     .decode_park_records(&record[..record.len() - 1])
                     .is_err()
+            );
+            if version >= super::AIRPORT_FLAGS_VERSION {
+                let mut one_flag_editor = parks[0].clone().into_editor();
+                one_flag_editor
+                    .airport_data_mut()
+                    .unwrap()
+                    .set_aircraft_stand(false)
+                    .unwrap();
+                let mut one_flag_expected = record.clone();
+                one_flag_expected[airport_start + 12] = 0;
+                assert_eq!(one_flag_editor.encode(), one_flag_expected);
+            }
+            let mut editor = parks[0].clone().into_editor();
+            {
+                let mut airport = editor.airport_data_mut().unwrap();
+                if version >= super::AIRPORT_TERRAIN_VERSION {
+                    airport.set_terrain_height(-12.5).unwrap();
+                } else {
+                    assert!(airport.set_terrain_height(1.0).is_err());
+                }
+                if version >= super::AIRPORT_PASSENGER_TOTALS_VERSION {
+                    airport.set_passenger_totals([9, 10]).unwrap();
+                } else {
+                    assert!(airport.set_passenger_totals([9, 10]).is_err());
+                }
+                if version >= super::AIRPORT_FLAGS_VERSION {
+                    airport.set_aircraft_stand(false).unwrap();
+                    airport.set_runway(true).unwrap();
+                    airport.set_terminal(true).unwrap();
+                } else {
+                    assert!(airport.set_aircraft_stand(false).is_err());
+                    assert!(airport.set_runway(false).is_err());
+                    assert!(airport.set_terminal(false).is_err());
+                }
+                if version >= super::AIRPORT_WEEKLY_CAPACITY_VERSION {
+                    airport.set_weekly_capacities([11, 12]).unwrap();
+                } else {
+                    assert!(airport.set_weekly_capacities([11, 12]).is_err());
+                }
+                if version >= super::AIRPORT_INCOMING_PASSENGERS_VERSION {
+                    airport.set_incoming_passenger_counts([13, 14]).unwrap();
+                } else {
+                    assert!(airport.set_incoming_passenger_counts([13, 14]).is_err());
+                }
+            }
+            let mut expected = record.clone();
+            if version >= super::AIRPORT_TERRAIN_VERSION {
+                expected[airport_start..airport_start + 4]
+                    .copy_from_slice(&(-12.5_f32).to_bits().to_be_bytes());
+            }
+            if version >= super::AIRPORT_PASSENGER_TOTALS_VERSION {
+                expected[airport_start + 4..airport_start + 12]
+                    .copy_from_slice(&[0, 0, 0, 9, 0, 0, 0, 10]);
+            }
+            if version >= super::AIRPORT_FLAGS_VERSION {
+                expected[airport_start + 12..airport_start + 15].copy_from_slice(&[0, 1, 1]);
+            }
+            if version >= super::AIRPORT_WEEKLY_CAPACITY_VERSION {
+                expected[airport_start + 15..airport_start + 23]
+                    .copy_from_slice(&[0, 0, 0, 11, 0, 0, 0, 12]);
+            }
+            if version >= super::AIRPORT_INCOMING_PASSENGERS_VERSION {
+                expected[airport_start + 23..airport_start + 31]
+                    .copy_from_slice(&[0, 0, 0, 13, 0, 0, 0, 14]);
+            }
+            assert_eq!(editor.encode(), expected);
+            let (edited_parks, edited_used) = prefix.decode_park_records(&expected).unwrap();
+            assert_eq!(edited_used, expected.len());
+            let edited_airport = edited_parks[0].airport_data().unwrap();
+            assert_eq!(
+                edited_airport.terrain_height().map(f32::to_bits),
+                (version >= super::AIRPORT_TERRAIN_VERSION).then_some((-12.5_f32).to_bits())
+            );
+            assert_eq!(
+                edited_airport.passenger_totals(),
+                (version >= super::AIRPORT_PASSENGER_TOTALS_VERSION).then_some([9, 10])
+            );
+            assert_eq!(
+                edited_airport.has_aircraft_stand(),
+                (version >= super::AIRPORT_FLAGS_VERSION).then_some(false)
+            );
+            assert_eq!(
+                edited_airport.has_runway(),
+                (version >= super::AIRPORT_FLAGS_VERSION).then_some(true)
+            );
+            assert_eq!(
+                edited_airport.has_terminal(),
+                (version >= super::AIRPORT_FLAGS_VERSION).then_some(true)
+            );
+            assert_eq!(
+                edited_airport.weekly_capacities(),
+                (version >= super::AIRPORT_WEEKLY_CAPACITY_VERSION).then_some([11, 12])
+            );
+            assert_eq!(
+                edited_airport.incoming_passenger_counts(),
+                (version >= super::AIRPORT_INCOMING_PASSENGERS_VERSION).then_some([13, 14])
             );
             for unsupported in [16] {
                 record[42] = unsupported;
