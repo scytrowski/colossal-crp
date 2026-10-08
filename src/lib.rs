@@ -3712,6 +3712,49 @@ mod tests {
     }
 
     #[test]
+    fn map_metadata_map_theme_reference_uses_string_wire_type() -> Result<(), CrpError> {
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut file = File::open(fixture_dir.join("metadata-v10.crp"))?;
+        let package = Package::read_from(&mut file)?;
+        let asset = &package.assets[0];
+        let mut metadata = MapMetaData::decode(asset)?;
+        metadata.map_theme_ref = Some("theme-reference".to_owned());
+
+        let encoded = metadata.encode()?;
+        let mut reader = crate::asset_io::PayloadReader::new(&asset.name, &encoded);
+        assert!(!reader.read_bool()?);
+        assert_eq!(reader.read_string()?, metadata.runtime_type);
+        assert_eq!(reader.read_string()?, metadata.object_name);
+        assert_eq!(reader.read_i32_le()?, 25);
+
+        for (index, expected_field) in ["builtin", "environment", "mapThemeRef"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(!reader.read_bool()?);
+            let field_type = reader.read_string()?;
+            let field_name = reader.read_string()?;
+            assert_eq!(field_name, expected_field);
+            if index == 0 {
+                assert_eq!(field_type.split(',').next(), Some("System.Boolean"));
+                let _builtin = reader.read_bool()?;
+            } else {
+                assert_eq!(field_type.split(',').next(), Some("System.String"));
+                let value = reader.read_string()?;
+                if index == 2 {
+                    assert_eq!(value, "theme-reference");
+                }
+            }
+        }
+
+        let mut edited_asset = asset.clone();
+        edited_asset.data = encoded;
+        let decoded = MapMetaData::decode(&edited_asset)?;
+        assert_eq!(decoded.map_theme_ref.as_deref(), Some("theme-reference"));
+        Ok(())
+    }
+
+    #[test]
     fn metadata_decoder_rejects_truncated_field_data() -> Result<(), CrpError> {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let mut file = File::open(fixture_dir.join("metadata-v10.crp"))?;

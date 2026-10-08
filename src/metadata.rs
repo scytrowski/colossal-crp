@@ -37,7 +37,7 @@ const FIELD_NAMES: [&str; MAP_METADATA_FIELD_COUNT] = [
 const FIELD_TYPES: [&str; MAP_METADATA_FIELD_COUNT] = [
     "System.Boolean, mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089",
     "System.String, mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089",
-    "ColossalFramework.Packaging.Package+Asset, ColossalManaged, Version=0.3.0.0, Culture=neutral, PublicKeyToken=null",
+    "System.String, mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089",
     "System.String, mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089",
     "System.DateTime, mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089",
     "ColossalFramework.Packaging.Package+Asset, ColossalManaged, Version=0.3.0.0, Culture=neutral, PublicKeyToken=null",
@@ -82,7 +82,7 @@ pub struct MapMetaData {
     pub builtin: Option<bool>,
     /// Map environment name.
     pub environment: Option<String>,
-    /// Referenced map theme asset checksum.
+    /// Map-theme reference stored as a string; its semantics are not established.
     pub map_theme_ref: Option<String>,
     /// User-visible map name.
     pub map_name: Option<String>,
