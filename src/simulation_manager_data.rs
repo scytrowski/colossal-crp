@@ -2364,6 +2364,105 @@ mod manager_boundary_tests {
     }
 
     #[test]
+    fn airport_field_edits_replace_only_park_bytes_in_manager_graph() {
+        let type_zero_park =
+            include_bytes!("../tests/fixtures/district-park-v117013-mp23-map01.bin");
+        let grids = include_bytes!("../tests/fixtures/district-grids-v117013-mp23-map01.bin");
+        let tail = include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin");
+        let next = include_bytes!("../tests/fixtures/district-next-v117013-event.bin");
+        let scalar_bytes = 94;
+        let campus_ten = &type_zero_park[scalar_bytes..];
+        let campus_tail_start = campus_ten.len() - 29;
+        let empty_report_start = campus_tail_start - 70;
+        let empty_report = &campus_ten[empty_report_start..campus_tail_start];
+        let mut campus_thirteen = campus_ten[..campus_tail_start].to_vec();
+        for _ in 0..3 {
+            campus_thirteen.extend_from_slice(empty_report);
+        }
+        campus_thirteen.extend_from_slice(&campus_ten[campus_tail_start..]);
+
+        let mut park = type_zero_park[..scalar_bytes].to_vec();
+        park[58] = 14;
+        park.extend_from_slice(&campus_thirteen);
+        let airport_start = park.len();
+        let mut airport_bytes = [0x5a; 31];
+        airport_bytes[12..15].copy_from_slice(&[1, 0x7f, 2]);
+        park.extend_from_slice(&airport_bytes);
+
+        let mut data = manager_with_park_boundary(117_013, &park, grids, tail, next);
+        let records = data.decode_district_manager_park_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].airport_data().unwrap().has_aircraft_stand(),
+            Some(true)
+        );
+
+        let mut editor = records[0].clone().into_editor();
+        {
+            let mut airport = editor.airport_data_mut().unwrap();
+            airport.set_terrain_height(1.5).unwrap();
+            airport
+                .set_passenger_totals([0x0102_0304, 0x1122_3344])
+                .unwrap();
+            airport.set_runway(true).unwrap();
+            airport
+                .set_weekly_capacities([0x5566_7788, 0x99aa_bbcc])
+                .unwrap();
+            airport
+                .set_incoming_passenger_counts([0xdead_beef, 0x1234_5678])
+                .unwrap();
+        }
+        let mut expected = park.to_vec();
+        expected[airport_start..airport_start + 4].copy_from_slice(&[0x3f, 0xc0, 0, 0]);
+        expected[airport_start + 4..airport_start + 12]
+            .copy_from_slice(&[1, 2, 3, 4, 0x11, 0x22, 0x33, 0x44]);
+        expected[airport_start + 13] = 1;
+        expected[airport_start + 15..airport_start + 23]
+            .copy_from_slice(&[0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc]);
+        expected[airport_start + 23..airport_start + 31]
+            .copy_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78]);
+        data.replace_district_park_record(&editor).unwrap();
+
+        let updated_records = data.decode_district_manager_park_records().unwrap();
+        assert_eq!(updated_records[0].encode(), expected);
+        let updated_airport = updated_records[0].airport_data().unwrap();
+        assert_eq!(
+            updated_airport.terrain_height().map(f32::to_bits),
+            Some(1.5_f32.to_bits())
+        );
+        assert_eq!(
+            updated_airport.passenger_totals(),
+            Some([0x0102_0304, 0x1122_3344])
+        );
+        assert_eq!(updated_airport.has_runway(), Some(true));
+        assert_eq!(updated_airport.has_terminal(), Some(false));
+        assert_eq!(
+            updated_airport.weekly_capacities(),
+            Some([0x5566_7788, 0x99aa_bbcc])
+        );
+        assert_eq!(
+            updated_airport.incoming_passenger_counts(),
+            Some([0xdead_beef, 0x1234_5678])
+        );
+
+        let (_, park_start) = data.decode_district_manager_flags_prefix().unwrap();
+        let (updated_grids, grid_end) = data.decode_district_manager_grids().unwrap();
+        assert_eq!(updated_grids.encode(), grids);
+        assert_eq!(
+            &data.serialized_object_graph()[park_start..park_start + expected.len()],
+            expected
+        );
+        assert_eq!(
+            &data.serialized_object_graph()[grid_end..grid_end + tail.len() + next.len()],
+            &[tail.as_slice(), next.as_slice()].concat()
+        );
+        assert_eq!(
+            data.decode_district_manager_tail().unwrap().1,
+            grid_end + tail.len()
+        );
+    }
+
+    #[test]
     fn campus_report_and_sports_array_edits_resize_park_safely() {
         let park = include_bytes!("../tests/fixtures/district-park-v117013-mp23-map01.bin");
         let grids = include_bytes!("../tests/fixtures/district-grids-v117013-mp23-map01.bin");
