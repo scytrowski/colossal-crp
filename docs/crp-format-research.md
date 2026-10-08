@@ -77,7 +77,7 @@ i64      asset size
 
 For each entry the reader computes its stream offset as the record's relative offset plus the base data offset plus `PackageImplementation.dataOffset`. The base `PackageImplementation` returns zero for `dataOffset`; a packaged implementation has a separate override. The read size is converted to `i32` when the in-memory asset is constructed, despite being stored as `i64` in the index.
 
-The concrete implementations clarify that offset rule. `FilePackage.GetStream` opens the package file and `MemoryPackage.GetStream` wraps the package byte array; both use the base zero `dataOffset`. `PackagedPackage.GetStream` delegates to its containing `Asset.GetStream`, and its `dataOffset` is the containing asset's absolute offset in the parent package. `Asset.GetStream` returns the containing package stream positioned at that offset, so the nested index's relative data offsets are added to the parent offset. The inspected path does not bound nested entries to the containing asset's declared size, and no type-53 package entry appears in the map corpus. A Rust implementation should bound nested-package reads by the parent asset range; the game DLL behavior here is not sample-validated for maps.
+The concrete implementations clarify that offset rule. `FilePackage.GetStream` opens the package file and `MemoryPackage.GetStream` wraps the package byte array; both use the base zero `dataOffset`. For nested packages, `PackagedPackage.GetStream` delegates to its containing `Asset.GetStream`, and its `dataOffset` is the containing asset's absolute offset in the parent package. The nested index's relative payload offsets are therefore added to that parent offset. The inspected `Asset.GetStream` path does not bound nested reads to the containing asset's declared size. No type-53 package entry appears in the map corpus; the nested-package behavior is DLL-derived and has no map-sample validation.
 
 The record's second string is passed to the `Asset` constructor as its checksum. The sample uses 32-character lowercase hexadecimal MD5 values; the algorithm and corpus-wide match are confirmed below.
 
@@ -124,6 +124,12 @@ The static initialization of `.AssetType` in `ColossalManaged.dll` defines these
 | 108 | User / ScenarioMetaData |
 
 The map corpus contains entry types 3, 52, 100, 102, 105, and 107. Across 105 files the occurrence counts are 237, 110, 104, 5, 12, and 1 respectively. Thus type 3 is used by preview/snapshot assets, type 52 by map data, and type 100 by map metadata in the inspected sample.
+
+### Type-53 nested package entries
+
+`Package.ReadIndexTable` (ColossalManaged.dll RVA `0x3C784`, IL `0x0180`–`0x019C`) checks each newly indexed asset's type. For type `Package` (numeric 53), it constructs another `Package` using the entry name and `Asset`; that constructor creates a `PackagedPackage` implementation (RVA `0x3BC80`) and reads an inner index. `PackagedPackage.GetStream` / `get_dataOffset` (RVAs `0x3D190` / `0x3D1C1`) use the parent asset stream and its absolute offset. `Package+Asset.GetStream` (RVA `0x5CC80`) seeks the containing package stream to the asset offset but returns that shared stream without limiting reads to the asset's declared size. As a result, malformed nested offsets can cross the parent entry's range while remaining inside the parent package file; the supplied DLL does not enforce the parent asset boundary on this path.
+
+This confirms that the framework treats a type-53 payload as another package and opens it recursively. The inspected `Package.Save` path copies each asset's bytes as provided; it does not flatten nested entries into the parent index. Across the 105 local maps and 469 indexed assets, there are no type-53 entries, so the nested header layout, real-world depth, and intended range constraints remain unverified against a game-produced nested package. The Rust reader should bound child parsing to the containing asset's exact byte range even though the inspected game path does not.
 
 The decoded reader layout was applied to all 105 map files. Every index parsed, every index ended at its declared base data offset, and every asset range fit within its file. This confirms the shared container layout across the observed format versions 4–10; it does not yet prove that all other `.crp` package families use the same implementation or payload encoding.
 
@@ -722,7 +728,7 @@ The previously reported 42 `FF` bytes and `00 19`/`00 1C` references occur after
 - No supplied AudioManager sample has an active channel, content, or milestone, and the AudioManager subset does not include versions below 281. Its reader gates and active record layouts are therefore not validated by game-produced samples.
 - StatisticsManager boundaries align in all 110 assets, but its queued `StatisticArray` and concrete history buffers have not been walked in the local serialized object graph. No corpus asset covers the pre-189 end-frame branch.
 - UnlockManager boundaries align in all 110 assets, but the corpus has no active milestone references or scenario triggers; its live milestone object bodies and scenario-specific branches remain unvalidated against game-produced samples. GuideManager's version-derived reference counts were walked in all 110 assets, but the referenced guide-object bodies remain unmapped; the supplied writer and reader also have documented old-version field-count asymmetries.
-- Whether type-53 nested packages occur in other `.crp` families and how their parent-asset ranges are intended to be bounded; no such entry appears in the map corpus.
+- Whether type-53 nested packages occur in other `.crp` families and what real nested-package depths and inner layouts those families use. The DLL recognizes and recursively opens type-53 assets, but no such entry appears in the local map corpus; its stream path does not enforce the containing asset's declared size.
 - Payload-level differences across outer package versions 4–10 and package families beyond the map types in the corpus. The index field layout itself is unchanged in these versions.
 
 ## Next research steps
