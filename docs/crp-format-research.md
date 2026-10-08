@@ -156,6 +156,33 @@ Across the corpus, the reflected metadata headers group as follows:
 
 The type-107 sample is an observed mismatch: the DLL's `UserAssetType` constants label 107 as `MapThemeMapMetaData`, but the entry payload advertises `SystemMapMetaData`. Preserve the outer type and inner runtime type independently when reading.
 
+The other map-used reflected schemas are now mapped from `Assembly-CSharp.dll` field metadata and checked against the map samples:
+
+| Runtime type | Declared fields in serialized order | Inherited fields | Header count |
+| --- | --- | --- | ---: |
+| `SystemMapMetaData` | `environment` (`String`), `timeStamp` (`DateTime`), `imageRef` (`Package+Asset`) | `assetRef` (`Package+Asset`) from `MetaData` | 4 |
+| `DistrictStyleMetaData` | `builtin` (`Boolean`), `name` (`String`), `steamTags` (`String[]`), `assets` (`String[]`), `timeStamp` (`DateTime`), `imageRef` (`Package+Asset`), `steamPreviewRef` (`Package+Asset`) | `assetRef` (`Package+Asset`) from `MetaData` | 8 |
+
+`PackageDeserializer.DeserializeObject` (ColossalManaged.dll RVA `0x40A04`) reads each non-null field according to the runtime field type. For arrays it reads a little-endian `i32` count and then each element. `PackageWriter.WriteArray` (RVA `0x3F444`) writes the count and each element; `PackageReader.ReadStringArray` (RVA `0x3EAAC`) confirms the `String[]` element encoding is a sequence of BinaryWriter strings. The type metadata supplies field names and declared types even when a sample's null marker omits that field's name and type from the payload.
+
+All five type-102 and twelve type-105 entries in the 105-map corpus are in `CO.crp` (outer format version 10). The five type-102 records have four fields and parse exactly to their payload ends (681–687 bytes). The twelve type-105 records have eight fields and parse exactly to their payload ends (916–938 bytes). In all twelve district-style samples, `builtin` is true, `steamTags` is null, `assets` is an empty string array, and the inherited `assetRef` is null; timestamps and both image references are present. These are sample observations, not defaults guaranteed by the type schema.
+
+The single type-107 entry in `CO.crp` uses the same four-field `SystemMapMetaData` runtime schema, with its `imageRef` null. The fields end at byte 535 of its 1,024-byte payload; the remaining 489 bytes are zero. This one sample does not establish whether the suffix is fixed-size padding or an artifact of this asset, so the metadata codec must preserve it as trailing bytes and not assign it meaning.
+
+The supplied `Assembly-CSharp.dll` also declares these metadata subclasses, each with an `assetRef` inherited from `MetaData`:
+
+| Outer type | Runtime class | Declared fields | Field count implied by the reflected schema |
+| ---: | --- | ---: | ---: |
+| 101 | `SaveGameMetaData` | 11 | 12 |
+| 103 | `CustomAssetMetaData` | 24 | 25 |
+| 104 | `ColorCorrectionMetaData` | 1 | 2 |
+| 106 | `MapThemeMetaData` | 78 | 79 |
+| 108 | `ScenarioMetaData` | 33 | 34 |
+
+Their constructors call `MetaData..ctor`, and `PackageDeserializer.DeserializeObject` handles their fields through the same reflection path. No entry with outer type 101, 103, 104, 106, or 108 appears in the 105-map corpus, so these counts and schemas are DLL-derived and have not been validated against game-produced payloads. Keep these payloads raw until representative files establish the actual field values, array contents, and version behavior. The DLL enum's type-107 label has no matching metadata class among these declarations; the one observed type-107 asset remains the `SystemMapMetaData` mismatch described above.
+
+Across the 18 type-102, type-105, and type-107 entries, all 35 non-null `Package+Asset` values match checksums in the `CO.crp` index. This independently confirms that those reflected asset references resolve through the package checksum strings in this sample.
+
 Type-3 texture entries use a dedicated texture reader rather than the generic reflected field-count form. The entry stores the non-null marker and runtime type string, then the texture name, a `linear` boolean, an `i32 anisoLevel` for outer package versions 6 and newer (older versions default it to 1), an `i32` byte count, and that many image bytes. The `CL Wolf Creek` textures have `linear=false`, `anisoLevel=1`, and PNG image data. This sequence was checked across all 237 type-3 entries: every byte count exactly matches the remaining payload, and every image buffer starts with the PNG signature `89 50 4E 47 0D 0A 1A 0A`.
 
 The Rust type-3 codec preserves the assembly-qualified runtime type and image bytes. Its encode/decode path was round-tripped against all 237 type-3 payloads in the external 105-map corpus, including the pre-version-6 `anisoLevel` gate.
