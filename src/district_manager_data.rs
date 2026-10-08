@@ -161,7 +161,7 @@ pub struct DistrictManagerTailData {
     serialized: Vec<u8>,
 }
 
-/// A DistrictManager tail with either DLL-derived fields or an observed opaque layout.
+/// Bytes after the DistrictManager grids with either DLL-derived fields or an opaque layout.
 ///
 /// The opaque layout is recognized only for the exact signatures found in the
 /// local MP23 and MP27 map samples. Both variants retain their original bytes
@@ -170,7 +170,7 @@ pub struct DistrictManagerTailData {
 pub enum DistrictManagerTail {
     /// The field layout implemented by the examined game DLL.
     Typed(DistrictManagerTailData),
-    /// A recognized 44-byte tail whose internal field boundaries are unknown.
+    /// A recognized 44-byte span whose field and object boundaries are unknown.
     OpaqueObserved(Vec<u8>),
 }
 
@@ -178,7 +178,7 @@ impl DistrictManagerTail {
     /// Decodes a DLL-derived tail or a narrowly recognized MP23/MP27 sample layout.
     ///
     /// Returns an error for truncated input and unrecognized layouts. The byte
-    /// count includes the profiler end reference but excludes following objects.
+    /// count includes the typed profiler end or observed two-byte reference.
     pub fn decode_preserving(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         match DistrictManagerTailData::decode(format_version, bytes) {
             Ok((tail, used)) => Ok((Self::Typed(tail), used)),
@@ -1795,7 +1795,7 @@ mod tests {
         DistrictManagerTail, DistrictManagerTailData, PARK_FLAGS_VERSION, POLICY_COUNT,
         district_policy_bool_count,
     };
-    use crate::data_serializer::write_unique_string;
+    use crate::data_serializer::{Reader, write_unique_string};
     use crate::encoded_array::{
         read_encoded_byte_array, write_encoded_bool_array, write_encoded_uint_array,
     };
@@ -2721,6 +2721,52 @@ mod tests {
         let (tail, used) = DistrictManagerTail::decode_preserving(118_011, &mp27_first).unwrap();
         assert_eq!(used, 44);
         assert_eq!(tail.encode(), mp27_first);
+    }
+
+    #[test]
+    fn game_excerpts_confirm_following_manager_boundaries() {
+        for (version, tail, next, expected_name, typed) in [
+            (
+                194,
+                &include_bytes!("../tests/fixtures/district-tail-v194-co.bin")[..],
+                &include_bytes!("../tests/fixtures/district-next-v194-info.bin")[..],
+                "InfoManager",
+                true,
+            ),
+            (
+                116_020,
+                &include_bytes!("../tests/fixtures/district-tail-v116020-desert.bin")[..],
+                &include_bytes!("../tests/fixtures/district-next-v116020-event.bin")[..],
+                "EventManager",
+                true,
+            ),
+            (
+                117_013,
+                &include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin")[..],
+                &include_bytes!("../tests/fixtures/district-next-v117013-statistics.bin")[..],
+                "StatisticsManager",
+                false,
+            ),
+            (
+                118_011,
+                &include_bytes!("../tests/fixtures/district-tail-v118011-mp27-map04.bin")[..],
+                &include_bytes!("../tests/fixtures/district-next-v118011-statistics.bin")[..],
+                "StatisticsManager",
+                false,
+            ),
+        ] {
+            let mut combined = tail.to_vec();
+            combined.extend_from_slice(next);
+            let (decoded, used) =
+                DistrictManagerTail::decode_preserving(version, &combined).unwrap();
+            assert_eq!(used, tail.len());
+            assert_eq!(decoded.typed().is_some(), typed);
+            assert_eq!(decoded.encode(), tail);
+            let mut reader = Reader::new(&combined[used..]);
+            let actual_name = reader.read_shared_string(&mut Vec::new()).unwrap();
+            assert_eq!(actual_name.as_deref(), Some(expected_name));
+            assert_eq!(reader.offset(), next.len());
+        }
     }
 
     #[test]

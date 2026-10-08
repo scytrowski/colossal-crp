@@ -919,11 +919,12 @@ impl SimulationManagerData {
         Ok((tail, tail_end))
     }
 
-    /// Finds the DistrictManager tail boundary, preserving an observed opaque layout.
+    /// Finds the boundary after the DistrictManager grids and following bytes.
     ///
     /// DLL-derived tails expose typed fields. The MP23/MP27 sample layout stays
     /// opaque and can be written back byte for byte. Unknown layouts return an
-    /// error; the returned offset follows the profiler end reference.
+    /// error; the returned offset follows the typed profiler end or observed
+    /// two-byte reference. Ownership of the opaque bytes is not established.
     pub fn decode_district_manager_tail_preserving(
         &self,
     ) -> Result<(DistrictManagerTail, usize), CrpError> {
