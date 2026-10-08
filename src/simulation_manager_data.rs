@@ -2440,6 +2440,47 @@ mod manager_boundary_tests {
             data.decode_district_manager_tail().unwrap().1,
             updated_grid_end + tail.len()
         );
+
+        let mut shrink_editor = updated_records[0].clone().into_editor();
+        shrink_editor
+            .campus_year_report_mut(0)
+            .unwrap()
+            .set_milestone_unlocked(None)
+            .unwrap();
+        let shrunk_record = shrink_editor.encode();
+        assert!(shrunk_record.len() < edited_record.len());
+        let shrink = edited_record.len() - shrunk_record.len();
+        data.replace_district_park_record(&shrink_editor).unwrap();
+
+        let shrunk_records = data.decode_district_manager_park_records().unwrap();
+        assert_eq!(shrunk_records[0].encode(), shrunk_record);
+        let shrunk_reports = shrunk_records[0].campus_year_reports().unwrap();
+        assert_eq!(shrunk_reports[0].tickets_income(), Some([1, 2, 3, 4, 5]));
+        assert_eq!(shrunk_reports[0].milestone_unlocked(), None);
+        assert_eq!(shrunk_reports[1].total_works(), Some(77));
+        assert_eq!(
+            shrunk_records[0]
+                .campus_sports_data()
+                .unwrap()
+                .away_matches_done(),
+            Some([true, false, true, false, true])
+        );
+        let (_, shrunk_grid_end) = data.decode_district_manager_grids().unwrap();
+        assert_eq!(shrunk_grid_end, updated_grid_end - shrink);
+        let shrunk_grid_start = shrunk_grid_end - grids.len();
+        assert_eq!(
+            &data.serialized_object_graph()[shrunk_grid_start..shrunk_grid_end],
+            grids
+        );
+        assert_eq!(
+            &data.serialized_object_graph()
+                [shrunk_grid_end..shrunk_grid_end + tail.len() + next.len()],
+            &[tail.as_slice(), next.as_slice()].concat()
+        );
+        assert_eq!(
+            data.decode_district_manager_tail().unwrap().1,
+            shrunk_grid_end + tail.len()
+        );
         assert_eq!(prefix.park_flags()[0], 1);
         assert_eq!(park_start + records[0].encode().len(), original_grid_start);
     }
