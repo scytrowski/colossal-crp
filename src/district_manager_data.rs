@@ -92,9 +92,17 @@ const PARK_LAST_VISITOR_COUNT_BYTES: usize = 4;
 const DISTRICT_GRID_CELLS: usize = 262_144;
 const DISTRICT_GRID_PLANES: usize = 8;
 const DISTRICT_GRID_VALUES: usize = DISTRICT_GRID_CELLS * DISTRICT_GRID_PLANES;
+const INDUSTRY_RESOURCE_VERSION: u32 = 111_009;
+const INDUSTRY_RESOURCE_TRADE_VERSION: u32 = 111_010;
 const INDUSTRY_RESOURCE_RECORDS: usize = 13;
-const INDUSTRY_RESOURCE_BASE_BYTES: usize = 40;
-const INDUSTRY_RESOURCE_EXPANDED_BYTES: usize = 56;
+const INDUSTRY_RESOURCE_BASE_FIELDS: usize = 10;
+const INDUSTRY_RESOURCE_TRADE_FIELDS: usize = 4;
+const INDUSTRY_RESOURCE_FIELD_BYTES: usize = 4;
+const INDUSTRY_RESOURCE_BASE_BYTES: usize =
+    INDUSTRY_RESOURCE_BASE_FIELDS * INDUSTRY_RESOURCE_FIELD_BYTES;
+const INDUSTRY_RESOURCE_EXPANDED_BYTES: usize = (INDUSTRY_RESOURCE_BASE_FIELDS
+    + INDUSTRY_RESOURCE_TRADE_FIELDS)
+    * INDUSTRY_RESOURCE_FIELD_BYTES;
 
 /// The initial known fields from `DistrictManager+Data`.
 ///
@@ -119,8 +127,8 @@ pub struct DistrictManagerFlagsPrefix {
 
 /// A supported park record from inner versions 110025–118011.
 ///
-/// Modeled scalar fields are interpreted. The exact record bytes are retained
-/// for unchanged writing, including fields not yet modeled.
+/// Modeled scalar and industry-resource fields are interpreted. The exact
+/// record bytes are retained for unchanged writing, including fields not yet modeled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkRecord {
     park_index: usize,
@@ -138,7 +146,9 @@ pub struct DistrictParkRecord {
     area_factor: Option<u8>,
     work_storage_deltas: Option<DistrictParkWorkStorageDeltas>,
     production_data: Option<DistrictParkProductionData>,
+    industry_resources: Option<Vec<DistrictParkIndustryResource>>,
     post_level_offsets: ParkPostLevelFieldOffsets,
+    industry_resource_offsets: Option<ParkIndustryResourceOffsets>,
     serialized: Vec<u8>,
 }
 
@@ -227,6 +237,115 @@ pub struct DistrictParkProductionData {
     pub final_workers: u16,
 }
 
+/// The thirteen industry resource blocks in their DistrictPark wire order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistrictParkIndustryResourceKind {
+    /// Grain resource block.
+    Grain,
+    /// Logs resource block.
+    Logs,
+    /// Ore resource block.
+    Ore,
+    /// Oil resource block.
+    Oil,
+    /// Animal-products resource block.
+    AnimalProducts,
+    /// Flour resource block.
+    Flour,
+    /// Paper resource block.
+    Paper,
+    /// Planed-timber resource block.
+    PlanedTimber,
+    /// Petroleum resource block.
+    Petroleum,
+    /// Plastics resource block.
+    Plastics,
+    /// Glass resource block.
+    Glass,
+    /// Metals resource block.
+    Metals,
+    /// Luxury-products resource block.
+    LuxuryProducts,
+}
+
+impl DistrictParkIndustryResourceKind {
+    fn index(self) -> usize {
+        match self {
+            Self::Grain => 0,
+            Self::Logs => 1,
+            Self::Ore => 2,
+            Self::Oil => 3,
+            Self::AnimalProducts => 4,
+            Self::Flour => 5,
+            Self::Paper => 6,
+            Self::PlanedTimber => 7,
+            Self::Petroleum => 8,
+            Self::Plastics => 9,
+            Self::Glass => 10,
+            Self::Metals => 11,
+            Self::LuxuryProducts => 12,
+        }
+    }
+}
+
+const INDUSTRY_RESOURCE_KINDS: [DistrictParkIndustryResourceKind; INDUSTRY_RESOURCE_RECORDS] = [
+    DistrictParkIndustryResourceKind::Grain,
+    DistrictParkIndustryResourceKind::Logs,
+    DistrictParkIndustryResourceKind::Ore,
+    DistrictParkIndustryResourceKind::Oil,
+    DistrictParkIndustryResourceKind::AnimalProducts,
+    DistrictParkIndustryResourceKind::Flour,
+    DistrictParkIndustryResourceKind::Paper,
+    DistrictParkIndustryResourceKind::PlanedTimber,
+    DistrictParkIndustryResourceKind::Petroleum,
+    DistrictParkIndustryResourceKind::Plastics,
+    DistrictParkIndustryResourceKind::Glass,
+    DistrictParkIndustryResourceKind::Metals,
+    DistrictParkIndustryResourceKind::LuxuryProducts,
+];
+
+/// Four temporary and final import/export counters added in inner version 111010.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistrictParkIndustryTradeData {
+    /// Temporary imported amount.
+    pub temporary_import: u32,
+    /// Temporary exported amount.
+    pub temporary_export: u32,
+    /// Final imported amount.
+    pub final_import: u32,
+    /// Final exported amount.
+    pub final_export: u32,
+}
+
+/// One of the thirteen `DistrictAreaResourceData` records on an industry park.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistrictParkIndustryResource {
+    /// Resource slot in the DLL-defined wire order.
+    pub kind: DistrictParkIndustryResourceKind,
+    /// Temporary consumption.
+    pub temporary_consumption: u32,
+    /// Temporary production.
+    pub temporary_production: u32,
+    /// Temporary buffer amount.
+    pub temporary_buffer_amount: u32,
+    /// Temporary incoming transfer.
+    pub temporary_incoming_transfer: u32,
+    /// Temporary buffer capacity.
+    pub temporary_buffer_capacity: u32,
+    /// Final consumption.
+    pub final_consumption: u32,
+    /// Final production.
+    pub final_production: u32,
+    /// Final buffer amount.
+    pub final_buffer_amount: u32,
+    /// Final incoming transfer.
+    pub final_incoming_transfer: u32,
+    /// Final buffer capacity.
+    pub final_buffer_capacity: u32,
+    /// Versioned import/export counters, absent before inner version 111010.
+    pub trade_data: Option<DistrictParkIndustryTradeData>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParkPostLevelFieldOffsets {
     gates: Option<usize>,
@@ -247,6 +366,12 @@ struct ParkProductionFieldOffsets {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParkIndustryResourceOffsets {
+    first_record: usize,
+    record_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DecodedParkPostLevelData {
     gates: Option<DistrictParkGateData>,
     capacities: Option<DistrictParkCapacities>,
@@ -260,8 +385,8 @@ struct DecodedParkPostLevelData {
 
 /// Editor for modeled scalar fields of one active DistrictManager park.
 ///
-/// All unmodeled fields remain byte-for-byte intact. Common scalar fields and
-/// ticket, visitor, work, storage, and production fields can be changed.
+/// All unmodeled fields remain byte-for-byte intact. Modeled scalar, visitor,
+/// production, and industry-resource fields can be changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkEditor {
     original_serialized: Vec<u8>,
@@ -620,6 +745,13 @@ impl DistrictParkRecord {
         self.production_data
     }
 
+    /// Returns the thirteen industry resource records in DLL wire order.
+    ///
+    /// This is present for park types 5–9 from inner version 111009.
+    pub fn industry_resources(&self) -> Option<&[DistrictParkIndustryResource]> {
+        self.industry_resources.as_deref()
+    }
+
     /// Creates an editor that preserves all unmodeled bytes in this record.
     pub fn into_editor(self) -> DistrictParkEditor {
         DistrictParkEditor {
@@ -926,6 +1058,53 @@ impl DistrictParkEditor {
             "final park workers",
         )?;
         self.record.production_data = Some(value);
+        Ok(())
+    }
+
+    /// Returns industry resources in the fixed DLL wire order when this park has them.
+    pub fn industry_resources(&self) -> Option<&[DistrictParkIndustryResource]> {
+        self.record.industry_resources()
+    }
+
+    /// Replaces one industry resource record without changing the surrounding park bytes.
+    ///
+    /// Returns an error when this park has no industry resources or when the trade-data
+    /// presence does not match the park's inner-version gate.
+    pub fn set_industry_resource(
+        &mut self,
+        value: DistrictParkIndustryResource,
+    ) -> Result<(), CrpError> {
+        let offsets = self
+            .record
+            .industry_resource_offsets
+            .ok_or_else(|| invalid_district_manager(0, "industry resource fields are absent"))?;
+        let index = value.kind.index();
+        if self
+            .record
+            .industry_resources
+            .as_ref()
+            .and_then(|resources| resources.get(index))
+            .is_none()
+        {
+            return Err(invalid_district_manager(
+                0,
+                "industry resource kind is outside this park's resource table",
+            ));
+        }
+        let has_trade_data = offsets.record_bytes == INDUSTRY_RESOURCE_EXPANDED_BYTES;
+        let encoded = encode_industry_resource(&value, has_trade_data)?;
+        let resource_offset = index
+            .checked_mul(offsets.record_bytes)
+            .and_then(|relative| offsets.first_record.checked_add(relative))
+            .ok_or(CrpError::ArithmeticOverflow(
+                "industry resource record offset",
+            ))?;
+        self.write_field(resource_offset, &encoded, "industry resource record")?;
+        let resources =
+            self.record.industry_resources.as_mut().ok_or_else(|| {
+                invalid_district_manager(0, "industry resource fields are absent")
+            })?;
+        resources[index] = value;
         Ok(())
     }
 
@@ -1838,8 +2017,9 @@ impl DistrictManagerFlagsPrefix {
     /// MP23/MP27 maps; other supported records follow the examined DLL's
     /// thirteen-report layout from version 112020. Other active versions or
     /// park types return an error. Types 5–9 include thirteen versioned
-    /// industry resource records. Each record preserves its original bytes for
-    /// exact unchanged writing. The returned byte count ends before the grid.
+    /// industry resource records. Their fields are decoded while the complete
+    /// record bytes remain available for exact unchanged writing. The returned
+    /// byte count ends before the grid.
     pub fn decode_park_records(
         &self,
         bytes: &[u8],
@@ -1918,26 +2098,22 @@ impl DistrictManagerFlagsPrefix {
             let visitor_data = decode_park_visitor_data(self.format_version, type_offset, fixed)?;
             let post_level_data =
                 decode_park_post_level_data(self.format_version, type_offset, fixed)?;
-            if (5..=9).contains(&park_type)
-                && self.format_version >= TYPE_ZERO_PARK_PRODUCTION_VERSION
+            let (industry_resources, industry_resource_offsets) = if (5..=9).contains(&park_type)
+                && self.format_version >= INDUSTRY_RESOURCE_VERSION
             {
                 // DistrictPark.IsIndustryType is true for types 5–9. The
                 // industry branch writes thirteen DistrictAreaResourceData
                 // records before the campus and airport branches.
-                let resource_bytes = if self.format_version >= 111_010 {
-                    INDUSTRY_RESOURCE_EXPANDED_BYTES
-                } else {
-                    INDUSTRY_RESOURCE_BASE_BYTES
-                };
-                reader
-                    .read_bytes(INDUSTRY_RESOURCE_RECORDS * resource_bytes)
-                    .map_err(|error| {
-                        invalid_district_manager(
-                            offset + reader.offset(),
-                            format!("park {park_index} industry resources: {error}"),
-                        )
-                    })?;
-            }
+                let (resources, resource_offsets) = decode_park_industry_resources(
+                    &mut reader,
+                    self.format_version,
+                    offset,
+                    park_index,
+                )?;
+                (Some(resources), Some(resource_offsets))
+            } else {
+                (None, None)
+            };
             if self.format_version >= 112_008
                 && ((10..=13).contains(&park_type)
                     || (self.format_version >= TYPE_ZERO_PARK_CAMPUS_VERSION && park_index == 0))
@@ -1999,7 +2175,9 @@ impl DistrictManagerFlagsPrefix {
                 area_factor: post_level_data.area_factor,
                 work_storage_deltas: post_level_data.work_storage_deltas,
                 production_data: post_level_data.production_data,
+                industry_resources,
                 post_level_offsets: post_level_data.offsets,
+                industry_resource_offsets,
                 serialized: bytes[offset..end].to_vec(),
             });
             offset = end;
@@ -2269,6 +2447,158 @@ fn decode_park_post_level_data(
         production_data,
         offsets,
     })
+}
+
+fn decode_park_industry_resources(
+    reader: &mut Reader<'_>,
+    format_version: u32,
+    park_offset: usize,
+    park_index: usize,
+) -> Result<
+    (
+        Vec<DistrictParkIndustryResource>,
+        ParkIndustryResourceOffsets,
+    ),
+    CrpError,
+> {
+    let record_bytes = if format_version >= INDUSTRY_RESOURCE_TRADE_VERSION {
+        INDUSTRY_RESOURCE_EXPANDED_BYTES
+    } else {
+        INDUSTRY_RESOURCE_BASE_BYTES
+    };
+    let block_bytes =
+        INDUSTRY_RESOURCE_RECORDS
+            .checked_mul(record_bytes)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "park industry resource block size",
+            ))?;
+    let first_record = reader.offset();
+    let block = match reader.read_bytes(block_bytes) {
+        Ok(block) => block,
+        Err(error) => {
+            let error_offset = park_offset
+                .checked_add(reader.offset())
+                .ok_or(CrpError::ArithmeticOverflow("park industry error offset"))?;
+            return Err(invalid_district_manager(
+                error_offset,
+                format!("park {park_index} industry resources: {error}"),
+            ));
+        }
+    };
+    let mut resource_reader = Reader::new(block);
+    let mut resources = Vec::with_capacity(INDUSTRY_RESOURCE_RECORDS);
+    for kind in INDUSTRY_RESOURCE_KINDS {
+        let mut read_field = |field: &str| -> Result<u32, CrpError> {
+            let field_offset = park_offset
+                .checked_add(first_record)
+                .and_then(|offset| offset.checked_add(resource_reader.offset()))
+                .ok_or(CrpError::ArithmeticOverflow("park industry field offset"))?;
+            resource_reader.read_u32_be().map_err(|error| {
+                invalid_district_manager(
+                    field_offset,
+                    format!("park {park_index} industry {kind:?} {field}: {error}"),
+                )
+            })
+        };
+        let temporary_consumption = read_field("temporary consumption")?;
+        let temporary_production = read_field("temporary production")?;
+        let temporary_buffer_amount = read_field("temporary buffer amount")?;
+        let temporary_incoming_transfer = read_field("temporary incoming transfer")?;
+        let temporary_buffer_capacity = read_field("temporary buffer capacity")?;
+        let final_consumption = read_field("final consumption")?;
+        let final_production = read_field("final production")?;
+        let final_buffer_amount = read_field("final buffer amount")?;
+        let final_incoming_transfer = read_field("final incoming transfer")?;
+        let final_buffer_capacity = read_field("final buffer capacity")?;
+        let trade_data = if format_version >= INDUSTRY_RESOURCE_TRADE_VERSION {
+            Some(DistrictParkIndustryTradeData {
+                temporary_import: read_field("temporary import")?,
+                temporary_export: read_field("temporary export")?,
+                final_import: read_field("final import")?,
+                final_export: read_field("final export")?,
+            })
+        } else {
+            None
+        };
+        resources.push(DistrictParkIndustryResource {
+            kind,
+            temporary_consumption,
+            temporary_production,
+            temporary_buffer_amount,
+            temporary_incoming_transfer,
+            temporary_buffer_capacity,
+            final_consumption,
+            final_production,
+            final_buffer_amount,
+            final_incoming_transfer,
+            final_buffer_capacity,
+            trade_data,
+        });
+    }
+    Ok((
+        resources,
+        ParkIndustryResourceOffsets {
+            first_record,
+            record_bytes,
+        },
+    ))
+}
+
+fn encode_industry_resource(
+    resource: &DistrictParkIndustryResource,
+    has_trade_data: bool,
+) -> Result<Vec<u8>, CrpError> {
+    if has_trade_data != resource.trade_data.is_some() {
+        return Err(invalid_district_manager(
+            0,
+            if has_trade_data {
+                "industry trade counters are required from inner version 111010"
+            } else {
+                "industry trade counters are absent before inner version 111010"
+            },
+        ));
+    }
+    let mut bytes = Vec::with_capacity(if has_trade_data {
+        INDUSTRY_RESOURCE_EXPANDED_BYTES
+    } else {
+        INDUSTRY_RESOURCE_BASE_BYTES
+    });
+    for value in [
+        resource.temporary_consumption,
+        resource.temporary_production,
+        resource.temporary_buffer_amount,
+        resource.temporary_incoming_transfer,
+        resource.temporary_buffer_capacity,
+        resource.final_consumption,
+        resource.final_production,
+        resource.final_buffer_amount,
+        resource.final_incoming_transfer,
+        resource.final_buffer_capacity,
+    ] {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    if let Some(trade_data) = resource.trade_data {
+        for value in [
+            trade_data.temporary_import,
+            trade_data.temporary_export,
+            trade_data.final_import,
+            trade_data.final_export,
+        ] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    let expected_bytes = if has_trade_data {
+        INDUSTRY_RESOURCE_EXPANDED_BYTES
+    } else {
+        INDUSTRY_RESOURCE_BASE_BYTES
+    };
+    if bytes.len() != expected_bytes {
+        return Err(invalid_district_manager(
+            0,
+            "encoded industry resource has an unexpected byte length",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn airport_park_bytes(format_version: u32) -> usize {
@@ -2603,7 +2933,8 @@ mod tests {
         AIRLINE_NAME_VERSION, AIRPORT_PANEL_VERSION, DISTRICT_COUNT, DISTRICT_GRID_CELLS,
         DISTRICT_GRID_VALUES, DistrictManagerFlagsPrefix, DistrictManagerGridData,
         DistrictManagerTailData, DistrictParkAttractiveness, DistrictParkCapacities,
-        DistrictParkGateData, DistrictParkProductionData, DistrictParkWorkStorageDeltas,
+        DistrictParkGateData, DistrictParkIndustryResource, DistrictParkIndustryResourceKind,
+        DistrictParkIndustryTradeData, DistrictParkProductionData, DistrictParkWorkStorageDeltas,
         PARK_FLAGS_VERSION, POLICY_COUNT, district_policy_bool_count,
     };
     use crate::data_serializer::{Reader, write_unique_string};
@@ -2872,6 +3203,7 @@ mod tests {
     fn park_types_one_through_nine_follow_il_resource_branch() {
         for (version, park_type, resource_bytes) in [
             (110_025, 4, 0),
+            (110_025, 5, 0),
             (111_009, 5, 13 * 40),
             (111_010, 9, 13 * 56),
             (112_004, 1, 0),
@@ -2900,6 +3232,31 @@ mod tests {
             assert_eq!(parks[0].park_index(), 5);
             assert_eq!(parks[0].park_type(), park_type);
             assert_eq!(parks[0].level(), 3);
+            assert_eq!(parks[0].industry_resources().is_some(), resource_bytes != 0);
+            if version < super::INDUSTRY_RESOURCE_VERSION && park_type == 5 {
+                let mut editor = parks[0].clone().into_editor();
+                assert!(
+                    editor
+                        .set_industry_resource(DistrictParkIndustryResource {
+                            kind: DistrictParkIndustryResourceKind::Grain,
+                            temporary_consumption: 0,
+                            temporary_production: 0,
+                            temporary_buffer_amount: 0,
+                            temporary_incoming_transfer: 0,
+                            temporary_buffer_capacity: 0,
+                            final_consumption: 0,
+                            final_production: 0,
+                            final_buffer_amount: 0,
+                            final_incoming_transfer: 0,
+                            final_buffer_capacity: 0,
+                            trade_data: None,
+                        })
+                        .is_err()
+                );
+            }
+            if let Some(resources) = parks[0].industry_resources() {
+                assert_eq!(resources.len(), super::INDUSTRY_RESOURCE_RECORDS);
+            }
             assert_eq!(parks[0].encode(), record);
             assert_eq!(bytes[used], 0xff);
             assert!(prefix.decode_type_zero_park_records(&bytes).is_err());
@@ -2912,6 +3269,152 @@ mod tests {
             }
             record[42] = 16;
             assert!(prefix.decode_park_records(&record).is_err());
+        }
+    }
+
+    #[test]
+    fn industry_resource_records_decode_and_edit_each_versioned_counter() {
+        let kinds = [
+            DistrictParkIndustryResourceKind::Grain,
+            DistrictParkIndustryResourceKind::Logs,
+            DistrictParkIndustryResourceKind::Ore,
+            DistrictParkIndustryResourceKind::Oil,
+            DistrictParkIndustryResourceKind::AnimalProducts,
+            DistrictParkIndustryResourceKind::Flour,
+            DistrictParkIndustryResourceKind::Paper,
+            DistrictParkIndustryResourceKind::PlanedTimber,
+            DistrictParkIndustryResourceKind::Petroleum,
+            DistrictParkIndustryResourceKind::Plastics,
+            DistrictParkIndustryResourceKind::Glass,
+            DistrictParkIndustryResourceKind::Metals,
+            DistrictParkIndustryResourceKind::LuxuryProducts,
+        ];
+        for (version, record_bytes, field_count) in [(111_009, 40, 10), (111_010, 56, 14)] {
+            let mut prefix_bytes = Vec::new();
+            zero_flags(&mut prefix_bytes);
+            let mut park_flags = [0_u32; DISTRICT_COUNT];
+            park_flags[5] = 1;
+            write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+            zero_policy_bools(&mut prefix_bytes, version);
+            let (prefix, _) =
+                DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+
+            let scalar_bytes = super::park_scalar_bytes(version);
+            let mut record = vec![0; scalar_bytes];
+            record[42] = 5;
+            let expected_value = |resource: usize, field: usize| {
+                0x1020_3000_u32 + (resource as u32 * 0x100) + field as u32
+            };
+            for resource in 0..kinds.len() {
+                for field in 0..field_count {
+                    record.extend_from_slice(&expected_value(resource, field).to_be_bytes());
+                }
+            }
+
+            let (parks, consumed) = prefix.decode_park_records(&record).unwrap();
+            assert_eq!(consumed, record.len());
+            let resources = parks[0].industry_resources().unwrap();
+            assert_eq!(resources.len(), kinds.len());
+            for (index, resource) in resources.iter().enumerate() {
+                assert_eq!(resource.kind, kinds[index]);
+                assert_eq!(resource.temporary_consumption, expected_value(index, 0));
+                assert_eq!(resource.temporary_production, expected_value(index, 1));
+                assert_eq!(resource.temporary_buffer_amount, expected_value(index, 2));
+                assert_eq!(
+                    resource.temporary_incoming_transfer,
+                    expected_value(index, 3)
+                );
+                assert_eq!(resource.temporary_buffer_capacity, expected_value(index, 4));
+                assert_eq!(resource.final_consumption, expected_value(index, 5));
+                assert_eq!(resource.final_production, expected_value(index, 6));
+                assert_eq!(resource.final_buffer_amount, expected_value(index, 7));
+                assert_eq!(resource.final_incoming_transfer, expected_value(index, 8));
+                assert_eq!(resource.final_buffer_capacity, expected_value(index, 9));
+                assert_eq!(
+                    resource.trade_data,
+                    (version >= 111_010).then_some(DistrictParkIndustryTradeData {
+                        temporary_import: expected_value(index, 10),
+                        temporary_export: expected_value(index, 11),
+                        final_import: expected_value(index, 12),
+                        final_export: expected_value(index, 13),
+                    })
+                );
+            }
+
+            let replacement = DistrictParkIndustryResource {
+                kind: DistrictParkIndustryResourceKind::PlanedTimber,
+                temporary_consumption: 0xa001_0001,
+                temporary_production: 0xa002_0002,
+                temporary_buffer_amount: 0xa003_0003,
+                temporary_incoming_transfer: 0xa004_0004,
+                temporary_buffer_capacity: 0xa005_0005,
+                final_consumption: 0xa006_0006,
+                final_production: 0xa007_0007,
+                final_buffer_amount: 0xa008_0008,
+                final_incoming_transfer: 0xa009_0009,
+                final_buffer_capacity: 0xa00a_000a,
+                trade_data: (version >= 111_010).then_some(DistrictParkIndustryTradeData {
+                    temporary_import: 0xa00b_000b,
+                    temporary_export: 0xa00c_000c,
+                    final_import: 0xa00d_000d,
+                    final_export: 0xa00e_000e,
+                }),
+            };
+            let mut editor = parks[0].clone().into_editor();
+            editor.set_industry_resource(replacement).unwrap();
+            assert_eq!(editor.industry_resources().unwrap()[7], replacement);
+
+            let mut expected = record.clone();
+            let edited_record_offset = scalar_bytes + 7 * record_bytes;
+            for (field, value) in [
+                replacement.temporary_consumption,
+                replacement.temporary_production,
+                replacement.temporary_buffer_amount,
+                replacement.temporary_incoming_transfer,
+                replacement.temporary_buffer_capacity,
+                replacement.final_consumption,
+                replacement.final_production,
+                replacement.final_buffer_amount,
+                replacement.final_incoming_transfer,
+                replacement.final_buffer_capacity,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let start = edited_record_offset + field * 4;
+                expected[start..start + 4].copy_from_slice(&value.to_be_bytes());
+            }
+            if let Some(trade_data) = replacement.trade_data {
+                for (field, value) in [
+                    trade_data.temporary_import,
+                    trade_data.temporary_export,
+                    trade_data.final_import,
+                    trade_data.final_export,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let start = edited_record_offset + (10 + field) * 4;
+                    expected[start..start + 4].copy_from_slice(&value.to_be_bytes());
+                }
+            }
+            assert_eq!(editor.encode(), expected);
+
+            let mismatched_trade_data = DistrictParkIndustryResource {
+                trade_data: if version < 111_010 {
+                    Some(DistrictParkIndustryTradeData {
+                        temporary_import: 1,
+                        temporary_export: 2,
+                        final_import: 3,
+                        final_export: 4,
+                    })
+                } else {
+                    None
+                },
+                ..replacement
+            };
+            assert!(editor.set_industry_resource(mismatched_trade_data).is_err());
+            assert_eq!(editor.encode(), expected);
         }
     }
 
@@ -2938,6 +3441,23 @@ mod tests {
         let (records, used) = prefix.decode_park_records(&bytes).unwrap();
         assert_eq!(used, expected_len);
         assert_eq!(records[0].park_type(), 5);
+        let resources = records[0].industry_resources().unwrap();
+        assert_eq!(resources.len(), 13);
+        assert_eq!(resources[0].kind, DistrictParkIndustryResourceKind::Grain);
+        assert_eq!(
+            resources[12].kind,
+            DistrictParkIndustryResourceKind::LuxuryProducts
+        );
+        assert_eq!(resources[0].temporary_consumption, 0xa5a5_a5a5);
+        assert_eq!(
+            resources[12].trade_data,
+            Some(DistrictParkIndustryTradeData {
+                temporary_import: 0xa5a5_a5a5,
+                temporary_export: 0xa5a5_a5a5,
+                final_import: 0xa5a5_a5a5,
+                final_export: 0xa5a5_a5a5,
+            })
+        );
         assert_eq!(records[0].encode(), bytes[..used]);
         assert_eq!(bytes[used], 0xff);
         assert!(

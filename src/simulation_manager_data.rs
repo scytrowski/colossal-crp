@@ -2136,6 +2136,10 @@ fn find_unique_bytes(haystack: &[u8], needle: &[u8], description: &str) -> Resul
 mod manager_boundary_tests {
     use super::{ManagerObjectReference, SimulationManagerData};
     use crate::data_serializer::write_unique_string;
+    use crate::district_manager_data::{
+        DistrictParkIndustryResource, DistrictParkIndustryResourceKind,
+        DistrictParkIndustryTradeData,
+    };
     use crate::encoded_array::{
         write_encoded_bool_array, write_encoded_uint_array, write_encoded_ushort_array,
     };
@@ -2347,6 +2351,94 @@ mod manager_boundary_tests {
         assert_eq!(
             stale_editor.random_seed(),
             u64::from_be_bytes(park[..8].try_into().unwrap())
+        );
+    }
+
+    #[test]
+    fn industry_resource_edit_replaces_only_its_manager_record_bytes() {
+        let type_zero_park =
+            include_bytes!("../tests/fixtures/district-park-v117013-mp23-map01.bin");
+        let grids = include_bytes!("../tests/fixtures/district-grids-v117013-mp23-map01.bin");
+        let tail = include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin");
+        let next = include_bytes!("../tests/fixtures/district-next-v117013-event.bin");
+        let scalar_bytes = 94;
+        let resource_bytes = 13 * 56;
+        let campus_ten = &type_zero_park[scalar_bytes..];
+        let campus_tail_start = campus_ten.len() - 29;
+        let empty_report_start = campus_tail_start - 70;
+        let empty_report = &campus_ten[empty_report_start..campus_tail_start];
+        let mut campus_thirteen = campus_ten[..campus_tail_start].to_vec();
+        for _ in 0..3 {
+            campus_thirteen.extend_from_slice(empty_report);
+        }
+        campus_thirteen.extend_from_slice(&campus_ten[campus_tail_start..]);
+
+        let mut park = type_zero_park[..scalar_bytes].to_vec();
+        park[58] = 5;
+        park.extend(vec![0x5a; resource_bytes]);
+        park.extend_from_slice(&campus_thirteen);
+        let mut data = manager_with_park_boundary(117_013, &park, grids, tail, next);
+        let records = data.decode_district_manager_park_records().unwrap();
+        assert_eq!(records[0].industry_resources().unwrap().len(), 13);
+
+        let replacement = DistrictParkIndustryResource {
+            kind: DistrictParkIndustryResourceKind::Grain,
+            temporary_consumption: 0x0102_0304,
+            temporary_production: 0x1112_1314,
+            temporary_buffer_amount: 0x2122_2324,
+            temporary_incoming_transfer: 0x3132_3334,
+            temporary_buffer_capacity: 0x4142_4344,
+            final_consumption: 0x5152_5354,
+            final_production: 0x6162_6364,
+            final_buffer_amount: 0x7172_7374,
+            final_incoming_transfer: 0x8182_8384,
+            final_buffer_capacity: 0x9192_9394,
+            trade_data: Some(DistrictParkIndustryTradeData {
+                temporary_import: 0xa1a2_a3a4,
+                temporary_export: 0xb1b2_b3b4,
+                final_import: 0xc1c2_c3c4,
+                final_export: 0xd1d2_d3d4,
+            }),
+        };
+        let mut editor = records[0].clone().into_editor();
+        editor.set_industry_resource(replacement).unwrap();
+        data.replace_district_park_record(&editor).unwrap();
+
+        let mut expected = park;
+        let values = [
+            replacement.temporary_consumption,
+            replacement.temporary_production,
+            replacement.temporary_buffer_amount,
+            replacement.temporary_incoming_transfer,
+            replacement.temporary_buffer_capacity,
+            replacement.final_consumption,
+            replacement.final_production,
+            replacement.final_buffer_amount,
+            replacement.final_incoming_transfer,
+            replacement.final_buffer_capacity,
+            replacement.trade_data.unwrap().temporary_import,
+            replacement.trade_data.unwrap().temporary_export,
+            replacement.trade_data.unwrap().final_import,
+            replacement.trade_data.unwrap().final_export,
+        ];
+        for (field, value) in values.into_iter().enumerate() {
+            let start = scalar_bytes + field * 4;
+            expected[start..start + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        let updated = data.decode_district_manager_park_records().unwrap();
+        assert_eq!(updated[0].encode(), expected);
+        assert_eq!(updated[0].industry_resources().unwrap()[0], replacement);
+
+        let (_, park_start) = data.decode_district_manager_flags_prefix().unwrap();
+        let graph = data.serialized_object_graph();
+        assert_eq!(
+            &graph[park_start + expected.len()..park_start + expected.len() + grids.len()],
+            grids
+        );
+        let (_, grid_end) = data.decode_district_manager_grids().unwrap();
+        assert_eq!(
+            &graph[grid_end..grid_end + tail.len() + next.len()],
+            &[tail.as_slice(), next.as_slice()].concat()
         );
     }
 
