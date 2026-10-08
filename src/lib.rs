@@ -55,7 +55,7 @@ pub use district_manager_data::{
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
-pub use metadata::{MapMetaData, ModInfo};
+pub use metadata::{DistrictStyleMetaData, MapMetaData, ModInfo, SystemMapMetaData};
 pub use net_manager_data::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLane, NetLanePrefix,
     NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
@@ -3712,6 +3712,99 @@ mod tests {
     }
 
     #[test]
+    fn system_map_and_district_style_metadata_fixtures_round_trip() -> Result<(), CrpError> {
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let system_map_asset = Asset {
+            name: "BuiltinTerrainMap-Sunny".to_owned(),
+            checksum: String::new(),
+            asset_type: 102,
+            relative_offset: 0,
+            data: fs::read(fixture_dir.join("system-map-metadata-v10.bin"))?,
+        };
+        let system_map = SystemMapMetaData::decode(&system_map_asset)?;
+        assert_eq!(system_map.outer_asset_type, 102);
+        assert_eq!(system_map.environment.as_deref(), Some("Sunny"));
+        assert_eq!(
+            system_map.time_stamp.as_deref(),
+            Some("2015-02-03T00:44:52.8767263+02:00")
+        );
+        assert_eq!(
+            system_map.image_ref.as_deref(),
+            Some("e1dc891bfb96977abd25e9c044dbddb8")
+        );
+        assert_eq!(
+            system_map.asset_ref.as_deref(),
+            Some("868304b7299cdbc6288371ba19f5da86")
+        );
+        assert_eq!(system_map.encode()?, system_map_asset.data);
+
+        let district_style_asset = Asset {
+            name: "EuropeanBuiltinStyle_q3oji4g".to_owned(),
+            checksum: String::new(),
+            asset_type: 105,
+            relative_offset: 0,
+            data: fs::read(fixture_dir.join("district-style-metadata-v10.bin"))?,
+        };
+        let district_style = DistrictStyleMetaData::decode(&district_style_asset)?;
+        assert_eq!(district_style.builtin, Some(true));
+        assert_eq!(
+            district_style.name.as_deref(),
+            Some("EuropeanBuiltinStyle_q3oji4g")
+        );
+        assert_eq!(district_style.steam_tags, None);
+        assert_eq!(district_style.assets, Some(Vec::new()));
+        assert_eq!(
+            district_style.time_stamp.as_deref(),
+            Some("2015-09-11T12:08:50.6724948+03:00")
+        );
+        assert_eq!(
+            district_style.image_ref.as_deref(),
+            Some("2281027cb20e062aa739f92e1fdbab04")
+        );
+        assert_eq!(
+            district_style.steam_preview_ref.as_deref(),
+            Some("337d62b997b9d7b9f25c6747f473f9c0")
+        );
+        assert_eq!(district_style.asset_ref, None);
+        assert_eq!(district_style.encode()?, district_style_asset.data);
+
+        let mut edited_style = district_style;
+        edited_style.assets = Some(vec!["asset-one".to_owned(), "asset-two".to_owned()]);
+        let mut edited_asset = district_style_asset;
+        edited_asset.data = edited_style.encode()?;
+        let decoded_edit = DistrictStyleMetaData::decode(&edited_asset)?;
+        assert_eq!(
+            decoded_edit.assets,
+            Some(vec!["asset-one".to_owned(), "asset-two".to_owned()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn type_107_system_map_metadata_preserves_outer_type_and_zero_suffix() -> Result<(), CrpError> {
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let asset = Asset {
+            name: "BuiltinTerrainMap-1aa5g6dfs748sf".to_owned(),
+            checksum: String::new(),
+            asset_type: 107,
+            relative_offset: 0,
+            data: fs::read(fixture_dir.join("system-map-theme-map-type107-v10.bin"))?,
+        };
+        let metadata = SystemMapMetaData::decode(&asset)?;
+        assert_eq!(metadata.outer_asset_type, 107);
+        assert_eq!(metadata.environment.as_deref(), Some("Europe"));
+        assert_eq!(metadata.image_ref, None);
+        assert_eq!(
+            metadata.asset_ref.as_deref(),
+            Some("93276827714a6175062b6645471e2680")
+        );
+        assert_eq!(metadata.trailing_bytes.len(), 489);
+        assert!(metadata.trailing_bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(metadata.encode()?, asset.data);
+        Ok(())
+    }
+
+    #[test]
     fn map_metadata_map_theme_reference_uses_string_wire_type() -> Result<(), CrpError> {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let mut file = File::open(fixture_dir.join("metadata-v10.crp"))?;
@@ -4006,6 +4099,66 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "set CRP_CORPUS_DIR and run explicitly to check reflected metadata assets"]
+    fn validates_optional_reflected_metadata_corpus() -> Result<(), Box<dyn std::error::Error>> {
+        let maps_dir = std::env::var_os("CRP_CORPUS_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| std::io::Error::other("CRP_CORPUS_DIR is not set"))?;
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(maps_dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|extension| extension == "crp") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        assert!(!paths.is_empty(), "external corpus contains no .crp files");
+
+        let mut map_metadata_count = 0_usize;
+        let mut system_map_metadata_count = 0_usize;
+        let mut district_style_metadata_count = 0_usize;
+        for path in paths {
+            let mut file = File::open(&path)?;
+            let package = Package::read_from(&mut file)?;
+            for asset in &package.assets {
+                match asset.asset_type {
+                    100 => {
+                        let metadata = MapMetaData::decode(asset)?;
+                        assert_eq!(metadata.encode()?, asset.data);
+                        map_metadata_count += 1;
+                    }
+                    102 | 107 => {
+                        let metadata = SystemMapMetaData::decode(asset)?;
+                        assert_eq!(metadata.outer_asset_type, asset.asset_type);
+                        assert_eq!(metadata.encode()?, asset.data);
+                        system_map_metadata_count += 1;
+                    }
+                    105 => {
+                        let metadata = DistrictStyleMetaData::decode(asset)?;
+                        assert_eq!(metadata.encode()?, asset.data);
+                        district_style_metadata_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(
+            map_metadata_count > 0,
+            "corpus contains no type-100 metadata"
+        );
+        assert!(
+            system_map_metadata_count > 0,
+            "corpus contains no type-102 or type-107 metadata"
+        );
+        assert!(
+            district_style_metadata_count > 0,
+            "corpus contains no type-105 metadata"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "set CRP_CORPUS_DIR and run explicitly to check a local full corpus"]
     fn validates_optional_external_map_corpus() -> Result<(), Box<dyn std::error::Error>> {
         let maps_dir = std::env::var_os("CRP_CORPUS_DIR")
@@ -4110,6 +4263,27 @@ mod tests {
                             metadata.encode()?,
                             asset.data,
                             "metadata round-trip mismatch for {:?} in {}",
+                            asset.name,
+                            path.display()
+                        );
+                    }
+                    102 | 107 => {
+                        let metadata = SystemMapMetaData::decode(asset)?;
+                        assert_eq!(metadata.outer_asset_type, asset.asset_type);
+                        assert_eq!(
+                            metadata.encode()?,
+                            asset.data,
+                            "system-map metadata round-trip mismatch for {:?} in {}",
+                            asset.name,
+                            path.display()
+                        );
+                    }
+                    105 => {
+                        let metadata = DistrictStyleMetaData::decode(asset)?;
+                        assert_eq!(
+                            metadata.encode()?,
+                            asset.data,
+                            "district-style metadata round-trip mismatch for {:?} in {}",
                             asset.name,
                             path.display()
                         );
