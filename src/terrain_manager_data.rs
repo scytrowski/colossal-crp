@@ -14,6 +14,7 @@ pub struct TerrainManagerData {
     raw_heights: Vec<u16>,
     block_height_deltas: Vec<u16>,
     dirt_buffer: i32,
+    object_references: Vec<Vec<u8>>,
     serialized_body: Vec<u8>,
 }
 
@@ -44,9 +45,13 @@ impl TerrainManagerData {
         } else {
             524_288
         };
+        let mut object_references = Vec::new();
         if version >= 244 {
+            object_references.reserve(3);
             for _ in 0..3 {
+                let start = reader.offset();
                 skip_object_reference(&mut reader)?;
+                object_references.push(reader.consumed_bytes()[start..].to_vec());
             }
         }
         let consumed = reader.offset();
@@ -55,6 +60,7 @@ impl TerrainManagerData {
                 raw_heights,
                 block_height_deltas,
                 dirt_buffer,
+                object_references,
                 serialized_body: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -74,6 +80,12 @@ impl TerrainManagerData {
     /// Returns the dirt buffer value, including its version default when absent.
     pub fn dirt_buffer(&self) -> i32 {
         self.dirt_buffer
+    }
+
+    /// Returns the three version-244+ object references in serialized order.
+    /// Each entry contains its exact DataSerializer header bytes.
+    pub fn object_references(&self) -> &[Vec<u8>] {
+        &self.object_references
     }
 
     /// Returns the original serialized object body unchanged.
@@ -102,5 +114,44 @@ fn skip_object_reference(reader: &mut Reader<'_>) -> Result<(), CrpError> {
             reader.read_u8()?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TERRAIN_HEIGHT_COUNT, TerrainManagerData};
+    use crate::data_serializer::write_unique_string;
+    use crate::encoded_array::write_encoded_ushort_array;
+
+    #[test]
+    fn terrain_prefix_retains_versioned_object_reference_headers() {
+        let mut bytes = Vec::new();
+        write_encoded_ushort_array(&mut bytes, &vec![0; TERRAIN_HEIGHT_COUNT]);
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.push(0xff);
+        bytes.extend_from_slice(&[0xfe, 0xfe]);
+        write_unique_string(&mut bytes, "TerrainToolGuide").unwrap();
+        bytes.extend_from_slice(&[0, 0, 7]);
+        let original = bytes.clone();
+
+        let (terrain, consumed) = TerrainManagerData::decode_prefix(244, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            terrain.object_references(),
+            [
+                vec![0xff],
+                {
+                    let mut reference = vec![0xfe, 0xfe];
+                    write_unique_string(&mut reference, "TerrainToolGuide").unwrap();
+                    reference
+                },
+                vec![0, 0, 7],
+            ]
+        );
+        assert_eq!(terrain.encode(), original);
+
+        let (legacy, legacy_consumed) = TerrainManagerData::decode_prefix(243, &bytes).unwrap();
+        assert!(legacy.object_references().is_empty());
+        assert!(legacy_consumed < bytes.len());
     }
 }

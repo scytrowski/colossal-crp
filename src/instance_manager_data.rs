@@ -113,6 +113,12 @@ impl InstanceManagerData {
         self.group_count
     }
 
+    /// Returns group IDs and their raw object-reference headers in field order.
+    /// The first four bytes of each entry are the group ID.
+    pub fn group_references(&self) -> &[Vec<u8>] {
+        &self.group_references
+    }
+
     /// Writes the original body byte for byte, including unknown references.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_body.clone()

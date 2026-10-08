@@ -12,6 +12,8 @@ mod data_serializer;
 mod district_manager_data;
 mod encoded_array;
 mod game_area_data;
+mod guide_data;
+mod guide_manager_data;
 mod instance_manager_data;
 mod metadata;
 mod net_manager_data;
@@ -19,6 +21,7 @@ mod path_manager_data;
 mod prop_manager_data;
 mod simulation_manager_data;
 mod simulation_metadata;
+mod statistics_manager_data;
 mod terrain_manager_data;
 mod texture;
 mod tree_manager_data;
@@ -54,6 +57,12 @@ pub use district_manager_data::{
     DistrictSubCultureKind, DistrictTourismBlock, DistrictTourismKind,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
+pub use guide_data::{
+    GuideInstanceBody, GuideInstanceEditor, GuideTriggerBaseEditor, GuideTriggerBasePrefix,
+};
+pub use guide_manager_data::{
+    GuideManagerReference, GuideManagerReferenceField, GuideManagerReferences,
+};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use metadata::{DistrictStyleMetaData, MapMetaData, ModInfo, SystemMapMetaData};
 pub use net_manager_data::{
@@ -69,9 +78,10 @@ pub use net_manager_data::{
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use prop_manager_data::PropManagerDataPrefix;
 pub use simulation_manager_data::{
-    ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
+    GuideBodyLocation, ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
+pub use statistics_manager_data::{StatisticArrayReferences, StatisticsManagerData};
 pub use terrain_manager_data::TerrainManagerData;
 pub use texture::TextureAsset;
 pub use tree_manager_data::{BurningTreeRecord, TreeInstanceRecord, TreeManagerDataPrefix};
@@ -3312,6 +3322,10 @@ mod tests {
         assert_eq!(instance.names()[0].name.as_deref(), Some("A"));
         assert_eq!(instance.names()[1].name, None);
         assert_eq!(instance.group_count(), Some(1));
+        assert_eq!(
+            instance.group_references(),
+            &[vec![0x0a, 0x0b, 0x0c, 0x0d, 0xff]]
+        );
         assert_eq!(instance.encode(), expected);
         assert_eq!(instance.into_editor().encode()?, expected);
         let (legacy_names, legacy_used) = InstanceManagerData::decode_prefix(194, &expected[..17])?;
@@ -4159,6 +4173,216 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads the local CL Wolf Creek game map from data/maps"]
+    fn validates_wolf_creek_building_manager_guide_locator()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
+        let mut file = File::open(&path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("Wolf Creek has no type-52 asset"))?;
+        let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 112_004);
+
+        let statistics = manager.decode_statistics_manager_data()?;
+        assert!(statistics.start_frame() <= 4_775);
+        assert_ne!(statistics.statistic_array_header(), &NetObjectHeader::Null);
+        assert!(statistics.encode().len() >= 6);
+
+        let guide_references = manager.decode_guide_manager_references()?;
+        assert_eq!(guide_references.references().len(), 48);
+        assert_eq!(guide_references.encode().len(), 48 * 3 + 2);
+        assert_eq!(
+            guide_references
+                .references()
+                .iter()
+                .filter(|reference| matches!(
+                    reference.header(),
+                    NetObjectHeader::NewSharedType(30)
+                ))
+                .count(),
+            19
+        );
+        assert_eq!(
+            guide_references
+                .references()
+                .iter()
+                .filter(|reference| matches!(
+                    reference.header(),
+                    NetObjectHeader::NewSharedType(32)
+                ))
+                .count(),
+            28
+        );
+        assert_eq!(
+            guide_references
+                .references()
+                .iter()
+                .filter(|reference| matches!(
+                    reference.header(),
+                    NetObjectHeader::NewSharedType(36)
+                ))
+                .count(),
+            1
+        );
+
+        let net_locations = manager.locate_net_manager_guide_bodies(metadata.save_app_version)?;
+        let net_location = net_locations
+            .first()
+            .and_then(Option::as_ref)
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("Wolf Creek NetManager guide 0 is null"))?;
+        let net_class = net_location
+            .type_name
+            .split(',')
+            .next()
+            .unwrap_or_default()
+            .rsplit('.')
+            .next()
+            .unwrap_or_default();
+        let net_body = &manager.serialized_object_graph()[net_location.graph_offset..];
+        let mut rewritten_net = manager.clone();
+        let mut expected_net_graph = manager.serialized_object_graph().to_vec();
+        match net_class {
+            "NetNodeInstanceGuide" => {
+                let (guide, consumed) = NetNodeInstanceGuideBody::decode(
+                    manager.format_version(),
+                    metadata.save_app_version,
+                    net_body,
+                )?;
+                assert_eq!(consumed, net_location.body_length);
+                let mut editor = guide.into_editor();
+                *editor.activation_frame_mut() = 0x0102_0304;
+                rewritten_net.replace_net_manager_node_instance_guide(
+                    0,
+                    metadata.save_app_version,
+                    &editor,
+                )?;
+                expected_net_graph[net_location.graph_offset + 4..net_location.graph_offset + 8]
+                    .copy_from_slice(&0x0102_0304_u32.to_be_bytes());
+            }
+            "NetSegmentInstanceGuide" => {
+                let (guide, consumed) = GuideInstanceBody::decode(net_body)?;
+                assert_eq!(consumed, net_location.body_length);
+                let mut editor = guide.into_editor();
+                *editor.build_index_mut() = 0x0102_0304;
+                rewritten_net.replace_net_manager_guide_instance_body(
+                    0,
+                    metadata.save_app_version,
+                    &editor,
+                )?;
+                expected_net_graph[net_location.graph_offset + 11..net_location.graph_offset + 15]
+                    .copy_from_slice(&0x0102_0304_u32.to_be_bytes());
+            }
+            "GenericGuide" | "ServiceTypeGuide" | "BuildingTypeGuide" => {
+                let (guide, consumed) = GuideTriggerBasePrefix::decode(net_body)?;
+                assert_eq!(consumed, net_location.body_length);
+                let mut editor = guide.into_editor();
+                *editor.activation_frame_mut() = 0x0102_0304;
+                rewritten_net.replace_net_manager_guide_trigger_base(
+                    0,
+                    metadata.save_app_version,
+                    &editor,
+                )?;
+                expected_net_graph[net_location.graph_offset + 4..net_location.graph_offset + 8]
+                    .copy_from_slice(&0x0102_0304_u32.to_be_bytes());
+            }
+            _ => {
+                return Err(std::io::Error::other(format!(
+                    "unsupported NetManager guide class in Wolf Creek: {}",
+                    net_location.type_name
+                ))
+                .into());
+            }
+        }
+        assert_eq!(rewritten_net.serialized_object_graph(), expected_net_graph);
+        assert_eq!(
+            rewritten_net.serialized_object_graph().len(),
+            manager.serialized_object_graph().len()
+        );
+
+        let building_locations =
+            manager.locate_building_manager_guide_bodies(metadata.save_app_version)?;
+        let location = building_locations
+            .get(4)
+            .and_then(Option::as_ref)
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("Wolf Creek BuildingManager guide 4 is null"))?;
+        assert_eq!(location.graph_offset, 4_200_608, "{location:?}");
+        assert_eq!(location.body_length, 17);
+        assert!(location.type_name.starts_with("BuildingOnFireGuide,"));
+
+        let (guide, consumed) =
+            GuideInstanceBody::decode(&manager.serialized_object_graph()[location.graph_offset..])?;
+        assert_eq!(consumed, 17);
+        let mut edited = guide.into_editor();
+        *edited.build_index_mut() = 0x1234_5678;
+        let mut rewritten = manager.clone();
+        rewritten.replace_guide_instance_body_at(location.graph_offset, &edited)?;
+        assert_eq!(
+            &rewritten.serialized_object_graph()
+                [location.graph_offset + 11..location.graph_offset + 15],
+            &0x1234_5678_u32.to_be_bytes()
+        );
+        assert_eq!(
+            rewritten.serialized_object_graph().len(),
+            manager.serialized_object_graph().len()
+        );
+
+        const BUILDING_GUIDES: &[u8] = include_bytes!(
+            "../tests/fixtures/building-manager-guide-bodies-v112004-wolf-creek.bin"
+        );
+        let (base, consumed) = GuideTriggerBasePrefix::decode(&BUILDING_GUIDES[85..])?;
+        assert_eq!(consumed, 11);
+        let mut base_editor = base.into_editor();
+        *base_editor.activation_frame_mut() = 0x0102_0304;
+        let base_location = building_locations
+            .get(5)
+            .and_then(Option::as_ref)
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("Wolf Creek BuildingManager guide 5 is null"))?;
+        assert_eq!(base_location.body_length, 11, "{base_location:?}");
+        assert!(
+            base_location.type_name.starts_with("GenericGuide,")
+                || base_location.type_name.starts_with("ServiceTypeGuide,")
+                || base_location.type_name.starts_with("BuildingTypeGuide,"),
+            "{base_location:?}"
+        );
+        let mut rewritten_base = manager.clone();
+        rewritten_base.replace_building_manager_guide_trigger_base(
+            5,
+            metadata.save_app_version,
+            &base_editor,
+        )?;
+        let changed_offsets = manager
+            .serialized_object_graph()
+            .iter()
+            .zip(rewritten_base.serialized_object_graph())
+            .enumerate()
+            .filter_map(|(offset, (original, rewritten))| (original != rewritten).then_some(offset))
+            .collect::<Vec<_>>();
+        let expected_changed_offsets =
+            (base_location.graph_offset + 4..base_location.graph_offset + 8).collect::<Vec<_>>();
+        assert_eq!(
+            changed_offsets, expected_changed_offsets,
+            "{base_location:?}"
+        );
+        assert_eq!(
+            &rewritten_base.serialized_object_graph()[changed_offsets[0]..changed_offsets[0] + 4],
+            &0x0102_0304_u32.to_be_bytes()
+        );
+        assert_eq!(
+            rewritten_base.serialized_object_graph().len(),
+            manager.serialized_object_graph().len()
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "set CRP_CORPUS_DIR and run explicitly to check a local full corpus"]
     fn validates_optional_external_map_corpus() -> Result<(), Box<dyn std::error::Error>> {
         let maps_dir = std::env::var_os("CRP_CORPUS_DIR")
@@ -4223,6 +4447,7 @@ mod tests {
         let mut checked_monument_effects_convenience = false;
         let mut checked_faculty_bonuses_convenience = false;
         let mut checked_race_team_unassigned_convenience = false;
+        let mut checked_guide_body_locator = false;
         let mut active_buildings = 0_usize;
         let mut buildings_with_secondary_flags = 0_usize;
         let mut building_guide_refs = 0_usize;
@@ -4305,6 +4530,43 @@ mod tests {
                             asset.name,
                             path.display()
                         );
+                        if path.file_name().and_then(|name| name.to_str())
+                            == Some("CL Wolf Creek.crp")
+                            && manager_data.format_version() == 112_004
+                        {
+                            let location = manager_data
+                                .locate_building_manager_guide_body(4, metadata.save_app_version)?;
+                            assert_eq!(location.graph_offset, 4_200_608);
+                            assert_eq!(location.body_length, 17);
+                            assert!(location.type_name.starts_with("BuildingOnFireGuide,"));
+                            assert_eq!(
+                                &manager_data.serialized_object_graph()
+                                    [location.graph_offset..location.graph_offset + 17],
+                                &[0; 17]
+                            );
+                            let (guide, consumed) = GuideInstanceBody::decode(
+                                &manager_data.serialized_object_graph()[location.graph_offset..],
+                            )?;
+                            assert_eq!(consumed, 17);
+                            let mut editor = guide.into_editor();
+                            *editor.build_index_mut() = 0x1234_5678;
+                            let mut edited_manager = manager_data.clone();
+                            edited_manager.replace_building_manager_guide_instance_body(
+                                4,
+                                metadata.save_app_version,
+                                &editor,
+                            )?;
+                            assert_eq!(
+                                &edited_manager.serialized_object_graph()
+                                    [location.graph_offset + 11..location.graph_offset + 15],
+                                &0x1234_5678_u32.to_be_bytes()
+                            );
+                            assert_eq!(
+                                edited_manager.serialized_object_graph().len(),
+                                manager_data.serialized_object_graph().len()
+                            );
+                            checked_guide_body_locator = true;
+                        }
                         let (zone, zone_end) = manager_data.decode_zone_manager_prefix()?;
                         assert_eq!(zone.format_version(), manager_data.format_version());
                         assert_eq!(zone.object_references().len(), 13);
@@ -5334,6 +5596,7 @@ mod tests {
         assert!(checked_monument_effects_convenience);
         assert!(checked_faculty_bonuses_convenience);
         assert!(checked_race_team_unassigned_convenience);
+        assert!(checked_guide_body_locator);
         assert!(active_buildings > 0);
         assert_eq!(segment_records, active_net_segments);
         eprintln!(

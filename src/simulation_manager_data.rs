@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::CrpError;
 use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
@@ -10,6 +12,15 @@ use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
+use crate::guide_data::{
+    GUIDE_INSTANCE_BODY_LEN, GUIDE_TRIGGER_BASE_PREFIX_LEN, GuideInstanceBody, GuideInstanceEditor,
+    GuideTriggerBaseEditor, GuideTriggerBasePrefix,
+};
+use crate::guide_manager_data::GuideManagerReferences;
+use crate::net_manager_data::{
+    NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader, read_net_object_header,
+};
+use crate::statistics_manager_data::StatisticsManagerData;
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
     BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlagsPrefix,
@@ -57,6 +68,101 @@ pub struct SerializableDataEntry {
     pub key: String,
     /// Serialized bytes; a null value is preserved as `None`.
     pub data: Option<Vec<u8>>,
+}
+
+/// Location and declared type of one queued `BuildingManager` guide body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuideBodyLocation {
+    /// DataSerializer object-list ID referenced by BuildingManager.
+    pub object_id: u32,
+    /// Byte offset relative to [`SimulationManagerData::serialized_object_graph`].
+    pub graph_offset: usize,
+    /// Serialized body length derived from the declared guide type.
+    pub body_length: usize,
+    /// Assembly-qualified type name from the object-reference table.
+    pub type_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedGuideObject {
+    object_id: u32,
+    type_name: String,
+}
+
+#[derive(Debug)]
+struct NetManagerGuideQueuePrefix {
+    children_start: usize,
+    object_table: DataSerializerObjectTable,
+    queued_objects: Vec<QueuedGuideObject>,
+    net_manager_object_ids: Vec<Option<u32>>,
+}
+
+#[derive(Debug, Clone)]
+struct DataSerializerObjectTable {
+    shared_types: Vec<String>,
+    object_types: Vec<String>,
+}
+
+impl DataSerializerObjectTable {
+    fn new(root_type: &str) -> Self {
+        Self {
+            shared_types: vec![root_type.to_owned()],
+            object_types: vec![root_type.to_owned()],
+        }
+    }
+
+    fn register(&mut self, header: &NetObjectHeader) -> Result<Option<u32>, CrpError> {
+        match header {
+            NetObjectHeader::Null => Ok(None),
+            NetObjectHeader::Existing(object_id) => {
+                let index = usize::try_from(*object_id)
+                    .map_err(|_| CrpError::ArithmeticOverflow("DataSerializer object ID"))?;
+                if self.object_types.get(index).is_none() {
+                    return Err(invalid(
+                        0,
+                        format!("object ID {object_id} is outside the object-list table"),
+                    ));
+                }
+                Ok(Some(*object_id))
+            }
+            NetObjectHeader::NewType(type_name) => {
+                if self.shared_types.len() >= MAX_SHARED_TYPES {
+                    return Err(invalid(0, "shared-type table exceeds the game limit"));
+                }
+                self.shared_types.push(type_name.clone());
+                self.allocate(type_name)
+            }
+            NetObjectHeader::NewSharedType(type_index) => {
+                let type_name = self
+                    .shared_types
+                    .get(usize::from(*type_index))
+                    .cloned()
+                    .ok_or_else(|| {
+                        invalid(
+                            0,
+                            format!("shared-type index {type_index} is outside the type table"),
+                        )
+                    })?;
+                self.allocate(&type_name)
+            }
+        }
+    }
+
+    fn allocate(&mut self, type_name: &str) -> Result<Option<u32>, CrpError> {
+        let object_id = u32::try_from(self.object_types.len())
+            .map_err(|_| CrpError::ArithmeticOverflow("DataSerializer object ID"))?;
+        if object_id >= MAX_OBJECT_ID {
+            return Err(invalid(0, "object ID exceeds the DataSerializer limit"));
+        }
+        self.object_types.push(type_name.to_owned());
+        Ok(Some(object_id))
+    }
+
+    fn type_name(&self, object_id: u32) -> Option<&str> {
+        self.object_types
+            .get(usize::try_from(object_id).ok()?)
+            .map(String::as_str)
+    }
 }
 
 /// Typed root fields of a type-52 `SimulationManager+Data` stream.
@@ -207,6 +313,88 @@ impl SimulationManagerData {
     /// Returns the uninterpreted queued manager-object serialization bytes.
     pub fn serialized_object_graph(&self) -> &[u8] {
         &self.serialized_object_graph
+    }
+
+    /// Decodes the version-gated object references stored in `GuideManager+Data`.
+    ///
+    /// The returned headers retain their exact field order and the profiler
+    /// end index. Shared-type and existing-object IDs are not resolved because
+    /// that requires replaying every preceding queued object. The rest of the
+    /// manager graph remains byte-preserved.
+    pub fn decode_guide_manager_references(&self) -> Result<GuideManagerReferences, CrpError> {
+        let guide_slot = unique_manager_slot(self.manager_objects.as_deref(), "GuideManager+Data")?;
+        self.decode_guide_manager_references_at(guide_slot)
+            .map(|(references, _)| references)
+    }
+
+    /// Decodes the inline `StatisticsManager+Data` fields.
+    ///
+    /// The result contains the start frame and raw `StatisticArray` reference
+    /// header, with the original profiler end index retained for exact
+    /// writing. The reference is not resolved to a queued object ID.
+    pub fn decode_statistics_manager_data(&self) -> Result<StatisticsManagerData, CrpError> {
+        let statistics_slot =
+            unique_manager_slot(self.manager_objects.as_deref(), "StatisticsManager+Data")?;
+        self.decode_statistics_manager_data_at(statistics_slot)
+            .map(|(data, _)| data)
+    }
+
+    fn decode_statistics_manager_data_at(
+        &self,
+        statistics_slot: usize,
+    ) -> Result<(StatisticsManagerData, usize), CrpError> {
+        let expected_profile_index = manager_profile_string_index(
+            self.manager_objects.as_deref(),
+            statistics_slot,
+            "StatisticsManager",
+        )?;
+        let tag = new_profiler_tag_bytes("StatisticsManager")?;
+        let tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &tag,
+            "StatisticsManager profiler tag",
+        )?;
+        let body_start = tag_start
+            .checked_add(tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("StatisticsManager body start"))?;
+        let (data, consumed) = StatisticsManagerData::decode(
+            self.format_version,
+            expected_profile_index,
+            &self.serialized_object_graph[body_start..],
+        )?;
+        let body_end = body_start
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow("StatisticsManager body end"))?;
+        Ok((data, body_end))
+    }
+
+    fn decode_guide_manager_references_at(
+        &self,
+        guide_slot: usize,
+    ) -> Result<(GuideManagerReferences, usize), CrpError> {
+        let expected_profile_index = manager_profile_string_index(
+            self.manager_objects.as_deref(),
+            guide_slot,
+            "GuideManager",
+        )?;
+        let tag = new_profiler_tag_bytes("GuideManager")?;
+        let tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &tag,
+            "GuideManager profiler tag",
+        )?;
+        let body_start = tag_start
+            .checked_add(tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("GuideManager body start"))?;
+        let (references, consumed) = GuideManagerReferences::decode(
+            self.format_version,
+            expected_profile_index,
+            &self.serialized_object_graph[body_start..],
+        )?;
+        let body_end = body_start
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow("GuideManager body end"))?;
+        Ok((references, body_end))
     }
 
     /// Decodes the first queued manager object when it is `GameAreaManager+Data`.
@@ -1812,6 +2000,533 @@ impl SimulationManagerData {
         Ok(())
     }
 
+    /// Replaces one already-located 17-byte guide body in the queued graph.
+    ///
+    /// `graph_offset` is relative to [`serialized_object_graph`](Self::serialized_object_graph),
+    /// after the root fields. Create `edited` from that body's decoded bytes.
+    /// This method verifies the original bytes still match at the supplied
+    /// offset and requires an equal-length replacement. Guide instance bodies
+    /// contain no object references, so this preserves queue ordering and
+    /// object IDs. It does not locate the body or validate its declared type;
+    /// the caller must derive the offset from the preceding queued objects.
+    pub fn replace_guide_instance_body_at(
+        &mut self,
+        graph_offset: usize,
+        edited: &GuideInstanceEditor,
+    ) -> Result<(), CrpError> {
+        self.replace_queued_bytes_at(
+            graph_offset,
+            edited.original_body_bytes(),
+            &edited.encode(),
+            "guide body",
+        )
+    }
+
+    /// Replaces one already-located 11-byte `GuideTriggerBase` prefix.
+    ///
+    /// `graph_offset` is relative to [`serialized_object_graph`](Self::serialized_object_graph),
+    /// after the root fields. Create `edited` from the queued object's decoded
+    /// prefix. This method verifies the original bytes at the supplied offset
+    /// and requires an equal-length replacement. It does not locate the prefix
+    /// or validate its declared object type; the caller must derive the offset
+    /// from the preceding queued objects.
+    pub fn replace_guide_trigger_base_at(
+        &mut self,
+        graph_offset: usize,
+        edited: &GuideTriggerBaseEditor,
+    ) -> Result<(), CrpError> {
+        self.replace_queued_bytes_at(
+            graph_offset,
+            edited.original_prefix_bytes(),
+            &edited.encode(),
+            "guide trigger prefix",
+        )
+    }
+
+    fn replace_queued_bytes_at(
+        &mut self,
+        graph_offset: usize,
+        original: &[u8],
+        replacement: &[u8],
+        description: &str,
+    ) -> Result<(), CrpError> {
+        if original.len() != replacement.len() {
+            return Err(invalid(
+                graph_offset,
+                format!("{description} replacement must preserve the original length"),
+            ));
+        }
+        let end = graph_offset
+            .checked_add(original.len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "queued guide replacement range",
+            ))?;
+        let Some(current) = self.serialized_object_graph.get(graph_offset..end) else {
+            return Err(invalid(
+                graph_offset,
+                format!("queued {description} extends past manager graph"),
+            ));
+        };
+        if current != original {
+            return Err(invalid(
+                graph_offset,
+                format!("queued bytes do not match the editor's original {description}"),
+            ));
+        }
+        self.serialized_object_graph[graph_offset..end].copy_from_slice(replacement);
+        Ok(())
+    }
+
+    fn net_manager_guide_queue_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetManagerGuideQueuePrefix, CrpError> {
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        for (slot, manager_type) in [
+            "GameAreaManager+Data",
+            "TerrainManager+Data",
+            "WaterSimulation+Data",
+            "InstanceManager+Data",
+            "PathManager+Data",
+            "NetManager+Data",
+            "BuildingManager+Data",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            expect_manager_type(Some(managers), slot, manager_type)?;
+        }
+        let guide_slots = managers
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, reference)| {
+                reference
+                    .as_ref()
+                    .is_some_and(|reference| reference.type_name.starts_with("GuideManager+Data"))
+                    .then_some(slot)
+            })
+            .collect::<Vec<_>>();
+        if guide_slots.len() != 1 {
+            return Err(invalid(
+                0,
+                "manager array must contain exactly one GuideManager+Data reference",
+            ));
+        }
+        let guide_slot = guide_slots[0];
+        let last_populated = managers.iter().rposition(Option::is_some);
+        if last_populated != Some(guide_slot) {
+            return Err(invalid(
+                guide_slot,
+                "GuideManager+Data is not the last populated manager reference",
+            ));
+        }
+
+        let (mut object_table, root_object_ids) = self.replay_manager_array()?;
+        if root_object_ids.len() != managers.len() {
+            return Err(invalid(
+                0,
+                "decoded manager references do not match their serialized array",
+            ));
+        }
+        for (slot, (reference, object_id)) in managers.iter().zip(&root_object_ids).enumerate() {
+            match (reference, object_id) {
+                (None, None) => {}
+                (Some(reference), Some(object_id))
+                    if reference.object_id == *object_id
+                        && object_table.type_name(*object_id)
+                            == Some(reference.type_name.as_str()) => {}
+                _ => {
+                    return Err(invalid(
+                        slot,
+                        "decoded manager reference disagrees with its serialized object ID or type",
+                    ));
+                }
+            }
+        }
+
+        let children_start = self.guide_manager_children_start(guide_slot)?;
+        let mut queued_objects = Vec::new();
+
+        let (game_area, _) = self.decode_game_area_prefix()?;
+        register_raw_queued_reference(
+            game_area.area_not_unlocked_reference(),
+            &mut object_table,
+            &mut queued_objects,
+            "GameAreaManager guide reference",
+        )?;
+
+        let (terrain, _) = self.decode_terrain_prefix()?;
+        for reference in terrain.object_references() {
+            register_raw_queued_reference(
+                reference,
+                &mut object_table,
+                &mut queued_objects,
+                "TerrainManager object reference",
+            )?;
+        }
+
+        let (instance, _) = self.decode_instance_prefix()?;
+        for reference in instance.group_references() {
+            let mut reader = Reader::new(reference);
+            reader.read_u32_be()?;
+            let header = read_net_object_header(&mut reader)?;
+            if reader.remaining() != 0 {
+                return Err(invalid(
+                    reader.offset(),
+                    "InstanceManager group reference has trailing bytes",
+                ));
+            }
+            register_queued_reference(&header, &mut object_table, &mut queued_objects)?;
+        }
+
+        let (net_tail, _) = self.decode_net_manager_tail_prefix(save_app_version)?;
+        let mut net_manager_object_ids = Vec::with_capacity(net_tail.object_headers().len());
+        for header in net_tail.object_headers() {
+            net_manager_object_ids.push(register_queued_reference(
+                header,
+                &mut object_table,
+                &mut queued_objects,
+            )?);
+        }
+
+        Ok(NetManagerGuideQueuePrefix {
+            children_start,
+            object_table,
+            queued_objects,
+            net_manager_object_ids,
+        })
+    }
+
+    /// Locates a queued NetManager guide body by its reference-header index.
+    ///
+    /// The locator reconstructs the DataSerializer type/object tables and
+    /// follows GameArea, Terrain, InstanceManager, and NetManager references.
+    /// It returns an error when an earlier queued object type is not
+    /// understood. Pass the saved application version for inner-version-221+
+    /// `NetNodeInstanceGuide` bodies. The supported manager layout requires
+    /// GameArea, Terrain, WaterSimulation, InstanceManager, PathManager,
+    /// NetManager, and BuildingManager in slots 0–6, with GuideManager as the
+    /// last populated manager reference.
+    pub fn locate_net_manager_guide_body(
+        &self,
+        header_index: usize,
+        save_app_version: Option<u32>,
+    ) -> Result<GuideBodyLocation, CrpError> {
+        let prefix = self.net_manager_guide_queue_prefix(save_app_version)?;
+        let object_id = prefix
+            .net_manager_object_ids
+            .get(header_index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| {
+                invalid(
+                    header_index,
+                    "NetManager guide-header index is out of bounds or references null",
+                )
+            })?;
+        locate_queued_object_body(
+            &self.serialized_object_graph,
+            prefix.children_start,
+            &prefix.queued_objects,
+            object_id,
+            self.format_version,
+            save_app_version,
+        )
+    }
+
+    /// Locates every queued NetManager guide body in header order.
+    ///
+    /// Null references remain `None`. All non-null bodies are resolved in one
+    /// queue walk, and repeated references return the same body location.
+    /// Unknown body types before the last requested object return an error.
+    pub fn locate_net_manager_guide_bodies(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<Option<GuideBodyLocation>>, CrpError> {
+        let prefix = self.net_manager_guide_queue_prefix(save_app_version)?;
+        locate_queued_object_bodies(
+            &self.serialized_object_graph,
+            prefix.children_start,
+            &prefix.queued_objects,
+            &prefix.net_manager_object_ids,
+            self.format_version,
+            save_app_version,
+        )
+    }
+
+    /// Locates a queued BuildingManager object body by its reference-header index.
+    ///
+    /// The locator follows the supported GameArea, Terrain, InstanceManager,
+    /// NetManager, and BuildingManager reference fields, reconstructs the
+    /// DataSerializer type/object tables, and advances through recognized
+    /// guide bodies preceding the requested object. It returns an error when
+    /// an earlier queued object type is not understood. Pass the saved
+    /// application version for inner-version-221+ `NetNodeInstanceGuide`
+    /// bodies. The current layout requires GameArea, Terrain, WaterSimulation,
+    /// InstanceManager, PathManager, NetManager, and BuildingManager in slots
+    /// 0–6, with GuideManager as the last populated manager reference.
+    pub fn locate_building_manager_guide_body(
+        &self,
+        header_index: usize,
+        save_app_version: Option<u32>,
+    ) -> Result<GuideBodyLocation, CrpError> {
+        let mut prefix = self.net_manager_guide_queue_prefix(save_app_version)?;
+        let (building_headers, _) = self.decode_building_object_headers_prefix(save_app_version)?;
+        if header_index >= building_headers.object_headers().len() {
+            return Err(invalid(
+                header_index,
+                "BuildingManager object-header index is out of bounds",
+            ));
+        }
+        let mut target_object_id = None;
+        for (index, header) in building_headers
+            .object_headers()
+            .iter()
+            .take(header_index + 1)
+            .enumerate()
+        {
+            let object_id = register_queued_reference(
+                header,
+                &mut prefix.object_table,
+                &mut prefix.queued_objects,
+            )?;
+            if index == header_index {
+                target_object_id = object_id;
+            }
+        }
+        let target_object_id = target_object_id
+            .ok_or_else(|| invalid(header_index, "BuildingManager guide reference is null"))?;
+
+        locate_queued_object_body(
+            &self.serialized_object_graph,
+            prefix.children_start,
+            &prefix.queued_objects,
+            target_object_id,
+            self.format_version,
+            save_app_version,
+        )
+    }
+
+    /// Locates every queued BuildingManager guide body in header order.
+    ///
+    /// Null references remain `None`. All non-null bodies are resolved in one
+    /// queue walk, and repeated references return the same body location.
+    /// Unknown body types before the last requested object return an error.
+    pub fn locate_building_manager_guide_bodies(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<Option<GuideBodyLocation>>, CrpError> {
+        let mut prefix = self.net_manager_guide_queue_prefix(save_app_version)?;
+        let (building_headers, _) = self.decode_building_object_headers_prefix(save_app_version)?;
+        let mut building_object_ids = Vec::with_capacity(building_headers.object_headers().len());
+        for header in building_headers.object_headers() {
+            building_object_ids.push(register_queued_reference(
+                header,
+                &mut prefix.object_table,
+                &mut prefix.queued_objects,
+            )?);
+        }
+        locate_queued_object_bodies(
+            &self.serialized_object_graph,
+            prefix.children_start,
+            &prefix.queued_objects,
+            &building_object_ids,
+            self.format_version,
+            save_app_version,
+        )
+    }
+
+    /// Replaces a BuildingManager `BuildingInstanceGuide` or
+    /// `BuildingOnFireGuide` body located from its reference-header index.
+    ///
+    /// The editor must originate from the body currently stored at that
+    /// location. The replacement remains exactly 17 bytes and does not change
+    /// object IDs or following queued data.
+    pub fn replace_building_manager_guide_instance_body(
+        &mut self,
+        header_index: usize,
+        save_app_version: Option<u32>,
+        edited: &GuideInstanceEditor,
+    ) -> Result<(), CrpError> {
+        let location = self.locate_building_manager_guide_body(header_index, save_app_version)?;
+        let class_name = object_class_name(&location.type_name);
+        if !matches!(class_name, "BuildingInstanceGuide" | "BuildingOnFireGuide")
+            || location.body_length != GUIDE_INSTANCE_BODY_LEN
+        {
+            return Err(invalid(
+                header_index,
+                format!(
+                    "BuildingManager object is {}, not a 17-byte building-instance guide",
+                    location.type_name
+                ),
+            ));
+        }
+        self.replace_guide_instance_body_at(location.graph_offset, edited)
+    }
+
+    /// Replaces a BuildingManager guide whose body is only a
+    /// `GuideTriggerBase` prefix.
+    ///
+    /// The method locates the body from its BuildingManager reference-header
+    /// index and accepts `GenericGuide`, `ServiceTypeGuide`, or
+    /// `BuildingTypeGuide` objects. The editor must originate from the prefix
+    /// currently stored at that location. The replacement remains 11 bytes,
+    /// preserving object IDs and following queued data.
+    pub fn replace_building_manager_guide_trigger_base(
+        &mut self,
+        header_index: usize,
+        save_app_version: Option<u32>,
+        edited: &GuideTriggerBaseEditor,
+    ) -> Result<(), CrpError> {
+        let location = self.locate_building_manager_guide_body(header_index, save_app_version)?;
+        let class_name = object_class_name(&location.type_name);
+        if !matches!(
+            class_name,
+            "GenericGuide" | "ServiceTypeGuide" | "BuildingTypeGuide"
+        ) || location.body_length != GUIDE_TRIGGER_BASE_PREFIX_LEN
+        {
+            return Err(invalid(
+                header_index,
+                format!(
+                    "BuildingManager object is {}, not an 11-byte trigger-only guide",
+                    location.type_name
+                ),
+            ));
+        }
+        self.replace_guide_trigger_base_at(location.graph_offset, edited)
+    }
+
+    /// Replaces a NetManager `NetSegmentInstanceGuide` body.
+    ///
+    /// The method locates the body from its NetManager reference-header index
+    /// and verifies the declared type. The editor must originate from the body
+    /// currently stored there. The replacement remains 17 bytes.
+    pub fn replace_net_manager_guide_instance_body(
+        &mut self,
+        header_index: usize,
+        save_app_version: Option<u32>,
+        edited: &GuideInstanceEditor,
+    ) -> Result<(), CrpError> {
+        let location = self.locate_net_manager_guide_body(header_index, save_app_version)?;
+        if object_class_name(&location.type_name) != "NetSegmentInstanceGuide"
+            || location.body_length != GUIDE_INSTANCE_BODY_LEN
+        {
+            return Err(invalid(
+                header_index,
+                format!(
+                    "NetManager object is {}, not a 17-byte segment-instance guide",
+                    location.type_name
+                ),
+            ));
+        }
+        self.replace_guide_instance_body_at(location.graph_offset, edited)
+    }
+
+    /// Replaces a NetManager guide whose body is only a `GuideTriggerBase`.
+    ///
+    /// The method locates the body from its NetManager reference-header index
+    /// and accepts `GenericGuide`, `ServiceTypeGuide`, or `BuildingTypeGuide`.
+    /// The editor must originate from the prefix currently stored there. The
+    /// replacement remains 11 bytes.
+    pub fn replace_net_manager_guide_trigger_base(
+        &mut self,
+        header_index: usize,
+        save_app_version: Option<u32>,
+        edited: &GuideTriggerBaseEditor,
+    ) -> Result<(), CrpError> {
+        let location = self.locate_net_manager_guide_body(header_index, save_app_version)?;
+        let class_name = object_class_name(&location.type_name);
+        if !matches!(
+            class_name,
+            "GenericGuide" | "ServiceTypeGuide" | "BuildingTypeGuide"
+        ) || location.body_length != GUIDE_TRIGGER_BASE_PREFIX_LEN
+        {
+            return Err(invalid(
+                header_index,
+                format!(
+                    "NetManager object is {}, not an 11-byte trigger-only guide",
+                    location.type_name
+                ),
+            ));
+        }
+        self.replace_guide_trigger_base_at(location.graph_offset, edited)
+    }
+
+    /// Replaces a NetManager `NetNodeInstanceGuide` body.
+    ///
+    /// The method locates the body from its NetManager reference-header index
+    /// and verifies both the declared type and the version-dependent body
+    /// length. The editor must originate from the body currently stored there.
+    pub fn replace_net_manager_node_instance_guide(
+        &mut self,
+        header_index: usize,
+        save_app_version: Option<u32>,
+        edited: &NetNodeInstanceGuideEditor,
+    ) -> Result<(), CrpError> {
+        if !edited.matches_version_gates(self.format_version, save_app_version) {
+            return Err(invalid(
+                header_index,
+                "NetNodeInstanceGuide editor uses different format or save-application version gates",
+            ));
+        }
+        let location = self.locate_net_manager_guide_body(header_index, save_app_version)?;
+        let original = edited.original_body_bytes();
+        if object_class_name(&location.type_name) != "NetNodeInstanceGuide"
+            || location.body_length != original.len()
+        {
+            return Err(invalid(
+                header_index,
+                format!(
+                    "NetManager object is {}, not a matching NetNodeInstanceGuide body",
+                    location.type_name
+                ),
+            ));
+        }
+        let replacement = edited.encode()?;
+        self.replace_queued_bytes_at(
+            location.graph_offset,
+            original,
+            &replacement,
+            "NetNodeInstanceGuide body",
+        )
+    }
+
+    fn replay_manager_array(
+        &self,
+    ) -> Result<(DataSerializerObjectTable, Vec<Option<u32>>), CrpError> {
+        let mut reader = Reader::new(&self.manager_array_bytes);
+        let first = reader.read_u8()?;
+        let mut object_table = DataSerializerObjectTable::new(ROOT_TYPE);
+        if first == 0xff {
+            if reader.remaining() != 0 {
+                return Err(invalid(1, "null manager array has trailing bytes"));
+            }
+            return Ok((object_table, Vec::new()));
+        }
+        let count = (u32::from(first) << 16) | u32::from(reader.read_u16_be()?);
+        if count > MAX_MANAGER_OBJECTS {
+            return Err(invalid(0, "manager object count exceeds 1,000,000"));
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| CrpError::ArithmeticOverflow("manager array count"))?;
+        let mut object_ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            object_ids.push(object_table.register(&read_net_object_header(&mut reader)?)?);
+        }
+        if reader.remaining() != 0 {
+            return Err(invalid(reader.offset(), "manager array has trailing bytes"));
+        }
+        Ok((object_table, object_ids))
+    }
+
+    fn guide_manager_children_start(&self, guide_slot: usize) -> Result<usize, CrpError> {
+        let (_, body_end) = self.decode_guide_manager_references_at(guide_slot)?;
+        Ok(body_end)
+    }
+
     /// Replaces the WaterSimulation body while retaining profiler tags and all
     /// other manager bytes in their original order.
     ///
@@ -2092,6 +2807,247 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
     }
 }
 
+fn register_raw_queued_reference(
+    bytes: &[u8],
+    object_table: &mut DataSerializerObjectTable,
+    queued_objects: &mut Vec<QueuedGuideObject>,
+    description: &str,
+) -> Result<(), CrpError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mut reader = Reader::new(bytes);
+    let header = read_net_object_header(&mut reader)?;
+    if reader.remaining() != 0 {
+        return Err(invalid(
+            reader.offset(),
+            format!("{description} has trailing bytes"),
+        ));
+    }
+    register_queued_reference(&header, object_table, queued_objects)?;
+    Ok(())
+}
+
+fn register_queued_reference(
+    header: &NetObjectHeader,
+    object_table: &mut DataSerializerObjectTable,
+    queued_objects: &mut Vec<QueuedGuideObject>,
+) -> Result<Option<u32>, CrpError> {
+    let previous_object_count = object_table.object_types.len();
+    let object_id = object_table.register(header)?;
+    if let Some(object_id) = object_id
+        && usize::try_from(object_id)
+            .ok()
+            .is_some_and(|index| index >= previous_object_count)
+    {
+        let type_name = object_table
+            .type_name(object_id)
+            .ok_or_else(|| invalid(0, "new object is missing from the object-list table"))?
+            .to_owned();
+        queued_objects.push(QueuedGuideObject {
+            object_id,
+            type_name,
+        });
+    }
+    Ok(object_id)
+}
+
+fn locate_queued_object_body(
+    graph: &[u8],
+    start_offset: usize,
+    queued_objects: &[QueuedGuideObject],
+    target_object_id: u32,
+    format_version: u32,
+    save_app_version: Option<u32>,
+) -> Result<GuideBodyLocation, CrpError> {
+    let mut locations = locate_queued_object_bodies(
+        graph,
+        start_offset,
+        queued_objects,
+        &[Some(target_object_id)],
+        format_version,
+        save_app_version,
+    )?;
+    locations.pop().flatten().ok_or_else(|| {
+        invalid(
+            start_offset,
+            format!("queued object ID {target_object_id} has no body"),
+        )
+    })
+}
+
+fn locate_queued_object_bodies(
+    graph: &[u8],
+    start_offset: usize,
+    queued_objects: &[QueuedGuideObject],
+    target_object_ids: &[Option<u32>],
+    format_version: u32,
+    save_app_version: Option<u32>,
+) -> Result<Vec<Option<GuideBodyLocation>>, CrpError> {
+    let mut target_indices = HashMap::<u32, Vec<usize>>::new();
+    let mut last_target_id = None;
+    for (index, object_id) in target_object_ids.iter().enumerate() {
+        if let Some(object_id) = object_id {
+            target_indices.entry(*object_id).or_default().push(index);
+            last_target_id =
+                Some(last_target_id.map_or(*object_id, |previous: u32| previous.max(*object_id)));
+        }
+    }
+    let Some(last_target_id) = last_target_id else {
+        return Ok(vec![None; target_object_ids.len()]);
+    };
+
+    let mut locations = vec![None; target_object_ids.len()];
+    let mut graph_offset = start_offset;
+    for object in queued_objects {
+        if object.object_id > last_target_id {
+            break;
+        }
+        let body_length = guide_object_body_length(
+            &object.type_name,
+            format_version,
+            save_app_version,
+            graph.get(graph_offset..).ok_or_else(|| {
+                invalid(
+                    graph_offset,
+                    "queued guide body starts outside the manager graph",
+                )
+            })?,
+            graph_offset,
+        )?;
+        if let Some(indices) = target_indices.get(&object.object_id) {
+            let location = GuideBodyLocation {
+                object_id: object.object_id,
+                graph_offset,
+                body_length,
+                type_name: object.type_name.clone(),
+            };
+            for index in indices {
+                locations[*index] = Some(location.clone());
+            }
+        }
+        graph_offset = graph_offset
+            .checked_add(body_length)
+            .ok_or(CrpError::ArithmeticOverflow("queued guide body offset"))?;
+    }
+
+    for (index, object_id) in target_object_ids.iter().enumerate() {
+        if let Some(object_id) = object_id
+            && locations[index].is_none()
+        {
+            return Err(invalid(
+                start_offset,
+                format!("queued object ID {object_id} has no body"),
+            ));
+        }
+    }
+    Ok(locations)
+}
+
+fn guide_object_body_length(
+    type_name: &str,
+    format_version: u32,
+    save_app_version: Option<u32>,
+    bytes: &[u8],
+    graph_offset: usize,
+) -> Result<usize, CrpError> {
+    match object_class_name(type_name) {
+        "GenericGuide" | "ServiceTypeGuide" | "BuildingTypeGuide" => {
+            GuideTriggerBasePrefix::decode(bytes).map(|(_, consumed)| consumed)
+        }
+        "NetSegmentInstanceGuide" | "BuildingInstanceGuide" | "BuildingOnFireGuide" => {
+            GuideInstanceBody::decode(bytes).map(|(_, consumed)| consumed)
+        }
+        "NetNodeInstanceGuide" => {
+            NetNodeInstanceGuideBody::decode(format_version, save_app_version, bytes)
+                .map(|(_, consumed)| consumed)
+        }
+        _ => Err(invalid(
+            graph_offset,
+            format!(
+                "cannot locate target guide because queued type {type_name} has no known body schema"
+            ),
+        )),
+    }
+}
+
+fn object_class_name(type_name: &str) -> &str {
+    type_name
+        .split(',')
+        .next()
+        .unwrap_or(type_name)
+        .trim()
+        .rsplit('.')
+        .next()
+        .unwrap_or(type_name)
+}
+
+fn unique_manager_slot(
+    manager_objects: Option<&[Option<ManagerObjectReference>]>,
+    expected_type: &str,
+) -> Result<usize, CrpError> {
+    let managers = manager_objects.ok_or_else(|| invalid(0, "manager object array is null"))?;
+    let slots = managers
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, reference)| {
+            reference
+                .as_ref()
+                .is_some_and(|reference| reference.type_name.starts_with(expected_type))
+                .then_some(slot)
+        })
+        .collect::<Vec<_>>();
+    if slots.len() != 1 {
+        return Err(invalid(
+            0,
+            format!("manager array must contain exactly one {expected_type} reference"),
+        ));
+    }
+    Ok(slots[0])
+}
+
+fn manager_profile_string_index(
+    manager_objects: Option<&[Option<ManagerObjectReference>]>,
+    manager_slot: usize,
+    expected_profile_name: &str,
+) -> Result<u16, CrpError> {
+    let managers = manager_objects.ok_or_else(|| invalid(0, "manager object array is null"))?;
+    if manager_slot >= managers.len() {
+        return Err(invalid(manager_slot, "manager slot is out of bounds"));
+    }
+    let mut strings = vec!["SimulationManager".to_owned()];
+    for reference in managers.iter().take(manager_slot + 1).flatten() {
+        let type_name = reference
+            .type_name
+            .split(',')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        let Some(profile_name) = type_name.strip_suffix("+Data") else {
+            return Err(invalid(
+                manager_slot,
+                format!(
+                    "cannot derive manager profiler tag from {}",
+                    reference.type_name
+                ),
+            ));
+        };
+        if !strings.iter().any(|string| string == profile_name) {
+            strings.push(profile_name.to_owned());
+        }
+    }
+    let index = strings
+        .iter()
+        .position(|string| string == expected_profile_name)
+        .ok_or_else(|| {
+            invalid(
+                manager_slot,
+                format!("{expected_profile_name} profiler tag is missing"),
+            )
+        })?;
+    u16::try_from(index).map_err(|_| CrpError::ArithmeticOverflow("profiler string index"))
+}
+
 fn expect_manager_type(
     manager_objects: Option<&[Option<ManagerObjectReference>]>,
     index: usize,
@@ -2143,7 +3099,11 @@ fn find_unique_bytes(haystack: &[u8], needle: &[u8], description: &str) -> Resul
 
 #[cfg(test)]
 mod manager_boundary_tests {
-    use super::{ManagerObjectReference, SimulationManagerData};
+    use super::{
+        DataSerializerObjectTable, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
+        QueuedGuideObject, SimulationManagerData, locate_queued_object_bodies,
+        locate_queued_object_body,
+    };
     use crate::data_serializer::write_unique_string;
     use crate::district_manager_data::{
         DistrictParkIndustryResource, DistrictParkIndustryResourceKind,
@@ -2152,6 +3112,27 @@ mod manager_boundary_tests {
     use crate::encoded_array::{
         write_encoded_bool_array, write_encoded_uint_array, write_encoded_ushort_array,
     };
+    use crate::net_manager_data::NetObjectHeader;
+    use crate::{GuideInstanceBody, GuideTriggerBasePrefix};
+
+    fn manager_with_graph(graph: Vec<u8>) -> SimulationManagerData {
+        SimulationManagerData {
+            format_version: 112_004,
+            current_tick_index: 0,
+            current_frame_index: 0,
+            current_build_index: 0,
+            randomizer_seed: 0,
+            day_time_offset_frames: None,
+            build_index_history: vec![0; 32],
+            serializable_data_storage: None,
+            root_fields_len: 0,
+            root_profile_begin_bytes: Vec::new(),
+            root_profile_end_bytes: Vec::new(),
+            manager_objects: None,
+            manager_array_bytes: Vec::new(),
+            serialized_object_graph: graph,
+        }
+    }
 
     fn synthetic_manager_data() -> SimulationManagerData {
         let mut graph = profiler_tag("ZoneManager");
@@ -2214,6 +3195,241 @@ mod manager_boundary_tests {
         let mut bytes = vec![0xfe];
         write_unique_string(&mut bytes, name).expect("short test tag is encodable");
         bytes
+    }
+
+    #[test]
+    fn guide_manager_reference_decoder_exposes_order_and_preserves_body_bytes() {
+        let mut graph = profiler_tag("GuideManager");
+        for _ in 0..48 {
+            graph.extend_from_slice(&[0xfe, 0x00, 0x24]);
+        }
+        graph.extend_from_slice(&[0x00, 0x01]);
+
+        let mut manager = manager_with_graph(graph.clone());
+        manager.manager_objects = Some(vec![Some(ManagerObjectReference {
+            object_id: 1,
+            type_name: "GuideManager+Data, Assembly-CSharp".to_owned(),
+        })]);
+        let references = manager.decode_guide_manager_references().unwrap();
+        assert_eq!(references.format_version(), 112_004);
+        assert_eq!(references.references().len(), 48);
+        assert_eq!(
+            references.references()[0].field(),
+            crate::GuideManagerReferenceField::ServiceNotUsed(0)
+        );
+        assert_eq!(
+            references.references()[1].field(),
+            crate::GuideManagerReferenceField::ServiceNeeded(0)
+        );
+        assert_eq!(
+            references.references()[0].header(),
+            &NetObjectHeader::NewSharedType(36)
+        );
+        assert_eq!(
+            references.encode(),
+            graph[profiler_tag("GuideManager").len()..]
+        );
+
+        manager.serialized_object_graph.pop();
+        assert!(manager.decode_guide_manager_references().is_err());
+    }
+
+    #[test]
+    fn statistics_manager_decoder_follows_profiler_tag_and_preserves_fields() {
+        let mut graph = profiler_tag("StatisticsManager");
+        graph.extend_from_slice(&0x0102_0304_u32.to_be_bytes());
+        graph.extend_from_slice(&[0xfe, 0xfe]);
+        write_unique_string(&mut graph, "StatisticArray").unwrap();
+        graph.extend_from_slice(&[0x00, 0x01]);
+
+        let mut manager = manager_with_graph(graph.clone());
+        manager.manager_objects = Some(vec![Some(ManagerObjectReference {
+            object_id: 1,
+            type_name: "StatisticsManager+Data, Assembly-CSharp".to_owned(),
+        })]);
+        let statistics = manager.decode_statistics_manager_data().unwrap();
+        assert_eq!(statistics.format_version(), 112_004);
+        assert_eq!(statistics.start_frame(), 0x0102_0304);
+        assert_eq!(
+            statistics.statistic_array_header(),
+            &NetObjectHeader::NewType("StatisticArray".to_owned())
+        );
+        assert_eq!(
+            statistics.encode(),
+            graph[profiler_tag("StatisticsManager").len()..]
+        );
+
+        manager.serialized_object_graph.pop();
+        assert!(manager.decode_statistics_manager_data().is_err());
+    }
+
+    #[test]
+    fn guide_body_replacement_checks_source_bytes_and_preserves_queue_length() {
+        let original_body = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0x7f, // base fields with noncanonical false bool
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, // build index and instance ID
+        ];
+        let mut graph = vec![0xaa, 0xbb, 0xcc];
+        graph.extend_from_slice(&original_body);
+        graph.extend_from_slice(&[0xdd, 0xee]);
+        let mut manager = manager_with_graph(graph.clone());
+        let (guide, consumed) = GuideInstanceBody::decode(&graph[3..]).unwrap();
+        assert_eq!(consumed, original_body.len());
+        let mut editor = guide.into_editor();
+        *editor.build_index_mut() = 0xa1b2_c3d4;
+        *editor.instance_id_mut() = 0xe5f6;
+
+        assert!(manager.replace_guide_instance_body_at(4, &editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), graph);
+        assert!(
+            manager
+                .replace_guide_instance_body_at(usize::MAX, &editor)
+                .is_err()
+        );
+        assert!(
+            manager
+                .replace_guide_instance_body_at(graph.len() - 2, &editor)
+                .is_err()
+        );
+
+        manager.replace_guide_instance_body_at(3, &editor).unwrap();
+        let mut expected = graph;
+        expected[14..18].copy_from_slice(&0xa1b2_c3d4_u32.to_be_bytes());
+        expected[18..20].copy_from_slice(&0xe5f6_u16.to_be_bytes());
+        assert_eq!(manager.serialized_object_graph(), expected);
+        assert_eq!(manager.serialized_object_graph().len(), expected.len());
+        assert_eq!(manager.serialized_object_graph()[0..3], [0xaa, 0xbb, 0xcc]);
+        assert_eq!(manager.serialized_object_graph()[20..], [0xdd, 0xee]);
+    }
+
+    #[test]
+    fn guide_trigger_prefix_replacement_checks_source_bytes_and_preserves_queue_length() {
+        let original_prefix = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0x7f];
+        let mut graph = vec![0xaa, 0xbb, 0xcc];
+        graph.extend_from_slice(&original_prefix);
+        graph.extend_from_slice(&[0xdd, 0xee]);
+        let mut manager = manager_with_graph(graph.clone());
+        let (guide, consumed) = GuideTriggerBasePrefix::decode(&graph[3..]).unwrap();
+        assert_eq!(consumed, GUIDE_TRIGGER_BASE_PREFIX_LEN);
+        let mut editor = guide.into_editor();
+        *editor.next_repeat_mut() = 0xa1b2_c3d4;
+        *editor.disabled_mut() = true;
+
+        assert!(manager.replace_guide_trigger_base_at(4, &editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), graph);
+        assert!(
+            manager
+                .replace_guide_trigger_base_at(usize::MAX, &editor)
+                .is_err()
+        );
+        assert!(
+            manager
+                .replace_guide_trigger_base_at(graph.len() - 2, &editor)
+                .is_err()
+        );
+
+        manager.replace_guide_trigger_base_at(3, &editor).unwrap();
+        let mut expected = graph;
+        expected[3..7].copy_from_slice(&0xa1b2_c3d4_u32.to_be_bytes());
+        expected[13] = 1;
+        assert_eq!(manager.serialized_object_graph(), expected);
+        assert_eq!(manager.serialized_object_graph().len(), expected.len());
+        assert_eq!(manager.serialized_object_graph()[0..3], [0xaa, 0xbb, 0xcc]);
+        assert_eq!(manager.serialized_object_graph()[14..], [0xdd, 0xee]);
+    }
+
+    #[test]
+    fn object_table_tracks_new_shared_and_existing_references() {
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        assert_eq!(
+            table
+                .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            table.register(&NetObjectHeader::NewSharedType(1)).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            table.register(&NetObjectHeader::Existing(1)).unwrap(),
+            Some(1)
+        );
+        assert_eq!(table.register(&NetObjectHeader::Null).unwrap(), None);
+        assert_eq!(table.type_name(2), Some("GenericGuide"));
+        assert!(table.register(&NetObjectHeader::Existing(3)).is_err());
+        assert!(table.register(&NetObjectHeader::NewSharedType(9)).is_err());
+    }
+
+    #[test]
+    fn queued_body_locator_advances_by_declared_body_schema() {
+        let first = [0; 11];
+        let second = [0; 17];
+        let third = [0; 11];
+        let mut graph = Vec::new();
+        graph.extend_from_slice(&first);
+        graph.extend_from_slice(&second);
+        graph.extend_from_slice(&third);
+        let objects = vec![
+            QueuedGuideObject {
+                object_id: 5,
+                type_name: "GenericGuide, Assembly-CSharp".to_owned(),
+            },
+            QueuedGuideObject {
+                object_id: 6,
+                type_name: "BuildingInstanceGuide, Assembly-CSharp".to_owned(),
+            },
+            QueuedGuideObject {
+                object_id: 7,
+                type_name: "ServiceTypeGuide, Assembly-CSharp".to_owned(),
+            },
+        ];
+
+        let location = locate_queued_object_body(&graph, 0, &objects, 6, 112_004, None).unwrap();
+        assert_eq!(location.object_id, 6);
+        assert_eq!(location.graph_offset, 11);
+        assert_eq!(location.body_length, 17);
+        assert_eq!(location.type_name, "BuildingInstanceGuide, Assembly-CSharp");
+        assert!(locate_queued_object_body(&graph, 0, &objects, 8, 112_004, None).is_err());
+        assert!(locate_queued_object_body(&graph[..20], 0, &objects, 6, 112_004, None).is_err());
+    }
+
+    #[test]
+    fn batch_queued_body_locator_preserves_header_order_and_repeated_references() {
+        let mut graph = vec![0; 11 + 17 + 11];
+        let objects = vec![
+            QueuedGuideObject {
+                object_id: 5,
+                type_name: "GenericGuide, Assembly-CSharp".to_owned(),
+            },
+            QueuedGuideObject {
+                object_id: 6,
+                type_name: "BuildingInstanceGuide, Assembly-CSharp".to_owned(),
+            },
+            QueuedGuideObject {
+                object_id: 7,
+                type_name: "ServiceTypeGuide, Assembly-CSharp".to_owned(),
+            },
+        ];
+        let object_ids = [Some(5), Some(6), Some(5), None, Some(7)];
+
+        let locations =
+            locate_queued_object_bodies(&graph, 0, &objects, &object_ids, 112_004, None).unwrap();
+
+        assert_eq!(locations.len(), object_ids.len());
+        assert_eq!(locations[0].as_ref().unwrap().graph_offset, 0);
+        assert_eq!(locations[1].as_ref().unwrap().graph_offset, 11);
+        assert_eq!(locations[2], locations[0]);
+        assert_eq!(locations[3], None);
+        assert_eq!(locations[4].as_ref().unwrap().graph_offset, 28);
+        assert!(
+            locate_queued_object_bodies(&graph, 0, &objects, &[Some(8)], 112_004, None,).is_err()
+        );
+
+        graph.truncate(20);
+        assert!(
+            locate_queued_object_bodies(&graph, 0, &objects, &[Some(6)], 112_004, None,).is_err()
+        );
     }
 
     fn manager_with_park_boundary(

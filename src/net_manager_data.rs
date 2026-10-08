@@ -2026,6 +2026,18 @@ impl NetNodeInstanceGuideEditor {
         output.extend_from_slice(&self.node_id.to_be_bytes());
         Ok(output)
     }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original.serialized_body
+    }
+
+    pub(crate) fn matches_version_gates(
+        &self,
+        format_version: u32,
+        save_app_version: Option<u32>,
+    ) -> bool {
+        self.original.format_version == format_version && self.save_app_version == save_app_version
+    }
 }
 
 fn legacy_guide_problems_to_u64(value: u32) -> u64 {
@@ -2099,6 +2111,8 @@ mod guide_tests {
         assert!(NetNodeInstanceGuideBody::decode(220, None, &bytes[..bytes.len() - 1]).is_err());
 
         let mut unchanged = guide.clone().into_editor();
+        assert!(unchanged.matches_version_gates(220, None));
+        assert!(!unchanged.matches_version_gates(221, None));
         assert_eq!(unchanged.encode().expect("no-op guide write"), bytes);
         *unchanged.disabled_mut() = true;
         let mut edited_bytes = bytes;
@@ -2139,6 +2153,8 @@ mod guide_tests {
         assert_eq!(current.encode(), wide);
 
         let mut editor = current.into_editor();
+        assert!(editor.matches_version_gates(221, Some(super::SAVE_APP_PROBLEMS_VERSION)));
+        assert!(!editor.matches_version_gates(221, Some(super::SAVE_APP_PROBLEMS_VERSION - 1)));
         *editor.problems_mut() = 0x0123_4567_89ab_cdef;
         let encoded = editor.encode().expect("wide problem edits encode");
         assert_eq!(&encoded[11..19], &0x0123_4567_89ab_cdef_u64.to_be_bytes());
