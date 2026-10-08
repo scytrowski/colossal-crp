@@ -2364,7 +2364,7 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn campus_array_edit_can_resize_park_and_preserve_following_manager_data() {
+    fn campus_report_and_sports_array_edits_resize_park_safely() {
         let park = include_bytes!("../tests/fixtures/district-park-v117013-mp23-map01.bin");
         let grids = include_bytes!("../tests/fixtures/district-grids-v117013-mp23-map01.bin");
         let tail = include_bytes!("../tests/fixtures/district-tail-v117013-mp23-map01.bin");
@@ -2378,15 +2378,39 @@ mod manager_boundary_tests {
 
         let mut editor = records[0].clone().into_editor();
         editor
-            .campus_sports_mut()
+            .campus_year_report_mut(0)
             .unwrap()
-            .set_away_matches_done([true, false, true, false, true])
+            .set_tickets_income([1, 2, 3, 4, 5])
             .unwrap();
-        assert_eq!(editor.encode().len(), park.len() + 1);
+        editor
+            .campus_year_report_mut(0)
+            .unwrap()
+            .set_milestone_unlocked(Some("Field notes"))
+            .unwrap();
+        editor
+            .campus_year_report_mut(1)
+            .unwrap()
+            .set_total_works(77)
+            .unwrap();
+        {
+            let mut sports = editor.campus_sports_mut().unwrap();
+            sports
+                .set_away_matches_done([true, false, true, false, true])
+                .unwrap();
+            sports.set_grant_type(0x5a).unwrap();
+        }
+        let edited_record = editor.encode();
+        assert_ne!(edited_record.len(), park.len());
+        let resize = edited_record.len().abs_diff(park.len());
+        assert!(edited_record.len() > park.len());
         data.replace_district_park_record(&editor).unwrap();
 
         let updated_records = data.decode_district_manager_park_records().unwrap();
-        assert_eq!(updated_records[0].encode(), editor.encode());
+        assert_eq!(updated_records[0].encode(), edited_record);
+        let reports = updated_records[0].campus_year_reports().unwrap();
+        assert_eq!(reports[0].tickets_income(), Some([1, 2, 3, 4, 5]));
+        assert_eq!(reports[0].milestone_unlocked(), Some("Field notes"));
+        assert_eq!(reports[1].total_works(), Some(77));
         assert_eq!(
             updated_records[0]
                 .campus_sports_data()
@@ -2394,10 +2418,17 @@ mod manager_boundary_tests {
                 .away_matches_done(),
             Some([true, false, true, false, true])
         );
-        let (_, updated_grid_end) = data.decode_district_manager_grids().unwrap();
-        assert_eq!(updated_grid_end, original_grid_end + 1);
         assert_eq!(
-            &data.serialized_object_graph()[original_grid_start + 1..updated_grid_end],
+            updated_records[0]
+                .campus_sports_data()
+                .unwrap()
+                .grant_type(),
+            0x5a
+        );
+        let (_, updated_grid_end) = data.decode_district_manager_grids().unwrap();
+        assert_eq!(updated_grid_end, original_grid_end + resize);
+        assert_eq!(
+            &data.serialized_object_graph()[original_grid_start + resize..updated_grid_end],
             grids
         );
         assert_eq!(

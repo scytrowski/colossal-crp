@@ -1,5 +1,5 @@
 use crate::CrpError;
-use crate::data_serializer::Reader;
+use crate::data_serializer::{Reader, write_nullable_unique_string};
 use crate::encoded_array::{
     read_encoded_bool_array, read_encoded_byte_array, read_encoded_uint_array,
     read_encoded_ulong_array, skip_encoded_ushort_array, write_encoded_bool_array,
@@ -462,8 +462,15 @@ struct CampusYearReportFieldOffsets {
     grant_work_index: Option<usize>,
     academic_works: Option<usize>,
     total_prize_money: Option<usize>,
+    tickets_income: Option<SerializedByteRange>,
+    winnings_income: Option<SerializedByteRange>,
+    matches_won: Option<SerializedByteRange>,
+    matches_lost: Option<SerializedByteRange>,
+    matches_cancelled: Option<SerializedByteRange>,
+    trophies: Option<SerializedByteRange>,
     toga_party_count: Option<usize>,
     toga_party_seeds: Option<usize>,
+    milestone_unlocked: Option<SerializedByteRange>,
     total_works: Option<usize>,
 }
 
@@ -508,20 +515,23 @@ struct DecodedParkPostLevelData {
 ///
 /// All unmodeled fields remain byte-for-byte intact. Modeled scalar, visitor,
 /// production, industry-resource, campus-summary, and fixed-width campus-report
-/// fields can be changed. The three modeled campus sports arrays can also be
-/// explicitly re-encoded, which may change this record's length.
+/// fields can be changed. Modeled campus report and sports arrays and report
+/// milestone text can also be explicitly re-encoded, which may change this
+/// record's length.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkEditor {
     original_serialized: Vec<u8>,
     record: DistrictParkRecord,
 }
 
-/// Edits fixed-width fields in one campus report without re-encoding its
-/// variable-length arrays or changing the containing park record's length.
+/// Edits fixed-width fields and explicitly re-encodes modeled arrays and text
+/// in one campus report; variable-length edits can resize the park record.
 #[derive(Debug)]
 pub struct DistrictCampusYearReportEditor<'a> {
     serialized: &'a mut Vec<u8>,
     report: &'a mut DistrictCampusYearReportData,
+    following_reports: &'a mut [DistrictCampusYearReportData],
+    sports_data: Option<&'a mut DistrictCampusSportsData>,
 }
 
 /// Edits fixed-width campus sports fields and rewrites its modeled arrays.
@@ -1552,15 +1562,28 @@ impl DistrictParkEditor {
         let DistrictParkRecord {
             serialized,
             campus_year_reports,
+            campus_sports_data,
             ..
         } = &mut self.record;
         let reports = campus_year_reports
             .as_mut()
             .ok_or_else(|| invalid_district_manager(0, "campus reports are absent"))?;
-        let report = reports.get_mut(index).ok_or_else(|| {
+        if index >= reports.len() {
+            return Err(invalid_district_manager(
+                0,
+                format!("campus report index {index} is out of range"),
+            ));
+        }
+        let (_, remaining_reports) = reports.split_at_mut(index);
+        let (report, following_reports) = remaining_reports.split_first_mut().ok_or_else(|| {
             invalid_district_manager(0, format!("campus report index {index} is out of range"))
         })?;
-        Ok(DistrictCampusYearReportEditor { serialized, report })
+        Ok(DistrictCampusYearReportEditor {
+            serialized,
+            report,
+            following_reports,
+            sports_data: campus_sports_data.as_mut(),
+        })
     }
 
     /// Returns remaining campus and varsity values when present.
@@ -1707,6 +1730,153 @@ impl DistrictCampusYearReportEditor<'_> {
             "campus report total prize money",
         )?;
         self.report.total_prize_money = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the five ticket-income values from inner version 112014.
+    pub fn set_tickets_income(&mut self, value: [u64; 5]) -> Result<(), CrpError> {
+        let mut encoded = Vec::new();
+        write_encoded_ulong_array(&mut encoded, &value);
+        self.replace_encoded_field(
+            self.report.field_offsets.tickets_income,
+            encoded,
+            "campus report ticket-income array",
+        )?;
+        self.report.tickets_income = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the five winnings-income values from inner version 112014.
+    pub fn set_winnings_income(&mut self, value: [u64; 5]) -> Result<(), CrpError> {
+        let mut encoded = Vec::new();
+        write_encoded_ulong_array(&mut encoded, &value);
+        self.replace_encoded_field(
+            self.report.field_offsets.winnings_income,
+            encoded,
+            "campus report winnings-income array",
+        )?;
+        self.report.winnings_income = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the five match-win values from inner version 112014.
+    pub fn set_matches_won(&mut self, value: [u8; 5]) -> Result<(), CrpError> {
+        self.set_byte_array(
+            self.report.field_offsets.matches_won,
+            value,
+            "campus report matches-won array",
+        )?;
+        self.report.matches_won = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the five match-loss values from inner version 112014.
+    pub fn set_matches_lost(&mut self, value: [u8; 5]) -> Result<(), CrpError> {
+        self.set_byte_array(
+            self.report.field_offsets.matches_lost,
+            value,
+            "campus report matches-lost array",
+        )?;
+        self.report.matches_lost = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the five cancelled-match values from inner version 112014.
+    pub fn set_matches_cancelled(&mut self, value: [u8; 5]) -> Result<(), CrpError> {
+        self.set_byte_array(
+            self.report.field_offsets.matches_cancelled,
+            value,
+            "campus report matches-cancelled array",
+        )?;
+        self.report.matches_cancelled = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the five trophy flags from inner version 112014.
+    pub fn set_trophies(&mut self, value: [bool; 5]) -> Result<(), CrpError> {
+        let mut encoded = Vec::new();
+        write_encoded_bool_array(&mut encoded, &value);
+        self.replace_encoded_field(
+            self.report.field_offsets.trophies,
+            encoded,
+            "campus report trophies array",
+        )?;
+        self.report.trophies = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the milestone string from inner version 112023.
+    ///
+    /// `None` writes the DataSerializer null marker while retaining the
+    /// serialized field; it does not remove the version-gated field.
+    pub fn set_milestone_unlocked(&mut self, value: Option<&str>) -> Result<(), CrpError> {
+        let mut encoded = Vec::new();
+        write_nullable_unique_string(&mut encoded, value)?;
+        self.replace_encoded_field(
+            self.report.field_offsets.milestone_unlocked,
+            encoded,
+            "campus report milestone string",
+        )?;
+        self.report.milestone_unlocked = value.map(str::to_owned);
+        Ok(())
+    }
+
+    fn set_byte_array(
+        &mut self,
+        range: Option<SerializedByteRange>,
+        value: [u8; 5],
+        field: &str,
+    ) -> Result<(), CrpError> {
+        let mut encoded = Vec::new();
+        write_encoded_byte_array(&mut encoded, &value);
+        self.replace_encoded_field(range, encoded, field)
+    }
+
+    fn replace_encoded_field(
+        &mut self,
+        range: Option<SerializedByteRange>,
+        replacement: Vec<u8>,
+        field: &str,
+    ) -> Result<(), CrpError> {
+        let range =
+            range.ok_or_else(|| invalid_district_manager(0, format!("{field} is absent")))?;
+        let replacement_end =
+            range
+                .start
+                .checked_add(replacement.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "DistrictManager campus report replacement end",
+                ))?;
+        let field_offsets = self
+            .report
+            .field_offsets
+            .shift_after_array_replacement(range, replacement_end)?;
+        let following_offsets = self
+            .following_reports
+            .iter()
+            .map(|report| {
+                report
+                    .field_offsets
+                    .shift_after_array_replacement(range, replacement_end)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let sports_offsets = self
+            .sports_data
+            .as_ref()
+            .map(|sports| {
+                sports
+                    .field_offsets
+                    .shift_after_array_replacement(range, replacement_end)
+            })
+            .transpose()?;
+        replace_serialized_range(self.serialized, range, replacement, field)?;
+        self.report.field_offsets = field_offsets;
+        for (report, offsets) in self.following_reports.iter_mut().zip(following_offsets) {
+            report.field_offsets = offsets;
+        }
+        if let (Some(sports), Some(offsets)) = (self.sports_data.as_deref_mut(), sports_offsets) {
+            sports.field_offsets = offsets;
+        }
         Ok(())
     }
 
@@ -2000,21 +2170,6 @@ impl DistrictCampusSportsEditor<'_> {
     ) -> Result<(), CrpError> {
         let range =
             range.ok_or_else(|| invalid_district_manager(0, format!("{field} is absent")))?;
-        if range.start > range.end || range.end > self.serialized.len() {
-            return Err(invalid_district_manager(
-                range.start,
-                format!("{field} range is outside the park record"),
-            ));
-        }
-        let old_len = range.end - range.start;
-        let new_len = self
-            .serialized
-            .len()
-            .checked_sub(old_len)
-            .and_then(|length| length.checked_add(replacement.len()))
-            .ok_or(CrpError::ArithmeticOverflow(
-                "DistrictManager campus array replacement length",
-            ))?;
         let replacement_end =
             range
                 .start
@@ -2026,14 +2181,44 @@ impl DistrictCampusSportsEditor<'_> {
             .data
             .field_offsets
             .shift_after_array_replacement(range, replacement_end)?;
-        if replacement_end > new_len {
-            return Err(CrpError::ArithmeticOverflow(
-                "DistrictManager campus array replacement result length",
-            ));
-        }
-        self.serialized.splice(range.start..range.end, replacement);
+        replace_serialized_range(self.serialized, range, replacement, field)?;
         self.data.field_offsets = field_offsets;
         Ok(())
+    }
+}
+
+impl CampusYearReportFieldOffsets {
+    fn shift_after_array_replacement(
+        mut self,
+        replaced: SerializedByteRange,
+        replacement_end: usize,
+    ) -> Result<Self, CrpError> {
+        self.student_count = shift_field_offset(self.student_count, replaced, replacement_end)?;
+        self.campus_attractiveness =
+            shift_field_offset(self.campus_attractiveness, replaced, replacement_end)?;
+        self.reputation_level =
+            shift_field_offset(self.reputation_level, replaced, replacement_end)?;
+        self.grant_type = shift_field_offset(self.grant_type, replaced, replacement_end)?;
+        self.grant_work_index =
+            shift_field_offset(self.grant_work_index, replaced, replacement_end)?;
+        self.academic_works = shift_field_offset(self.academic_works, replaced, replacement_end)?;
+        self.total_prize_money =
+            shift_field_offset(self.total_prize_money, replaced, replacement_end)?;
+        self.toga_party_count =
+            shift_field_offset(self.toga_party_count, replaced, replacement_end)?;
+        self.toga_party_seeds =
+            shift_field_offset(self.toga_party_seeds, replaced, replacement_end)?;
+        self.total_works = shift_field_offset(self.total_works, replaced, replacement_end)?;
+        self.tickets_income = shift_array_range(self.tickets_income, replaced, replacement_end)?;
+        self.winnings_income = shift_array_range(self.winnings_income, replaced, replacement_end)?;
+        self.matches_won = shift_array_range(self.matches_won, replaced, replacement_end)?;
+        self.matches_lost = shift_array_range(self.matches_lost, replaced, replacement_end)?;
+        self.matches_cancelled =
+            shift_array_range(self.matches_cancelled, replaced, replacement_end)?;
+        self.trophies = shift_array_range(self.trophies, replaced, replacement_end)?;
+        self.milestone_unlocked =
+            shift_array_range(self.milestone_unlocked, replaced, replacement_end)?;
+        Ok(self)
     }
 }
 
@@ -2078,6 +2263,41 @@ impl CampusSportsFieldOffsets {
             shift_array_range(self.away_matches_array, replaced, replacement_end)?;
         Ok(self)
     }
+}
+
+fn replace_serialized_range(
+    serialized: &mut Vec<u8>,
+    range: SerializedByteRange,
+    replacement: Vec<u8>,
+    field: &str,
+) -> Result<(), CrpError> {
+    if range.start > range.end || range.end > serialized.len() {
+        return Err(invalid_district_manager(
+            range.start,
+            format!("{field} range is outside the park record"),
+        ));
+    }
+    let new_length = serialized
+        .len()
+        .checked_sub(range.end - range.start)
+        .and_then(|length| length.checked_add(replacement.len()))
+        .ok_or(CrpError::ArithmeticOverflow(
+            "DistrictManager encoded field replacement length",
+        ))?;
+    let replacement_end =
+        range
+            .start
+            .checked_add(replacement.len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "DistrictManager encoded field replacement end",
+            ))?;
+    if replacement_end > new_length {
+        return Err(CrpError::ArithmeticOverflow(
+            "DistrictManager encoded field result length",
+        ));
+    }
+    serialized.splice(range.start..range.end, replacement);
+    Ok(())
 }
 
 fn shift_field_offset(
@@ -3803,12 +4023,42 @@ fn read_year_report(
         academic_works = Some(works);
         field_offsets.total_prize_money = Some(reader.offset());
         total_prize_money = Some(reader.read_u64_be()?);
+        let array_start = reader.offset();
         tickets_income = Some(read_campus_report_ulong_array(reader, "ticket income")?);
+        field_offsets.tickets_income = Some(SerializedByteRange {
+            start: array_start,
+            end: reader.offset(),
+        });
+        let array_start = reader.offset();
         winnings_income = Some(read_campus_report_ulong_array(reader, "winnings income")?);
+        field_offsets.winnings_income = Some(SerializedByteRange {
+            start: array_start,
+            end: reader.offset(),
+        });
+        let array_start = reader.offset();
         matches_won = Some(read_campus_report_byte_array(reader, "matches won")?);
+        field_offsets.matches_won = Some(SerializedByteRange {
+            start: array_start,
+            end: reader.offset(),
+        });
+        let array_start = reader.offset();
         matches_lost = Some(read_campus_report_byte_array(reader, "matches lost")?);
+        field_offsets.matches_lost = Some(SerializedByteRange {
+            start: array_start,
+            end: reader.offset(),
+        });
+        let array_start = reader.offset();
         matches_cancelled = Some(read_campus_report_byte_array(reader, "matches cancelled")?);
+        field_offsets.matches_cancelled = Some(SerializedByteRange {
+            start: array_start,
+            end: reader.offset(),
+        });
+        let array_start = reader.offset();
         trophies = Some(read_campus_report_bool_array(reader)?);
+        field_offsets.trophies = Some(SerializedByteRange {
+            start: array_start,
+            end: reader.offset(),
+        });
     }
     let mut toga_party_count = None;
     let mut toga_party_seeds = None;
@@ -3824,7 +4074,13 @@ fn read_year_report(
     }
     let milestone_field_present = format_version >= 112_023;
     let milestone_unlocked = if milestone_field_present {
-        reader.read_unique_string()?
+        let string_start = reader.offset();
+        let value = reader.read_unique_string()?;
+        field_offsets.milestone_unlocked = Some(SerializedByteRange {
+            start: string_start,
+            end: reader.offset(),
+        });
+        value
     } else {
         None
     };
@@ -4805,6 +5061,7 @@ mod tests {
                     let mut report_editor = editor.campus_year_report_mut(0).unwrap();
                     assert!(report_editor.set_toga_party_count(1).is_err());
                     assert!(report_editor.set_total_works(1).is_err());
+                    assert!(report_editor.set_milestone_unlocked(Some("later")).is_err());
                 }
                 {
                     let mut sports_editor = editor.campus_sports_mut().unwrap();
@@ -4816,6 +5073,13 @@ mod tests {
             if version == 112_013 {
                 let mut editor = parks[0].clone().into_editor();
                 let original = editor.encode();
+                assert!(
+                    editor
+                        .campus_year_report_mut(0)
+                        .unwrap()
+                        .set_tickets_income([1; 5])
+                        .is_err()
+                );
                 assert!(
                     editor
                         .campus_sports_mut()
@@ -4911,7 +5175,7 @@ mod tests {
     }
 
     #[test]
-    fn campus_reports_decode_versioned_fields_and_edit_fixed_width_values() {
+    fn campus_reports_decode_versioned_fields_and_edit_arrays_and_scalars() {
         let version = 112_026;
         let mut prefix_bytes = Vec::new();
         if version >= AIRLINE_NAME_VERSION {
@@ -4992,11 +5256,45 @@ mod tests {
         assert_eq!(report.milestone_unlocked(), Some(""));
         assert_eq!(report.total_works(), Some(-11));
 
+        let mut null_editor = parks[0].clone().into_editor();
+        null_editor
+            .campus_year_report_mut(0)
+            .unwrap()
+            .set_milestone_unlocked(None)
+            .unwrap();
+        let null_record = null_editor.encode();
+        let null_string_offset = super::park_scalar_bytes(version) + report_start + 82;
+        assert_eq!(null_record[null_string_offset], 0xff);
+        let (null_parks, consumed) = prefix.decode_park_records(&null_record).unwrap();
+        assert_eq!(consumed, null_record.len());
+        assert!(null_parks[0].campus_year_reports().unwrap()[0].has_milestone_field());
+        assert_eq!(
+            null_parks[0].campus_year_reports().unwrap()[0].milestone_unlocked(),
+            None
+        );
+
         let mut editor = parks.into_iter().next().unwrap().into_editor();
         let new_works = [-8, 9, i32::MIN, 10];
         let new_seeds = [i64::MAX, 0, -1];
+        let new_tickets = [10, 20, 30, 40, 50];
+        let new_winnings = [6, 7, 8, 9, 10];
+        let new_matches_won = [9, 8, 7, 6, 5];
+        let new_matches_lost = [1, 2, 3, 4, 5];
+        let new_matches_cancelled = [0, 1, 0, 1, 0];
+        let new_trophies = [false; 5];
         {
             let mut report_editor = editor.campus_year_report_mut(0).unwrap();
+            report_editor.set_tickets_income(new_tickets).unwrap();
+            report_editor.set_winnings_income(new_winnings).unwrap();
+            report_editor.set_matches_won(new_matches_won).unwrap();
+            report_editor.set_matches_lost(new_matches_lost).unwrap();
+            report_editor
+                .set_matches_cancelled(new_matches_cancelled)
+                .unwrap();
+            report_editor.set_trophies(new_trophies).unwrap();
+            report_editor
+                .set_milestone_unlocked(Some("History"))
+                .unwrap();
             report_editor.set_student_count(123).unwrap();
             report_editor.set_academic_works(new_works).unwrap();
             report_editor.set_toga_party_seeds(new_seeds).unwrap();
@@ -5005,9 +5303,70 @@ mod tests {
             assert_eq!(report_editor.report().academic_works(), Some(new_works));
             assert_eq!(report_editor.report().toga_party_seeds(), Some(new_seeds));
             assert_eq!(report_editor.report().total_works(), Some(77));
+            assert_eq!(report_editor.report().tickets_income(), Some(new_tickets));
+            assert_eq!(report_editor.report().winnings_income(), Some(new_winnings));
+            assert_eq!(report_editor.report().matches_won(), Some(new_matches_won));
+            assert_eq!(
+                report_editor.report().matches_lost(),
+                Some(new_matches_lost)
+            );
+            assert_eq!(
+                report_editor.report().matches_cancelled(),
+                Some(new_matches_cancelled)
+            );
+            assert_eq!(report_editor.report().trophies(), Some(new_trophies));
+            assert_eq!(report_editor.report().milestone_unlocked(), Some("History"));
         }
+        let new_following_report_works = 0x1234;
+        editor
+            .campus_year_report_mut(1)
+            .unwrap()
+            .set_total_works(new_following_report_works)
+            .unwrap();
+        editor
+            .campus_sports_mut()
+            .unwrap()
+            .set_grant_type(0x5a)
+            .unwrap();
+
         let mut expected = record;
         let first_report_offset = super::park_scalar_bytes(version) + report_start;
+        let mut encoded_tickets = vec![0x04];
+        for value in new_tickets {
+            encoded_tickets.extend_from_slice(&value.to_be_bytes());
+        }
+        expected.splice(
+            first_report_offset + 36..first_report_offset + 46,
+            encoded_tickets,
+        );
+        let mut encoded_winnings = vec![0x04];
+        for value in new_winnings {
+            encoded_winnings.extend_from_slice(&value.to_be_bytes());
+        }
+        expected.splice(
+            first_report_offset + 77..first_report_offset + 78,
+            encoded_winnings,
+        );
+        expected.splice(
+            first_report_offset + 118..first_report_offset + 124,
+            [0x04, 9, 8, 7, 6, 5],
+        );
+        expected.splice(
+            first_report_offset + 124..first_report_offset + 125,
+            [0x04, 1, 2, 3, 4, 5],
+        );
+        expected.splice(
+            first_report_offset + 130..first_report_offset + 131,
+            [0x04, 0, 1, 0, 1, 0],
+        );
+        expected.splice(
+            first_report_offset + 136..first_report_offset + 138,
+            [0x00, 0x00],
+        );
+        expected.splice(
+            first_report_offset + 163..first_report_offset + 166,
+            [0x80, 0x00, 0x07, 0xc8, 33, 10, 1, 0xfb, 3, 7],
+        );
         expected[first_report_offset..first_report_offset + 4]
             .copy_from_slice(&123_i32.to_be_bytes());
         for (index, value) in new_works.iter().enumerate() {
@@ -5015,12 +5374,47 @@ mod tests {
             expected[start..start + 4].copy_from_slice(&value.to_be_bytes());
         }
         for (index, value) in new_seeds.iter().enumerate() {
-            let start = first_report_offset + 58 + index * 8;
+            let start = first_report_offset + 58 + 81 + index * 8;
             expected[start..start + 8].copy_from_slice(&value.to_be_bytes());
         }
-        let total_works_start = first_report_offset + 85;
+        let total_works_start = first_report_offset + 173;
         expected[total_works_start..total_works_start + 2].copy_from_slice(&77_i16.to_be_bytes());
-        assert_eq!(editor.encode(), expected);
+        let following_total_works_start = first_report_offset + 245;
+        expected[following_total_works_start..following_total_works_start + 2]
+            .copy_from_slice(&new_following_report_works.to_be_bytes());
+        let sports_grant_offset = super::park_scalar_bytes(version) + campus.len() - 26 + 88 + 1;
+        expected[sports_grant_offset] = 0x5a;
+        let actual = editor.encode();
+        assert_eq!(actual.len(), expected.len());
+        if actual != expected {
+            let index = actual
+                .iter()
+                .zip(&expected)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(0);
+            panic!(
+                "first campus report edit mismatch at byte {index}: actual {:?}, expected {:?}",
+                &actual[index.saturating_sub(4)..(index + 4).min(actual.len())],
+                &expected[index.saturating_sub(4)..(index + 4).min(expected.len())]
+            );
+        }
+
+        let (edited_parks, consumed) = prefix.decode_park_records(&expected).unwrap();
+        assert_eq!(consumed, expected.len());
+        let edited_reports = edited_parks[0].campus_year_reports().unwrap();
+        assert_eq!(edited_reports[0].tickets_income(), Some(new_tickets));
+        assert_eq!(edited_reports[0].winnings_income(), Some(new_winnings));
+        assert_eq!(edited_reports[0].trophies(), Some(new_trophies));
+        assert_eq!(edited_reports[0].milestone_unlocked(), Some("History"));
+        assert_eq!(edited_reports[0].total_works(), Some(77));
+        assert_eq!(
+            edited_reports[1].total_works(),
+            Some(new_following_report_works)
+        );
+        assert_eq!(
+            edited_parks[0].campus_sports_data().unwrap().grant_type(),
+            0x5a
+        );
     }
 
     #[test]

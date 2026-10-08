@@ -308,6 +308,19 @@ pub(crate) fn write_unique_string(output: &mut Vec<u8>, value: &str) -> Result<(
     Ok(())
 }
 
+pub(crate) fn write_nullable_unique_string(
+    output: &mut Vec<u8>,
+    value: Option<&str>,
+) -> Result<(), CrpError> {
+    match value {
+        Some(value) => write_unique_string(output, value),
+        None => {
+            output.push(NULL_MARKER);
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn write_u24_be(output: &mut Vec<u8>, value: u32) -> Result<(), CrpError> {
     if value >= 0xff_0000 {
         return Err(CrpError::ArithmeticOverflow("DataSerializer 24-bit count"));
