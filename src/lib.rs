@@ -81,7 +81,10 @@ pub use simulation_manager_data::{
     GuideBodyLocation, ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
-pub use statistics_manager_data::{StatisticArrayReferences, StatisticsManagerData};
+pub use statistics_manager_data::{
+    StatisticArrayReferences, StatisticInt32Data, StatisticInt32Editor, StatisticInt64Data,
+    StatisticInt64Editor, StatisticsManagerData,
+};
 pub use terrain_manager_data::TerrainManagerData;
 pub use texture::TextureAsset;
 pub use tree_manager_data::{BurningTreeRecord, TreeInstanceRecord, TreeManagerDataPrefix};
