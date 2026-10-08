@@ -4177,6 +4177,81 @@ mod tests {
 
     #[test]
     #[ignore = "reads the local CL Wolf Creek game map from data/maps"]
+    fn validates_wolf_creek_statistic_child_queue() -> Result<(), Box<dyn std::error::Error>> {
+        const STATISTIC_ARRAY_TYPE_INDEX: u16 = 38;
+        const STATISTIC_INT64_TYPE_INDEX: u16 = 39;
+        const STATISTIC_INT32_TYPE_INDEX: u16 = 40;
+        const CHILDREN_START: usize = 4_202_391;
+        const CHILDREN_END: usize = 4_204_993;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
+        let mut file = File::open(path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("Wolf Creek has no type-52 asset"))?;
+        let (_, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 112_004);
+
+        let references_fixture =
+            include_bytes!("../tests/fixtures/statistic-array-references-v112004-wolf-creek.bin");
+        let int64_fixture =
+            include_bytes!("../tests/fixtures/statistic-int64-v112004-wolf-creek.bin");
+        let int32_fixture =
+            include_bytes!("../tests/fixtures/statistic-int32-v112004-wolf-creek.bin");
+        let nested_array_fixture =
+            include_bytes!("../tests/fixtures/statistic-array-nested-v112004-wolf-creek.bin");
+        let (references, _) = StatisticArrayReferences::decode(references_fixture)?;
+        let graph = manager.serialized_object_graph();
+        let mut offset = CHILDREN_START;
+
+        for (index, header) in references.references().iter().enumerate() {
+            let bytes = graph
+                .get(offset..)
+                .ok_or_else(|| std::io::Error::other("statistic body offset exceeds graph"))?;
+            let consumed = match header {
+                NetObjectHeader::NewSharedType(STATISTIC_ARRAY_TYPE_INDEX) => {
+                    StatisticArrayReferences::decode(bytes)?.1
+                }
+                NetObjectHeader::NewSharedType(STATISTIC_INT64_TYPE_INDEX) => {
+                    StatisticInt64Data::decode(manager.format_version(), bytes)?.1
+                }
+                NetObjectHeader::NewType(type_name) if type_name.starts_with("StatisticInt64,") => {
+                    StatisticInt64Data::decode(manager.format_version(), bytes)?.1
+                }
+                NetObjectHeader::NewSharedType(STATISTIC_INT32_TYPE_INDEX) => {
+                    StatisticInt32Data::decode(manager.format_version(), bytes)?.1
+                }
+                NetObjectHeader::NewType(type_name) if type_name.starts_with("StatisticInt32,") => {
+                    StatisticInt32Data::decode(manager.format_version(), bytes)?.1
+                }
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected statistic child reference {index}: {other:?}"
+                    ))
+                    .into());
+                }
+            };
+            let body = &graph[offset..offset + consumed];
+            match index {
+                3 => assert_eq!(body, int64_fixture),
+                4 => assert_eq!(body, int32_fixture),
+                14 => assert_eq!(body, nested_array_fixture),
+                _ => {}
+            }
+            offset += consumed;
+        }
+
+        assert_eq!(references.references().len(), 60);
+        assert_eq!(offset, CHILDREN_END);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads the local CL Wolf Creek game map from data/maps"]
     fn validates_wolf_creek_building_manager_guide_locator()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");

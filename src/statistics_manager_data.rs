@@ -651,6 +651,53 @@ mod tests {
     }
 
     #[test]
+    fn wolf_creek_statistic_child_bodies_match_game_produced_records() {
+        const ARRAY: &[u8] =
+            include_bytes!("../tests/fixtures/statistic-array-nested-v112004-wolf-creek.bin");
+        const INT32: &[u8] =
+            include_bytes!("../tests/fixtures/statistic-int32-v112004-wolf-creek.bin");
+        const INT64: &[u8] =
+            include_bytes!("../tests/fixtures/statistic-int64-v112004-wolf-creek.bin");
+
+        let (array, array_len) = StatisticArrayReferences::decode(ARRAY).unwrap();
+        assert_eq!(array_len, ARRAY.len());
+        assert_eq!(array.references().len(), 3);
+        assert!(
+            array
+                .references()
+                .iter()
+                .all(|reference| *reference == NetObjectHeader::NewSharedType(40))
+        );
+        assert_eq!(array.encode(), ARRAY);
+
+        let (statistic, consumed) = StatisticInt32Data::decode(112_004, INT32).unwrap();
+        assert_eq!(consumed, INT32.len());
+        assert_eq!(statistic.start_frame(), 4_243_412_992);
+        assert_eq!(statistic.end_frame(), Some(1_920_255));
+        assert_eq!(statistic.sample_count(), 64_282);
+        assert_eq!(statistic.temporary_value(), -1_920_000);
+        assert_eq!(statistic.temporary_value_2(), 3_072_255);
+        assert_eq!(statistic.latest_value(), -3_071_745);
+        assert_eq!(statistic.total_value(), -34_215_681);
+        assert_eq!(statistic.history().len(), 256);
+        assert_eq!(statistic.history()[0], 3);
+        assert_eq!(statistic.encode(), INT32);
+
+        let (statistic, consumed) = StatisticInt64Data::decode(112_004, INT64).unwrap();
+        assert_eq!(consumed, INT64.len());
+        assert_eq!(statistic.start_frame(), 0);
+        assert_eq!(statistic.end_frame(), Some(0));
+        assert_eq!(statistic.sample_count(), 40);
+        assert_eq!(statistic.temporary_value(), 261_632);
+        assert_eq!(statistic.temporary_value_2(), 2_953_798_581_661_739_008);
+        assert_eq!(statistic.latest_value(), 359_725_196_296_333_566);
+        assert_eq!(statistic.total_value(), 11_538_275_692_971_262);
+        assert_eq!(statistic.history().len(), 256);
+        assert_eq!(statistic.history()[0], -144_070_116_686_430_208);
+        assert_eq!(statistic.encode(), INT64);
+    }
+
+    #[test]
     fn statistics_manager_decodes_start_frame_reference_and_profiler_end() {
         let mut bytes = 0x0102_0304_u32.to_be_bytes().to_vec();
         bytes.extend_from_slice(&[0xfe, 0xfe]);
