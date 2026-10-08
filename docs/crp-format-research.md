@@ -77,6 +77,8 @@ i64      asset size
 
 For each entry the reader computes its stream offset as the record's relative offset plus the base data offset plus `PackageImplementation.dataOffset`. The base `PackageImplementation` returns zero for `dataOffset`; a packaged implementation has a separate override. The read size is converted to `i32` when the in-memory asset is constructed, despite being stored as `i64` in the index.
 
+The concrete implementations clarify that offset rule. `FilePackage.GetStream` opens the package file and `MemoryPackage.GetStream` wraps the package byte array; both use the base zero `dataOffset`. `PackagedPackage.GetStream` delegates to its containing `Asset.GetStream`, and its `dataOffset` is the containing asset's absolute offset in the parent package. `Asset.GetStream` returns the containing package stream positioned at that offset, so the nested index's relative data offsets are added to the parent offset. The inspected path does not bound nested entries to the containing asset's declared size, and no type-53 package entry appears in the map corpus. A Rust implementation should bound nested-package reads by the parent asset range; the game DLL behavior here is not sample-validated for maps.
+
 The record's second string is passed to the `Asset` constructor as its checksum. The sample uses 32-character lowercase hexadecimal MD5 values; the algorithm and corpus-wide match are confirmed below.
 
 This layout matches `CL Wolf Creek.crp` exactly. Its header values are version `6`, package name `CL Wolf Creek`, empty author, package version `0`, main asset `CL Wolf Creek`, four records, and base data offset `337` (`0x151`). The four records are:
@@ -124,6 +126,8 @@ The static initialization of `.AssetType` in `ColossalManaged.dll` defines these
 The map corpus contains entry types 3, 52, 100, 102, 105, and 107. Across 105 files the occurrence counts are 237, 110, 104, 5, 12, and 1 respectively. Thus type 3 is used by preview/snapshot assets, type 52 by map data, and type 100 by map metadata in the inspected sample.
 
 The decoded reader layout was applied to all 105 map files. Every index parsed, every index ended at its declared base data offset, and every asset range fit within its file. This confirms the shared container layout across the observed format versions 4–10; it does not yet prove that all other `.crp` package families use the same implementation or payload encoding.
+
+`Package.ReadIndexTable` (ColossalManaged.dll RVA `0x3C784`) has one package-format-version-specific index behavior: when the header's `u16` format version is 2, it remaps legacy asset type values 5–8 to `Text`, `Assembly`, `Data`, and `Package` (current values 50–53) through `RemapAssetType` (RVA `0x3C73C`). The later `u32` package version is not used for this remapping. The index field order and widths have no other version branches in this method; all observed versions 4–10 use the same layout. The version-2 remapping is DLL-confirmed but outside the map corpus.
 
 ## Reflected metadata payloads
 
@@ -504,16 +508,16 @@ The previously reported 42 `FF` bytes and `00 19`/`00 1C` references occur after
 
 ## Open questions
 
-- Any version-specific changes to index fields.
-- Whether data offsets and entry sizes require additional handling for all package implementation types.
-- The remaining manager-specific data field sequences.
-- Semantic differences between versions 4–10.
+- Historical writer behavior for old inner serializer versions; the supplied DLL writes several current layouts without the reader's old-version gates, but older writer DLLs are unavailable.
+- The remaining manager-specific data field sequences, especially CitizenManager and graph entries after the decoded managers.
+- Whether type-53 nested packages occur in other `.crp` families and how their parent-asset ranges are intended to be bounded; no such entry appears in the map corpus.
+- Payload-level differences across outer package versions 4–10 and package families beyond the map types in the corpus. The index field layout itself is unchanged in these versions.
 
 ## Next research steps
 
-1. Decode the remaining manager-specific `IDataContainer` payloads, beginning with network, building, and citizen data.
-2. Confirm the shared format rules on non-map package families.
-3. Compare field-level behavior across the observed inner serializer versions before defining the public Rust API.
+1. Continue the Type-52 manager graph after the decoded DistrictManager sections, including CitizenManager and later manager entries.
+2. Inspect representative non-map packages for type-53 nested packages and additional asset types.
+3. Compare payload-level behavior across outer package versions 4–10 and observed inner serializer versions where game-produced samples are available.
 
 ## Limitations of this pass
 
