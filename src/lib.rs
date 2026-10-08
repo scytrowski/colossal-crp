@@ -4283,7 +4283,10 @@ mod tests {
         assert_eq!(int64_count, 44);
         assert_eq!(int32_count, 115);
         assert_eq!(offset, NESTED_CHILDREN_END);
-        assert_eq!(graph.len() - offset, 60);
+        let trailing_bytes = graph
+            .get(offset..)
+            .ok_or_else(|| std::io::Error::other("nested statistic run exceeds graph"))?;
+        assert_eq!(trailing_bytes.len(), 60);
         Ok(())
     }
 
