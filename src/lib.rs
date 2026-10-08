@@ -40,11 +40,12 @@ pub use building_manager_data::{
 };
 pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
-    DistrictAgeCategory, DistrictAgePopulation, DistrictCampusData, DistrictCampusYearReportData,
-    DistrictCampusYearReportEditor, DistrictDemographicBlock, DistrictDemographicKind,
-    DistrictHotelBlock, DistrictManagerFlagsPrefix, DistrictManagerGridData,
-    DistrictManagerGridEditor, DistrictManagerTailData, DistrictParkAttractiveness,
-    DistrictParkCapacities, DistrictParkEditor, DistrictParkGateData, DistrictParkIndustryResource,
+    DistrictAgeCategory, DistrictAgePopulation, DistrictCampusData, DistrictCampusSportsData,
+    DistrictCampusSportsEditor, DistrictCampusYearReportData, DistrictCampusYearReportEditor,
+    DistrictDemographicBlock, DistrictDemographicKind, DistrictHotelBlock,
+    DistrictManagerFlagsPrefix, DistrictManagerGridData, DistrictManagerGridEditor,
+    DistrictManagerTailData, DistrictParkAttractiveness, DistrictParkCapacities,
+    DistrictParkEditor, DistrictParkGateData, DistrictParkIndustryResource,
     DistrictParkIndustryResourceKind, DistrictParkIndustryTradeData, DistrictParkProductionData,
     DistrictParkRecord, DistrictParkVisitorData, DistrictParkWorkStorageDeltas,
     DistrictPopulationRecord, DistrictPrivateDataBlock, DistrictPrivateDataKind,

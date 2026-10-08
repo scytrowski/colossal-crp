@@ -151,6 +151,7 @@ pub struct DistrictParkRecord {
     campus_data: Option<DistrictCampusData>,
     campus_data_offset: Option<usize>,
     campus_year_reports: Option<Vec<DistrictCampusYearReportData>>,
+    campus_sports_data: Option<DistrictCampusSportsData>,
     post_level_offsets: ParkPostLevelFieldOffsets,
     industry_resource_offsets: Option<ParkIndustryResourceOffsets>,
     serialized: Vec<u8>,
@@ -397,6 +398,51 @@ pub struct DistrictCampusYearReportData {
     field_offsets: CampusYearReportFieldOffsets,
 }
 
+/// Remaining fixed campus, staffing, and varsity values in the campus block.
+///
+/// Coach-hire ticks are the raw signed 64-bit values from `EncodedArray.Long`.
+/// The game converts them through `f32` and clamps them to `DateTime` limits
+/// before constructing its in-memory values, so this type avoids that lossy
+/// conversion. Encoded coach-time, varsity-color, and away-match arrays can be
+/// read but are not rewritten by the editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictCampusSportsData {
+    is_main_campus: bool,
+    grant_type: u8,
+    coach_count: u8,
+    cheerleading_budget: i16,
+    academic_staff_count: Option<u8>,
+    academic_staff_accumulation_bits: Option<u32>,
+    coach_hire_time_ticks: [i64; 25],
+    win_probability: u8,
+    varsity_identity_index: i16,
+    varsity_color: [u8; 3],
+    lifetime_trophies: Option<i16>,
+    static_varsity_attractiveness_modifier: Option<i16>,
+    dynamic_varsity_attractiveness_modifier: Option<i16>,
+    sports: Option<i16>,
+    away_matches_done: Option<[bool; 5]>,
+    campus_building_count: Option<i16>,
+    field_offsets: CampusSportsFieldOffsets,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CampusSportsFieldOffsets {
+    is_main_campus: Option<usize>,
+    grant_type: Option<usize>,
+    coach_count: Option<usize>,
+    cheerleading_budget: Option<usize>,
+    academic_staff_count: Option<usize>,
+    academic_staff_accumulation: Option<usize>,
+    win_probability: Option<usize>,
+    varsity_identity_index: Option<usize>,
+    lifetime_trophies: Option<usize>,
+    static_varsity_attractiveness_modifier: Option<usize>,
+    dynamic_varsity_attractiveness_modifier: Option<usize>,
+    sports: Option<usize>,
+    campus_building_count: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct CampusYearReportFieldOffsets {
     student_count: Option<usize>,
@@ -465,6 +511,13 @@ pub struct DistrictParkEditor {
 pub struct DistrictCampusYearReportEditor<'a> {
     serialized: &'a mut Vec<u8>,
     report: &'a mut DistrictCampusYearReportData,
+}
+
+/// Edits fixed-width campus and varsity values while preserving encoded arrays.
+#[derive(Debug)]
+pub struct DistrictCampusSportsEditor<'a> {
+    serialized: &'a mut Vec<u8>,
+    data: &'a mut DistrictCampusSportsData,
 }
 
 /// The decoded district and optional park grid planes from `DistrictManager+Data`.
@@ -838,6 +891,11 @@ impl DistrictParkRecord {
         self.campus_year_reports.as_deref()
     }
 
+    /// Returns remaining campus and varsity values when a campus block exists.
+    pub fn campus_sports_data(&self) -> Option<&DistrictCampusSportsData> {
+        self.campus_sports_data.as_ref()
+    }
+
     /// Creates an editor that preserves all unmodeled bytes in this record.
     pub fn into_editor(self) -> DistrictParkEditor {
         DistrictParkEditor {
@@ -943,6 +1001,88 @@ impl DistrictCampusYearReportData {
     /// Returns total works from inner version 112026.
     pub fn total_works(&self) -> Option<i16> {
         self.total_works
+    }
+}
+
+impl DistrictCampusSportsData {
+    /// Returns the campus-state value; `ReadBool` is true only for raw byte `1`.
+    pub fn is_main_campus(&self) -> bool {
+        self.is_main_campus
+    }
+
+    /// Returns the campus grant type.
+    pub fn grant_type(&self) -> u8 {
+        self.grant_type
+    }
+
+    /// Returns the coach count.
+    pub fn coach_count(&self) -> u8 {
+        self.coach_count
+    }
+
+    /// Returns the signed cheerleading budget.
+    pub fn cheerleading_budget(&self) -> i16 {
+        self.cheerleading_budget
+    }
+
+    /// Returns academic staff count from inner version 112025.
+    pub fn academic_staff_count(&self) -> Option<u8> {
+        self.academic_staff_count
+    }
+
+    /// Returns academic staff accumulation from inner version 112025.
+    pub fn academic_staff_accumulation(&self) -> Option<f32> {
+        self.academic_staff_accumulation_bits.map(f32::from_bits)
+    }
+
+    /// Returns all 25 raw signed coach-hire time values in serialized order.
+    pub fn coach_hire_time_ticks(&self) -> &[i64; 25] {
+        &self.coach_hire_time_ticks
+    }
+
+    /// Returns varsity win probability.
+    pub fn win_probability(&self) -> u8 {
+        self.win_probability
+    }
+
+    /// Returns the signed varsity identity index.
+    pub fn varsity_identity_index(&self) -> i16 {
+        self.varsity_identity_index
+    }
+
+    /// Returns varsity color as red, green, and blue bytes.
+    pub fn varsity_color(&self) -> [u8; 3] {
+        self.varsity_color
+    }
+
+    /// Returns lifetime trophies from inner version 112009.
+    pub fn lifetime_trophies(&self) -> Option<i16> {
+        self.lifetime_trophies
+    }
+
+    /// Returns the static varsity attractiveness modifier from version 112011.
+    pub fn static_varsity_attractiveness_modifier(&self) -> Option<i16> {
+        self.static_varsity_attractiveness_modifier
+    }
+
+    /// Returns the dynamic varsity attractiveness modifier from version 112012.
+    pub fn dynamic_varsity_attractiveness_modifier(&self) -> Option<i16> {
+        self.dynamic_varsity_attractiveness_modifier
+    }
+
+    /// Returns the sports field from inner version 112013.
+    pub fn sports(&self) -> Option<i16> {
+        self.sports
+    }
+
+    /// Returns away-match flags from inner version 112014.
+    pub fn away_matches_done(&self) -> Option<[bool; 5]> {
+        self.away_matches_done
+    }
+
+    /// Returns campus-building count from inner version 112024.
+    pub fn campus_building_count(&self) -> Option<i16> {
+        self.campus_building_count
     }
 }
 
@@ -1412,6 +1552,27 @@ impl DistrictParkEditor {
         Ok(DistrictCampusYearReportEditor { serialized, report })
     }
 
+    /// Returns remaining campus and varsity values when present.
+    pub fn campus_sports_data(&self) -> Option<&DistrictCampusSportsData> {
+        self.record.campus_sports_data()
+    }
+
+    /// Returns an editor for fixed-width campus and varsity fields.
+    ///
+    /// Encoded coach-time, color, and away-match arrays are read-only and are
+    /// preserved in the original park bytes.
+    pub fn campus_sports_mut(&mut self) -> Result<DistrictCampusSportsEditor<'_>, CrpError> {
+        let DistrictParkRecord {
+            serialized,
+            campus_sports_data,
+            ..
+        } = &mut self.record;
+        let data = campus_sports_data
+            .as_mut()
+            .ok_or_else(|| invalid_district_manager(0, "campus sports fields are absent"))?;
+        Ok(DistrictCampusSportsEditor { serialized, data })
+    }
+
     /// Writes the edited record while retaining every unmodeled byte.
     pub fn encode(&self) -> Vec<u8> {
         self.record.serialized.clone()
@@ -1588,6 +1749,187 @@ impl DistrictCampusYearReportEditor<'_> {
             .checked_add(value.len())
             .ok_or(CrpError::ArithmeticOverflow(
                 "DistrictManager campus report field end",
+            ))?;
+        let destination = self.serialized.get_mut(offset..end).ok_or_else(|| {
+            invalid_district_manager(offset, format!("{field} is outside the park record"))
+        })?;
+        destination.copy_from_slice(value);
+        Ok(())
+    }
+}
+
+impl DistrictCampusSportsEditor<'_> {
+    /// Returns the current decoded campus and varsity values.
+    pub fn data(&self) -> &DistrictCampusSportsData {
+        self.data
+    }
+
+    /// Replaces the campus-state bool, writing canonical byte `0` or `1`.
+    pub fn set_is_main_campus(&mut self, value: bool) -> Result<(), CrpError> {
+        self.write_field(
+            self.data.field_offsets.is_main_campus,
+            &[u8::from(value)],
+            "is-main-campus flag",
+        )?;
+        self.data.is_main_campus = value;
+        Ok(())
+    }
+
+    /// Replaces the campus grant type.
+    pub fn set_grant_type(&mut self, value: u8) -> Result<(), CrpError> {
+        self.write_field(
+            self.data.field_offsets.grant_type,
+            &[value],
+            "campus grant type",
+        )?;
+        self.data.grant_type = value;
+        Ok(())
+    }
+
+    /// Replaces the coach count.
+    pub fn set_coach_count(&mut self, value: u8) -> Result<(), CrpError> {
+        self.write_field(
+            self.data.field_offsets.coach_count,
+            &[value],
+            "campus coach count",
+        )?;
+        self.data.coach_count = value;
+        Ok(())
+    }
+
+    /// Replaces the signed cheerleading budget.
+    pub fn set_cheerleading_budget(&mut self, value: i16) -> Result<(), CrpError> {
+        self.write_field(
+            self.data.field_offsets.cheerleading_budget,
+            &value.to_be_bytes(),
+            "cheerleading budget",
+        )?;
+        self.data.cheerleading_budget = value;
+        Ok(())
+    }
+
+    /// Replaces academic staff count from inner version 112025.
+    pub fn set_academic_staff_count(&mut self, value: u8) -> Result<(), CrpError> {
+        self.write_field(
+            self.data.field_offsets.academic_staff_count,
+            &[value],
+            "academic staff count",
+        )?;
+        self.data.academic_staff_count = Some(value);
+        Ok(())
+    }
+
+    /// Replaces academic staff accumulation from inner version 112025.
+    pub fn set_academic_staff_accumulation(&mut self, value: f32) -> Result<(), CrpError> {
+        let bits = value.to_bits();
+        self.write_field(
+            self.data.field_offsets.academic_staff_accumulation,
+            &bits.to_be_bytes(),
+            "academic staff accumulation",
+        )?;
+        self.data.academic_staff_accumulation_bits = Some(bits);
+        Ok(())
+    }
+
+    /// Replaces varsity win probability.
+    pub fn set_win_probability(&mut self, value: u8) -> Result<(), CrpError> {
+        self.write_field(
+            self.data.field_offsets.win_probability,
+            &[value],
+            "varsity win probability",
+        )?;
+        self.data.win_probability = value;
+        Ok(())
+    }
+
+    /// Replaces the signed varsity identity index.
+    pub fn set_varsity_identity_index(&mut self, value: i16) -> Result<(), CrpError> {
+        self.write_field(
+            self.data.field_offsets.varsity_identity_index,
+            &value.to_be_bytes(),
+            "varsity identity index",
+        )?;
+        self.data.varsity_identity_index = value;
+        Ok(())
+    }
+
+    /// Replaces lifetime trophies from inner version 112009.
+    pub fn set_lifetime_trophies(&mut self, value: i16) -> Result<(), CrpError> {
+        self.write_field(
+            self.data.field_offsets.lifetime_trophies,
+            &value.to_be_bytes(),
+            "lifetime trophies",
+        )?;
+        self.data.lifetime_trophies = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the static varsity attractiveness modifier from version 112011.
+    pub fn set_static_varsity_attractiveness_modifier(
+        &mut self,
+        value: i16,
+    ) -> Result<(), CrpError> {
+        self.write_field(
+            self.data
+                .field_offsets
+                .static_varsity_attractiveness_modifier,
+            &value.to_be_bytes(),
+            "static varsity attractiveness modifier",
+        )?;
+        self.data.static_varsity_attractiveness_modifier = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the dynamic varsity attractiveness modifier from version 112012.
+    pub fn set_dynamic_varsity_attractiveness_modifier(
+        &mut self,
+        value: i16,
+    ) -> Result<(), CrpError> {
+        self.write_field(
+            self.data
+                .field_offsets
+                .dynamic_varsity_attractiveness_modifier,
+            &value.to_be_bytes(),
+            "dynamic varsity attractiveness modifier",
+        )?;
+        self.data.dynamic_varsity_attractiveness_modifier = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the sports field from inner version 112013.
+    pub fn set_sports(&mut self, value: i16) -> Result<(), CrpError> {
+        self.write_field(
+            self.data.field_offsets.sports,
+            &value.to_be_bytes(),
+            "varsity sports field",
+        )?;
+        self.data.sports = Some(value);
+        Ok(())
+    }
+
+    /// Replaces campus-building count from inner version 112024.
+    pub fn set_campus_building_count(&mut self, value: i16) -> Result<(), CrpError> {
+        self.write_field(
+            self.data.field_offsets.campus_building_count,
+            &value.to_be_bytes(),
+            "campus building count",
+        )?;
+        self.data.campus_building_count = Some(value);
+        Ok(())
+    }
+
+    fn write_field(
+        &mut self,
+        offset: Option<usize>,
+        value: &[u8],
+        field: &str,
+    ) -> Result<(), CrpError> {
+        let offset =
+            offset.ok_or_else(|| invalid_district_manager(0, format!("{field} is absent")))?;
+        let end = offset
+            .checked_add(value.len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "DistrictManager campus sports field end",
             ))?;
         let destination = self.serialized.get_mut(offset..end).ok_or_else(|| {
             invalid_district_manager(offset, format!("{field} is outside the park record"))
@@ -2490,32 +2832,33 @@ impl DistrictManagerFlagsPrefix {
             } else {
                 (None, None)
             };
-            let (campus_data, campus_data_offset, campus_year_reports) = if self.format_version
-                >= 112_008
-                && ((10..=13).contains(&park_type)
-                    || (self.format_version >= TYPE_ZERO_PARK_CAMPUS_VERSION && park_index == 0))
-            {
-                // The supplied MP23/MP27 type-0 slot-0 records contain ten
-                // report records in total. The examined DLL reads thirteen.
-                let observed_ten_reports = use_ten_reports && park_index == 0 && park_type == 0;
-                let campus_data_offset = reader.offset();
-                let (campus_data, campus_year_reports) =
-                    read_campus(&mut reader, self.format_version, observed_ten_reports).map_err(
-                        |error| {
-                            invalid_district_manager(
-                                offset + reader.offset(),
-                                format!("park {park_index} campus block: {error}"),
-                            )
-                        },
-                    )?;
-                (
-                    Some(campus_data),
-                    Some(campus_data_offset),
-                    Some(campus_year_reports),
-                )
-            } else {
-                (None, None, None)
-            };
+            let (campus_data, campus_data_offset, campus_year_reports, campus_sports_data) =
+                if self.format_version >= 112_008
+                    && ((10..=13).contains(&park_type)
+                        || (self.format_version >= TYPE_ZERO_PARK_CAMPUS_VERSION
+                            && park_index == 0))
+                {
+                    // The supplied MP23/MP27 type-0 slot-0 records contain ten
+                    // report records in total. The examined DLL reads thirteen.
+                    let observed_ten_reports = use_ten_reports && park_index == 0 && park_type == 0;
+                    let campus_data_offset = reader.offset();
+                    let (campus_data, campus_year_reports, campus_sports_data) =
+                        read_campus(&mut reader, self.format_version, observed_ten_reports)
+                            .map_err(|error| {
+                                invalid_district_manager(
+                                    offset + reader.offset(),
+                                    format!("park {park_index} campus block: {error}"),
+                                )
+                            })?;
+                    (
+                        Some(campus_data),
+                        Some(campus_data_offset),
+                        Some(campus_year_reports),
+                        Some(campus_sports_data),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
             if park_type == 14 {
                 reader
                     .read_bytes(airport_park_bytes(self.format_version))
@@ -2565,6 +2908,7 @@ impl DistrictManagerFlagsPrefix {
                 campus_data,
                 campus_data_offset,
                 campus_year_reports,
+                campus_sports_data,
                 post_level_offsets: post_level_data.offsets,
                 industry_resource_offsets,
                 serialized: bytes[offset..end].to_vec(),
@@ -3013,7 +3357,14 @@ fn read_campus(
     reader: &mut Reader<'_>,
     format_version: u32,
     observed_ten_reports: bool,
-) -> Result<(DistrictCampusData, Vec<DistrictCampusYearReportData>), CrpError> {
+) -> Result<
+    (
+        DistrictCampusData,
+        Vec<DistrictCampusYearReportData>,
+        DistrictCampusSportsData,
+    ),
+    CrpError,
+> {
     // DistrictManager+Data.Deserialize reads this for campus types from 112008
     // and for slot 0 of any type from 114005.
     let student_count = reader.read_u16_be()?;
@@ -3034,25 +3385,97 @@ fn read_campus(
     for _ in 0..report_count {
         reports.push(read_year_report(reader, format_version)?);
     }
-    reader.read_bytes(5)?; // Campus state, grant, coach, and cheerleading budget.
-    if format_version >= 112_025 {
-        reader.read_bytes(5)?; // Academic staff count and accumulation.
-    }
+    let mut sports_field_offsets = CampusSportsFieldOffsets::default();
+    sports_field_offsets.is_main_campus = Some(reader.offset());
+    let is_main_campus = reader.read_u8()? == 1;
+    sports_field_offsets.grant_type = Some(reader.offset());
+    let grant_type = reader.read_u8()?;
+    sports_field_offsets.coach_count = Some(reader.offset());
+    let coach_count = reader.read_u8()?;
+    sports_field_offsets.cheerleading_budget = Some(reader.offset());
+    let cheerleading_budget = reader.read_i16_be()?;
+    let (academic_staff_count, academic_staff_accumulation_bits) = if format_version >= 112_025 {
+        sports_field_offsets.academic_staff_count = Some(reader.offset());
+        let staff_count = reader.read_u8()?;
+        sports_field_offsets.academic_staff_accumulation = Some(reader.offset());
+        let accumulation = reader.read_f32_be()?.to_bits();
+        (Some(staff_count), Some(accumulation))
+    } else {
+        (None, None)
+    };
     // EncodedArray.Long has the ULong control layout and 64-bit wire width.
-    read_encoded_ulong_array(reader, 25)?;
-    reader.read_bytes(3)?; // Win probability and varsity identity.
-    read_encoded_byte_array(reader, 3)?; // Varsity color.
-    for gate in [112_009, 112_011, 112_012, 112_013] {
-        if format_version >= gate {
-            reader.read_bytes(2)?; // Versioned varsity or sports field.
-        }
+    let coach_hire_times = read_encoded_ulong_array(reader, 25)?;
+    let mut coach_hire_time_ticks = [0_i64; 25];
+    for (target, value) in coach_hire_time_ticks.iter_mut().zip(coach_hire_times) {
+        *target = value as i64;
     }
-    if format_version >= 112_014 {
-        read_encoded_bool_array(reader, 5)?; // Away matches.
-    }
-    if format_version >= 112_024 {
-        reader.read_bytes(2)?; // Campus building count.
-    }
+    sports_field_offsets.win_probability = Some(reader.offset());
+    let win_probability = reader.read_u8()?;
+    sports_field_offsets.varsity_identity_index = Some(reader.offset());
+    let varsity_identity_index = reader.read_i16_be()?;
+    let varsity_color: [u8; 3] = read_encoded_byte_array(reader, 3)?
+        .try_into()
+        .map_err(|_| reader.invalid("encoded varsity color did not contain three values"))?;
+    let lifetime_trophies = if format_version >= 112_009 {
+        sports_field_offsets.lifetime_trophies = Some(reader.offset());
+        Some(reader.read_i16_be()?)
+    } else {
+        None
+    };
+    let static_varsity_attractiveness_modifier = if format_version >= 112_011 {
+        sports_field_offsets.static_varsity_attractiveness_modifier = Some(reader.offset());
+        Some(reader.read_i16_be()?)
+    } else {
+        None
+    };
+    let dynamic_varsity_attractiveness_modifier = if format_version >= 112_012 {
+        sports_field_offsets.dynamic_varsity_attractiveness_modifier = Some(reader.offset());
+        Some(reader.read_i16_be()?)
+    } else {
+        None
+    };
+    let sports = if format_version >= 112_013 {
+        sports_field_offsets.sports = Some(reader.offset());
+        Some(reader.read_i16_be()?)
+    } else {
+        None
+    };
+    let away_matches_done = if format_version >= 112_014 {
+        Some(
+            read_encoded_bool_array(reader, 5)?
+                .try_into()
+                .map_err(|_| {
+                    reader.invalid("encoded away-match array did not contain five values")
+                })?,
+        )
+    } else {
+        None
+    };
+    let campus_building_count = if format_version >= 112_024 {
+        sports_field_offsets.campus_building_count = Some(reader.offset());
+        Some(reader.read_i16_be()?)
+    } else {
+        None
+    };
+    let sports_data = DistrictCampusSportsData {
+        is_main_campus,
+        grant_type,
+        coach_count,
+        cheerleading_budget,
+        academic_staff_count,
+        academic_staff_accumulation_bits,
+        coach_hire_time_ticks,
+        win_probability,
+        varsity_identity_index,
+        varsity_color,
+        lifetime_trophies,
+        static_varsity_attractiveness_modifier,
+        dynamic_varsity_attractiveness_modifier,
+        sports,
+        away_matches_done,
+        campus_building_count,
+        field_offsets: sports_field_offsets,
+    };
     Ok((
         DistrictCampusData {
             student_count,
@@ -3061,6 +3484,7 @@ fn read_campus(
             academic_works,
         },
         reports,
+        sports_data,
     ))
 }
 
@@ -4129,6 +4553,36 @@ mod tests {
                 }
                 None => assert!(version < 112_008),
             }
+            match parks[0].campus_sports_data() {
+                Some(sports) => {
+                    assert!(!sports.is_main_campus());
+                    assert_eq!(sports.grant_type(), 0);
+                    assert_eq!(sports.coach_count(), 0);
+                    assert_eq!(sports.cheerleading_budget(), 0);
+                    assert_eq!(sports.academic_staff_count().is_some(), version >= 112_025);
+                    assert_eq!(
+                        sports.academic_staff_accumulation().is_some(),
+                        version >= 112_025
+                    );
+                    assert_eq!(sports.coach_hire_time_ticks(), &[0; 25]);
+                    assert_eq!(sports.win_probability(), 0);
+                    assert_eq!(sports.varsity_identity_index(), 0);
+                    assert_eq!(sports.varsity_color(), [0; 3]);
+                    assert_eq!(sports.lifetime_trophies().is_some(), version >= 112_009);
+                    assert_eq!(
+                        sports.static_varsity_attractiveness_modifier().is_some(),
+                        version >= 112_011
+                    );
+                    assert_eq!(
+                        sports.dynamic_varsity_attractiveness_modifier().is_some(),
+                        version >= 112_012
+                    );
+                    assert_eq!(sports.sports().is_some(), version >= 112_013);
+                    assert_eq!(sports.away_matches_done().is_some(), version >= 112_014);
+                    assert_eq!(sports.campus_building_count().is_some(), version >= 112_024);
+                }
+                None => assert!(version < 112_008),
+            }
             if version == 112_014 {
                 let mut editor = parks[0].clone().into_editor();
                 let original = editor.encode();
@@ -4136,6 +4590,11 @@ mod tests {
                     let mut report_editor = editor.campus_year_report_mut(0).unwrap();
                     assert!(report_editor.set_toga_party_count(1).is_err());
                     assert!(report_editor.set_total_works(1).is_err());
+                }
+                {
+                    let mut sports_editor = editor.campus_sports_mut().unwrap();
+                    assert!(sports_editor.set_academic_staff_count(1).is_err());
+                    assert!(sports_editor.set_campus_building_count(1).is_err());
                 }
                 assert_eq!(editor.encode(), original);
             }
@@ -4334,6 +4793,125 @@ mod tests {
         }
         let total_works_start = first_report_offset + 85;
         expected[total_works_start..total_works_start + 2].copy_from_slice(&77_i16.to_be_bytes());
+        assert_eq!(editor.encode(), expected);
+    }
+
+    #[test]
+    fn campus_sports_fields_decode_versioned_values_and_edit_in_place() {
+        let version = 112_026;
+        let mut prefix_bytes = Vec::new();
+        if version >= AIRLINE_NAME_VERSION {
+            write_unique_string(&mut prefix_bytes, "").unwrap();
+        }
+        if version >= AIRPORT_PANEL_VERSION {
+            prefix_bytes.push(0);
+        }
+        zero_flags(&mut prefix_bytes);
+        let mut park_flags = [0_u32; DISTRICT_COUNT];
+        park_flags[5] = 1;
+        write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+        zero_policy_bools(&mut prefix_bytes, version);
+        let (prefix, _) =
+            DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+
+        let mut campus = zero_campus(version);
+        let sports_offset = 22 + 13 * 72;
+        campus[sports_offset] = 1; // ReadBool is true only for byte one.
+        campus[sports_offset + 1] = 0xa1;
+        campus[sports_offset + 2] = 7;
+        campus[sports_offset + 3..sports_offset + 5].copy_from_slice(&(-123_i16).to_be_bytes());
+        campus[sports_offset + 5] = 8;
+        campus[sports_offset + 6..sports_offset + 10]
+            .copy_from_slice(&1.5_f32.to_bits().to_be_bytes());
+        campus[sports_offset + 11] = 72;
+        campus[sports_offset + 12..sports_offset + 14].copy_from_slice(&(-9_i16).to_be_bytes());
+        campus[sports_offset + 15..sports_offset + 17].copy_from_slice(&10_i16.to_be_bytes());
+        campus[sports_offset + 17..sports_offset + 19].copy_from_slice(&(-11_i16).to_be_bytes());
+        campus[sports_offset + 19..sports_offset + 21].copy_from_slice(&12_i16.to_be_bytes());
+        campus[sports_offset + 21..sports_offset + 23].copy_from_slice(&(-13_i16).to_be_bytes());
+        campus[sports_offset + 24..sports_offset + 26].copy_from_slice(&14_i16.to_be_bytes());
+        let mut encoded_coach_times = vec![1]; // Two literal values, then 23 equal deltas.
+        encoded_coach_times.extend_from_slice(&(-7_i64).to_be_bytes());
+        encoded_coach_times.extend_from_slice(&(-7_i64).to_be_bytes());
+        encoded_coach_times.push(0x96);
+        campus.splice(sports_offset + 10..sports_offset + 11, encoded_coach_times);
+
+        let mut record = vec![0; super::park_scalar_bytes(version)];
+        record[42 + super::park_happiness_bytes(version)] = 10;
+        record.extend_from_slice(&campus);
+        let (parks, consumed) = prefix.decode_park_records(&record).unwrap();
+        assert_eq!(consumed, record.len());
+        let sports = parks[0].campus_sports_data().unwrap();
+        assert!(sports.is_main_campus());
+        assert_eq!(sports.grant_type(), 0xa1);
+        assert_eq!(sports.coach_count(), 7);
+        assert_eq!(sports.cheerleading_budget(), -123);
+        assert_eq!(sports.academic_staff_count(), Some(8));
+        assert_eq!(sports.academic_staff_accumulation(), Some(1.5));
+        assert_eq!(sports.coach_hire_time_ticks(), &[-7; 25]);
+        assert_eq!(sports.win_probability(), 72);
+        assert_eq!(sports.varsity_identity_index(), -9);
+        assert_eq!(sports.varsity_color(), [0; 3]);
+        assert_eq!(sports.lifetime_trophies(), Some(10));
+        assert_eq!(sports.static_varsity_attractiveness_modifier(), Some(-11));
+        assert_eq!(sports.dynamic_varsity_attractiveness_modifier(), Some(12));
+        assert_eq!(sports.sports(), Some(-13));
+        assert_eq!(sports.away_matches_done(), Some([false; 5]));
+        assert_eq!(sports.campus_building_count(), Some(14));
+
+        let mut editor = parks.into_iter().next().unwrap().into_editor();
+        let new_staff_accumulation = -2.25_f32;
+        {
+            let mut campus_editor = editor.campus_sports_mut().unwrap();
+            campus_editor.set_is_main_campus(false).unwrap();
+            campus_editor.set_grant_type(9).unwrap();
+            campus_editor.set_coach_count(10).unwrap();
+            campus_editor.set_cheerleading_budget(-101).unwrap();
+            campus_editor.set_academic_staff_count(11).unwrap();
+            campus_editor
+                .set_academic_staff_accumulation(new_staff_accumulation)
+                .unwrap();
+            campus_editor.set_win_probability(88).unwrap();
+            campus_editor.set_varsity_identity_index(222).unwrap();
+            campus_editor.set_lifetime_trophies(33).unwrap();
+            campus_editor
+                .set_static_varsity_attractiveness_modifier(44)
+                .unwrap();
+            campus_editor
+                .set_dynamic_varsity_attractiveness_modifier(55)
+                .unwrap();
+            campus_editor.set_sports(66).unwrap();
+            campus_editor.set_campus_building_count(77).unwrap();
+            assert!(!campus_editor.data().is_main_campus());
+            assert_eq!(
+                campus_editor.data().academic_staff_accumulation(),
+                Some(new_staff_accumulation)
+            );
+        }
+
+        let mut expected = record;
+        let start = super::park_scalar_bytes(version) + sports_offset;
+        let coach_array_growth = 17;
+        expected[start] = 0;
+        expected[start + 1] = 9;
+        expected[start + 2] = 10;
+        expected[start + 3..start + 5].copy_from_slice(&(-101_i16).to_be_bytes());
+        expected[start + 5] = 11;
+        expected[start + 6..start + 10]
+            .copy_from_slice(&new_staff_accumulation.to_bits().to_be_bytes());
+        expected[start + 11 + coach_array_growth] = 88;
+        expected[start + 12 + coach_array_growth..start + 14 + coach_array_growth]
+            .copy_from_slice(&222_i16.to_be_bytes());
+        expected[start + 15 + coach_array_growth..start + 17 + coach_array_growth]
+            .copy_from_slice(&33_i16.to_be_bytes());
+        expected[start + 17 + coach_array_growth..start + 19 + coach_array_growth]
+            .copy_from_slice(&44_i16.to_be_bytes());
+        expected[start + 19 + coach_array_growth..start + 21 + coach_array_growth]
+            .copy_from_slice(&55_i16.to_be_bytes());
+        expected[start + 21 + coach_array_growth..start + 23 + coach_array_growth]
+            .copy_from_slice(&66_i16.to_be_bytes());
+        expected[start + 24 + coach_array_growth..start + 26 + coach_array_growth]
+            .copy_from_slice(&77_i16.to_be_bytes());
         assert_eq!(editor.encode(), expected);
     }
 
