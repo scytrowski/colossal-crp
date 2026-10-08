@@ -1264,6 +1264,16 @@ impl DistrictManagerFlagsPrefix {
         bytes: &[u8],
         maximum_type: u8,
     ) -> Result<(Vec<DistrictParkRecord>, usize), CrpError> {
+        let use_ten_reports = matches!(self.format_version, 117_013 | 118_011);
+        self.decode_park_records_with_ten_reports(bytes, maximum_type, use_ten_reports)
+    }
+
+    pub(crate) fn decode_park_records_with_ten_reports(
+        &self,
+        bytes: &[u8],
+        maximum_type: u8,
+        use_ten_reports: bool,
+    ) -> Result<(Vec<DistrictParkRecord>, usize), CrpError> {
         if self.park_flags.iter().all(|flags| *flags == 0) {
             return Ok((Vec::new(), 0));
         }
@@ -1333,9 +1343,7 @@ impl DistrictManagerFlagsPrefix {
             {
                 // The supplied MP23/MP27 type-0 slot-0 records contain ten
                 // report records in total. The examined DLL reads thirteen.
-                let observed_ten_reports = park_index == 0
-                    && park_type == 0
-                    && matches!(self.format_version, 117_013 | 118_011);
+                let observed_ten_reports = use_ten_reports && park_index == 0 && park_type == 0;
                 skip_campus(&mut reader, self.format_version, observed_ten_reports).map_err(
                     |error| {
                         invalid_district_manager(
