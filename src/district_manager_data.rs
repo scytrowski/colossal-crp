@@ -216,7 +216,11 @@ pub struct DistrictParkCapacities {
     pub final_main: u16,
 }
 
-/// Versioned airport fields stored in park type 14 records.
+/// Version-gated airport fields read from park type 14 records.
+///
+/// Values follow the `Deserialize` layout. The game `Serialize` method writes
+/// the full airport block without these version gates, so this type preserves
+/// the shorter read-side record for versions before 114011.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DistrictAirportData {
     terrain_height_bits: Option<u32>,
@@ -571,7 +575,12 @@ pub struct DistrictCampusSportsEditor<'a> {
     data: &'a mut DistrictCampusSportsData,
 }
 
-/// Edits versioned fixed-width airport fields in one park type 14 record.
+/// Edits version-gated fixed-width airport fields in one park type 14 record.
+///
+/// Setters return an error when a field is absent at the record's inner
+/// version. Edits preserve the record length and all untouched bytes. For
+/// versions before 114011, this follows the `Deserialize` layout rather than
+/// the game's `Serialize` method, which writes the full 31-byte block.
 #[derive(Debug)]
 pub struct DistrictAirportEditor<'a> {
     serialized: &'a mut Vec<u8>,
@@ -979,7 +988,7 @@ impl DistrictAirportData {
         self.terrain_height_bits.map(f32::from_bits)
     }
 
-    /// Returns total passenger counts from inner version 114004.
+    /// Returns `[incoming, outgoing]` passenger totals from inner version 114004.
     pub fn passenger_totals(&self) -> Option<[u32; 2]> {
         self.passenger_totals
     }
@@ -999,12 +1008,12 @@ impl DistrictAirportData {
         self.terminal
     }
 
-    /// Returns weekly passenger capacities from inner version 114010.
+    /// Returns `[temporary, final]` weekly passenger capacities from inner version 114010.
     pub fn weekly_capacities(&self) -> Option<[u32; 2]> {
         self.weekly_capacities
     }
 
-    /// Returns incoming passenger counts from inner version 114011.
+    /// Returns `[temporary, final]` incoming passenger counts from inner version 114011.
     pub fn incoming_passenger_counts(&self) -> Option<[u32; 2]> {
         self.incoming_passenger_counts
     }
@@ -1751,7 +1760,7 @@ impl DistrictAirportEditor<'_> {
         Ok(())
     }
 
-    /// Replaces passenger totals from inner version 114004.
+    /// Replaces `[incoming, outgoing]` passenger totals from inner version 114004.
     pub fn set_passenger_totals(&mut self, value: [u32; 2]) -> Result<(), CrpError> {
         let offset =
             self.data.field_offsets.passenger_totals.ok_or_else(|| {
@@ -1794,7 +1803,7 @@ impl DistrictAirportEditor<'_> {
         Ok(())
     }
 
-    /// Replaces weekly passenger capacities from inner version 114010.
+    /// Replaces `[temporary, final]` weekly passenger capacities from inner version 114010.
     pub fn set_weekly_capacities(&mut self, value: [u32; 2]) -> Result<(), CrpError> {
         let offset =
             self.data.field_offsets.weekly_capacities.ok_or_else(|| {
@@ -1808,7 +1817,7 @@ impl DistrictAirportEditor<'_> {
         Ok(())
     }
 
-    /// Replaces incoming passenger counts from inner version 114011.
+    /// Replaces `[temporary, final]` incoming passenger counts from inner version 114011.
     pub fn set_incoming_passenger_counts(&mut self, value: [u32; 2]) -> Result<(), CrpError> {
         let offset = self
             .data
