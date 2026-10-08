@@ -1,5 +1,5 @@
 use crate::asset_io::{
-    PayloadReader, write_bool, write_f32_le, write_i32_le, write_i64_le, write_string, write_u32_le,
+    PayloadReader, write_bool, write_f32_le, write_i32_le, write_string, write_u32_le, write_u64_le,
 };
 use crate::{Asset, CrpError};
 
@@ -102,8 +102,8 @@ const FIELD_TYPES: [&str; MAP_METADATA_FIELD_COUNT] = [
 pub struct ModInfo {
     /// The mod name recorded in the map metadata.
     pub name: String,
-    /// The recorded published file ID, or `-1` when no ID is stored.
-    pub published_file_id: i64,
+    /// The raw unsigned workshop ID recorded by the game.
+    pub published_file_id: u64,
 }
 
 /// Typed view of the reflected type-100 `MapMetaData` payload.
@@ -948,7 +948,7 @@ fn read_mods(reader: &mut PayloadReader<'_>) -> Result<Vec<ModInfo>, CrpError> {
     for _ in 0..count {
         mods.push(ModInfo {
             name: reader.read_string()?,
-            published_file_id: reader.read_i64_le()?,
+            published_file_id: reader.read_u64_le()?,
         });
     }
     Ok(mods)
@@ -960,14 +960,14 @@ fn write_mods(output: &mut Vec<u8>, mods: &[ModInfo]) -> Result<(), CrpError> {
     write_i32_le(output, count);
     for entry in mods {
         write_string(output, &entry.name)?;
-        write_i64_le(output, entry.published_file_id);
+        write_u64_le(output, entry.published_file_id);
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{read_string_array, write_string_array};
+    use super::{ModInfo, read_mods, read_string_array, write_mods, write_string_array};
     use crate::CrpError;
     use crate::asset_io::PayloadReader;
 
@@ -992,5 +992,28 @@ mod tests {
             read_string_array(&mut reader),
             Err(CrpError::InvalidAssetPayload { .. })
         ));
+    }
+
+    #[test]
+    fn mod_info_uses_unsigned_workshop_id_bytes() -> Result<(), CrpError> {
+        let expected = [
+            1, 0, 0, 0, // one mod
+            1, b'A', // BinaryWriter string "A"
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // UInt64.MaxValue
+        ];
+        let mut reader = PayloadReader::new("mods", &expected);
+        let mods = read_mods(&mut reader)?;
+        assert_eq!(
+            mods,
+            [ModInfo {
+                name: "A".to_owned(),
+                published_file_id: u64::MAX,
+            }]
+        );
+
+        let mut encoded = Vec::new();
+        write_mods(&mut encoded, &mods)?;
+        assert_eq!(encoded, expected);
+        Ok(())
     }
 }

@@ -3657,7 +3657,7 @@ mod tests {
                 "metadata-v4.crp",
                 "ND Island Hopping",
                 "The Archipelago",
-                Some(("UnlimitedMoney", -1)),
+                Some(("UnlimitedMoney", u64::MAX)),
                 1153,
             ),
             (

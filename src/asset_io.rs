@@ -60,9 +60,9 @@ impl<'a> PayloadReader<'a> {
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    pub(crate) fn read_i64_le(&mut self) -> Result<i64, CrpError> {
+    pub(crate) fn read_u64_le(&mut self) -> Result<u64, CrpError> {
         let bytes = self.read_bytes(8)?;
-        Ok(i64::from_le_bytes([
+        Ok(u64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))
     }
@@ -121,7 +121,7 @@ pub(crate) fn write_u32_le(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn write_i64_le(output: &mut Vec<u8>, value: i64) {
+pub(crate) fn write_u64_le(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
