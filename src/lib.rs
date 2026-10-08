@@ -40,16 +40,17 @@ pub use building_manager_data::{
 };
 pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
-    DistrictAgeCategory, DistrictAgePopulation, DistrictCampusData, DistrictDemographicBlock,
-    DistrictDemographicKind, DistrictHotelBlock, DistrictManagerFlagsPrefix,
-    DistrictManagerGridData, DistrictManagerGridEditor, DistrictManagerTailData,
-    DistrictParkAttractiveness, DistrictParkCapacities, DistrictParkEditor, DistrictParkGateData,
-    DistrictParkIndustryResource, DistrictParkIndustryResourceKind, DistrictParkIndustryTradeData,
-    DistrictParkProductionData, DistrictParkRecord, DistrictParkVisitorData,
-    DistrictParkWorkStorageDeltas, DistrictPopulationRecord, DistrictPrivateDataBlock,
-    DistrictPrivateDataKind, DistrictSpecializationBlock, DistrictSpecializationKind,
-    DistrictStatisticsBlock, DistrictStatisticsKind, DistrictSubCultureBlock,
-    DistrictSubCultureKind, DistrictTourismBlock, DistrictTourismKind,
+    DistrictAgeCategory, DistrictAgePopulation, DistrictCampusData, DistrictCampusYearReportData,
+    DistrictCampusYearReportEditor, DistrictDemographicBlock, DistrictDemographicKind,
+    DistrictHotelBlock, DistrictManagerFlagsPrefix, DistrictManagerGridData,
+    DistrictManagerGridEditor, DistrictManagerTailData, DistrictParkAttractiveness,
+    DistrictParkCapacities, DistrictParkEditor, DistrictParkGateData, DistrictParkIndustryResource,
+    DistrictParkIndustryResourceKind, DistrictParkIndustryTradeData, DistrictParkProductionData,
+    DistrictParkRecord, DistrictParkVisitorData, DistrictParkWorkStorageDeltas,
+    DistrictPopulationRecord, DistrictPrivateDataBlock, DistrictPrivateDataKind,
+    DistrictSpecializationBlock, DistrictSpecializationKind, DistrictStatisticsBlock,
+    DistrictStatisticsKind, DistrictSubCultureBlock, DistrictSubCultureKind, DistrictTourismBlock,
+    DistrictTourismKind,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};

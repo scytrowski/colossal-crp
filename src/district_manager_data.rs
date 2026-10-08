@@ -127,8 +127,8 @@ pub struct DistrictManagerFlagsPrefix {
 
 /// A supported park record from inner versions 110025–118011.
 ///
-/// Modeled scalar, industry-resource, and campus-summary fields are
-/// interpreted. The exact record bytes are retained for unchanged writing,
+/// Modeled scalar, industry-resource, campus-summary, and campus-report fields
+/// are interpreted. The exact record bytes are retained for unchanged writing,
 /// including fields not yet modeled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkRecord {
@@ -150,6 +150,7 @@ pub struct DistrictParkRecord {
     industry_resources: Option<Vec<DistrictParkIndustryResource>>,
     campus_data: Option<DistrictCampusData>,
     campus_data_offset: Option<usize>,
+    campus_year_reports: Option<Vec<DistrictCampusYearReportData>>,
     post_level_offsets: ParkPostLevelFieldOffsets,
     industry_resource_offsets: Option<ParkIndustryResourceOffsets>,
     serialized: Vec<u8>,
@@ -352,7 +353,9 @@ pub struct DistrictParkIndustryResource {
 /// Core student and academic-work values in a campus park's versioned block.
 ///
 /// The four academic-work integers are exposed in wire order because the
-/// supplied DLL does not name their individual serialized meanings.
+/// supplied DLL does not name their individual serialized meanings. The
+/// block begins at inner version 112008 for campus parks and at 114005 for the
+/// slot-0 compatibility record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DistrictCampusData {
     /// Current student count.
@@ -363,6 +366,49 @@ pub struct DistrictCampusData {
     pub campus_building_attractiveness: u16,
     /// Four `AcademicWorksData` signed 32-bit values in serialized order.
     pub academic_works: [i32; 4],
+}
+
+/// One serialized campus report, in its on-disk order.
+///
+/// The game exposes current, prior, and ledger reports through fields of
+/// different owners. The reader keeps these entries in wire order and does
+/// not infer a role for each entry where the sample layout is ambiguous.
+/// Individual fields are `None` when omitted by the inner-version gates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictCampusYearReportData {
+    student_count: Option<i32>,
+    campus_attractiveness: Option<i32>,
+    reputation_level: Option<i8>,
+    grant_type: Option<i8>,
+    grant_work_index: Option<i16>,
+    academic_works: Option<[i32; 4]>,
+    total_prize_money: Option<u64>,
+    tickets_income: Option<[u64; 5]>,
+    winnings_income: Option<[u64; 5]>,
+    matches_won: Option<[u8; 5]>,
+    matches_lost: Option<[u8; 5]>,
+    matches_cancelled: Option<[u8; 5]>,
+    trophies: Option<[bool; 5]>,
+    toga_party_count: Option<i8>,
+    toga_party_seeds: Option<[i64; 3]>,
+    milestone_field_present: bool,
+    milestone_unlocked: Option<String>,
+    total_works: Option<i16>,
+    field_offsets: CampusYearReportFieldOffsets,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CampusYearReportFieldOffsets {
+    student_count: Option<usize>,
+    campus_attractiveness: Option<usize>,
+    reputation_level: Option<usize>,
+    grant_type: Option<usize>,
+    grant_work_index: Option<usize>,
+    academic_works: Option<usize>,
+    total_prize_money: Option<usize>,
+    toga_party_count: Option<usize>,
+    toga_party_seeds: Option<usize>,
+    total_works: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,11 +451,20 @@ struct DecodedParkPostLevelData {
 /// Editor for modeled scalar fields of one active DistrictManager park.
 ///
 /// All unmodeled fields remain byte-for-byte intact. Modeled scalar, visitor,
-/// production, industry-resource, and campus-summary fields can be changed.
+/// production, industry-resource, campus-summary, and fixed-width campus-report
+/// fields can be changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkEditor {
     original_serialized: Vec<u8>,
     record: DistrictParkRecord,
+}
+
+/// Edits fixed-width fields in one campus report without re-encoding its
+/// variable-length arrays or changing the containing park record's length.
+#[derive(Debug)]
+pub struct DistrictCampusYearReportEditor<'a> {
+    serialized: &'a mut Vec<u8>,
+    report: &'a mut DistrictCampusYearReportData,
 }
 
 /// The decoded district and optional park grid planes from `DistrictManager+Data`.
@@ -772,9 +827,15 @@ impl DistrictParkRecord {
     }
 
     /// Returns the leading student and academic-work values when this record
-    /// contains a campus block.
+    /// contains a campus or slot-0 compatibility block.
     pub fn campus_data(&self) -> Option<DistrictCampusData> {
         self.campus_data
+    }
+
+    /// Returns the campus reports in serialized order when the record has a
+    /// campus block. Their current/prior/ledger roles are not inferred.
+    pub fn campus_year_reports(&self) -> Option<&[DistrictCampusYearReportData]> {
+        self.campus_year_reports.as_deref()
     }
 
     /// Creates an editor that preserves all unmodeled bytes in this record.
@@ -788,6 +849,100 @@ impl DistrictParkRecord {
     /// Writes the exact record bytes, including fields not yet modeled.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized.clone()
+    }
+}
+
+impl DistrictCampusYearReportData {
+    /// Returns student count when serialized by this report version.
+    pub fn student_count(&self) -> Option<i32> {
+        self.student_count
+    }
+
+    /// Returns campus attractiveness when serialized by this report version.
+    pub fn campus_attractiveness(&self) -> Option<i32> {
+        self.campus_attractiveness
+    }
+
+    /// Returns reputation level when serialized by this report version.
+    pub fn reputation_level(&self) -> Option<i8> {
+        self.reputation_level
+    }
+
+    /// Returns grant type when serialized by this report version.
+    pub fn grant_type(&self) -> Option<i8> {
+        self.grant_type
+    }
+
+    /// Returns grant work index when serialized by this report version.
+    pub fn grant_work_index(&self) -> Option<i16> {
+        self.grant_work_index
+    }
+
+    /// Returns four academic-work values in their serialized order.
+    pub fn academic_works(&self) -> Option<[i32; 4]> {
+        self.academic_works
+    }
+
+    /// Returns total prize money.
+    pub fn total_prize_money(&self) -> Option<u64> {
+        self.total_prize_money
+    }
+
+    /// Returns five ticket-income values in their serialized order.
+    pub fn tickets_income(&self) -> Option<[u64; 5]> {
+        self.tickets_income
+    }
+
+    /// Returns five winnings-income values in their serialized order.
+    pub fn winnings_income(&self) -> Option<[u64; 5]> {
+        self.winnings_income
+    }
+
+    /// Returns five match-win values in their serialized order.
+    pub fn matches_won(&self) -> Option<[u8; 5]> {
+        self.matches_won
+    }
+
+    /// Returns five match-loss values in their serialized order.
+    pub fn matches_lost(&self) -> Option<[u8; 5]> {
+        self.matches_lost
+    }
+
+    /// Returns five cancelled-match values in their serialized order.
+    pub fn matches_cancelled(&self) -> Option<[u8; 5]> {
+        self.matches_cancelled
+    }
+
+    /// Returns trophy flags in their serialized order.
+    pub fn trophies(&self) -> Option<[bool; 5]> {
+        self.trophies
+    }
+
+    /// Returns the toga-party count from inner version 112017.
+    pub fn toga_party_count(&self) -> Option<i8> {
+        self.toga_party_count
+    }
+
+    /// Returns the three toga-party seeds from inner version 112017.
+    pub fn toga_party_seeds(&self) -> Option<[i64; 3]> {
+        self.toga_party_seeds
+    }
+
+    /// Returns true if the milestone string field is serialized.
+    pub fn has_milestone_field(&self) -> bool {
+        self.milestone_field_present
+    }
+
+    /// Returns the decoded milestone string, or `None` for a null or absent value.
+    /// Use [`Self::has_milestone_field`] to distinguish a serialized null from
+    /// a field omitted by the inner-version gate.
+    pub fn milestone_unlocked(&self) -> Option<&str> {
+        self.milestone_unlocked.as_deref()
+    }
+
+    /// Returns total works from inner version 112026.
+    pub fn total_works(&self) -> Option<i16> {
+        self.total_works
     }
 }
 
@@ -1233,6 +1388,30 @@ impl DistrictParkEditor {
         Ok(())
     }
 
+    /// Returns campus reports in serialized order when present.
+    pub fn campus_year_reports(&self) -> Option<&[DistrictCampusYearReportData]> {
+        self.record.campus_year_reports()
+    }
+
+    /// Returns an editor for one campus report in serialized order.
+    pub fn campus_year_report_mut(
+        &mut self,
+        index: usize,
+    ) -> Result<DistrictCampusYearReportEditor<'_>, CrpError> {
+        let DistrictParkRecord {
+            serialized,
+            campus_year_reports,
+            ..
+        } = &mut self.record;
+        let reports = campus_year_reports
+            .as_mut()
+            .ok_or_else(|| invalid_district_manager(0, "campus reports are absent"))?;
+        let report = reports.get_mut(index).ok_or_else(|| {
+            invalid_district_manager(0, format!("campus report index {index} is out of range"))
+        })?;
+        Ok(DistrictCampusYearReportEditor { serialized, report })
+    }
+
     /// Writes the edited record while retaining every unmodeled byte.
     pub fn encode(&self) -> Vec<u8> {
         self.record.serialized.clone()
@@ -1268,6 +1447,153 @@ impl DistrictParkEditor {
             .visitor_data
             .as_mut()
             .ok_or_else(|| invalid_district_manager(0, "visitor fields are absent"))
+    }
+}
+
+impl DistrictCampusYearReportEditor<'_> {
+    /// Returns the current decoded report values.
+    pub fn report(&self) -> &DistrictCampusYearReportData {
+        self.report
+    }
+
+    /// Replaces student count.
+    pub fn set_student_count(&mut self, value: i32) -> Result<(), CrpError> {
+        self.write_field(
+            self.report.field_offsets.student_count,
+            &value.to_be_bytes(),
+            "campus report student count",
+        )?;
+        self.report.student_count = Some(value);
+        Ok(())
+    }
+
+    /// Replaces campus attractiveness.
+    pub fn set_campus_attractiveness(&mut self, value: i32) -> Result<(), CrpError> {
+        self.write_field(
+            self.report.field_offsets.campus_attractiveness,
+            &value.to_be_bytes(),
+            "campus report attractiveness",
+        )?;
+        self.report.campus_attractiveness = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the report's signed reputation level.
+    pub fn set_reputation_level(&mut self, value: i8) -> Result<(), CrpError> {
+        self.write_field(
+            self.report.field_offsets.reputation_level,
+            &[value as u8],
+            "campus report reputation level",
+        )?;
+        self.report.reputation_level = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the report's signed grant type.
+    pub fn set_grant_type(&mut self, value: i8) -> Result<(), CrpError> {
+        self.write_field(
+            self.report.field_offsets.grant_type,
+            &[value as u8],
+            "campus report grant type",
+        )?;
+        self.report.grant_type = Some(value);
+        Ok(())
+    }
+
+    /// Replaces grant work index.
+    pub fn set_grant_work_index(&mut self, value: i16) -> Result<(), CrpError> {
+        self.write_field(
+            self.report.field_offsets.grant_work_index,
+            &value.to_be_bytes(),
+            "campus report grant work index",
+        )?;
+        self.report.grant_work_index = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the four academic-work values.
+    pub fn set_academic_works(&mut self, value: [i32; 4]) -> Result<(), CrpError> {
+        let mut bytes = [0_u8; 16];
+        for (index, item) in value.iter().enumerate() {
+            let start = index * 4;
+            bytes[start..start + 4].copy_from_slice(&item.to_be_bytes());
+        }
+        self.write_field(
+            self.report.field_offsets.academic_works,
+            &bytes,
+            "campus report academic works",
+        )?;
+        self.report.academic_works = Some(value);
+        Ok(())
+    }
+
+    /// Replaces total prize money.
+    pub fn set_total_prize_money(&mut self, value: u64) -> Result<(), CrpError> {
+        self.write_field(
+            self.report.field_offsets.total_prize_money,
+            &value.to_be_bytes(),
+            "campus report total prize money",
+        )?;
+        self.report.total_prize_money = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the signed toga-party count from inner version 112017.
+    pub fn set_toga_party_count(&mut self, value: i8) -> Result<(), CrpError> {
+        self.write_field(
+            self.report.field_offsets.toga_party_count,
+            &[value as u8],
+            "campus report toga-party count",
+        )?;
+        self.report.toga_party_count = Some(value);
+        Ok(())
+    }
+
+    /// Replaces the three signed toga-party seeds from inner version 112017.
+    pub fn set_toga_party_seeds(&mut self, value: [i64; 3]) -> Result<(), CrpError> {
+        let mut bytes = [0_u8; 24];
+        for (index, item) in value.iter().enumerate() {
+            let start = index * 8;
+            bytes[start..start + 8].copy_from_slice(&item.to_be_bytes());
+        }
+        self.write_field(
+            self.report.field_offsets.toga_party_seeds,
+            &bytes,
+            "campus report toga-party seeds",
+        )?;
+        self.report.toga_party_seeds = Some(value);
+        Ok(())
+    }
+
+    /// Replaces total works from inner version 112026.
+    pub fn set_total_works(&mut self, value: i16) -> Result<(), CrpError> {
+        self.write_field(
+            self.report.field_offsets.total_works,
+            &value.to_be_bytes(),
+            "campus report total works",
+        )?;
+        self.report.total_works = Some(value);
+        Ok(())
+    }
+
+    fn write_field(
+        &mut self,
+        offset: Option<usize>,
+        value: &[u8],
+        field: &str,
+    ) -> Result<(), CrpError> {
+        let offset =
+            offset.ok_or_else(|| invalid_district_manager(0, format!("{field} is absent")))?;
+        let end = offset
+            .checked_add(value.len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "DistrictManager campus report field end",
+            ))?;
+        let destination = self.serialized.get_mut(offset..end).ok_or_else(|| {
+            invalid_district_manager(offset, format!("{field} is outside the park record"))
+        })?;
+        destination.copy_from_slice(value);
+        Ok(())
     }
 }
 
@@ -2164,7 +2490,8 @@ impl DistrictManagerFlagsPrefix {
             } else {
                 (None, None)
             };
-            let (campus_data, campus_data_offset) = if self.format_version >= 112_008
+            let (campus_data, campus_data_offset, campus_year_reports) = if self.format_version
+                >= 112_008
                 && ((10..=13).contains(&park_type)
                     || (self.format_version >= TYPE_ZERO_PARK_CAMPUS_VERSION && park_index == 0))
             {
@@ -2172,7 +2499,7 @@ impl DistrictManagerFlagsPrefix {
                 // report records in total. The examined DLL reads thirteen.
                 let observed_ten_reports = use_ten_reports && park_index == 0 && park_type == 0;
                 let campus_data_offset = reader.offset();
-                let campus_data =
+                let (campus_data, campus_year_reports) =
                     read_campus(&mut reader, self.format_version, observed_ten_reports).map_err(
                         |error| {
                             invalid_district_manager(
@@ -2181,9 +2508,13 @@ impl DistrictManagerFlagsPrefix {
                             )
                         },
                     )?;
-                (Some(campus_data), Some(campus_data_offset))
+                (
+                    Some(campus_data),
+                    Some(campus_data_offset),
+                    Some(campus_year_reports),
+                )
             } else {
-                (None, None)
+                (None, None, None)
             };
             if park_type == 14 {
                 reader
@@ -2233,6 +2564,7 @@ impl DistrictManagerFlagsPrefix {
                 industry_resources,
                 campus_data,
                 campus_data_offset,
+                campus_year_reports,
                 post_level_offsets: post_level_data.offsets,
                 industry_resource_offsets,
                 serialized: bytes[offset..end].to_vec(),
@@ -2681,7 +3013,7 @@ fn read_campus(
     reader: &mut Reader<'_>,
     format_version: u32,
     observed_ten_reports: bool,
-) -> Result<DistrictCampusData, CrpError> {
+) -> Result<(DistrictCampusData, Vec<DistrictCampusYearReportData>), CrpError> {
     // DistrictManager+Data.Deserialize reads this for campus types from 112008
     // and for slot 0 of any type from 114005.
     let student_count = reader.read_u16_be()?;
@@ -2698,8 +3030,9 @@ fn read_campus(
     } else {
         report_count
     };
+    let mut reports = Vec::with_capacity(report_count);
     for _ in 0..report_count {
-        skip_year_report(reader, format_version)?;
+        reports.push(read_year_report(reader, format_version)?);
     }
     reader.read_bytes(5)?; // Campus state, grant, coach, and cheerleading budget.
     if format_version >= 112_025 {
@@ -2720,12 +3053,15 @@ fn read_campus(
     if format_version >= 112_024 {
         reader.read_bytes(2)?; // Campus building count.
     }
-    Ok(DistrictCampusData {
-        student_count,
-        student_capacity,
-        campus_building_attractiveness,
-        academic_works,
-    })
+    Ok((
+        DistrictCampusData {
+            student_count,
+            student_capacity,
+            campus_building_attractiveness,
+            academic_works,
+        },
+        reports,
+    ))
 }
 
 fn skip_pedestrian_zone(
@@ -2791,26 +3127,125 @@ fn skip_pedestrian_zone(
     Ok(())
 }
 
-fn skip_year_report(reader: &mut Reader<'_>, format_version: u32) -> Result<(), CrpError> {
+fn read_year_report(
+    reader: &mut Reader<'_>,
+    format_version: u32,
+) -> Result<DistrictCampusYearReportData, CrpError> {
+    let mut field_offsets = CampusYearReportFieldOffsets::default();
+    let mut student_count = None;
+    let mut campus_attractiveness = None;
+    let mut reputation_level = None;
+    let mut grant_type = None;
+    let mut grant_work_index = None;
+    let mut academic_works = None;
+    let mut total_prize_money = None;
+    let mut tickets_income = None;
+    let mut winnings_income = None;
+    let mut matches_won = None;
+    let mut matches_lost = None;
+    let mut matches_cancelled = None;
+    let mut trophies = None;
     if format_version >= 112_014 {
-        reader.read_bytes(36)?; // Counts, grant fields, academic works, prize money.
-        read_encoded_ulong_array(reader, 5)?; // Ticket income.
-        read_encoded_ulong_array(reader, 5)?; // Winnings income.
-        for _ in 0..3 {
-            read_encoded_byte_array(reader, 5)?; // Match results.
+        field_offsets.student_count = Some(reader.offset());
+        student_count = Some(reader.read_i32_be()?);
+        field_offsets.campus_attractiveness = Some(reader.offset());
+        campus_attractiveness = Some(reader.read_i32_be()?);
+        field_offsets.reputation_level = Some(reader.offset());
+        reputation_level = Some(reader.read_u8()? as i8);
+        field_offsets.grant_type = Some(reader.offset());
+        grant_type = Some(reader.read_u8()? as i8);
+        field_offsets.grant_work_index = Some(reader.offset());
+        grant_work_index = Some(reader.read_i16_be()?);
+        field_offsets.academic_works = Some(reader.offset());
+        let mut works = [0_i32; 4];
+        for value in &mut works {
+            *value = reader.read_i32_be()?;
         }
-        read_encoded_bool_array(reader, 5)?; // Trophies.
+        academic_works = Some(works);
+        field_offsets.total_prize_money = Some(reader.offset());
+        total_prize_money = Some(reader.read_u64_be()?);
+        tickets_income = Some(read_campus_report_ulong_array(reader, "ticket income")?);
+        winnings_income = Some(read_campus_report_ulong_array(reader, "winnings income")?);
+        matches_won = Some(read_campus_report_byte_array(reader, "matches won")?);
+        matches_lost = Some(read_campus_report_byte_array(reader, "matches lost")?);
+        matches_cancelled = Some(read_campus_report_byte_array(reader, "matches cancelled")?);
+        trophies = Some(read_campus_report_bool_array(reader)?);
     }
+    let mut toga_party_count = None;
+    let mut toga_party_seeds = None;
     if format_version >= 112_017 {
-        reader.read_bytes(25)?; // Toga count and three 64-bit seeds.
+        field_offsets.toga_party_count = Some(reader.offset());
+        toga_party_count = Some(reader.read_u8()? as i8);
+        field_offsets.toga_party_seeds = Some(reader.offset());
+        let mut seeds = [0_i64; 3];
+        for value in &mut seeds {
+            *value = reader.read_u64_be()? as i64;
+        }
+        toga_party_seeds = Some(seeds);
     }
-    if format_version >= 112_023 {
-        reader.read_unique_string()?; // Milestone name.
-    }
-    if format_version >= 112_026 {
-        reader.read_bytes(2)?; // Total works.
-    }
-    Ok(())
+    let milestone_field_present = format_version >= 112_023;
+    let milestone_unlocked = if milestone_field_present {
+        reader.read_unique_string()?
+    } else {
+        None
+    };
+    let total_works = if format_version >= 112_026 {
+        field_offsets.total_works = Some(reader.offset());
+        Some(reader.read_i16_be()?)
+    } else {
+        None
+    };
+    Ok(DistrictCampusYearReportData {
+        student_count,
+        campus_attractiveness,
+        reputation_level,
+        grant_type,
+        grant_work_index,
+        academic_works,
+        total_prize_money,
+        tickets_income,
+        winnings_income,
+        matches_won,
+        matches_lost,
+        matches_cancelled,
+        trophies,
+        toga_party_count,
+        toga_party_seeds,
+        milestone_field_present,
+        milestone_unlocked,
+        total_works,
+        field_offsets,
+    })
+}
+
+fn read_campus_report_ulong_array(
+    reader: &mut Reader<'_>,
+    field: &str,
+) -> Result<[u64; 5], CrpError> {
+    read_encoded_ulong_array(reader, 5)?
+        .try_into()
+        .map_err(|_| {
+            reader.invalid(format!(
+                "encoded campus report {field} did not contain five values"
+            ))
+        })
+}
+
+fn read_campus_report_byte_array(
+    reader: &mut Reader<'_>,
+    field: &str,
+) -> Result<[u8; 5], CrpError> {
+    read_encoded_byte_array(reader, 5)?.try_into().map_err(|_| {
+        reader.invalid(format!(
+            "encoded campus report {field} did not contain five values"
+        ))
+    })
+}
+
+fn read_campus_report_bool_array(reader: &mut Reader<'_>) -> Result<[bool; 5], CrpError> {
+    read_encoded_bool_array(reader, 5)?
+        .try_into()
+        .map_err(|_| reader.invalid("encoded campus report trophies did not contain five values"))
 }
 
 fn read_district_private_data(
@@ -3681,6 +4116,29 @@ mod tests {
                     academic_works: [0; 4],
                 })
             );
+            match parks[0].campus_year_reports() {
+                Some(reports) => {
+                    let expected_report_count = 2
+                        + usize::from(version >= 112_009)
+                        + if version >= 112_020 { 10 } else { 0 };
+                    assert_eq!(reports.len(), expected_report_count);
+                    assert_eq!(reports[0].student_count().is_some(), version >= 112_014);
+                    assert_eq!(reports[0].toga_party_count().is_some(), version >= 112_017);
+                    assert_eq!(reports[0].has_milestone_field(), version >= 112_023);
+                    assert_eq!(reports[0].total_works().is_some(), version >= 112_026);
+                }
+                None => assert!(version < 112_008),
+            }
+            if version == 112_014 {
+                let mut editor = parks[0].clone().into_editor();
+                let original = editor.encode();
+                {
+                    let mut report_editor = editor.campus_year_report_mut(0).unwrap();
+                    assert!(report_editor.set_toga_party_count(1).is_err());
+                    assert!(report_editor.set_total_works(1).is_err());
+                }
+                assert_eq!(editor.encode(), original);
+            }
             assert_eq!(bytes[used], 0xff);
             if expected_campus_bytes != 0 {
                 assert!(
@@ -3764,6 +4222,119 @@ mod tests {
             &record[campus_offset + expected_summary.len()..]
         );
         assert_eq!(editor.campus_data(), Some(replacement));
+    }
+
+    #[test]
+    fn campus_reports_decode_versioned_fields_and_edit_fixed_width_values() {
+        let version = 112_026;
+        let mut prefix_bytes = Vec::new();
+        if version >= AIRLINE_NAME_VERSION {
+            write_unique_string(&mut prefix_bytes, "").unwrap();
+        }
+        if version >= AIRPORT_PANEL_VERSION {
+            prefix_bytes.push(0);
+        }
+        zero_flags(&mut prefix_bytes);
+        let mut park_flags = [0_u32; DISTRICT_COUNT];
+        park_flags[5] = 1;
+        write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+        zero_policy_bools(&mut prefix_bytes, version);
+        let (prefix, _) =
+            DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+
+        let mut campus = zero_campus(version);
+        let report_start = 22;
+        campus[report_start..report_start + 4].copy_from_slice(&(-7_i32).to_be_bytes());
+        campus[report_start + 4..report_start + 8].copy_from_slice(&0x1020_3040_i32.to_be_bytes());
+        campus[report_start + 8] = 0xfe; // Signed reputation level -2.
+        campus[report_start + 9] = 0xfd; // Signed grant type -3.
+        campus[report_start + 10..report_start + 12].copy_from_slice(&(-9_i16).to_be_bytes());
+        let academic_works = [1, -2, 3, i32::MAX];
+        for (index, value) in academic_works.iter().enumerate() {
+            let start = report_start + 12 + index * 4;
+            campus[start..start + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        campus[report_start + 28..report_start + 36]
+            .copy_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
+
+        let mut ticket_income = vec![0x00];
+        ticket_income.extend_from_slice(&10_u64.to_be_bytes());
+        ticket_income.push(0x83); // Four repeats of the +10 delta.
+        campus.splice(report_start + 36..report_start + 37, ticket_income);
+        let matches_won_offset = report_start + 36 + 10 + 1;
+        campus.splice(
+            matches_won_offset..matches_won_offset + 1,
+            [0x04, 1, 2, 3, 4, 5],
+        );
+        let trophies_offset = report_start + 36 + 10 + 1 + 6 + 1 + 1;
+        campus.splice(trophies_offset..trophies_offset + 1, [0x00, 0x15]);
+
+        let toga_offset = report_start + 57;
+        campus[toga_offset] = 0xff; // Signed count -1.
+        for (index, value) in [1_i64, -2, i64::MIN].iter().enumerate() {
+            let start = toga_offset + 1 + index * 8;
+            campus[start..start + 8].copy_from_slice(&value.to_be_bytes());
+        }
+        let total_works_offset = report_start + 85;
+        campus[total_works_offset..total_works_offset + 2]
+            .copy_from_slice(&(-11_i16).to_be_bytes());
+
+        let mut record = vec![0; super::park_scalar_bytes(version)];
+        record[42 + super::park_happiness_bytes(version)] = 10;
+        record.extend_from_slice(&campus);
+        let (parks, consumed) = prefix.decode_park_records(&record).unwrap();
+        assert_eq!(consumed, record.len());
+        let reports = parks[0].campus_year_reports().unwrap();
+        assert_eq!(reports.len(), 13);
+        let report = &reports[0];
+        assert_eq!(report.student_count(), Some(-7));
+        assert_eq!(report.campus_attractiveness(), Some(0x1020_3040));
+        assert_eq!(report.reputation_level(), Some(-2));
+        assert_eq!(report.grant_type(), Some(-3));
+        assert_eq!(report.grant_work_index(), Some(-9));
+        assert_eq!(report.academic_works(), Some(academic_works));
+        assert_eq!(report.total_prize_money(), Some(0x0102_0304_0506_0708));
+        assert_eq!(report.tickets_income(), Some([10, 20, 30, 40, 50]));
+        assert_eq!(report.winnings_income(), Some([0; 5]));
+        assert_eq!(report.matches_won(), Some([1, 2, 3, 4, 5]));
+        assert_eq!(report.matches_lost(), Some([0; 5]));
+        assert_eq!(report.matches_cancelled(), Some([0; 5]));
+        assert_eq!(report.trophies(), Some([true, false, true, false, true]));
+        assert_eq!(report.toga_party_count(), Some(-1));
+        assert_eq!(report.toga_party_seeds(), Some([1, -2, i64::MIN]));
+        assert!(report.has_milestone_field());
+        assert_eq!(report.milestone_unlocked(), Some(""));
+        assert_eq!(report.total_works(), Some(-11));
+
+        let mut editor = parks.into_iter().next().unwrap().into_editor();
+        let new_works = [-8, 9, i32::MIN, 10];
+        let new_seeds = [i64::MAX, 0, -1];
+        {
+            let mut report_editor = editor.campus_year_report_mut(0).unwrap();
+            report_editor.set_student_count(123).unwrap();
+            report_editor.set_academic_works(new_works).unwrap();
+            report_editor.set_toga_party_seeds(new_seeds).unwrap();
+            report_editor.set_total_works(77).unwrap();
+            assert_eq!(report_editor.report().student_count(), Some(123));
+            assert_eq!(report_editor.report().academic_works(), Some(new_works));
+            assert_eq!(report_editor.report().toga_party_seeds(), Some(new_seeds));
+            assert_eq!(report_editor.report().total_works(), Some(77));
+        }
+        let mut expected = record;
+        let first_report_offset = super::park_scalar_bytes(version) + report_start;
+        expected[first_report_offset..first_report_offset + 4]
+            .copy_from_slice(&123_i32.to_be_bytes());
+        for (index, value) in new_works.iter().enumerate() {
+            let start = first_report_offset + 12 + index * 4;
+            expected[start..start + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        for (index, value) in new_seeds.iter().enumerate() {
+            let start = first_report_offset + 58 + index * 8;
+            expected[start..start + 8].copy_from_slice(&value.to_be_bytes());
+        }
+        let total_works_start = first_report_offset + 85;
+        expected[total_works_start..total_works_start + 2].copy_from_slice(&77_i16.to_be_bytes());
+        assert_eq!(editor.encode(), expected);
     }
 
     #[test]
@@ -4573,6 +5144,17 @@ mod tests {
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].park_index(), 0);
             assert_eq!(records[0].encode(), bytes[..used]);
+            if version == 115_014 {
+                let reports = records[0].campus_year_reports().unwrap();
+                assert_eq!(reports.len(), 13);
+                assert_eq!(reports[0].student_count(), Some(0));
+                assert_eq!(reports[0].tickets_income(), Some([0; 5]));
+                assert_eq!(reports[0].matches_won(), Some([0; 5]));
+                assert_eq!(reports[0].trophies(), Some([false; 5]));
+                assert!(reports[0].has_milestone_field());
+                assert_eq!(reports[0].milestone_unlocked(), None);
+                assert_eq!(reports[0].total_works(), Some(0));
+            }
             let visitor_data = records[0].visitor_data().unwrap();
             assert_eq!(
                 visitor_data.total_visitors(),
