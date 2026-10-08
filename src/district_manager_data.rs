@@ -127,8 +127,9 @@ pub struct DistrictManagerFlagsPrefix {
 
 /// A supported park record from inner versions 110025–118011.
 ///
-/// Modeled scalar and industry-resource fields are interpreted. The exact
-/// record bytes are retained for unchanged writing, including fields not yet modeled.
+/// Modeled scalar, industry-resource, and campus-summary fields are
+/// interpreted. The exact record bytes are retained for unchanged writing,
+/// including fields not yet modeled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkRecord {
     park_index: usize,
@@ -147,6 +148,8 @@ pub struct DistrictParkRecord {
     work_storage_deltas: Option<DistrictParkWorkStorageDeltas>,
     production_data: Option<DistrictParkProductionData>,
     industry_resources: Option<Vec<DistrictParkIndustryResource>>,
+    campus_data: Option<DistrictCampusData>,
+    campus_data_offset: Option<usize>,
     post_level_offsets: ParkPostLevelFieldOffsets,
     industry_resource_offsets: Option<ParkIndustryResourceOffsets>,
     serialized: Vec<u8>,
@@ -346,6 +349,22 @@ pub struct DistrictParkIndustryResource {
     pub trade_data: Option<DistrictParkIndustryTradeData>,
 }
 
+/// Core student and academic-work values in a campus park's versioned block.
+///
+/// The four academic-work integers are exposed in wire order because the
+/// supplied DLL does not name their individual serialized meanings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistrictCampusData {
+    /// Current student count.
+    pub student_count: u16,
+    /// Student capacity.
+    pub student_capacity: u16,
+    /// Campus-building attractiveness accumulator.
+    pub campus_building_attractiveness: u16,
+    /// Four `AcademicWorksData` signed 32-bit values in serialized order.
+    pub academic_works: [i32; 4],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParkPostLevelFieldOffsets {
     gates: Option<usize>,
@@ -386,7 +405,7 @@ struct DecodedParkPostLevelData {
 /// Editor for modeled scalar fields of one active DistrictManager park.
 ///
 /// All unmodeled fields remain byte-for-byte intact. Modeled scalar, visitor,
-/// production, and industry-resource fields can be changed.
+/// production, industry-resource, and campus-summary fields can be changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictParkEditor {
     original_serialized: Vec<u8>,
@@ -750,6 +769,12 @@ impl DistrictParkRecord {
     /// This is present for park types 5–9 from inner version 111009.
     pub fn industry_resources(&self) -> Option<&[DistrictParkIndustryResource]> {
         self.industry_resources.as_deref()
+    }
+
+    /// Returns the leading student and academic-work values when this record
+    /// contains a campus block.
+    pub fn campus_data(&self) -> Option<DistrictCampusData> {
+        self.campus_data
     }
 
     /// Creates an editor that preserves all unmodeled bytes in this record.
@@ -1180,6 +1205,31 @@ impl DistrictParkEditor {
             .ok_or_else(|| invalid_district_manager(0, "last visitor count is absent"))?;
         self.write_field(offset, &value.to_be_bytes(), "last visitor count")?;
         self.visitor_data_mut()?.last_visitor_count = Some(value);
+        Ok(())
+    }
+
+    /// Returns the leading student and academic-work values when present.
+    pub fn campus_data(&self) -> Option<DistrictCampusData> {
+        self.record.campus_data()
+    }
+
+    /// Replaces the fixed 22-byte campus summary while preserving the rest of
+    /// the versioned campus block exactly.
+    pub fn set_campus_data(&mut self, value: DistrictCampusData) -> Result<(), CrpError> {
+        let offset = self
+            .record
+            .campus_data_offset
+            .ok_or_else(|| invalid_district_manager(0, "campus fields are absent"))?;
+        let mut bytes = [0_u8; 22];
+        bytes[0..2].copy_from_slice(&value.student_count.to_be_bytes());
+        bytes[2..4].copy_from_slice(&value.student_capacity.to_be_bytes());
+        bytes[4..6].copy_from_slice(&value.campus_building_attractiveness.to_be_bytes());
+        for (index, item) in value.academic_works.iter().enumerate() {
+            let start = 6 + index * 4;
+            bytes[start..start + 4].copy_from_slice(&item.to_be_bytes());
+        }
+        self.write_field(offset, &bytes, "campus student and academic-work fields")?;
+        self.record.campus_data = Some(value);
         Ok(())
     }
 
@@ -2114,22 +2164,27 @@ impl DistrictManagerFlagsPrefix {
             } else {
                 (None, None)
             };
-            if self.format_version >= 112_008
+            let (campus_data, campus_data_offset) = if self.format_version >= 112_008
                 && ((10..=13).contains(&park_type)
                     || (self.format_version >= TYPE_ZERO_PARK_CAMPUS_VERSION && park_index == 0))
             {
                 // The supplied MP23/MP27 type-0 slot-0 records contain ten
                 // report records in total. The examined DLL reads thirteen.
                 let observed_ten_reports = use_ten_reports && park_index == 0 && park_type == 0;
-                skip_campus(&mut reader, self.format_version, observed_ten_reports).map_err(
-                    |error| {
-                        invalid_district_manager(
-                            offset + reader.offset(),
-                            format!("park {park_index} campus block: {error}"),
-                        )
-                    },
-                )?;
-            }
+                let campus_data_offset = reader.offset();
+                let campus_data =
+                    read_campus(&mut reader, self.format_version, observed_ten_reports).map_err(
+                        |error| {
+                            invalid_district_manager(
+                                offset + reader.offset(),
+                                format!("park {park_index} campus block: {error}"),
+                            )
+                        },
+                    )?;
+                (Some(campus_data), Some(campus_data_offset))
+            } else {
+                (None, None)
+            };
             if park_type == 14 {
                 reader
                     .read_bytes(airport_park_bytes(self.format_version))
@@ -2176,6 +2231,8 @@ impl DistrictManagerFlagsPrefix {
                 work_storage_deltas: post_level_data.work_storage_deltas,
                 production_data: post_level_data.production_data,
                 industry_resources,
+                campus_data,
+                campus_data_offset,
                 post_level_offsets: post_level_data.offsets,
                 industry_resource_offsets,
                 serialized: bytes[offset..end].to_vec(),
@@ -2620,14 +2677,20 @@ fn read_district_age_population(
     })
 }
 
-fn skip_campus(
+fn read_campus(
     reader: &mut Reader<'_>,
     format_version: u32,
     observed_ten_reports: bool,
-) -> Result<(), CrpError> {
+) -> Result<DistrictCampusData, CrpError> {
     // DistrictManager+Data.Deserialize reads this for campus types from 112008
     // and for slot 0 of any type from 114005.
-    reader.read_bytes(6 + 16)?; // Student fields and AcademicWorksData.
+    let student_count = reader.read_u16_be()?;
+    let student_capacity = reader.read_u16_be()?;
+    let campus_building_attractiveness = reader.read_u16_be()?;
+    let mut academic_works = [0_i32; 4];
+    for value in &mut academic_works {
+        *value = reader.read_i32_be()?;
+    }
     let report_count =
         2 + usize::from(format_version >= 112_009) + if format_version >= 112_020 { 10 } else { 0 };
     let report_count = if observed_ten_reports {
@@ -2657,7 +2720,12 @@ fn skip_campus(
     if format_version >= 112_024 {
         reader.read_bytes(2)?; // Campus building count.
     }
-    Ok(())
+    Ok(DistrictCampusData {
+        student_count,
+        student_capacity,
+        campus_building_attractiveness,
+        academic_works,
+    })
 }
 
 fn skip_pedestrian_zone(
@@ -2724,15 +2792,21 @@ fn skip_pedestrian_zone(
 }
 
 fn skip_year_report(reader: &mut Reader<'_>, format_version: u32) -> Result<(), CrpError> {
-    reader.read_bytes(36)?; // Counts, grant fields, academic works, prize money.
-    read_encoded_ulong_array(reader, 5)?; // Ticket income.
-    read_encoded_ulong_array(reader, 5)?; // Winnings income.
-    for _ in 0..3 {
-        read_encoded_byte_array(reader, 5)?; // Match results.
+    if format_version >= 112_014 {
+        reader.read_bytes(36)?; // Counts, grant fields, academic works, prize money.
+        read_encoded_ulong_array(reader, 5)?; // Ticket income.
+        read_encoded_ulong_array(reader, 5)?; // Winnings income.
+        for _ in 0..3 {
+            read_encoded_byte_array(reader, 5)?; // Match results.
+        }
+        read_encoded_bool_array(reader, 5)?; // Trophies.
     }
-    read_encoded_bool_array(reader, 5)?; // Trophies.
-    reader.read_bytes(25)?; // Toga count and three 64-bit seeds.
-    reader.read_unique_string()?; // Milestone name.
+    if format_version >= 112_017 {
+        reader.read_bytes(25)?; // Toga count and three 64-bit seeds.
+    }
+    if format_version >= 112_023 {
+        reader.read_unique_string()?; // Milestone name.
+    }
     if format_version >= 112_026 {
         reader.read_bytes(2)?; // Total works.
     }
@@ -2931,11 +3005,12 @@ fn invalid_district_manager(offset: usize, reason: impl Into<String>) -> CrpErro
 mod tests {
     use super::{
         AIRLINE_NAME_VERSION, AIRPORT_PANEL_VERSION, DISTRICT_COUNT, DISTRICT_GRID_CELLS,
-        DISTRICT_GRID_VALUES, DistrictManagerFlagsPrefix, DistrictManagerGridData,
-        DistrictManagerTailData, DistrictParkAttractiveness, DistrictParkCapacities,
-        DistrictParkGateData, DistrictParkIndustryResource, DistrictParkIndustryResourceKind,
-        DistrictParkIndustryTradeData, DistrictParkProductionData, DistrictParkWorkStorageDeltas,
-        PARK_FLAGS_VERSION, POLICY_COUNT, district_policy_bool_count,
+        DISTRICT_GRID_VALUES, DistrictCampusData, DistrictManagerFlagsPrefix,
+        DistrictManagerGridData, DistrictManagerTailData, DistrictParkAttractiveness,
+        DistrictParkCapacities, DistrictParkGateData, DistrictParkIndustryResource,
+        DistrictParkIndustryResourceKind, DistrictParkIndustryTradeData,
+        DistrictParkProductionData, DistrictParkWorkStorageDeltas, PARK_FLAGS_VERSION,
+        POLICY_COUNT, district_policy_bool_count,
     };
     use crate::data_serializer::{Reader, write_unique_string};
     use crate::encoded_array::{
@@ -2956,12 +3031,18 @@ mod tests {
     fn zero_campus_with_reports(version: u32, report_count: usize) -> Vec<u8> {
         let mut bytes = vec![0; 22]; // Student fields and academic works.
         for _ in 0..report_count {
-            bytes.extend_from_slice(&[0; 36]);
-            bytes.extend_from_slice(&[0x84; 2]); // Two five-value ULong arrays.
-            bytes.extend_from_slice(&[0x84; 3]); // Three five-value Byte arrays.
-            bytes.push(0x80); // Five false bools in one packed byte.
-            bytes.extend_from_slice(&[0; 25]);
-            write_unique_string(&mut bytes, "").unwrap();
+            if version >= 112_014 {
+                bytes.extend_from_slice(&[0; 36]);
+                bytes.extend_from_slice(&[0x84; 2]); // Two five-value ULong arrays.
+                bytes.extend_from_slice(&[0x84; 3]); // Three five-value Byte arrays.
+                bytes.push(0x80); // Five false bools in one packed byte.
+            }
+            if version >= 112_017 {
+                bytes.extend_from_slice(&[0; 25]);
+            }
+            if version >= 112_023 {
+                write_unique_string(&mut bytes, "").unwrap();
+            }
             if version >= 112_026 {
                 bytes.extend_from_slice(&[0; 2]);
             }
@@ -3547,13 +3628,15 @@ mod tests {
     fn campus_park_records_follow_versioned_report_and_sports_gates() {
         for (version, park_type, expected_campus_bytes) in [
             (112_007, 10, 0),
-            (112_008, 10, 172),
-            (112_009, 11, 244),
-            (112_011, 12, 246),
-            (112_012, 13, 248),
-            (112_013, 10, 250),
-            (112_014, 11, 251),
-            (112_020, 12, 951),
+            (112_008, 10, 32),
+            (112_009, 11, 34),
+            (112_011, 12, 36),
+            (112_012, 13, 38),
+            (112_013, 10, 40),
+            (112_014, 11, 167),
+            (112_017, 11, 242),
+            (112_020, 12, 912),
+            (112_023, 12, 951),
             (112_024, 13, 953),
             (112_025, 10, 958),
             (112_026, 11, 984),
@@ -3589,6 +3672,15 @@ mod tests {
             assert_eq!(used, record.len());
             assert_eq!(parks[0].park_type(), park_type);
             assert_eq!(parks[0].encode(), record);
+            assert_eq!(
+                parks[0].campus_data(),
+                (version >= 112_008).then_some(DistrictCampusData {
+                    student_count: 0,
+                    student_capacity: 0,
+                    campus_building_attractiveness: 0,
+                    academic_works: [0; 4],
+                })
+            );
             assert_eq!(bytes[used], 0xff);
             if expected_campus_bytes != 0 {
                 assert!(
@@ -3599,6 +3691,79 @@ mod tests {
             }
             assert!(prefix.decode_type_zero_park_records(&record).is_err());
         }
+    }
+
+    #[test]
+    fn campus_summary_can_be_edited_without_rewriting_the_rest_of_the_record() {
+        let version = 112_026;
+        let mut prefix_bytes = Vec::new();
+        if version >= AIRLINE_NAME_VERSION {
+            write_unique_string(&mut prefix_bytes, "").unwrap();
+        }
+        if version >= AIRPORT_PANEL_VERSION {
+            prefix_bytes.push(0);
+        }
+        zero_flags(&mut prefix_bytes);
+        let mut park_flags = [0_u32; DISTRICT_COUNT];
+        park_flags[5] = 1;
+        write_encoded_uint_array(&mut prefix_bytes, &park_flags);
+        zero_policy_bools(&mut prefix_bytes, version);
+        let (prefix, _) =
+            DistrictManagerFlagsPrefix::decode_prefix(version, &prefix_bytes).unwrap();
+
+        let initial = DistrictCampusData {
+            student_count: 0x1234,
+            student_capacity: 0x5678,
+            campus_building_attractiveness: 0x9abc,
+            academic_works: [0x0102_0304, -2, 0x1122_3344, i32::MIN],
+        };
+        let mut campus = zero_campus(version);
+        campus[0..2].copy_from_slice(&initial.student_count.to_be_bytes());
+        campus[2..4].copy_from_slice(&initial.student_capacity.to_be_bytes());
+        campus[4..6].copy_from_slice(&initial.campus_building_attractiveness.to_be_bytes());
+        for (index, value) in initial.academic_works.iter().enumerate() {
+            let start = 6 + index * 4;
+            campus[start..start + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        let mut record = vec![0; super::park_scalar_bytes(version)];
+        record[42 + super::park_happiness_bytes(version)] = 10;
+        record.extend_from_slice(&campus);
+
+        let (parks, consumed) = prefix.decode_park_records(&record).unwrap();
+        assert_eq!(consumed, record.len());
+        assert_eq!(parks[0].campus_data(), Some(initial));
+        assert_eq!(parks[0].encode(), record);
+
+        let replacement = DistrictCampusData {
+            student_count: 7,
+            student_capacity: 900,
+            campus_building_attractiveness: 123,
+            academic_works: [-1, 2, i32::MAX, 0x5566_7788],
+        };
+        let mut editor = parks.into_iter().next().unwrap().into_editor();
+        assert_eq!(editor.campus_data(), Some(initial));
+        editor.set_campus_data(replacement).unwrap();
+        let edited = editor.encode();
+        let campus_offset = super::park_scalar_bytes(version);
+        let expected_summary = {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&replacement.student_count.to_be_bytes());
+            bytes.extend_from_slice(&replacement.student_capacity.to_be_bytes());
+            bytes.extend_from_slice(&replacement.campus_building_attractiveness.to_be_bytes());
+            for value in replacement.academic_works {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            bytes
+        };
+        assert_eq!(
+            &edited[campus_offset..campus_offset + expected_summary.len()],
+            expected_summary
+        );
+        assert_eq!(
+            &edited[campus_offset + expected_summary.len()..],
+            &record[campus_offset + expected_summary.len()..]
+        );
+        assert_eq!(editor.campus_data(), Some(replacement));
     }
 
     #[test]
