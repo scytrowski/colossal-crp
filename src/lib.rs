@@ -4292,8 +4292,8 @@ mod tests {
 
     #[test]
     #[ignore = "reads the local data/maps corpus"]
-    fn validates_statistics_manager_in_local_map_corpus() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn validates_statistics_and_guide_manager_records_in_local_map_corpus()
+    -> Result<(), Box<dyn std::error::Error>> {
         let maps_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps");
         let mut paths = fs::read_dir(maps_dir)?
             .map(|entry| entry.map(|entry| entry.path()))
@@ -4301,7 +4301,7 @@ mod tests {
         paths.retain(|path| path.extension().is_some_and(|extension| extension == "crp"));
         paths.sort();
 
-        let mut statistics_manager_count = 0;
+        let mut manager_record_count = 0;
         for path in paths {
             let mut file = File::open(&path)?;
             let package = Package::read_from(&mut file)?;
@@ -4316,11 +4316,19 @@ mod tests {
                     ))
                 })?;
                 assert_eq!(statistics.format_version(), manager.format_version());
-                statistics_manager_count += 1;
+                let guides = manager.decode_guide_manager_references().map_err(|error| {
+                    std::io::Error::other(format!(
+                        "{} asset {:?}: {error}",
+                        path.display(),
+                        asset.name
+                    ))
+                })?;
+                assert_eq!(guides.format_version(), manager.format_version());
+                manager_record_count += 1;
             }
         }
 
-        assert_eq!(statistics_manager_count, 110);
+        assert_eq!(manager_record_count, 110);
         Ok(())
     }
 

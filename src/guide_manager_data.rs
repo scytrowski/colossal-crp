@@ -75,6 +75,7 @@ impl GuideManagerReference {
 pub struct GuideManagerReferences {
     format_version: u32,
     references: Vec<GuideManagerReference>,
+    profile_end_shared_string_index: u16,
     serialized_body: Vec<u8>,
 }
 
@@ -89,6 +90,15 @@ impl GuideManagerReferences {
         &self.references
     }
 
+    /// Returns the profiler end index stored by this manager body.
+    ///
+    /// The index is retained as serialized. Resolving it requires the full
+    /// DataSerializer shared-string table, which this manager-level decoder
+    /// does not reconstruct.
+    pub fn profile_end_shared_string_index(&self) -> u16 {
+        self.profile_end_shared_string_index
+    }
+
     /// Returns the body fields and profiler end index byte for byte.
     ///
     /// This is the body after the manager's profiler begin tag; it does not
@@ -97,11 +107,7 @@ impl GuideManagerReferences {
         self.serialized_body.clone()
     }
 
-    pub(crate) fn decode(
-        format_version: u32,
-        expected_profile_index: u16,
-        bytes: &[u8],
-    ) -> Result<(Self, usize), CrpError> {
+    pub(crate) fn decode(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         let fields = reference_fields(format_version);
         let mut reader = Reader::new(bytes);
         let mut references = Vec::with_capacity(fields.len());
@@ -111,17 +117,13 @@ impl GuideManagerReferences {
                 header: read_net_object_header(&mut reader)?,
             });
         }
-        let profile_end = reader.read_u16_be()?;
-        if profile_end != expected_profile_index {
-            return Err(reader.invalid(format!(
-                "GuideManager end tag refers to profiler string {profile_end}, expected {expected_profile_index}"
-            )));
-        }
+        let profile_end_shared_string_index = reader.read_u16_be()?;
         let consumed = reader.offset();
         Ok((
             Self {
                 format_version,
                 references,
+                profile_end_shared_string_index,
                 serialized_body: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -259,14 +261,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_retains_exact_headers_and_checks_profiler_end_index() {
+    fn decode_retains_exact_headers_and_profiler_end_index() {
         let mut bytes = Vec::new();
         for _ in 0..48 {
             bytes.extend_from_slice(&[0xfe, 0x00, 0x24]);
         }
         bytes.extend_from_slice(&[0x00, 0x1d]);
 
-        let (guide, consumed) = GuideManagerReferences::decode(112_004, 0x1d, &bytes).unwrap();
+        let (guide, consumed) = GuideManagerReferences::decode(112_004, &bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(guide.references().len(), 48);
         assert_eq!(
@@ -281,18 +283,24 @@ mod tests {
             guide.references()[0].header(),
             &NetObjectHeader::NewSharedType(0x24)
         );
+        assert_eq!(guide.profile_end_shared_string_index(), 0x1d);
         assert_eq!(guide.encode(), bytes);
-        assert!(GuideManagerReferences::decode(112_004, 0x1e, &bytes).is_err());
-        assert!(GuideManagerReferences::decode(112_004, 0x1d, &bytes[..bytes.len() - 1]).is_err());
+        let mut mismatched = bytes.clone();
+        *mismatched.last_mut().unwrap() = 0x1e;
+        let (guide, consumed) = GuideManagerReferences::decode(112_004, &mismatched).unwrap();
+        assert_eq!(consumed, mismatched.len());
+        assert_eq!(guide.profile_end_shared_string_index(), 0x1e);
+        assert!(GuideManagerReferences::decode(112_004, &bytes[..bytes.len() - 1]).is_err());
     }
 
     #[test]
     fn wolf_creek_manager_reference_fixture_has_independently_known_type_counts() {
         const FIXTURE: &[u8] =
             include_bytes!("../tests/fixtures/guide-manager-references-v112004-wolf-creek.bin");
-        let (guide, consumed) = GuideManagerReferences::decode(112_004, 0x1d, FIXTURE).unwrap();
+        let (guide, consumed) = GuideManagerReferences::decode(112_004, FIXTURE).unwrap();
         assert_eq!(consumed, FIXTURE.len());
         assert_eq!(guide.references().len(), 48);
+        assert_eq!(guide.profile_end_shared_string_index(), 0x1d);
         assert!(
             guide.references()[..28]
                 .iter()

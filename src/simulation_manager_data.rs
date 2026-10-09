@@ -318,12 +318,13 @@ impl SimulationManagerData {
     /// Decodes the version-gated object references stored in `GuideManager+Data`.
     ///
     /// The returned headers retain their exact field order and the profiler
-    /// end index. Shared-type and existing-object IDs are not resolved because
-    /// that requires replaying every preceding queued object. The rest of the
-    /// manager graph remains byte-preserved.
+    /// end index. The index is not resolved against the full DataSerializer
+    /// shared-string table. Shared-type and existing-object IDs are also not
+    /// resolved because that requires replaying every preceding queued object.
+    /// The rest of the manager graph remains byte-preserved.
     pub fn decode_guide_manager_references(&self) -> Result<GuideManagerReferences, CrpError> {
-        let guide_slot = unique_manager_slot(self.manager_objects.as_deref(), "GuideManager+Data")?;
-        self.decode_guide_manager_references_at(guide_slot)
+        unique_manager_slot(self.manager_objects.as_deref(), "GuideManager+Data")?;
+        self.decode_guide_manager_references_at()
             .map(|(references, _)| references)
     }
 
@@ -364,13 +365,7 @@ impl SimulationManagerData {
 
     fn decode_guide_manager_references_at(
         &self,
-        guide_slot: usize,
     ) -> Result<(GuideManagerReferences, usize), CrpError> {
-        let expected_profile_index = manager_profile_string_index(
-            self.manager_objects.as_deref(),
-            guide_slot,
-            "GuideManager",
-        )?;
         let tag = new_profiler_tag_bytes("GuideManager")?;
         let tag_start = find_unique_bytes(
             &self.serialized_object_graph,
@@ -382,7 +377,6 @@ impl SimulationManagerData {
             .ok_or(CrpError::ArithmeticOverflow("GuideManager body start"))?;
         let (references, consumed) = GuideManagerReferences::decode(
             self.format_version,
-            expected_profile_index,
             &self.serialized_object_graph[body_start..],
         )?;
         let body_end = body_start
@@ -2141,7 +2135,7 @@ impl SimulationManagerData {
             }
         }
 
-        let children_start = self.guide_manager_children_start(guide_slot)?;
+        let children_start = self.guide_manager_children_start()?;
         let mut queued_objects = Vec::new();
 
         let (game_area, _) = self.decode_game_area_prefix()?;
@@ -2516,8 +2510,8 @@ impl SimulationManagerData {
         Ok((object_table, object_ids))
     }
 
-    fn guide_manager_children_start(&self, guide_slot: usize) -> Result<usize, CrpError> {
-        let (_, body_end) = self.decode_guide_manager_references_at(guide_slot)?;
+    fn guide_manager_children_start(&self) -> Result<usize, CrpError> {
+        let (_, body_end) = self.decode_guide_manager_references_at()?;
         Ok(body_end)
     }
 
@@ -3000,48 +2994,6 @@ fn unique_manager_slot(
     Ok(slots[0])
 }
 
-fn manager_profile_string_index(
-    manager_objects: Option<&[Option<ManagerObjectReference>]>,
-    manager_slot: usize,
-    expected_profile_name: &str,
-) -> Result<u16, CrpError> {
-    let managers = manager_objects.ok_or_else(|| invalid(0, "manager object array is null"))?;
-    if manager_slot >= managers.len() {
-        return Err(invalid(manager_slot, "manager slot is out of bounds"));
-    }
-    let mut strings = vec!["SimulationManager".to_owned()];
-    for reference in managers.iter().take(manager_slot + 1).flatten() {
-        let type_name = reference
-            .type_name
-            .split(',')
-            .next()
-            .unwrap_or_default()
-            .trim();
-        let Some(profile_name) = type_name.strip_suffix("+Data") else {
-            return Err(invalid(
-                manager_slot,
-                format!(
-                    "cannot derive manager profiler tag from {}",
-                    reference.type_name
-                ),
-            ));
-        };
-        if !strings.iter().any(|string| string == profile_name) {
-            strings.push(profile_name.to_owned());
-        }
-    }
-    let index = strings
-        .iter()
-        .position(|string| string == expected_profile_name)
-        .ok_or_else(|| {
-            invalid(
-                manager_slot,
-                format!("{expected_profile_name} profiler tag is missing"),
-            )
-        })?;
-    u16::try_from(index).map_err(|_| CrpError::ArithmeticOverflow("profiler string index"))
-}
-
 fn expect_manager_type(
     manager_objects: Option<&[Option<ManagerObjectReference>]>,
     index: usize,
@@ -3219,6 +3171,7 @@ mod manager_boundary_tests {
             references.references()[0].header(),
             &NetObjectHeader::NewSharedType(36)
         );
+        assert_eq!(references.profile_end_shared_string_index(), 1);
         assert_eq!(
             references.encode(),
             graph[profiler_tag("GuideManager").len()..]
@@ -3226,6 +3179,27 @@ mod manager_boundary_tests {
 
         manager.serialized_object_graph.pop();
         assert!(manager.decode_guide_manager_references().is_err());
+    }
+
+    #[test]
+    fn guide_manager_preserves_game_profile_index_without_resolving_it() {
+        let fixture =
+            include_bytes!("../tests/fixtures/guide-manager-references-v114009-ap-hanami.bin");
+        let mut manager = manager_with_graph(fixture.to_vec());
+        manager.format_version = 114_009;
+        manager.manager_objects = Some(vec![Some(ManagerObjectReference {
+            object_id: 1,
+            type_name: "GuideManager+Data, Assembly-CSharp".to_owned(),
+        })]);
+
+        let guide = manager.decode_guide_manager_references().unwrap();
+        assert_eq!(guide.format_version(), 114_009);
+        assert_eq!(guide.references().len(), 54);
+        assert_eq!(guide.profile_end_shared_string_index(), 33);
+        assert_eq!(
+            guide.encode(),
+            fixture[profiler_tag("GuideManager").len()..]
+        );
     }
 
     #[test]
