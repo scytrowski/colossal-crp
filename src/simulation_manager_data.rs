@@ -12,7 +12,9 @@ use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
-use crate::encoded_array::{read_encoded_uint_array, read_encoded_ushort_array};
+use crate::encoded_array::{
+    read_encoded_float_array, read_encoded_uint_array, read_encoded_ushort_array,
+};
 use crate::guide_data::{
     GUIDE_INSTANCE_BODY_LEN, GUIDE_TRIGGER_BASE_PREFIX_LEN, GuideInstanceBody, GuideInstanceEditor,
     GuideTriggerBaseEditor, GuideTriggerBasePrefix,
@@ -75,6 +77,15 @@ pub struct ResolvedObjectReference {
     pub object_id: u32,
     /// Assembly-qualified runtime type name resolved from the shared-type list.
     pub type_name: String,
+}
+
+/// One active EconomyManager investment's serialized float history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EconomyInvestmentValueSeries {
+    /// Investment index in the game's serialized range 1–254.
+    pub investment_index: u16,
+    /// Float values retained in the order written by the game.
+    pub values: Vec<f32>,
 }
 
 /// One entry in `SimulationManager.m_serializableDataStorage`.
@@ -3104,7 +3115,34 @@ impl SimulationManagerData {
     ) -> Result<Vec<u16>, CrpError> {
         let prefix = self.transport_manager_queue_prefix(save_app_version)?;
         let body = self.economy_manager_body(&prefix.object_table)?;
-        decode_economy_manager_investment_flags(self.format_version, body, &prefix.object_table)
+        decode_economy_manager_investment_flags_from_body(
+            self.format_version,
+            body,
+            &prefix.object_table,
+        )
+        .map(|(flags, _)| flags)
+    }
+
+    /// Decodes each active investment's `EncodedArray.Float` value history.
+    ///
+    /// This supports inner version 116017 and newer and returns active entries
+    /// in serialized investment-index order. Negative value counts and
+    /// truncated arrays return errors. The same newly declared guide-reference
+    /// and preceding TransportManager requirements as
+    /// [`decode_economy_manager_investment_flags`](Self::decode_economy_manager_investment_flags)
+    /// apply. Other investment columns and prefab assignments remain opaque.
+    pub fn decode_economy_manager_investment_value_series(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<EconomyInvestmentValueSeries>, CrpError> {
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        let body = self.economy_manager_body(&prefix.object_table)?;
+        decode_economy_manager_investment_value_series(
+            self.format_version,
+            body,
+            &prefix.object_table,
+        )
+        .map(|(series, _)| series)
     }
 
     /// Resolves the version-gated object references at the end of DistrictManager.
@@ -3825,11 +3863,11 @@ fn find_economy_manager_guide_header_positions(
     Ok(matches)
 }
 
-fn decode_economy_manager_investment_flags(
+fn decode_economy_manager_investment_flags_from_body(
     format_version: u32,
     bytes: &[u8],
     object_table: &DataSerializerObjectTable,
-) -> Result<Vec<u16>, CrpError> {
+) -> Result<(Vec<u16>, usize), CrpError> {
     if format_version < 116_017 {
         return Err(invalid(
             0,
@@ -3854,7 +3892,81 @@ fn decode_economy_manager_investment_flags(
         )
     })?;
     let mut reader = Reader::new(flag_bytes);
-    read_encoded_ushort_array(&mut reader, ECONOMY_INVESTMENT_FLAG_COUNT)
+    let flags = read_encoded_ushort_array(&mut reader, ECONOMY_INVESTMENT_FLAG_COUNT)?;
+    let values_start =
+        flags_start
+            .checked_add(reader.offset())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EconomyManager investment values start",
+            ))?;
+    Ok((flags, values_start))
+}
+
+fn decode_economy_manager_investment_value_series(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: &DataSerializerObjectTable,
+) -> Result<(Vec<EconomyInvestmentValueSeries>, usize), CrpError> {
+    let (flags, values_start) =
+        decode_economy_manager_investment_flags_from_body(format_version, bytes, object_table)?;
+    let value_bytes = bytes.get(values_start..).ok_or_else(|| {
+        invalid(
+            values_start,
+            "investment values start outside EconomyManager",
+        )
+    })?;
+    let mut reader = Reader::new(value_bytes);
+    let mut series = Vec::new();
+    for (offset, flag) in flags.into_iter().enumerate() {
+        if flag == 0 {
+            continue;
+        }
+        let investment_index = u16::try_from(offset + 1)
+            .map_err(|_| CrpError::ArithmeticOverflow("EconomyManager investment index"))?;
+        let count_offset =
+            values_start
+                .checked_add(reader.offset())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "EconomyManager investment value-count offset",
+                ))?;
+        let count = reader.read_i16_be().map_err(|error| {
+            invalid(
+                count_offset,
+                format!("investment {investment_index} value count: {error}"),
+            )
+        })?;
+        if count < 0 {
+            return Err(invalid(
+                count_offset,
+                format!("negative investment value count {count}"),
+            ));
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| reader.invalid("investment value count does not fit this platform"))?;
+        let value_offset =
+            values_start
+                .checked_add(reader.offset())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "EconomyManager investment values offset",
+                ))?;
+        let values = read_encoded_float_array(&mut reader, count).map_err(|error| {
+            invalid(
+                value_offset,
+                format!("investment {investment_index} values: {error}"),
+            )
+        })?;
+        series.push(EconomyInvestmentValueSeries {
+            investment_index,
+            values,
+        });
+    }
+    let values_end =
+        values_start
+            .checked_add(reader.offset())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EconomyManager investment values end",
+            ))?;
+    Ok((series, values_end))
 }
 
 fn data_serializer_class_name(type_name: &str) -> &str {
@@ -4381,11 +4493,13 @@ fn find_unique_bytes(haystack: &[u8], needle: &[u8], description: &str) -> Resul
 mod manager_boundary_tests {
     use super::{
         DataSerializerObjectTable, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
-        QueuedGuideObject, SimulationManagerData, decode_economy_manager_investment_flags,
-        decode_transport_manager_reference_body, economy_manager_object_header_count,
-        find_economy_manager_guide_headers, find_trailing_object_headers,
-        locate_queued_object_bodies, locate_queued_object_body, register_reference_headers,
-        transport_manager_line_number_count, transport_manager_object_header_count,
+        QueuedGuideObject, SimulationManagerData,
+        decode_economy_manager_investment_flags_from_body,
+        decode_economy_manager_investment_value_series, decode_transport_manager_reference_body,
+        economy_manager_object_header_count, find_economy_manager_guide_headers,
+        find_trailing_object_headers, locate_queued_object_bodies, locate_queued_object_body,
+        register_reference_headers, transport_manager_line_number_count,
+        transport_manager_object_header_count,
     };
     use crate::data_serializer::write_unique_string;
     use crate::district_manager_data::{
@@ -5197,13 +5311,110 @@ mod manager_boundary_tests {
         let mut body = vec![0xfe, 0x00, 0x01].repeat(5);
         body.extend_from_slice(&[0x00, 0x00, 0x01, 0xff, 0xff]);
 
-        let flags = decode_economy_manager_investment_flags(116_017, &body, &table).unwrap();
+        let (flags, values_start) =
+            decode_economy_manager_investment_flags_from_body(116_017, &body, &table).unwrap();
         assert_eq!(flags, (1_u16..=254).collect::<Vec<_>>());
-        assert!(decode_economy_manager_investment_flags(116_016, &body, &table).is_err());
+        assert_eq!(values_start, 20);
+        assert!(decode_economy_manager_investment_flags_from_body(116_016, &body, &table).is_err());
 
         let mut truncated = vec![0xfe, 0x00, 0x01].repeat(5);
         truncated.extend_from_slice(&[0x00, 0x00, 0x01, 0x00]);
-        assert!(decode_economy_manager_investment_flags(116_017, &truncated, &table).is_err());
+        assert!(
+            decode_economy_manager_investment_flags_from_body(116_017, &truncated, &table).is_err()
+        );
+    }
+
+    #[test]
+    fn economy_manager_investment_value_series_follow_active_flags() {
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        table
+            .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+            .unwrap();
+        let mut body = vec![0xfe, 0x00, 0x01].repeat(5);
+        body.extend_from_slice(&[
+            0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xff, 0xf8, 0x00,
+            0x02, 0x01, 0x3f, 0x80, 0x00, 0x00, 0xc0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x40,
+            0xa0, 0x00, 0x00,
+        ]);
+
+        let (series, values_end) =
+            decode_economy_manager_investment_value_series(116_017, &body, &table).unwrap();
+        assert_eq!(values_end, body.len());
+        assert_eq!(
+            series,
+            [
+                super::EconomyInvestmentValueSeries {
+                    investment_index: 1,
+                    values: [1.0, -2.5].to_vec(),
+                },
+                super::EconomyInvestmentValueSeries {
+                    investment_index: 3,
+                    values: [5.0].to_vec(),
+                },
+            ]
+        );
+
+        let mut negative_count = body[..28].to_vec();
+        negative_count.extend_from_slice(&[0xff, 0xff]);
+        assert!(
+            decode_economy_manager_investment_value_series(116_017, &negative_count, &table)
+                .is_err()
+        );
+
+        let mut truncated_values = body[..28].to_vec();
+        truncated_values.extend_from_slice(&[0x00, 0x02, 0x00, 0x3f, 0x80]);
+        assert!(
+            decode_economy_manager_investment_value_series(116_017, &truncated_values, &table)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn economy_manager_investment_value_series_matches_boreal_fixture() {
+        let bytes =
+            include_bytes!("../tests/fixtures/economy-investment-values-v116019-boreal.bin");
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        for index in 0..29 {
+            table
+                .register(&NetObjectHeader::NewType(format!("FixtureType{index}")))
+                .unwrap();
+        }
+        table
+            .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+            .unwrap();
+
+        let (series, values_end) =
+            decode_economy_manager_investment_value_series(116_019, bytes, &table).unwrap();
+        assert_eq!(values_end, bytes.len());
+        assert_eq!(
+            series
+                .iter()
+                .map(|entry| entry.investment_index)
+                .collect::<Vec<_>>(),
+            [8, 16, 19, 34, 69, 81, 85, 124, 158, 162, 185, 187, 250]
+        );
+        assert!(series.iter().all(|entry| entry.values.len() == 1));
+        assert_eq!(
+            series
+                .iter()
+                .map(|entry| entry.values[0].to_bits())
+                .collect::<Vec<_>>(),
+            [
+                0x4401_0000,
+                0x4504_3000,
+                0x4248_0000,
+                0x447b_7666,
+                0x42fa_0000,
+                0x447a_0000,
+                0x44fe_a000,
+                0x4382_0000,
+                0x444d_c000,
+                0x44b2_2000,
+                0x445d_4000,
+                0x4315_0000,
+                0x4455_0000,
+            ]
+        );
     }
 
     #[test]

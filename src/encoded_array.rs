@@ -59,6 +59,40 @@ pub(crate) fn read_encoded_bool_array(
         .collect())
 }
 
+/// Decodes `EncodedArray.Float` literal and repeat controls.
+pub(crate) fn read_encoded_float_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<Vec<f32>, CrpError> {
+    // Even a repeat control produces at most 128 values per encoded byte.
+    let maximum_decodable_count = reader.remaining().saturating_mul(128);
+    if count > maximum_decodable_count {
+        return Err(reader.invalid(format!(
+            "EncodedArray.Float count {count} cannot fit in {} remaining control bytes",
+            reader.remaining()
+        )));
+    }
+    let mut values = Vec::with_capacity(count);
+    let mut previous_value = 0.0_f32;
+    while values.len() < count {
+        let control = reader.read_u8()?;
+        let remaining = count - values.len();
+        if control < 0x80 {
+            let run_length = (usize::from(control) + 1).min(remaining);
+            for _ in 0..run_length {
+                previous_value = reader.read_f32_be()?;
+                values.push(previous_value);
+            }
+        } else {
+            let run_length = (usize::from(control) - 0x7f).min(remaining);
+            for _ in 0..run_length {
+                values.push(previous_value);
+            }
+        }
+    }
+    Ok(values)
+}
+
 pub(crate) fn write_encoded_bool_array(output: &mut Vec<u8>, values: &[bool]) {
     let mut packed = vec![0_u8; values.len().div_ceil(8)];
     for (index, value) in values.iter().copied().enumerate() {
@@ -310,9 +344,9 @@ fn repeated_delta_run(values: &[u16], start: usize, previous: u16, delta: i16) -
 #[cfg(test)]
 mod tests {
     use super::{
-        read_encoded_bool_array, read_encoded_byte_array, read_encoded_uint_array,
-        read_encoded_ulong_array, read_encoded_ushort_array, skip_encoded_ushort_array,
-        write_encoded_bool_array,
+        read_encoded_bool_array, read_encoded_byte_array, read_encoded_float_array,
+        read_encoded_uint_array, read_encoded_ulong_array, read_encoded_ushort_array,
+        skip_encoded_ushort_array, write_encoded_bool_array,
     };
     use crate::data_serializer::Reader;
 
@@ -413,6 +447,48 @@ mod tests {
 
         let mut empty = Reader::new(&[]);
         assert!(read_encoded_bool_array(&mut empty, 0).unwrap().is_empty());
+        assert_eq!(empty.offset(), 0);
+    }
+
+    #[test]
+    fn float_array_decodes_literal_ieee_values_and_repeats_the_previous_value() {
+        let bytes = [0x01, 0x3f, 0x80, 0x00, 0x00, 0xc0, 0x20, 0x00, 0x00, 0x80];
+        let mut reader = Reader::new(&bytes);
+        let values = read_encoded_float_array(&mut reader, 3).expect("valid Float controls");
+
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            [
+                1.0_f32.to_bits(),
+                (-2.5_f32).to_bits(),
+                (-2.5_f32).to_bits()
+            ]
+        );
+        assert_eq!(reader.offset(), bytes.len());
+    }
+
+    #[test]
+    fn float_array_stops_inside_repeat_runs_and_rejects_truncated_literals() {
+        let bytes = [0x00, 0x40, 0xa0, 0x00, 0x00, 0x83, 0x12];
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            read_encoded_float_array(&mut reader, 3).expect("valid repeat run"),
+            [5.0, 5.0, 5.0]
+        );
+        assert_eq!(reader.offset(), 6);
+        assert_eq!(reader.read_u8().unwrap(), 0x12);
+
+        let mut truncated = Reader::new(&[0x00, 0x3f, 0x80, 0x00]);
+        assert!(read_encoded_float_array(&mut truncated, 1).is_err());
+
+        let mut impossible = Reader::new(&[0xff]);
+        assert!(read_encoded_float_array(&mut impossible, 129).is_err());
+
+        let mut empty = Reader::new(&[]);
+        assert!(read_encoded_float_array(&mut empty, 0).unwrap().is_empty());
         assert_eq!(empty.offset(), 0);
     }
 

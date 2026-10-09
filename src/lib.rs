@@ -81,8 +81,8 @@ pub use net_manager_data::{
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use prop_manager_data::PropManagerDataPrefix;
 pub use simulation_manager_data::{
-    GuideBodyLocation, ManagerObjectReference, ResolvedObjectReference, SerializableDataEntry,
-    SimulationManagerData,
+    EconomyInvestmentValueSeries, GuideBodyLocation, ManagerObjectReference,
+    ResolvedObjectReference, SerializableDataEntry, SimulationManagerData,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use statistics_manager_data::{
@@ -4526,6 +4526,17 @@ mod tests {
                 assert_eq!(
                     investment_flags.iter().filter(|flag| **flag != 0).count(),
                     13,
+                    "{file_name}"
+                );
+                let value_series = manager
+                    .decode_economy_manager_investment_value_series(metadata.save_app_version)?;
+                assert_eq!(value_series.len(), 13, "{file_name}");
+                assert!(
+                    value_series
+                        .iter()
+                        .map(|series| series.values.len())
+                        .sum::<usize>()
+                        > 0,
                     "{file_name}"
                 );
             }
