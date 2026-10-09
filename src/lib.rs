@@ -4315,6 +4315,28 @@ mod tests {
             for asset in package.assets.iter().filter(|asset| asset.asset_type == 52) {
                 let (_, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
                 let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+                if manager.format_version() >= 116_000 {
+                    let references =
+                        manager
+                            .resolve_economy_manager_references(None)
+                            .map_err(|error| {
+                                std::io::Error::other(format!(
+                                    "{} asset {:?}: {error}",
+                                    path.display(),
+                                    asset.name
+                                ))
+                            })?;
+                    let expected_count = if manager.format_version() >= 116_017 {
+                        5
+                    } else {
+                        2
+                    };
+                    assert_eq!(references.len(), expected_count);
+                    assert!(references.iter().flatten().all(|reference| {
+                        reference.type_name.starts_with("GenericGuide,")
+                            || reference.type_name == "GenericGuide"
+                    }));
+                }
                 let statistics = manager.decode_statistics_manager_data().map_err(|error| {
                     std::io::Error::other(format!(
                         "{} asset {:?}: {error}",
@@ -4449,6 +4471,55 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads the local NorthEurope2FINAL and CCMP2 Boreal Map 1 samples from data/maps"]
+    fn validates_modern_economy_manager_guide_references() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let samples = [
+            ("NorthEurope2FINAL.crp", 116_011, 2),
+            ("CCMP2 Boreal Map 1.crp", 116_019, 5),
+        ];
+        let expected_type =
+            "GenericGuide, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
+        for (file_name, expected_version, expected_count) in samples {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("data/maps")
+                .join(file_name);
+            let mut file = File::open(&path)?;
+            let package = Package::read_from(&mut file)?;
+            let asset = package
+                .assets
+                .iter()
+                .find(|asset| asset.asset_type == 52)
+                .ok_or_else(|| {
+                    std::io::Error::other(format!("{file_name} has no type-52 asset"))
+                })?;
+            let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+            let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+            assert_eq!(manager.format_version(), expected_version);
+            let references =
+                manager.resolve_economy_manager_references(metadata.save_app_version)?;
+            assert_eq!(references.len(), expected_count, "{file_name}");
+            assert!(references.iter().all(|reference| {
+                reference
+                    .as_ref()
+                    .is_some_and(|reference| reference.type_name == expected_type)
+            }));
+            let district_references = manager
+                .resolve_district_manager_references(metadata.save_app_version)
+                .map_err(|error| {
+                    std::io::Error::other(format!("{file_name} district references: {error}"))
+                })?;
+            let expected_district_count = if expected_version >= 116_016 { 19 } else { 18 };
+            assert_eq!(
+                district_references.len(),
+                expected_district_count,
+                "{file_name}"
+            );
+        }
         Ok(())
     }
 
