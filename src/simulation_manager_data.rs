@@ -210,6 +210,12 @@ impl EconomyManagerInvestmentsEditor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EconomyManagerBodyLayout {
+    segmented_long_arrays: bool,
+    has_additional_cash_value: bool,
+}
+
 /// Editable tax and service-budget arrays at the start of `EconomyManager+Data`.
 ///
 /// The editor preserves the remainder of the bounded manager body verbatim.
@@ -273,12 +279,14 @@ impl EconomyManagerBudgetEditor {
 /// Editable income and expense history arrays at the start of `EconomyManager+Data`.
 ///
 /// Arrays absent at the selected inner version are represented by `None`. The
-/// editor preserves the rest of the bounded manager body verbatim. The current
-/// count mapping is boundary-checked on modern files but remains uncertain for
-/// unobserved reader versions.
+/// income and expense slices include both serialized segments when the selected
+/// body uses the split layout. The editor preserves the rest of the bounded
+/// manager body verbatim and selects a layout only when its scalar boundary
+/// uniquely matches the versioned guide references.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EconomyManagerIncomeExpenseEditor {
     format_version: u32,
+    layout: EconomyManagerBodyLayout,
     income: Vec<i64>,
     total_income: Option<Vec<i64>>,
     expenses: Vec<i64>,
@@ -386,6 +394,7 @@ pub struct EconomyLoanRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EconomyManagerLoansAndCashEditor {
     format_version: u32,
+    layout: EconomyManagerBodyLayout,
     loans: [EconomyLoanRecord; ECONOMY_MANAGER_LOAN_COUNT],
     cash_values: [i64; ECONOMY_MANAGER_CASH_VALUE_COUNT],
     starting_money: Option<i64>,
@@ -435,7 +444,7 @@ impl EconomyManagerLoansAndCashEditor {
     }
 
     /// Returns the additional version-287 `i64` consumed and discarded by the
-    /// supplied reader before its four modeled cash fields.
+    /// supplied reader when it is present in the selected body layout.
     pub fn unmodeled_cash_value_raw(&self) -> Option<i64> {
         self.unmodeled_cash_value_raw
     }
@@ -4269,11 +4278,12 @@ impl SimulationManagerData {
     /// Decodes EconomyManager's income and expense history arrays.
     ///
     /// The array lengths and optional loan, policy, and total fields follow the
-    /// inner DataSerializer version. For version 116000 and newer, decoding also
-    /// validates the scalar boundary against two or five newly declared
-    /// `GenericGuide` references and accepts only the observed zero- or one-byte
-    /// prefix before loans. Unsupported reference layouts or truncated fields
-    /// return an error. Other EconomyManager bytes remain opaque.
+    /// inner DataSerializer version and the selected body layout. From version
+    /// 116000, decoding tries the observed legacy and segmented layouts and
+    /// accepts one only when its scalar fields end at the versioned
+    /// `GenericGuide` references, allowing the observed zero- or one-byte
+    /// prefix. Ambiguous, unsupported, or truncated layouts return an error.
+    /// Other EconomyManager bytes remain opaque.
     pub fn decode_economy_manager_income_expense_editor(
         &self,
         save_app_version: Option<u32>,
@@ -4284,29 +4294,23 @@ impl SimulationManagerData {
             .serialized_object_graph
             .get(body_range)
             .ok_or_else(|| invalid(0, "EconomyManager body range exceeds manager graph"))?;
-        let editor = decode_economy_manager_income_expense_editor(self.format_version, body)?;
         if self.format_version >= 116_000 {
-            let scalar_prefix_bytes = economy_manager_scalar_prefix_from_reference(
+            return decode_economy_manager_body_layout(
                 self.format_version,
                 body,
                 &prefix.object_table,
-                editor.prefix_end,
-            )?;
-            decode_economy_manager_loans_and_cash_editor_with_prefix(
-                self.format_version,
-                body,
-                scalar_prefix_bytes,
-            )?;
+            )
+            .map(|(income_expenses, _)| income_expenses);
         }
-        Ok(editor)
+        decode_economy_manager_income_expense_editor(self.format_version, body)
     }
 
     /// Replaces EconomyManager's income and expense history arrays.
     ///
     /// The editor must come from this manager's current body and use the same
-    /// inner version. Replacement rewrites only the two encoded-array scopes,
-    /// emits those arrays as deterministic literal blocks, validates the
-    /// result, and restores the graph if validation fails.
+    /// inner version. Replacement rewrites only the income and expense array
+    /// scopes using the selected layout, emits deterministic literal blocks,
+    /// validates the result, and restores the graph if validation fails.
     pub fn replace_economy_manager_income_expense(
         &mut self,
         edited: &EconomyManagerIncomeExpenseEditor,
@@ -4367,9 +4371,11 @@ impl SimulationManagerData {
     /// Optional fields follow their inner-version gates. The tax multiplier is
     /// returned in its raw serialized form, including the older scaled values.
     /// Guide references and later investment bytes remain opaque. From version
-    /// 116000, decoding requires the two or five newly declared `GenericGuide`
-    /// references and a supported zero- or one-byte prefix before the loan
-    /// fields; unsupported layouts and truncation return an error.
+    /// 116000, decoding selects a supported EconomyManager layout by matching
+    /// the scalar boundary against the two or five newly declared
+    /// `GenericGuide` references. The observed segmented layout omits the
+    /// additional `i64` consumed by the supplied reader. Ambiguous, unsupported,
+    /// or truncated layouts return an error.
     pub fn decode_economy_manager_loans_and_cash_editor(
         &self,
         save_app_version: Option<u32>,
@@ -4380,23 +4386,15 @@ impl SimulationManagerData {
             .serialized_object_graph
             .get(body_range)
             .ok_or_else(|| invalid(0, "EconomyManager body range exceeds manager graph"))?;
-        let scalar_prefix_bytes = if self.format_version >= 116_000 {
-            let income_expense =
-                decode_economy_manager_income_expense_editor(self.format_version, body)?;
-            economy_manager_scalar_prefix_from_reference(
+        if self.format_version >= 116_000 {
+            return decode_economy_manager_body_layout(
                 self.format_version,
                 body,
                 &prefix.object_table,
-                income_expense.prefix_end,
-            )?
-        } else {
-            0
-        };
-        decode_economy_manager_loans_and_cash_editor_with_prefix(
-            self.format_version,
-            body,
-            scalar_prefix_bytes,
-        )
+            )
+            .map(|(_, loans_and_cash)| loans_and_cash);
+        }
+        decode_economy_manager_loans_and_cash_editor_with_prefix(self.format_version, body, 0)
     }
 
     /// Replaces EconomyManager's loans and following cash and tax scalars.
@@ -5357,6 +5355,67 @@ fn economy_manager_total_array_count(format_version: u32) -> Option<usize> {
     }
 }
 
+fn economy_manager_loan_expense_count(format_version: u32) -> Option<usize> {
+    if format_version >= 120_002 {
+        Some(20)
+    } else if format_version >= 101 {
+        Some(19)
+    } else {
+        None
+    }
+}
+
+fn economy_manager_policy_expense_count(format_version: u32) -> Option<usize> {
+    if format_version >= 120_002 {
+        Some(20)
+    } else if format_version >= 117_001 {
+        Some(19)
+    } else if format_version >= 115_005 {
+        Some(18)
+    } else if format_version >= 150 {
+        Some(17)
+    } else {
+        None
+    }
+}
+
+fn legacy_economy_manager_body_layout(format_version: u32) -> EconomyManagerBodyLayout {
+    EconomyManagerBodyLayout {
+        segmented_long_arrays: false,
+        has_additional_cash_value: format_version >= 287,
+    }
+}
+
+fn economy_manager_body_layout_candidates(format_version: u32) -> Vec<EconomyManagerBodyLayout> {
+    let cash_value_options = if format_version >= 287 {
+        [Some(true), Some(false)]
+    } else {
+        [Some(false), None]
+    };
+    let mut layouts = Vec::with_capacity(if format_version >= 287 { 4 } else { 2 });
+    for segmented_long_arrays in [false, true] {
+        for has_additional_cash_value in cash_value_options.into_iter().flatten() {
+            layouts.push(EconomyManagerBodyLayout {
+                segmented_long_arrays,
+                has_additional_cash_value,
+            });
+        }
+    }
+    layouts
+}
+
+fn economy_manager_scalar_length_for_layout(
+    format_version: u32,
+    layout: EconomyManagerBodyLayout,
+) -> usize {
+    let reader_length = decode_economy_manager_loan_scalar_length(format_version);
+    if format_version >= 287 && !layout.has_additional_cash_value {
+        reader_length - 8
+    } else {
+        reader_length
+    }
+}
+
 fn decode_economy_manager_budget_editor(
     format_version: u32,
     bytes: &[u8],
@@ -5476,6 +5535,18 @@ fn decode_economy_manager_income_expense_editor(
     format_version: u32,
     bytes: &[u8],
 ) -> Result<EconomyManagerIncomeExpenseEditor, CrpError> {
+    decode_economy_manager_income_expense_editor_with_layout(
+        format_version,
+        bytes,
+        legacy_economy_manager_body_layout(format_version),
+    )
+}
+
+fn decode_economy_manager_income_expense_editor_with_layout(
+    format_version: u32,
+    bytes: &[u8],
+    layout: EconomyManagerBodyLayout,
+) -> Result<EconomyManagerIncomeExpenseEditor, CrpError> {
     let budget_prefix = decode_economy_manager_budget_editor(format_version, bytes)?;
     let mut reader = Reader::new(bytes);
     reader
@@ -5486,9 +5557,21 @@ fn decode_economy_manager_income_expense_editor(
     let secondary_count = economy_manager_expense_count(format_version);
     let income_offset = reader.offset();
     let mut income_scope = EncodedLongArrayReader::default();
-    let income = income_scope
+    let mut income = income_scope
         .read_array(&mut reader, primary_count)
         .map_err(|error| invalid(income_offset, format!("EconomyManager income: {error}")))?;
+    if layout.segmented_long_arrays {
+        let offset = reader.offset();
+        let second_segment = income_scope
+            .read_array(&mut reader, secondary_count)
+            .map_err(|error| {
+                invalid(
+                    offset,
+                    format!("EconomyManager income second segment: {error}"),
+                )
+            })?;
+        income.extend(second_segment);
+    }
     let total_count = economy_manager_total_array_count(format_version);
     let total_income = if let Some(count) = total_count {
         let offset = reader.offset();
@@ -5505,14 +5588,31 @@ fn decode_economy_manager_income_expense_editor(
 
     let mut expense_scope = EncodedLongArrayReader::default();
     let expenses_offset = reader.offset();
-    let expenses = expense_scope
+    let mut expenses = expense_scope
         .read_array(&mut reader, primary_count)
         .map_err(|error| invalid(expenses_offset, format!("EconomyManager expenses: {error}")))?;
-    let loan_expenses = if format_version >= 101 {
+    if layout.segmented_long_arrays {
+        let offset = reader.offset();
+        let second_segment = expense_scope
+            .read_array(&mut reader, secondary_count)
+            .map_err(|error| {
+                invalid(
+                    offset,
+                    format!("EconomyManager expenses second segment: {error}"),
+                )
+            })?;
+        expenses.extend(second_segment);
+    }
+    let loan_count = if layout.segmented_long_arrays {
+        economy_manager_loan_expense_count(format_version)
+    } else {
+        (format_version >= 101).then_some(secondary_count)
+    };
+    let loan_expenses = if let Some(count) = loan_count {
         let offset = reader.offset();
         Some(
             expense_scope
-                .read_array(&mut reader, secondary_count)
+                .read_array(&mut reader, count)
                 .map_err(|error| {
                     invalid(offset, format!("EconomyManager loan expenses: {error}"))
                 })?,
@@ -5520,11 +5620,16 @@ fn decode_economy_manager_income_expense_editor(
     } else {
         None
     };
-    let policy_expenses = if format_version >= 152 {
+    let policy_count = if layout.segmented_long_arrays {
+        economy_manager_policy_expense_count(format_version)
+    } else {
+        (format_version >= 152).then_some(secondary_count)
+    };
+    let policy_expenses = if let Some(count) = policy_count {
         let offset = reader.offset();
         Some(
             expense_scope
-                .read_array(&mut reader, secondary_count)
+                .read_array(&mut reader, count)
                 .map_err(|error| {
                     invalid(offset, format!("EconomyManager policy expenses: {error}"))
                 })?,
@@ -5547,6 +5652,7 @@ fn decode_economy_manager_income_expense_editor(
 
     Ok(EconomyManagerIncomeExpenseEditor {
         format_version,
+        layout,
         income,
         total_income,
         expenses,
@@ -5570,7 +5676,12 @@ fn encode_economy_manager_income_expense_editor(
     }
     let primary_count = economy_manager_income_count(editor.format_version);
     let secondary_count = economy_manager_expense_count(editor.format_version);
-    let expected_income_count = primary_count;
+    let expected_income_count = primary_count
+        + if editor.layout.segmented_long_arrays {
+            secondary_count
+        } else {
+            0
+        };
     if editor.income.len() != expected_income_count {
         return Err(invalid(
             0,
@@ -5580,7 +5691,7 @@ fn encode_economy_manager_income_expense_editor(
             ),
         ));
     }
-    let expected_expense_count = primary_count;
+    let expected_expense_count = expected_income_count;
     if editor.expenses.len() != expected_expense_count {
         return Err(invalid(
             0,
@@ -5599,12 +5710,20 @@ fn encode_economy_manager_income_expense_editor(
     validate_economy_manager_optional_array(
         "loan expenses",
         editor.loan_expenses.as_deref(),
-        (editor.format_version >= 101).then_some(secondary_count),
+        if editor.layout.segmented_long_arrays {
+            economy_manager_loan_expense_count(editor.format_version)
+        } else {
+            (editor.format_version >= 101).then_some(secondary_count)
+        },
     )?;
     validate_economy_manager_optional_array(
         "policy expenses",
         editor.policy_expenses.as_deref(),
-        (editor.format_version >= 152).then_some(secondary_count),
+        if editor.layout.segmented_long_arrays {
+            economy_manager_policy_expense_count(editor.format_version)
+        } else {
+            (editor.format_version >= 152).then_some(secondary_count)
+        },
     )?;
     validate_economy_manager_optional_array(
         "total expenses",
@@ -5613,11 +5732,23 @@ fn encode_economy_manager_income_expense_editor(
     )?;
 
     let mut output = editor.original_body[..editor.prefix_start].to_vec();
-    write_encoded_long_array(&mut output, &editor.income);
+    write_economy_manager_history_array(
+        &mut output,
+        &editor.income,
+        primary_count,
+        secondary_count,
+        editor.layout.segmented_long_arrays,
+    );
     if let Some(values) = &editor.total_income {
         write_encoded_long_array(&mut output, values);
     }
-    write_encoded_long_array(&mut output, &editor.expenses);
+    write_economy_manager_history_array(
+        &mut output,
+        &editor.expenses,
+        primary_count,
+        secondary_count,
+        editor.layout.segmented_long_arrays,
+    );
     if let Some(values) = &editor.loan_expenses {
         write_encoded_long_array(&mut output, values);
     }
@@ -5629,6 +5760,21 @@ fn encode_economy_manager_income_expense_editor(
     }
     output.extend_from_slice(&editor.original_body[editor.prefix_end..]);
     Ok(output)
+}
+
+fn write_economy_manager_history_array(
+    output: &mut Vec<u8>,
+    values: &[i64],
+    first_count: usize,
+    second_count: usize,
+    segmented: bool,
+) {
+    if segmented {
+        write_encoded_long_array(output, &values[..first_count]);
+        write_encoded_long_array(output, &values[first_count..first_count + second_count]);
+    } else {
+        write_encoded_long_array(output, values);
+    }
 }
 
 fn validate_economy_manager_optional_array(
@@ -5665,11 +5811,29 @@ fn decode_economy_manager_loans_and_cash_editor(
     decode_economy_manager_loans_and_cash_editor_with_prefix(format_version, bytes, 0)
 }
 
+#[cfg(test)]
 fn economy_manager_scalar_prefix_from_reference(
     format_version: u32,
     bytes: &[u8],
     object_table: &DataSerializerObjectTable,
     income_expense_end: usize,
+) -> Result<usize, CrpError> {
+    economy_manager_scalar_prefix_from_reference_with_layout(
+        format_version,
+        bytes,
+        object_table,
+        income_expense_end,
+        legacy_economy_manager_body_layout(format_version),
+    )
+}
+
+#[cfg(test)]
+fn economy_manager_scalar_prefix_from_reference_with_layout(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: &DataSerializerObjectTable,
+    income_expense_end: usize,
+    layout: EconomyManagerBodyLayout,
 ) -> Result<usize, CrpError> {
     let references =
         find_economy_manager_guide_header_positions(format_version, bytes, object_table)?;
@@ -5677,8 +5841,25 @@ fn economy_manager_scalar_prefix_from_reference(
         .first()
         .map(|(offset, _, _)| *offset)
         .ok_or_else(|| invalid(bytes.len(), "EconomyManager guide references are absent"))?;
+    economy_manager_scalar_prefix_from_first_reference(
+        format_version,
+        first_reference,
+        income_expense_end,
+        layout,
+    )
+}
+
+fn economy_manager_scalar_prefix_from_first_reference(
+    format_version: u32,
+    first_reference: usize,
+    income_expense_end: usize,
+    layout: EconomyManagerBodyLayout,
+) -> Result<usize, CrpError> {
     let scalar_end = income_expense_end
-        .checked_add(decode_economy_manager_loan_scalar_length(format_version))
+        .checked_add(economy_manager_scalar_length_for_layout(
+            format_version,
+            layout,
+        ))
         .ok_or(CrpError::ArithmeticOverflow(
             "EconomyManager scalar boundary",
         ))?;
@@ -5697,6 +5878,78 @@ fn economy_manager_scalar_prefix_from_reference(
     Ok(prefix_bytes)
 }
 
+fn decode_economy_manager_body_layout(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: &DataSerializerObjectTable,
+) -> Result<
+    (
+        EconomyManagerIncomeExpenseEditor,
+        EconomyManagerLoansAndCashEditor,
+    ),
+    CrpError,
+> {
+    let references =
+        find_economy_manager_guide_header_positions(format_version, bytes, object_table)?;
+    let first_reference = references
+        .first()
+        .map(|(offset, _, _)| *offset)
+        .ok_or_else(|| invalid(bytes.len(), "EconomyManager guide references are absent"))?;
+    let mut matching_layouts = Vec::new();
+    let mut rejected_layouts = Vec::new();
+
+    for layout in economy_manager_body_layout_candidates(format_version) {
+        let decoded = (|| {
+            let income_expenses = decode_economy_manager_income_expense_editor_with_layout(
+                format_version,
+                bytes,
+                layout,
+            )?;
+            let scalar_prefix_bytes = economy_manager_scalar_prefix_from_first_reference(
+                format_version,
+                first_reference,
+                income_expenses.prefix_end,
+                layout,
+            )?;
+            let loans_and_cash = decode_economy_manager_loans_and_cash_editor_with_layout(
+                format_version,
+                bytes,
+                scalar_prefix_bytes,
+                layout,
+            )?;
+            if loans_and_cash.prefix_end != first_reference {
+                return Err(invalid(
+                    loans_and_cash.prefix_end,
+                    "EconomyManager scalar fields do not end at the first guide reference",
+                ));
+            }
+            Ok::<_, CrpError>((income_expenses, loans_and_cash))
+        })();
+        match decoded {
+            Ok(decoded) => matching_layouts.push((layout, decoded)),
+            Err(error) => rejected_layouts.push(format!("{layout:?}: {error}")),
+        }
+    }
+
+    match matching_layouts.len() {
+        1 => matching_layouts
+            .pop()
+            .map(|(_, decoded)| decoded)
+            .ok_or_else(|| invalid(first_reference, "EconomyManager layout selection failed")),
+        0 => Err(invalid(
+            first_reference,
+            format!(
+                "no EconomyManager Long/scalar layout matches the guide boundary ({})",
+                rejected_layouts.join("; ")
+            ),
+        )),
+        count => Err(invalid(
+            first_reference,
+            format!("EconomyManager layout is ambiguous: {count} candidates match"),
+        )),
+    }
+}
+
 fn decode_economy_manager_loan_scalar_length(format_version: u32) -> usize {
     let loan_length = if format_version >= 193 { 16 } else { 12 };
     (ECONOMY_MANAGER_LOAN_COUNT * loan_length)
@@ -5712,8 +5965,22 @@ fn decode_economy_manager_loans_and_cash_editor_with_prefix(
     bytes: &[u8],
     scalar_prefix_bytes: usize,
 ) -> Result<EconomyManagerLoansAndCashEditor, CrpError> {
+    decode_economy_manager_loans_and_cash_editor_with_layout(
+        format_version,
+        bytes,
+        scalar_prefix_bytes,
+        legacy_economy_manager_body_layout(format_version),
+    )
+}
+
+fn decode_economy_manager_loans_and_cash_editor_with_layout(
+    format_version: u32,
+    bytes: &[u8],
+    scalar_prefix_bytes: usize,
+    layout: EconomyManagerBodyLayout,
+) -> Result<EconomyManagerLoansAndCashEditor, CrpError> {
     let income_expense_prefix =
-        decode_economy_manager_income_expense_editor(format_version, bytes)?;
+        decode_economy_manager_income_expense_editor_with_layout(format_version, bytes, layout)?;
     let mut reader = Reader::new(bytes);
     reader
         .read_bytes(income_expense_prefix.prefix_end)
@@ -5775,7 +6042,7 @@ fn decode_economy_manager_loans_and_cash_editor_with_prefix(
     } else {
         None
     };
-    let unmodeled_cash_value_raw = if format_version >= 287 {
+    let unmodeled_cash_value_raw = if format_version >= 287 && layout.has_additional_cash_value {
         Some(read_economy_manager_scalar_field(
             &mut reader,
             "additional version-287 cash value",
@@ -5822,6 +6089,7 @@ fn decode_economy_manager_loans_and_cash_editor_with_prefix(
 
     Ok(EconomyManagerLoansAndCashEditor {
         format_version,
+        layout,
         loans,
         cash_values,
         starting_money,
@@ -5859,7 +6127,7 @@ fn encode_economy_manager_loans_and_cash_editor(
     validate_economy_manager_scalar_option(
         "additional version-287 cash value",
         editor.unmodeled_cash_value_raw,
-        editor.format_version >= 287,
+        editor.format_version >= 287 && editor.layout.has_additional_cash_value,
     )?;
     validate_economy_manager_scalar_option(
         "tax multiplier",
@@ -7546,17 +7814,21 @@ mod manager_boundary_tests {
     use super::{
         DataSerializerObjectTable, ECONOMY_MANAGER_CASH_VALUE_COUNT, ECONOMY_MANAGER_LOAN_COUNT,
         EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
-        GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference, QueuedDataObject,
-        SimulationManagerData, TransportManagerSelection, TransportManagerSharedStringValue,
-        decode_economy_manager_budget_editor, decode_economy_manager_income_expense_editor,
+        EconomyManagerBodyLayout, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
+        QueuedDataObject, SimulationManagerData, TransportManagerSelection,
+        TransportManagerSharedStringValue, decode_economy_manager_budget_editor,
+        decode_economy_manager_income_expense_editor,
+        decode_economy_manager_income_expense_editor_with_layout,
         decode_economy_manager_investment_editor,
         decode_economy_manager_investment_flags_from_body,
         decode_economy_manager_investment_prefabs_from_body,
         decode_economy_manager_investment_value_series, decode_economy_manager_investments,
         decode_economy_manager_loan_scalar_length, decode_economy_manager_loans_and_cash_editor,
+        decode_economy_manager_loans_and_cash_editor_with_layout,
         decode_economy_manager_loans_and_cash_editor_with_prefix,
         decode_transport_manager_reference_body, economy_manager_expense_count,
-        economy_manager_income_count, economy_manager_object_header_count,
+        economy_manager_income_count, economy_manager_loan_expense_count,
+        economy_manager_object_header_count, economy_manager_policy_expense_count,
         economy_manager_scalar_prefix_from_reference, economy_manager_service_budget_count,
         economy_manager_tax_rate_count, economy_manager_total_array_count,
         find_economy_manager_guide_header_positions, find_economy_manager_guide_headers,
@@ -7663,6 +7935,51 @@ mod manager_boundary_tests {
         if format_version >= 159 {
             body.extend_from_slice(&[0; 4]);
         }
+        body
+    }
+
+    fn synthetic_economy_manager_segmented_body(format_version: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        append_zero_encoded_byte_array(&mut body, economy_manager_tax_rate_count(format_version));
+        append_zero_encoded_byte_array(
+            &mut body,
+            economy_manager_service_budget_count(format_version)
+                * if format_version >= 214 { 2 } else { 1 },
+        );
+
+        let first_count = economy_manager_income_count(format_version);
+        let second_count = economy_manager_expense_count(format_version);
+        append_zero_encoded_long_array(&mut body, first_count);
+        append_zero_encoded_long_array(&mut body, second_count);
+        let total_count = economy_manager_total_array_count(format_version).unwrap();
+        append_zero_encoded_long_array(&mut body, total_count);
+        append_zero_encoded_long_array(&mut body, first_count);
+        append_zero_encoded_long_array(&mut body, second_count);
+        append_zero_encoded_long_array(
+            &mut body,
+            economy_manager_loan_expense_count(format_version).unwrap(),
+        );
+        append_zero_encoded_long_array(
+            &mut body,
+            economy_manager_policy_expense_count(format_version).unwrap(),
+        );
+        append_zero_encoded_long_array(&mut body, total_count);
+
+        for index in 0..ECONOMY_MANAGER_LOAN_COUNT {
+            body.extend_from_slice(&(-(100 + index as i32)).to_be_bytes());
+            body.extend_from_slice(&(200 + index as i32).to_be_bytes());
+            body.extend_from_slice(&(10 + index as i16).to_be_bytes());
+            body.extend_from_slice(&(30 + index as i16).to_be_bytes());
+            body.extend_from_slice(&(400 + index as i32).to_be_bytes());
+        }
+        body.extend_from_slice(&500_i64.to_be_bytes());
+        for value in [600_i64, 700, 800, 900] {
+            body.extend_from_slice(&value.to_be_bytes());
+        }
+        body.extend_from_slice(&1_i16.to_be_bytes());
+        body.extend_from_slice(&2_i16.to_be_bytes());
+        body.extend_from_slice(&3_u32.to_be_bytes());
+        body.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
         body
     }
 
@@ -8873,6 +9190,34 @@ mod manager_boundary_tests {
                 "{version}"
             );
         }
+        for (version, expected) in [
+            (100, None),
+            (101, Some(19)),
+            (120_001, Some(19)),
+            (120_002, Some(20)),
+        ] {
+            assert_eq!(
+                economy_manager_loan_expense_count(version),
+                expected,
+                "{version}"
+            );
+        }
+        for (version, expected) in [
+            (149, None),
+            (150, Some(17)),
+            (115_004, Some(17)),
+            (115_005, Some(18)),
+            (116_999, Some(18)),
+            (117_001, Some(19)),
+            (120_001, Some(19)),
+            (120_002, Some(20)),
+        ] {
+            assert_eq!(
+                economy_manager_policy_expense_count(version),
+                expected,
+                "{version}"
+            );
+        }
     }
 
     #[test]
@@ -8953,6 +9298,109 @@ mod manager_boundary_tests {
         assert_eq!(
             &decoded.original_body[decoded.prefix_end..],
             [0xaa, 0xbb, 0xcc]
+        );
+    }
+
+    #[test]
+    fn economy_manager_segmented_layout_reads_and_writes_exact_fields() {
+        let format_version = 117_013;
+        let layout = EconomyManagerBodyLayout {
+            segmented_long_arrays: true,
+            has_additional_cash_value: false,
+        };
+        let body = synthetic_economy_manager_segmented_body(format_version);
+        let primary_count = 2_380;
+        let second_count = 697;
+        let total_count = 19;
+        let mut editor =
+            decode_economy_manager_income_expense_editor_with_layout(format_version, &body, layout)
+                .unwrap();
+        assert_eq!(editor.income().len(), primary_count + second_count);
+        assert_eq!(editor.expenses().len(), primary_count + second_count);
+        assert_eq!(editor.total_income().unwrap().len(), total_count);
+        assert_eq!(editor.loan_expenses().unwrap().len(), 19);
+        assert_eq!(editor.policy_expenses().unwrap().len(), 19);
+        assert_eq!(editor.total_expenses().unwrap().len(), total_count);
+
+        editor.income_mut()[0] = -7;
+        editor.income_mut()[primary_count] = 17;
+        editor.total_income_mut().unwrap()[0] = 11;
+        editor.expenses_mut()[0] = 22;
+        editor.expenses_mut()[primary_count] = -33;
+        editor.loan_expenses_mut().unwrap()[0] = 44;
+        editor.policy_expenses_mut().unwrap()[0] = 55;
+        editor.total_expenses_mut().unwrap()[0] = 66;
+
+        let encoded = editor.encode().unwrap();
+        let mut expected = body[..editor.prefix_start].to_vec();
+        let mut primary = vec![0_i64; primary_count];
+        primary[0] = -7;
+        let mut second = vec![0_i64; second_count];
+        second[0] = 17;
+        append_expected_long_literals(&mut expected, &primary);
+        append_expected_long_literals(&mut expected, &second);
+        let mut totals = vec![0_i64; total_count];
+        totals[0] = 11;
+        append_expected_long_literals(&mut expected, &totals);
+        primary[0] = 22;
+        second[0] = -33;
+        append_expected_long_literals(&mut expected, &primary);
+        append_expected_long_literals(&mut expected, &second);
+        let mut category_values = vec![0_i64; 19];
+        category_values[0] = 44;
+        append_expected_long_literals(&mut expected, &category_values);
+        category_values[0] = 55;
+        append_expected_long_literals(&mut expected, &category_values);
+        totals[0] = 66;
+        append_expected_long_literals(&mut expected, &totals);
+        expected.extend_from_slice(&body[editor.prefix_end..]);
+        assert_eq!(encoded, expected);
+
+        let decoded = decode_economy_manager_income_expense_editor_with_layout(
+            format_version,
+            &encoded,
+            layout,
+        )
+        .unwrap();
+        assert_eq!(decoded.income()[0], -7);
+        assert_eq!(decoded.income()[primary_count], 17);
+        assert_eq!(decoded.total_income().unwrap()[0], 11);
+        assert_eq!(decoded.expenses()[0], 22);
+        assert_eq!(decoded.expenses()[primary_count], -33);
+        assert_eq!(decoded.loan_expenses().unwrap()[0], 44);
+        assert_eq!(decoded.policy_expenses().unwrap()[0], 55);
+        assert_eq!(decoded.total_expenses().unwrap()[0], 66);
+
+        let mut loans = decode_economy_manager_loans_and_cash_editor_with_layout(
+            format_version,
+            &body,
+            0,
+            layout,
+        )
+        .unwrap();
+        assert_eq!(loans.loans()[0].amount_taken, -100);
+        assert_eq!(loans.loans()[0].interest_paid, Some(400));
+        assert_eq!(loans.starting_money(), Some(500));
+        assert_eq!(loans.unmodeled_cash_value_raw(), None);
+        assert_eq!(loans.cash_values(), &[600, 700, 800, 900]);
+        assert_eq!(loans.encode().unwrap(), body);
+
+        loans.cash_values_mut()[0] = -8;
+        let encoded_loans = loans.encode().unwrap();
+        let mut expected_loans = body.clone();
+        let cash_offset = loans.prefix_start + 3 * 16 + 8;
+        expected_loans[cash_offset..cash_offset + 8].copy_from_slice(&(-8_i64).to_be_bytes());
+        assert_eq!(encoded_loans, expected_loans);
+        assert_eq!(
+            decode_economy_manager_loans_and_cash_editor_with_layout(
+                format_version,
+                &encoded_loans,
+                0,
+                layout,
+            )
+            .unwrap()
+            .cash_values()[0],
+            -8
         );
     }
 
@@ -9345,13 +9793,77 @@ mod manager_boundary_tests {
             expected_first_reference,
             expected_old_gap,
             expected_split_gap,
+            expected_segmented,
+            expected_reader_only_cash,
+            expected_income_count,
+            expected_loan_expense_count,
         ) in [
-            ("NorthEurope2FINAL.crp", 116_011, 326, 1, -17),
-            ("CCMP2 Boreal Map 1.crp", 116_019, 393, 0, -17),
-            ("CCMP2 Temperate Map 1.crp", 116_019, 424, 0, -17),
-            ("MM Shifting Sands.crp", 117_005, 289, 3, -8),
-            ("MP23_Map02.crp", 117_013, 402, 9, -8),
-            ("MP27_Map01.crp", 118_011, 305, 9, -8),
+            (
+                "NorthEurope2FINAL.crp",
+                116_011,
+                326,
+                1,
+                -17,
+                false,
+                true,
+                2_380,
+                680,
+            ),
+            (
+                "CCMP2 Boreal Map 1.crp",
+                116_019,
+                393,
+                0,
+                -17,
+                false,
+                true,
+                2_380,
+                680,
+            ),
+            (
+                "CCMP2 Temperate Map 1.crp",
+                116_019,
+                424,
+                0,
+                -17,
+                false,
+                true,
+                2_380,
+                680,
+            ),
+            (
+                "MM Shifting Sands.crp",
+                117_005,
+                289,
+                3,
+                -8,
+                true,
+                false,
+                3_077,
+                19,
+            ),
+            (
+                "MP23_Map02.crp",
+                117_013,
+                402,
+                9,
+                -8,
+                true,
+                false,
+                3_077,
+                19,
+            ),
+            (
+                "MP27_Map01.crp",
+                118_011,
+                305,
+                9,
+                -8,
+                true,
+                false,
+                3_077,
+                19,
+            ),
         ] {
             let mut file = File::open(maps_dir.join(file_name))?;
             let package = Package::read_from(&mut file)?;
@@ -9361,7 +9873,7 @@ mod manager_boundary_tests {
                 .find(|asset| asset.asset_type == 52)
                 .ok_or_else(|| std::io::Error::other("map has no type-52 asset"))?;
             let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
-            let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+            let mut manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
             let version = manager.format_version();
             assert_eq!(version, expected_version, "{file_name}");
             let queue_prefix = manager.transport_manager_queue_prefix(metadata.save_app_version)?;
@@ -9420,6 +9932,73 @@ mod manager_boundary_tests {
             );
             if version >= 117_001 {
                 assert_eq!(split_gap + 8, 0, "{file_name} without the reader-only i64");
+            }
+
+            let mut income_editor =
+                manager.decode_economy_manager_income_expense_editor(metadata.save_app_version)?;
+            assert_eq!(
+                income_editor.layout.segmented_long_arrays, expected_segmented,
+                "{file_name} array layout"
+            );
+            assert_eq!(
+                income_editor.income().len(),
+                expected_income_count,
+                "{file_name} income count"
+            );
+            assert_eq!(
+                income_editor.loan_expenses().map(<[i64]>::len),
+                Some(expected_loan_expense_count),
+                "{file_name} loan-expense count"
+            );
+
+            let loans_editor =
+                manager.decode_economy_manager_loans_and_cash_editor(metadata.save_app_version)?;
+            assert_eq!(
+                loans_editor.layout.has_additional_cash_value, expected_reader_only_cash,
+                "{file_name} cash layout"
+            );
+            assert_eq!(
+                loans_editor.unmodeled_cash_value_raw().is_some(),
+                expected_reader_only_cash
+            );
+            assert_eq!(
+                loans_editor.encode()?,
+                body,
+                "{file_name} unchanged scalar bytes"
+            );
+
+            if matches!(file_name, "NorthEurope2FINAL.crp" | "MP23_Map02.crp") {
+                let old_income = income_editor.income()[0];
+                income_editor.income_mut()[0] = old_income.wrapping_add(1);
+                manager.replace_economy_manager_income_expense(
+                    &income_editor,
+                    metadata.save_app_version,
+                )?;
+                assert_eq!(
+                    manager
+                        .decode_economy_manager_income_expense_editor(metadata.save_app_version)?
+                        .income()[0],
+                    old_income.wrapping_add(1),
+                    "{file_name} edited income"
+                );
+            }
+
+            if file_name == "MP23_Map02.crp" {
+                let mut current_loans = manager
+                    .decode_economy_manager_loans_and_cash_editor(metadata.save_app_version)?;
+                let old_cash = current_loans.cash_values()[0];
+                current_loans.cash_values_mut()[0] = old_cash.wrapping_add(1);
+                manager.replace_economy_manager_loans_and_cash(
+                    &current_loans,
+                    metadata.save_app_version,
+                )?;
+                assert_eq!(
+                    manager
+                        .decode_economy_manager_loans_and_cash_editor(metadata.save_app_version)?
+                        .cash_values()[0],
+                    old_cash.wrapping_add(1),
+                    "{file_name} edited cash value"
+                );
             }
         }
         Ok(())
