@@ -25,6 +25,7 @@ mod statistics_manager_data;
 mod terrain_manager_data;
 mod texture;
 mod tree_manager_data;
+mod unlock_manager_data;
 mod water_simulation_data;
 mod zone_manager_data;
 
@@ -88,6 +89,9 @@ pub use statistics_manager_data::{
 pub use terrain_manager_data::TerrainManagerData;
 pub use texture::TextureAsset;
 pub use tree_manager_data::{BurningTreeRecord, TreeInstanceRecord, TreeManagerDataPrefix};
+pub use unlock_manager_data::{
+    UnlockManagerMilestoneArray, UnlockManagerMilestoneKind, UnlockManagerReferences,
+};
 pub use water_simulation_data::{
     WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
 };
@@ -4324,6 +4328,37 @@ mod tests {
                     ))
                 })?;
                 assert_eq!(guides.format_version(), manager.format_version());
+                let unlock = manager
+                    .decode_unlock_manager_references()
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "{} asset {:?}: {error}",
+                            path.display(),
+                            asset.name
+                        ))
+                    })?;
+                assert_eq!(unlock.format_version(), manager.format_version());
+                assert!(
+                    unlock
+                        .arrays()
+                        .iter()
+                        .all(|array| array.references().is_empty())
+                );
+                let expected_array_count = 14
+                    + usize::from(manager.format_version() >= 248)
+                    + usize::from(manager.format_version() >= 110_009);
+                assert_eq!(unlock.arrays().len(), expected_array_count);
+                if manager.format_version() >= 279 {
+                    assert_eq!(unlock.scenario_trigger_count(), Some(0));
+                    assert!(unlock.scenario_trigger_references().is_empty());
+                } else {
+                    assert_eq!(unlock.scenario_trigger_count(), None);
+                }
+                assert!(unlock.milestones_not_used().is_some());
+                assert_eq!(
+                    unlock.scenario_goals_not_used().is_some(),
+                    manager.format_version() >= 295
+                );
                 manager_record_count += 1;
             }
         }

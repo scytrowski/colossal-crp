@@ -23,6 +23,7 @@ use crate::net_manager_data::{
 use crate::statistics_manager_data::{
     StatisticInt32Editor, StatisticInt64Editor, StatisticsManagerData, StatisticsManagerEditor,
 };
+use crate::unlock_manager_data::UnlockManagerReferences;
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
     BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlagsPrefix,
@@ -363,6 +364,63 @@ impl SimulationManagerData {
             .checked_add(consumed)
             .ok_or(CrpError::ArithmeticOverflow("StatisticsManager body end"))?;
         Ok((data, body_end))
+    }
+
+    /// Decodes the versioned milestone-reference arrays in `UnlockManager+Data`.
+    ///
+    /// The decoder retains unresolved object references and the profiler end
+    /// index. It supports the current array layout from inner version 127,
+    /// except for versions 262–278 and non-empty scenario-trigger data. The
+    /// body boundary is checked against the following `MessageManager+Data`
+    /// profiler tag in the serialized object graph.
+    pub fn decode_unlock_manager_references(&self) -> Result<UnlockManagerReferences, CrpError> {
+        let slot = unique_manager_slot(self.manager_objects.as_deref(), "UnlockManager+Data")?;
+        let next_slot = slot
+            .checked_add(1)
+            .ok_or(CrpError::ArithmeticOverflow("UnlockManager next slot"))?;
+        expect_manager_type(
+            self.manager_objects.as_deref(),
+            next_slot,
+            "MessageManager+Data",
+        )?;
+        self.decode_unlock_manager_references_at()
+            .map(|(references, _)| references)
+    }
+
+    fn decode_unlock_manager_references_at(
+        &self,
+    ) -> Result<(UnlockManagerReferences, usize), CrpError> {
+        let tag = new_profiler_tag_bytes("UnlockManager")?;
+        let tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &tag,
+            "UnlockManager profiler tag",
+        )?;
+        let body_start = tag_start
+            .checked_add(tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("UnlockManager body start"))?;
+        let (references, consumed) = UnlockManagerReferences::decode(
+            self.format_version,
+            &self.serialized_object_graph[body_start..],
+        )?;
+        let body_end = body_start
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow("UnlockManager body end"))?;
+        let next_tag = new_profiler_tag_bytes("MessageManager")?;
+        let next_tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &next_tag,
+            "MessageManager profiler tag",
+        )?;
+        if body_end != next_tag_start {
+            return Err(invalid(
+                body_end,
+                format!(
+                    "UnlockManager ends at {body_end}, but MessageManager begins at {next_tag_start}"
+                ),
+            ));
+        }
+        Ok((references, body_end))
     }
 
     /// Replaces the start frame in the queued `StatisticsManager+Data` body.
@@ -3472,6 +3530,43 @@ mod manager_boundary_tests {
 
         manager.serialized_object_graph.pop();
         assert!(manager.decode_statistics_manager_data().is_err());
+    }
+
+    #[test]
+    fn unlock_manager_checks_versioned_fields_against_the_next_manager_tag() {
+        let mut graph = profiler_tag("UnlockManager");
+        for _ in 0..15 {
+            graph.extend_from_slice(&0_u16.to_be_bytes());
+        }
+        graph.push(0xff);
+        graph.extend_from_slice(&0x002a_u16.to_be_bytes());
+        graph.extend(profiler_tag("MessageManager"));
+
+        let mut manager = manager_with_graph(graph.clone());
+        manager.format_version = 248;
+        manager.manager_objects = Some(vec![
+            Some(ManagerObjectReference {
+                object_id: 1,
+                type_name: "UnlockManager+Data, Assembly-CSharp".to_owned(),
+            }),
+            Some(ManagerObjectReference {
+                object_id: 2,
+                type_name: "MessageManager+Data, Assembly-CSharp".to_owned(),
+            }),
+        ]);
+        let record = manager.decode_unlock_manager_references().unwrap();
+        assert_eq!(record.arrays().len(), 15);
+        assert_eq!(record.profile_end_shared_string_index(), 42);
+        assert_eq!(
+            record.encode(),
+            graph[profiler_tag("UnlockManager").len()
+                ..graph.len() - profiler_tag("MessageManager").len()]
+        );
+
+        manager
+            .serialized_object_graph
+            .insert(graph.len() - profiler_tag("MessageManager").len(), 0xaa);
+        assert!(manager.decode_unlock_manager_references().is_err());
     }
 
     #[test]
