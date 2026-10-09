@@ -137,6 +137,16 @@ pub(crate) fn write_encoded_ulong_array(output: &mut Vec<u8>, values: &[u64]) {
     }
 }
 
+/// Writes signed 64-bit values with the ULong codec's identical bit layout.
+pub(crate) fn write_encoded_long_array(output: &mut Vec<u8>, values: &[i64]) {
+    for chunk in values.chunks(64) {
+        output.push((chunk.len() - 1) as u8);
+        for value in chunk {
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+
 /// Writes signed 32-bit values using the unsigned codec's identical bit layout.
 pub(crate) fn write_encoded_int_array(output: &mut Vec<u8>, values: &[i32]) {
     for chunk in values.chunks(64) {
@@ -309,6 +319,17 @@ pub(crate) fn read_encoded_ulong_array(
     Ok(values)
 }
 
+/// Decodes `EncodedArray.Long` using the ULong control layout and signed bit patterns.
+pub(crate) fn read_encoded_long_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<Vec<i64>, CrpError> {
+    Ok(read_encoded_ulong_array(reader, count)?
+        .into_iter()
+        .map(|bits| bits as i64)
+        .collect())
+}
+
 // Explicit canonical writer: literal blocks and repeated signed deltas.
 pub(crate) fn write_encoded_ushort_array(output: &mut Vec<u8>, values: &[u16]) {
     let mut index = 0;
@@ -359,8 +380,9 @@ fn repeated_delta_run(values: &[u16], start: usize, previous: u16, delta: i16) -
 mod tests {
     use super::{
         read_encoded_bool_array, read_encoded_byte_array, read_encoded_float_array,
-        read_encoded_uint_array, read_encoded_ulong_array, read_encoded_ushort_array,
-        skip_encoded_ushort_array, write_encoded_bool_array, write_encoded_float_array,
+        read_encoded_long_array, read_encoded_uint_array, read_encoded_ulong_array,
+        read_encoded_ushort_array, skip_encoded_ushort_array, write_encoded_bool_array,
+        write_encoded_float_array, write_encoded_long_array,
     };
     use crate::data_serializer::Reader;
 
@@ -435,6 +457,45 @@ mod tests {
     fn ulong_array_rejects_truncated_close_delta() {
         let mut reader = Reader::new(&[0, 0, 0, 0, 0, 0, 0, 0, 5, 0x40, 0]);
         assert!(read_encoded_ulong_array(&mut reader, 2).is_err());
+    }
+
+    #[test]
+    fn long_array_decodes_signed_literals_repeats_and_close_deltas() {
+        let mut bytes = vec![0x00];
+        bytes.extend_from_slice(&(-7_i64).to_be_bytes());
+        bytes.extend_from_slice(&[0x81, 0x40, 0x00, 0x00, 0x00, 0x02]);
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            read_encoded_long_array(&mut reader, 4).expect("valid signed Long controls"),
+            [-7, -14, -21, -26]
+        );
+        assert_eq!(reader.offset(), bytes.len());
+    }
+
+    #[test]
+    fn long_array_rejects_truncated_signed_literals() {
+        let mut reader = Reader::new(&[0x00, 0xff, 0xff, 0xff]);
+        assert!(read_encoded_long_array(&mut reader, 1).is_err());
+    }
+
+    #[test]
+    fn long_array_writer_emits_expected_big_endian_literal_bits() {
+        let values = [-7_i64, i64::MIN, 0, i64::MAX];
+        let mut encoded = Vec::new();
+        write_encoded_long_array(&mut encoded, &values);
+
+        let mut expected = vec![0x03];
+        expected.extend_from_slice(&(-7_i64).to_be_bytes());
+        expected.extend_from_slice(&i64::MIN.to_be_bytes());
+        expected.extend_from_slice(&0_i64.to_be_bytes());
+        expected.extend_from_slice(&i64::MAX.to_be_bytes());
+        assert_eq!(encoded, expected);
+
+        let mut reader = Reader::new(&encoded);
+        assert_eq!(
+            read_encoded_long_array(&mut reader, values.len()).expect("valid Long literals"),
+            values
+        );
     }
 
     #[test]

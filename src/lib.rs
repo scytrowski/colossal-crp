@@ -82,9 +82,9 @@ pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use prop_manager_data::PropManagerDataPrefix;
 pub use simulation_manager_data::{
     EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
-    EconomyInvestmentValueSeries, EconomyManagerBudgetEditor, EconomyManagerInvestmentsEditor,
-    GuideBodyLocation, ManagerObjectReference, ResolvedObjectReference, SerializableDataEntry,
-    SimulationManagerData,
+    EconomyInvestmentValueSeries, EconomyManagerBudgetEditor, EconomyManagerIncomeExpenseEditor,
+    EconomyManagerInvestmentsEditor, GuideBodyLocation, ManagerObjectReference,
+    ResolvedObjectReference, SerializableDataEntry, SimulationManagerData,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use statistics_manager_data::{
@@ -4510,6 +4510,22 @@ mod tests {
                     .as_ref()
                     .is_some_and(|reference| reference.type_name == expected_type)
             }));
+            let income_expenses =
+                manager.decode_economy_manager_income_expense_editor(metadata.save_app_version)?;
+            assert_eq!(income_expenses.income().len(), 2_380, "{file_name}");
+            assert_eq!(income_expenses.total_income().map(<[i64]>::len), Some(18));
+            assert_eq!(income_expenses.expenses().len(), 680, "{file_name}");
+            assert_eq!(
+                income_expenses.loan_expenses().map(<[i64]>::len),
+                Some(680),
+                "{file_name}"
+            );
+            assert_eq!(
+                income_expenses.policy_expenses().map(<[i64]>::len),
+                Some(680),
+                "{file_name}"
+            );
+            assert_eq!(income_expenses.total_expenses().map(<[i64]>::len), Some(18));
             let district_references = manager
                 .resolve_district_manager_references(metadata.save_app_version)
                 .map_err(|error| {
@@ -4598,6 +4614,36 @@ mod tests {
                 .decode_economy_manager_budget_editor(metadata.save_app_version)?
                 .tax_rates()[0],
             changed_tax_rate
+        );
+
+        let mut income_expenses =
+            manager.decode_economy_manager_income_expense_editor(metadata.save_app_version)?;
+        let changed_income = -987_654_321_i64;
+        let changed_loan_expense = 123_456_789_i64;
+        let changed_policy_expense = -456_789_123_i64;
+        income_expenses.income_mut()[0] = changed_income;
+        income_expenses.loan_expenses_mut().ok_or_else(|| {
+            std::io::Error::other("Boreal has no version-gated loan-expense array")
+        })?[0] = changed_loan_expense;
+        income_expenses.policy_expenses_mut().ok_or_else(|| {
+            std::io::Error::other("Boreal has no version-gated policy-expense array")
+        })?[0] = changed_policy_expense;
+        manager
+            .replace_economy_manager_income_expense(&income_expenses, metadata.save_app_version)?;
+        let decoded_income_expenses =
+            manager.decode_economy_manager_income_expense_editor(metadata.save_app_version)?;
+        assert_eq!(decoded_income_expenses.income()[0], changed_income);
+        assert_eq!(
+            decoded_income_expenses.loan_expenses().ok_or_else(|| {
+                std::io::Error::other("Boreal loan-expense array disappeared after replacement")
+            })?[0],
+            changed_loan_expense
+        );
+        assert_eq!(
+            decoded_income_expenses.policy_expenses().ok_or_else(|| {
+                std::io::Error::other("Boreal policy-expense array disappeared after replacement")
+            })?[0],
+            changed_policy_expense
         );
         Ok(())
     }
