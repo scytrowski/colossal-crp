@@ -6747,9 +6747,10 @@ fn find_unique_bytes(haystack: &[u8], needle: &[u8], description: &str) -> Resul
 #[cfg(test)]
 mod manager_boundary_tests {
     use super::{
-        DataSerializerObjectTable, EconomyInvestmentData, EconomyInvestmentPrefabAssignment,
-        EconomyInvestmentPrefabTable, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
-        QueuedGuideObject, SimulationManagerData, decode_economy_manager_budget_editor,
+        DataSerializerObjectTable, ECONOMY_MANAGER_CASH_VALUE_COUNT, ECONOMY_MANAGER_LOAN_COUNT,
+        EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
+        GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference, QueuedGuideObject,
+        SimulationManagerData, decode_economy_manager_budget_editor,
         decode_economy_manager_income_expense_editor, decode_economy_manager_investment_editor,
         decode_economy_manager_investment_flags_from_body,
         decode_economy_manager_investment_prefabs_from_body,
@@ -6758,11 +6759,12 @@ mod manager_boundary_tests {
         decode_economy_manager_loans_and_cash_editor_with_prefix,
         decode_transport_manager_reference_body, economy_manager_expense_count,
         economy_manager_income_count, economy_manager_object_header_count,
-        economy_manager_service_budget_count, economy_manager_tax_rate_count,
-        economy_manager_total_array_count, find_economy_manager_guide_header_positions,
-        find_economy_manager_guide_headers, find_trailing_object_headers,
-        locate_queued_object_bodies, locate_queued_object_body, register_reference_headers,
-        transport_manager_line_number_count, transport_manager_object_header_count,
+        economy_manager_scalar_prefix_from_reference, economy_manager_service_budget_count,
+        economy_manager_tax_rate_count, economy_manager_total_array_count,
+        find_economy_manager_guide_header_positions, find_economy_manager_guide_headers,
+        find_trailing_object_headers, locate_queued_object_bodies, locate_queued_object_body,
+        register_reference_headers, transport_manager_line_number_count,
+        transport_manager_object_header_count,
     };
     use crate::data_serializer::write_unique_string;
     use crate::district_manager_data::{
@@ -6774,8 +6776,11 @@ mod manager_boundary_tests {
     };
     use crate::net_manager_data::NetObjectHeader;
     use crate::{
-        GuideInstanceBody, GuideTriggerBasePrefix, StatisticInt32Data, StatisticInt64Data,
+        GuideInstanceBody, GuideTriggerBasePrefix, Package, SimulationMetaData, StatisticInt32Data,
+        StatisticInt64Data,
     };
+    use std::fs::File;
+    use std::path::PathBuf;
 
     fn manager_with_graph(graph: Vec<u8>) -> SimulationManagerData {
         SimulationManagerData {
@@ -8067,6 +8072,85 @@ mod manager_boundary_tests {
             assert_eq!(decoded.loans()[0].amount_taken, -765_432);
             assert_eq!(decoded.cash_values()[3], 0x0102_0304_0506_0708);
         }
+    }
+
+    #[test]
+    #[ignore = "reads NorthEurope2FINAL and CCMP2 Boreal Map 1 from data/maps"]
+    fn economy_manager_long_and_scalar_boundaries_match_map_fixtures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let maps_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps");
+        for (file_name, expected_version) in [
+            ("NorthEurope2FINAL.crp", 116_011),
+            ("CCMP2 Boreal Map 1.crp", 116_019),
+        ] {
+            let path = maps_dir.join(file_name);
+            let mut file = File::open(&path)?;
+            let package = Package::read_from(&mut file)?;
+            let asset = package
+                .assets
+                .iter()
+                .find(|asset| asset.asset_type == 52)
+                .ok_or_else(|| std::io::Error::other("map has no type-52 asset"))?;
+            let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+            let manager_bytes = asset
+                .data
+                .get(metadata_len..)
+                .ok_or_else(|| std::io::Error::other("metadata exceeds type-52 asset"))?;
+            let manager = SimulationManagerData::decode(manager_bytes)?;
+            assert_eq!(manager.format_version(), expected_version, "{file_name}");
+
+            let queue_prefix = manager.transport_manager_queue_prefix(metadata.save_app_version)?;
+            let body_range = manager.economy_manager_body_range(&queue_prefix.object_table)?;
+            let body = manager
+                .serialized_object_graph
+                .get(body_range)
+                .ok_or_else(|| std::io::Error::other("EconomyManager body exceeds graph"))?;
+            let income_expenses =
+                decode_economy_manager_income_expense_editor(manager.format_version(), body)?;
+            let scalar_prefix_bytes = economy_manager_scalar_prefix_from_reference(
+                manager.format_version(),
+                body,
+                &queue_prefix.object_table,
+                income_expenses.prefix_end,
+            )?;
+            let loans_and_cash = decode_economy_manager_loans_and_cash_editor_with_prefix(
+                manager.format_version(),
+                body,
+                scalar_prefix_bytes,
+            )?;
+
+            assert_eq!(loans_and_cash.loans().len(), ECONOMY_MANAGER_LOAN_COUNT);
+            assert_eq!(
+                loans_and_cash.cash_values().len(),
+                ECONOMY_MANAGER_CASH_VALUE_COUNT
+            );
+            assert_eq!(loans_and_cash.encode()?, body, "{file_name}");
+
+            let rewritten_income = income_expenses.encode()?;
+            let redecoded_income = decode_economy_manager_income_expense_editor(
+                manager.format_version(),
+                &rewritten_income,
+            )?;
+            assert_eq!(redecoded_income.income(), income_expenses.income());
+            assert_eq!(
+                redecoded_income.total_income(),
+                income_expenses.total_income()
+            );
+            assert_eq!(redecoded_income.expenses(), income_expenses.expenses());
+            assert_eq!(
+                redecoded_income.loan_expenses(),
+                income_expenses.loan_expenses()
+            );
+            assert_eq!(
+                redecoded_income.policy_expenses(),
+                income_expenses.policy_expenses()
+            );
+            assert_eq!(
+                redecoded_income.total_expenses(),
+                income_expenses.total_expenses()
+            );
+        }
+        Ok(())
     }
 
     #[test]
