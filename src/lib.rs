@@ -14,6 +14,7 @@ mod encoded_array;
 mod game_area_data;
 mod guide_data;
 mod guide_manager_data;
+mod info_manager_data;
 mod instance_manager_data;
 mod message_manager_data;
 mod metadata;
@@ -65,6 +66,7 @@ pub use guide_data::{
 pub use guide_manager_data::{
     GuideManagerReference, GuideManagerReferenceField, GuideManagerReferences,
 };
+pub use info_manager_data::InfoManagerData;
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use message_manager_data::{MessageDataEntry, MessageManagerData, MessageManagerDataEditor};
 pub use metadata::{DistrictStyleMetaData, MapMetaData, ModInfo, SystemMapMetaData};
@@ -4752,6 +4754,31 @@ mod tests {
         );
         assert!(selections.selections().is_empty());
         assert_eq!(selections.encode_unchanged(), [0, 0]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads the local CL Wolf Creek sample from data/maps"]
+    fn validates_wolf_creek_info_manager_mask() -> Result<(), Box<dyn std::error::Error>> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
+        let mut file = File::open(path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("CL Wolf Creek has no type-52 asset"))?;
+        let (_, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let mut manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 112_004);
+
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let mut info = manager.decode_info_manager_data()?;
+        assert_eq!(info.encoded_len(), 8);
+        assert_eq!(info.encode_unchanged().len(), 8);
+        info.set_visited_info_views(info.visited_info_views())?;
+        manager.replace_info_manager_data(&info)?;
+        assert_eq!(manager.serialized_object_graph(), original_graph);
         Ok(())
     }
 

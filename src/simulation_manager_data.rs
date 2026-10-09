@@ -25,6 +25,7 @@ use crate::guide_data::{
     GuideTriggerBaseEditor, GuideTriggerBasePrefix,
 };
 use crate::guide_manager_data::GuideManagerReferences;
+use crate::info_manager_data::InfoManagerData;
 use crate::message_manager_data::{MessageManagerData, MessageManagerDataEditor};
 use crate::net_manager_data::{
     NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader, read_net_object_header,
@@ -822,6 +823,118 @@ impl SimulationManagerData {
         unique_manager_slot(self.manager_objects.as_deref(), "StatisticsManager+Data")?;
         self.decode_statistics_manager_data_at()
             .map(|(data, _)| data)
+    }
+
+    /// Decodes the versioned visited-view mask in `InfoManager+Data`.
+    ///
+    /// The field is four bytes before inner version 110003 and eight bytes
+    /// from that version onward. The next manager profiler tag must follow the
+    /// field and its two-byte loading-profiler end reference. This locator
+    /// currently supports the unique-string profiler tags observed in the map
+    /// corpus; missing, ambiguous, or differently encoded tags return errors.
+    pub fn decode_info_manager_data(&self) -> Result<InfoManagerData, CrpError> {
+        let field_range = self.info_manager_field_range()?;
+        let bytes = self
+            .serialized_object_graph
+            .get(field_range)
+            .ok_or_else(|| invalid(0, "InfoManager field range exceeds manager graph"))?;
+        let (data, consumed) = InfoManagerData::decode(self.format_version, bytes)?;
+        if consumed != bytes.len() {
+            return Err(invalid(
+                consumed,
+                "InfoManager field length disagrees with its version gate",
+            ));
+        }
+        Ok(data)
+    }
+
+    /// Replaces the visited-view mask while preserving the version-selected
+    /// field width, profiler end reference, and following manager bytes.
+    ///
+    /// `edited` must come from this stream's current InfoManager bytes. Legacy
+    /// inner versions reject masks that do not fit in 32 bits.
+    pub fn replace_info_manager_data(&mut self, edited: &InfoManagerData) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited InfoManager version does not match this stream",
+            ));
+        }
+        let field_range = self.info_manager_field_range()?;
+        let current = self
+            .serialized_object_graph
+            .get(field_range.clone())
+            .ok_or_else(|| invalid(0, "InfoManager field range exceeds manager graph"))?;
+        if current != edited.original_bytes() {
+            return Err(invalid(
+                field_range.start,
+                "InfoManager bytes do not match the editor's source field",
+            ));
+        }
+        let replacement = edited.encode();
+        if replacement.len() != field_range.len() {
+            return Err(invalid(
+                field_range.start,
+                "InfoManager replacement must preserve the original field width",
+            ));
+        }
+        self.serialized_object_graph[field_range].copy_from_slice(&replacement);
+        self.decode_info_manager_data()?;
+        Ok(())
+    }
+
+    fn info_manager_field_range(&self) -> Result<Range<usize>, CrpError> {
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "InfoManager+Data")?;
+        let first_next_slot = slot
+            .checked_add(1)
+            .ok_or(CrpError::ArithmeticOverflow("InfoManager next slot"))?;
+        let (next_slot, next_manager) = managers
+            .iter()
+            .enumerate()
+            .skip(first_next_slot)
+            .find_map(|(next_slot, reference)| {
+                reference.as_ref().map(|reference| (next_slot, reference))
+            })
+            .ok_or_else(|| invalid(slot, "InfoManager has no following manager reference"))?;
+
+        let graph = &self.serialized_object_graph;
+        let tag = new_profiler_tag_bytes("InfoManager")?;
+        let tag_start = find_unique_bytes(graph, &tag, "InfoManager profiler tag")?;
+        let field_start = tag_start
+            .checked_add(tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("InfoManager field start"))?;
+        let (_, field_len) = InfoManagerData::decode(
+            self.format_version,
+            graph
+                .get(field_start..)
+                .ok_or_else(|| invalid(field_start, "InfoManager field starts past graph end"))?,
+        )?;
+        let field_end = field_start
+            .checked_add(field_len)
+            .ok_or(CrpError::ArithmeticOverflow("InfoManager field end"))?;
+        let next_tag_start = field_end
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "InfoManager profiler end position",
+            ))?;
+        let next_name = manager_profiler_name(next_manager, next_slot)?;
+        let next_tag = new_profiler_tag_bytes(&next_name)?;
+        if graph
+            .get(next_tag_start..)
+            .is_none_or(|tail| !tail.starts_with(&next_tag))
+        {
+            return Err(invalid(
+                next_tag_start,
+                format!(
+                    "InfoManager field does not end before the expected {next_name} profiler tag"
+                ),
+            ));
+        }
+        Ok(field_start..field_end)
     }
 
     fn decode_statistics_manager_data_at(
@@ -7198,6 +7311,105 @@ mod manager_boundary_tests {
         let mut bytes = vec![0xfe];
         write_unique_string(&mut bytes, name).expect("short test tag is encodable");
         bytes
+    }
+
+    fn info_manager_with_next(
+        format_version: u32,
+        mask_bytes: &[u8],
+        next_manager: &str,
+        next_tag_name: &str,
+    ) -> SimulationManagerData {
+        let mut graph = profiler_tag("InfoManager");
+        graph.extend_from_slice(mask_bytes);
+        graph.extend_from_slice(&[0x12, 0x34]);
+        graph.extend(profiler_tag(next_tag_name));
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = format_version;
+        manager.manager_objects = Some(vec![
+            Some(ManagerObjectReference {
+                object_id: 1,
+                type_name: "InfoManager+Data, Assembly-CSharp".to_owned(),
+            }),
+            Some(ManagerObjectReference {
+                object_id: 2,
+                type_name: format!("{next_manager}+Data, Assembly-CSharp"),
+            }),
+        ]);
+        manager
+    }
+
+    #[test]
+    fn info_manager_mask_decodes_and_replaces_at_versioned_boundary() {
+        for (version, original, replacement) in [
+            (
+                110_002,
+                vec![0x12, 0x34, 0x56, 0x78],
+                vec![0xa1, 0xb2, 0xc3, 0xd4],
+            ),
+            (
+                110_003,
+                vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+                vec![0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10],
+            ),
+        ] {
+            let mut manager = info_manager_with_next(
+                version,
+                &original,
+                "StatisticsManager",
+                "StatisticsManager",
+            );
+            let tail_start =
+                manager.serialized_object_graph.len() - profiler_tag("StatisticsManager").len();
+            let original_tail = manager.serialized_object_graph[tail_start - 2..].to_vec();
+            let mut edited = manager.decode_info_manager_data().unwrap();
+            assert_eq!(edited.encode_unchanged(), original);
+            let decoded_value = if version < 110_003 {
+                u64::from(u32::from_be_bytes(original.as_slice().try_into().unwrap()))
+            } else {
+                u64::from_be_bytes(original.as_slice().try_into().unwrap())
+            };
+            assert_eq!(edited.visited_info_views(), decoded_value);
+
+            let replacement_value = if version < 110_003 {
+                u64::from(u32::from_be_bytes(
+                    replacement.as_slice().try_into().unwrap(),
+                ))
+            } else {
+                u64::from_be_bytes(replacement.as_slice().try_into().unwrap())
+            };
+            edited.set_visited_info_views(replacement_value).unwrap();
+            manager.replace_info_manager_data(&edited).unwrap();
+            assert_eq!(
+                manager.decode_info_manager_data().unwrap().encode(),
+                replacement
+            );
+            assert_eq!(
+                &manager.serialized_object_graph[tail_start - 2..],
+                original_tail
+            );
+        }
+    }
+
+    #[test]
+    fn info_manager_decoder_rejects_wrong_next_profiler_tag_and_stale_edits() {
+        let manager = info_manager_with_next(
+            110_003,
+            &[0, 0, 0, 0, 0, 0, 0, 1],
+            "StatisticsManager",
+            "AudioManager",
+        );
+        assert!(manager.decode_info_manager_data().is_err());
+
+        let mut manager = info_manager_with_next(
+            110_003,
+            &[0, 0, 0, 0, 0, 0, 0, 1],
+            "StatisticsManager",
+            "StatisticsManager",
+        );
+        let edited = manager.decode_info_manager_data().unwrap();
+        let field_start = profiler_tag("InfoManager").len();
+        manager.serialized_object_graph[field_start] ^= 1;
+        assert!(manager.replace_info_manager_data(&edited).is_err());
     }
 
     #[test]
