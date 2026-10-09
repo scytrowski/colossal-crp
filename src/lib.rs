@@ -4719,20 +4719,39 @@ mod tests {
         for reference in &references[3..] {
             assert!(reference.type_name.starts_with("GenericGuide,"));
         }
-        let selections =
-            manager.decode_transport_manager_selection_prefix(metadata.save_app_version)?;
-        assert_eq!(selections.format_version(), 116_020);
-        assert!(selections.selections().is_empty());
-        assert_eq!(
-            selections.encoded_len(),
-            selections.encode_unchanged().len()
-        );
-        assert_eq!(selections.encode_unchanged(), [0, 0]);
         let investments = manager.decode_economy_manager_investments(metadata.save_app_version)?;
         assert!(!investments.is_empty());
         let prefabs =
             manager.decode_economy_manager_investment_prefabs(metadata.save_app_version)?;
         assert_eq!(prefabs.assignments.len(), investments.len());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads the local NorthEurope2FINAL sample from data/maps"]
+    fn validates_north_europe_transport_shared_strings() -> Result<(), Box<dyn std::error::Error>> {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/NorthEurope2FINAL.crp");
+        let mut file = File::open(path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("NorthEurope2FINAL has no type-52 asset"))?;
+        let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 116_011);
+
+        let selections =
+            manager.decode_transport_manager_selection_prefix(metadata.save_app_version)?;
+        assert_eq!(selections.format_version(), 116_011);
+        assert_eq!(
+            selections.encoded_len(),
+            selections.encode_unchanged().len()
+        );
+        assert!(selections.selections().is_empty());
+        assert_eq!(selections.encode_unchanged(), [0, 0]);
         Ok(())
     }
 

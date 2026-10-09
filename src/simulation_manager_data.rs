@@ -64,6 +64,7 @@ const MAX_OBJECT_ID: u32 = 0xfe_0000;
 const MAX_SHARED_TYPES: usize = 65_024;
 const LOADING_PROFILER_END_TAG_BYTES: usize = 2;
 const MAX_TRAILING_HEADER_CANDIDATES: usize = 64;
+const TRANSPORT_MANAGER_SLOT: usize = 18;
 const ECONOMY_INVESTMENT_FLAG_COUNT: usize = 254;
 const ECONOMY_MANAGER_LOAN_COUNT: usize = 3;
 const ECONOMY_MANAGER_CASH_VALUE_COUNT: usize = 4;
@@ -502,15 +503,19 @@ pub struct GuideBodyLocation {
 
 /// One shared-string value in the TransportManager vehicle-selection table.
 ///
-/// New strings carry their decoded nullable text. Existing entries retain the
-/// stream-wide table index because earlier shared-string values are not fully
-/// traversed by this decoder.
+/// New strings carry their decoded nullable text. Existing entries retain both
+/// the stream-wide table index and the resolved value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportManagerSharedStringValue {
     /// A value introduced by the `FE` marker and followed by a unique string.
     New(Option<String>),
-    /// A two-byte index into the stream-wide shared-string table.
-    ExistingIndex(u16),
+    /// A resolved value addressed by a two-byte stream-wide table index.
+    Existing {
+        /// Original table index from the stream.
+        index: u16,
+        /// Value stored at that index; it may be null.
+        value: Option<String>,
+    },
 }
 
 /// One key and shared-string value in the TransportManager selection table.
@@ -525,8 +530,8 @@ pub struct TransportManagerSelection {
 /// Version-gated TransportManager vehicle-selection table.
 ///
 /// The original field bytes are retained for exact unchanged writing. Existing
-/// shared-string indexes remain unresolved until preceding serialized strings
-/// are traversed.
+/// shared-string indexes are resolved against the preceding manager profiler
+/// tags and BuildingManager selection tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerSelectionPrefix {
     format_version: u32,
@@ -571,7 +576,6 @@ struct QueuedObjectReferencePrefix {
     water_manager_object_ids: Vec<Option<u32>>,
     zone_manager_object_ids: Vec<Option<u32>>,
     transport_manager_object_ids: Vec<Option<u32>>,
-    transport_manager_selection_prefix: Option<TransportManagerSelectionPrefix>,
     economy_manager_object_ids: Vec<Option<u32>>,
     district_manager_object_ids: Vec<Option<u32>>,
 }
@@ -2946,7 +2950,6 @@ impl SimulationManagerData {
             water_manager_object_ids: Vec::new(),
             zone_manager_object_ids: Vec::new(),
             transport_manager_object_ids: Vec::new(),
-            transport_manager_selection_prefix: None,
             economy_manager_object_ids: Vec::new(),
             district_manager_object_ids: Vec::new(),
         })
@@ -3026,7 +3029,6 @@ impl SimulationManagerData {
             &mut prefix.object_table,
             &mut prefix.queued_objects,
         )?;
-        prefix.transport_manager_selection_prefix = Some(fields.selection_prefix);
         Ok(prefix)
     }
 
@@ -3078,6 +3080,27 @@ impl SimulationManagerData {
         &self,
         object_table: &DataSerializerObjectTable,
     ) -> Result<TransportManagerReferenceFields, CrpError> {
+        let (body_range, _) = self.transport_manager_body_range()?;
+        let manager_slot = self
+            .manager_objects
+            .as_deref()
+            .and_then(|managers| managers.get(TRANSPORT_MANAGER_SLOT))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| invalid(TRANSPORT_MANAGER_SLOT, "TransportManager reference is null"))?;
+        if object_table.type_name(manager_slot.object_id) != Some(manager_slot.type_name.as_str()) {
+            return Err(invalid(
+                TRANSPORT_MANAGER_SLOT,
+                "TransportManager root reference disagrees with the replayed object table",
+            ));
+        }
+        let body = self
+            .serialized_object_graph
+            .get(body_range)
+            .ok_or_else(|| invalid(0, "TransportManager body range exceeds manager graph"))?;
+        decode_transport_manager_reference_body(self.format_version, body, Some(object_table), None)
+    }
+
+    fn transport_manager_body_range(&self) -> Result<(Range<usize>, usize), CrpError> {
         expect_manager_type(self.manager_objects.as_deref(), 15, "TreeManager+Data")?;
         expect_manager_type(self.manager_objects.as_deref(), 17, "VehicleManager+Data")?;
         let weather_type = self
@@ -3095,7 +3118,11 @@ impl SimulationManagerData {
                 "expected WeatherManager+Data or WindManager+Data before VehicleManager",
             ));
         }
-        expect_manager_type(self.manager_objects.as_deref(), 18, "TransportManager+Data")?;
+        expect_manager_type(
+            self.manager_objects.as_deref(),
+            TRANSPORT_MANAGER_SLOT,
+            "TransportManager+Data",
+        )?;
         expect_manager_type(self.manager_objects.as_deref(), 19, "EconomyManager+Data")?;
         if self.format_version < 164 {
             return Err(invalid(
@@ -3103,18 +3130,7 @@ impl SimulationManagerData {
                 "TransportManager reference resolution requires inner version 164 or newer",
             ));
         }
-        let manager_slot = self
-            .manager_objects
-            .as_deref()
-            .and_then(|managers| managers.get(18))
-            .and_then(Option::as_ref)
-            .ok_or_else(|| invalid(18, "TransportManager reference is null"))?;
-        if object_table.type_name(manager_slot.object_id) != Some(manager_slot.type_name.as_str()) {
-            return Err(invalid(
-                18,
-                "TransportManager root reference disagrees with the replayed object table",
-            ));
-        }
+
         let transport_tag = new_profiler_tag_bytes("TransportManager")?;
         let transport_tag_start = find_unique_bytes(
             &self.serialized_object_graph,
@@ -3145,9 +3161,85 @@ impl SimulationManagerData {
                 "TransportManager fields are not followed by a valid closing tag and EconomyManager",
             ));
         }
+        Ok((body_start..end_tag_start, transport_tag_start))
+    }
 
-        let body = &self.serialized_object_graph[body_start..end_tag_start];
-        decode_transport_manager_reference_body(self.format_version, body, object_table)
+    fn transport_manager_shared_strings(
+        &self,
+        save_app_version: Option<u32>,
+        transport_tag_start: usize,
+    ) -> Result<Vec<Option<String>>, CrpError> {
+        if self.format_version < 114_001 {
+            return Ok(Vec::new());
+        }
+        let (building_selections, _) =
+            self.decode_building_service_selection_prefix(save_app_version)?;
+        let mut shared_strings = building_selections.shared_strings().to_vec();
+
+        let graph = &self.serialized_object_graph;
+        let building_tag = new_profiler_tag_bytes("BuildingManager")?;
+        let building_tag_start =
+            find_unique_bytes(graph, &building_tag, "BuildingManager profiler tag")?;
+        let mut search_start = building_tag_start.checked_add(building_tag.len()).ok_or(
+            CrpError::ArithmeticOverflow("BuildingManager profiler tag end"),
+        )?;
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+
+        for (slot, manager) in managers
+            .iter()
+            .enumerate()
+            .take(TRANSPORT_MANAGER_SLOT + 1)
+            .skip(7)
+        {
+            let Some(manager) = manager else {
+                continue;
+            };
+            let profiler_name = manager_profiler_name(manager, slot)?;
+            let profiler_tag = new_profiler_tag_bytes(&profiler_name)?;
+            let tag_start = if slot == TRANSPORT_MANAGER_SLOT {
+                if graph
+                    .get(transport_tag_start..)
+                    .is_none_or(|tail| !tail.starts_with(&profiler_tag))
+                {
+                    return Err(invalid(
+                        transport_tag_start,
+                        "TransportManager root reference does not match its profiler tag",
+                    ));
+                }
+                transport_tag_start
+            } else {
+                let search_end = transport_tag_start.min(graph.len());
+                let search = graph
+                    .get(search_start..search_end)
+                    .ok_or_else(|| invalid(search_start, "manager profiler range is invalid"))?;
+                let relative_start = find_unique_bytes(
+                    search,
+                    &profiler_tag,
+                    &format!("{profiler_name} profiler tag after manager slot {slot}"),
+                )?;
+                search_start
+                    .checked_add(relative_start)
+                    .ok_or(CrpError::ArithmeticOverflow("manager profiler tag offset"))?
+            };
+
+            let mut tag_reader = Reader::new(&graph[tag_start..]);
+            let decoded_name = tag_reader.read_shared_string(&mut shared_strings)?;
+            if decoded_name.as_deref() != Some(profiler_name.as_str()) {
+                return Err(invalid(
+                    tag_start,
+                    format!(
+                        "manager slot {slot} profiler tag resolved to {decoded_name:?}, expected {profiler_name}"
+                    ),
+                ));
+            }
+            search_start = tag_start
+                .checked_add(tag_reader.offset())
+                .ok_or(CrpError::ArithmeticOverflow("manager profiler tag end"))?;
+        }
+        Ok(shared_strings)
     }
 
     fn economy_manager_body(
@@ -3524,19 +3616,30 @@ impl SimulationManagerData {
 
     /// Decodes TransportManager's final vehicle-selection table from version 114001.
     ///
-    /// New shared strings are decoded; references to earlier shared strings are
-    /// returned as their original table indexes because this queue walk does not
-    /// traverse every preceding shared-string value. The returned prefix retains
-    /// the field bytes for exact unchanged writing. Active line buffers and
-    /// nonempty milestone lists remain unsupported by the current queue walk.
+    /// New shared strings are decoded, and existing indexes are resolved against
+    /// preceding manager profiler tags and BuildingManager selection tables. The
+    /// returned prefix retains the field bytes for exact unchanged writing. Active
+    /// line buffers and nonempty milestone lists remain unsupported by this decoder.
     pub fn decode_transport_manager_selection_prefix(
         &self,
         save_app_version: Option<u32>,
     ) -> Result<TransportManagerSelectionPrefix, CrpError> {
-        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
-        prefix
-            .transport_manager_selection_prefix
-            .ok_or_else(|| invalid(18, "TransportManager selection table was not decoded"))
+        let (body_range, transport_tag_start) = self.transport_manager_body_range()?;
+        let body = self
+            .serialized_object_graph
+            .get(body_range)
+            .ok_or_else(|| invalid(0, "TransportManager body range exceeds manager graph"))?;
+        let mut shared_strings =
+            self.transport_manager_shared_strings(save_app_version, transport_tag_start)?;
+        let fields = decode_transport_manager_reference_body(
+            self.format_version,
+            body,
+            None,
+            Some(&mut shared_strings),
+        )?;
+        fields
+            .selection_prefix
+            .ok_or_else(|| invalid(TRANSPORT_MANAGER_SLOT, "selection fields were not decoded"))
     }
 
     /// Resolves EconomyManager's trailing guide object references.
@@ -6442,7 +6545,8 @@ fn transport_manager_line_number_count(format_version: u32) -> usize {
 fn decode_transport_manager_reference_body(
     format_version: u32,
     bytes: &[u8],
-    object_table: &DataSerializerObjectTable,
+    object_table: Option<&DataSerializerObjectTable>,
+    mut shared_strings: Option<&mut Vec<Option<String>>>,
 ) -> Result<TransportManagerReferenceFields, CrpError> {
     if format_version < 164 {
         return Err(invalid(
@@ -6506,9 +6610,12 @@ fn decode_transport_manager_reference_body(
     }
     let selection_start = reader.offset();
     let mut selections = Vec::new();
+    let capture_selections = shared_strings.is_some();
+    #[cfg(test)]
+    let mut selection_count = 0;
     if format_version >= 114_001 {
-        let selection_count = reader.read_i16_be()?;
-        if selection_count < 0 {
+        let serialized_count = reader.read_i16_be()?;
+        if serialized_count < 0 {
             let count_offset =
                 reader
                     .offset()
@@ -6518,21 +6625,32 @@ fn decode_transport_manager_reference_body(
                     ))?;
             return Err(invalid(
                 count_offset,
-                format!("negative TransportManager selection count {selection_count}"),
+                format!("negative TransportManager selection count {serialized_count}"),
             ));
         }
-        let selection_count = usize::try_from(selection_count)
+        let parsed_selection_count = usize::try_from(serialized_count)
             .map_err(|_| reader.invalid("selection count does not fit this platform"))?;
-        if selection_count > reader.remaining() / 4 {
+        #[cfg(test)]
+        {
+            selection_count = parsed_selection_count;
+        }
+        if parsed_selection_count > reader.remaining() / 4 {
             return Err(
                 reader.invalid("TransportManager selection count cannot fit in remaining bytes")
             );
         }
-        selections.reserve(selection_count);
-        for _ in 0..selection_count {
+        if capture_selections {
+            selections.reserve(parsed_selection_count);
+        }
+        for _ in 0..parsed_selection_count {
             let key = reader.read_i16_be()?;
-            let value = read_transport_manager_shared_string_value(&mut reader)?;
-            selections.push(TransportManagerSelection { key, value });
+            if let Some(shared_strings) = shared_strings.as_deref_mut() {
+                let value =
+                    read_transport_manager_shared_string_value(&mut reader, shared_strings)?;
+                selections.push(TransportManagerSelection { key, value });
+            } else {
+                skip_transport_manager_shared_string_value(&mut reader)?;
+            }
         }
     }
     if reader.remaining() != 0 {
@@ -6541,38 +6659,69 @@ fn decode_transport_manager_reference_body(
             "TransportManager reference fields do not end at the manager boundary",
         ));
     }
-    let mut checked_table = object_table.clone();
-    for header in &headers {
-        checked_table.register(header)?;
+    if let Some(object_table) = object_table {
+        let mut checked_table = object_table.clone();
+        for header in &headers {
+            checked_table.register(header)?;
+        }
     }
-    let selection_prefix = TransportManagerSelectionPrefix {
+    let selection_prefix = capture_selections.then(|| TransportManagerSelectionPrefix {
         format_version,
         selections,
         serialized_prefix: reader.consumed_bytes()[selection_start..reader.offset()].to_vec(),
-    };
+    });
     Ok(TransportManagerReferenceFields {
         object_headers: headers,
         selection_prefix,
+        #[cfg(test)]
+        selection_count,
     })
 }
 
 #[derive(Debug)]
 struct TransportManagerReferenceFields {
     object_headers: Vec<NetObjectHeader>,
-    selection_prefix: TransportManagerSelectionPrefix,
+    selection_prefix: Option<TransportManagerSelectionPrefix>,
+    #[cfg(test)]
+    selection_count: usize,
 }
 
 fn read_transport_manager_shared_string_value(
     reader: &mut Reader<'_>,
+    shared_strings: &mut Vec<Option<String>>,
 ) -> Result<TransportManagerSharedStringValue, CrpError> {
     match reader.read_u8()? {
-        0xfe => Ok(TransportManagerSharedStringValue::New(
-            reader.read_unique_string()?,
-        )),
+        0xfe => {
+            let value = reader.read_unique_string()?;
+            if shared_strings.len() >= MAX_SHARED_TYPES {
+                return Err(reader.invalid("shared-string table exceeds the game limit"));
+            }
+            shared_strings.push(value.clone());
+            Ok(TransportManagerSharedStringValue::New(value))
+        }
         0xff => Err(reader.invalid("shared-string reference uses a reserved marker")),
-        high => Ok(TransportManagerSharedStringValue::ExistingIndex(
-            u16::from_be_bytes([high, reader.read_u8()?]),
-        )),
+        high => {
+            let index = u16::from_be_bytes([high, reader.read_u8()?]);
+            let value = shared_strings
+                .get(usize::from(index))
+                .cloned()
+                .ok_or_else(|| reader.invalid("shared-string index is out of bounds"))?;
+            Ok(TransportManagerSharedStringValue::Existing { index, value })
+        }
+    }
+}
+
+fn skip_transport_manager_shared_string_value(reader: &mut Reader<'_>) -> Result<(), CrpError> {
+    match reader.read_u8()? {
+        0xfe => {
+            reader.read_unique_string()?;
+            Ok(())
+        }
+        0xff => Err(reader.invalid("shared-string reference uses a reserved marker")),
+        _ => {
+            reader.read_u8()?;
+            Ok(())
+        }
     }
 }
 
@@ -6809,6 +6958,27 @@ fn expect_manager_type(
     Ok(())
 }
 
+fn manager_profiler_name(
+    reference: &ManagerObjectReference,
+    slot: usize,
+) -> Result<String, CrpError> {
+    let type_name = reference
+        .type_name
+        .split(',')
+        .next()
+        .ok_or_else(|| invalid(slot, "manager type name is empty"))?;
+    let name = type_name
+        .strip_suffix("+Data")
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            invalid(
+                slot,
+                format!("manager type {type_name} has no +Data suffix"),
+            )
+        })?;
+    Ok(name.to_owned())
+}
+
 fn new_profiler_tag_bytes(name: &str) -> Result<Vec<u8>, CrpError> {
     let mut bytes = vec![0xfe];
     write_unique_string(&mut bytes, name)?;
@@ -6871,7 +7041,7 @@ mod manager_boundary_tests {
         GuideInstanceBody, GuideTriggerBasePrefix, Package, SimulationMetaData, StatisticInt32Data,
         StatisticInt64Data,
     };
-    use std::fs::File;
+    use std::fs::{self, File};
     use std::path::PathBuf;
 
     fn manager_with_graph(graph: Vec<u8>) -> SimulationManagerData {
@@ -7552,7 +7722,13 @@ mod manager_boundary_tests {
             0x00, 0x00, 0x02, // Existing object 2.
         ]);
 
-        let decoded = decode_transport_manager_reference_body(112_004, &bytes, &table).unwrap();
+        let decoded = decode_transport_manager_reference_body(
+            112_004,
+            &bytes,
+            Some(&table),
+            Some(&mut Vec::new()),
+        )
+        .unwrap();
         assert_eq!(
             decoded.object_headers,
             [
@@ -7565,21 +7741,41 @@ mod manager_boundary_tests {
                 NetObjectHeader::Existing(2),
             ]
         );
-        assert!(decoded.selection_prefix.selections().is_empty());
-        assert!(decoded.selection_prefix.encode_unchanged().is_empty());
+        let selection_prefix = decoded.selection_prefix.unwrap();
+        assert!(selection_prefix.selections().is_empty());
+        assert!(selection_prefix.encode_unchanged().is_empty());
         let mut nonempty_milestones = bytes.clone();
         nonempty_milestones[3] = 1;
         assert!(
-            decode_transport_manager_reference_body(112_004, &nonempty_milestones, &table).is_err()
+            decode_transport_manager_reference_body(
+                112_004,
+                &nonempty_milestones,
+                Some(&table),
+                Some(&mut Vec::new()),
+            )
+            .is_err()
         );
         let mut active_lines = Vec::new();
         write_encoded_uint_array(&mut active_lines, &[1, 0, 0, 0]);
         write_encoded_uint_array(&mut active_lines, &[0; 251]);
         active_lines.extend_from_slice(&bytes[2..]);
-        assert!(decode_transport_manager_reference_body(112_004, &active_lines, &table).is_err());
         assert!(
-            decode_transport_manager_reference_body(112_004, &bytes[..bytes.len() - 1], &table)
-                .is_err()
+            decode_transport_manager_reference_body(
+                112_004,
+                &active_lines,
+                Some(&table),
+                Some(&mut Vec::new()),
+            )
+            .is_err()
+        );
+        assert!(
+            decode_transport_manager_reference_body(
+                112_004,
+                &bytes[..bytes.len() - 1],
+                Some(&table),
+                Some(&mut Vec::new()),
+            )
+            .is_err()
         );
 
         let mut selection_bytes = vec![0xff, 0xfe];
@@ -7595,16 +7791,19 @@ mod manager_boundary_tests {
         selection_bytes.extend_from_slice(&5_i16.to_be_bytes());
         let second_shared_string_offset = selection_bytes.len();
         selection_bytes.extend_from_slice(&[0x00, 0x00]);
+        let mut shared_strings = vec![Some("SimulationManager".to_owned())];
         let decoded = decode_transport_manager_reference_body(
             114_001,
             &selection_bytes,
-            &DataSerializerObjectTable::new("SimulationManager+Data"),
+            Some(&DataSerializerObjectTable::new("SimulationManager+Data")),
+            Some(&mut shared_strings),
         )
         .unwrap();
         assert_eq!(decoded.object_headers, vec![NetObjectHeader::Null; 7]);
-        assert_eq!(decoded.selection_prefix.format_version(), 114_001);
+        let selection_prefix = decoded.selection_prefix.unwrap();
+        assert_eq!(selection_prefix.format_version(), 114_001);
         assert_eq!(
-            decoded.selection_prefix.selections(),
+            selection_prefix.selections(),
             [
                 TransportManagerSelection {
                     key: -3,
@@ -7612,12 +7811,15 @@ mod manager_boundary_tests {
                 },
                 TransportManagerSelection {
                     key: 5,
-                    value: TransportManagerSharedStringValue::ExistingIndex(0),
+                    value: TransportManagerSharedStringValue::Existing {
+                        index: 0,
+                        value: Some("SimulationManager".to_owned()),
+                    },
                 },
             ]
         );
         assert_eq!(
-            decoded.selection_prefix.encode_unchanged(),
+            selection_prefix.encode_unchanged(),
             selection_bytes[count_offset..]
         );
 
@@ -7627,7 +7829,8 @@ mod manager_boundary_tests {
             decode_transport_manager_reference_body(
                 114_001,
                 &negative_count,
-                &DataSerializerObjectTable::new("SimulationManager+Data"),
+                Some(&DataSerializerObjectTable::new("SimulationManager+Data")),
+                Some(&mut vec![Some("SimulationManager".to_owned())]),
             )
             .is_err()
         );
@@ -7638,7 +7841,20 @@ mod manager_boundary_tests {
             decode_transport_manager_reference_body(
                 114_001,
                 &reserved_shared_marker,
-                &DataSerializerObjectTable::new("SimulationManager+Data"),
+                Some(&DataSerializerObjectTable::new("SimulationManager+Data")),
+                Some(&mut vec![Some("SimulationManager".to_owned())]),
+            )
+            .is_err()
+        );
+
+        let mut out_of_bounds_shared_index = selection_bytes.clone();
+        out_of_bounds_shared_index[second_shared_string_offset + 1] = 2;
+        assert!(
+            decode_transport_manager_reference_body(
+                114_001,
+                &out_of_bounds_shared_index,
+                Some(&DataSerializerObjectTable::new("SimulationManager+Data")),
+                Some(&mut vec![Some("SimulationManager".to_owned())]),
             )
             .is_err()
         );
@@ -7647,7 +7863,8 @@ mod manager_boundary_tests {
             decode_transport_manager_reference_body(
                 114_001,
                 &selection_bytes[..selection_bytes.len() - 1],
-                &DataSerializerObjectTable::new("SimulationManager+Data"),
+                Some(&DataSerializerObjectTable::new("SimulationManager+Data")),
+                Some(&mut vec![Some("SimulationManager".to_owned())]),
             )
             .is_err()
         );
@@ -7670,6 +7887,105 @@ mod manager_boundary_tests {
         assert_eq!(transport_manager_line_number_count(111_006), 14);
         assert_eq!(transport_manager_line_number_count(113_000), 16);
         assert_eq!(transport_manager_line_number_count(113_008), 17);
+    }
+
+    #[test]
+    #[ignore = "reads the local data/maps corpus"]
+    fn transport_manager_shared_string_indexes_resolve_in_local_corpus()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let maps_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps");
+        let mut paths = fs::read_dir(maps_dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "crp"))
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        let mut type_52_assets = 0_usize;
+        let mut selection_pairs = 0_usize;
+        let mut assets_with_selections = 0_usize;
+        let mut validated_nonempty_sample = false;
+        for path in paths {
+            let mut file = File::open(&path)?;
+            let package = Package::read_from(&mut file)?;
+            for asset in package.assets.iter().filter(|asset| asset.asset_type == 52) {
+                type_52_assets += 1;
+                let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+                let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+                let (body_range, _) = manager.transport_manager_body_range()?;
+                let body = manager
+                    .serialized_object_graph()
+                    .get(body_range)
+                    .ok_or_else(|| std::io::Error::other("TransportManager range exceeds graph"))?;
+                let raw_fields = decode_transport_manager_reference_body(
+                    manager.format_version(),
+                    body,
+                    None,
+                    None,
+                )?;
+                selection_pairs += raw_fields.selection_count;
+                if raw_fields.selection_count == 0 {
+                    continue;
+                }
+                assets_with_selections += 1;
+                if !validated_nonempty_sample {
+                    let decoded = manager
+                        .decode_transport_manager_selection_prefix(metadata.save_app_version)?;
+                    assert_eq!(decoded.selections().len(), raw_fields.selection_count);
+                    let existing_count = decoded
+                        .selections()
+                        .iter()
+                        .filter(|selection| {
+                            matches!(
+                                &selection.value,
+                                TransportManagerSharedStringValue::Existing { .. }
+                            )
+                        })
+                        .count();
+                    assert_eq!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("AP Hanami Bay.crp")
+                    );
+                    assert_eq!(manager.format_version(), 114_009);
+                    assert_eq!(decoded.selections().len(), 44);
+                    assert_eq!(existing_count, 40);
+                    assert!(decoded.selections().iter().any(|selection| {
+                        selection.key == 226
+                            && matches!(
+                                &selection.value,
+                                TransportManagerSharedStringValue::New(Some(value))
+                                    if value == "Metro"
+                            )
+                    }));
+                    assert!(decoded.selections().iter().any(|selection| {
+                        selection.key == 55
+                            && matches!(
+                                &selection.value,
+                                TransportManagerSharedStringValue::Existing {
+                                    index: 22,
+                                    value: Some(value),
+                                } if value == "Bus"
+                            )
+                    }));
+                    assert!(decoded.selections().iter().any(|selection| {
+                        selection.key == 148
+                            && matches!(
+                                &selection.value,
+                                TransportManagerSharedStringValue::Existing {
+                                    index: 23,
+                                    value: Some(value),
+                                } if value == "Train Engine"
+                            )
+                    }));
+                    validated_nonempty_sample = true;
+                }
+            }
+        }
+
+        assert_eq!(type_52_assets, 110);
+        assert_eq!(selection_pairs, 93);
+        assert_eq!(assets_with_selections, 8);
+        assert!(validated_nonempty_sample);
+        Ok(())
     }
 
     #[test]
