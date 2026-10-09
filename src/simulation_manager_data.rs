@@ -137,11 +137,13 @@ pub struct EconomyInvestmentPrefabTable {
 
 /// Editable investment data for a bounded `EconomyManager+Data` body.
 ///
-/// This editor supports inner version 116017 and newer. It retains the
-/// original body so replacement can reject stale editors and preserve bytes
-/// before the investment flags and after the decoded prefab table. The
-/// encoded arrays are rewritten using deterministic valid encodings; their
-/// original compression choices are not preserved.
+/// This editor supports inner version 116009 and newer. Versions 116009–116016
+/// are accepted only when the decoded investment scope uniquely reaches the
+/// bounded EconomyManager body end. It retains the original body so replacement
+/// can reject stale editors and preserve bytes before the investment flags and
+/// after the decoded prefab table. The encoded arrays are rewritten using
+/// deterministic valid encodings; their original compression choices are not
+/// preserved.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EconomyManagerInvestmentsEditor {
     format_version: u32,
@@ -3312,10 +3314,12 @@ impl SimulationManagerData {
 
     /// Creates an editor for the bounded EconomyManager investment body.
     ///
-    /// Supports inner version 116017 and newer when the required versioned
-    /// `GenericGuide` references resolve. The editor retains all bytes before
-    /// the investment flags and after the decoded prefab table. Its encoded
-    /// arrays may use different valid compression controls after writing.
+    /// Supports inner version 116009 and newer when the required versioned
+    /// `GenericGuide` references resolve. Versions 116009–116016 additionally
+    /// require one investment layout to parse through the bounded body end. The
+    /// editor retains all bytes before the investment flags and after the
+    /// decoded prefab table. Its encoded arrays may use different valid
+    /// compression controls after writing.
     pub fn decode_economy_manager_investments_editor(
         &self,
         save_app_version: Option<u32>,
@@ -3332,9 +3336,11 @@ impl SimulationManagerData {
     /// Replaces the modeled EconomyManager investment body from an editor.
     ///
     /// The editor must come from this manager's current bytes and use the same
-    /// inner version. Only versions 116017 and newer are supported. The method
-    /// validates the rewritten body before keeping it and restores the graph
-    /// if that validation fails.
+    /// inner version. It supports version 116009 and newer when the investment
+    /// layout can be bounded as described by
+    /// [`decode_economy_manager_investments_editor`](Self::decode_economy_manager_investments_editor).
+    /// The method validates the rewritten body before keeping it and restores
+    /// the graph if that validation fails.
     pub fn replace_economy_manager_investments(
         &mut self,
         edited: &EconomyManagerInvestmentsEditor,
@@ -4744,10 +4750,10 @@ fn decode_economy_manager_investment_editor(
     bytes: &[u8],
     object_table: &DataSerializerObjectTable,
 ) -> Result<EconomyManagerInvestmentsEditor, CrpError> {
-    if format_version < 116_017 {
+    if format_version < 116_009 {
         return Err(invalid(
             0,
-            "EconomyManager investment editing requires inner version 116017 or newer",
+            "EconomyManager investment editing requires inner version 116009 or newer",
         ));
     }
     let flags_start = economy_manager_investment_flags_start(format_version, bytes, object_table)?;
@@ -4775,10 +4781,10 @@ fn decode_economy_manager_investment_editor(
 fn encode_economy_manager_investment_editor(
     editor: &EconomyManagerInvestmentsEditor,
 ) -> Result<Vec<u8>, CrpError> {
-    if editor.format_version < 116_017 {
+    if editor.format_version < 116_009 {
         return Err(invalid(
             0,
-            "EconomyManager investment editing requires inner version 116017 or newer",
+            "EconomyManager investment editing requires inner version 116009 or newer",
         ));
     }
     if editor.flags.len() != ECONOMY_INVESTMENT_FLAG_COUNT {
@@ -4823,6 +4829,26 @@ fn encode_economy_manager_investment_editor(
                 editor.flags_start,
                 format!(
                     "active investment records must follow flag order: expected index {expected_index}, found {}",
+                    investment.investment_index
+                ),
+            ));
+        }
+        if editor.format_version < 116_010 && investment.requirement_missing_date_ticks != 0 {
+            return Err(invalid(
+                editor.flags_start,
+                format!(
+                    "investment {} has a requirement date before its version gate",
+                    investment.investment_index
+                ),
+            ));
+        }
+        if editor.format_version < 116_012
+            && (investment.current_state != 0 || investment.random_influence.to_bits() != 0)
+        {
+            return Err(invalid(
+                editor.flags_start,
+                format!(
+                    "investment {} has state fields before their version gate",
                     investment.investment_index
                 ),
             ));
@@ -4890,12 +4916,16 @@ fn encode_economy_manager_investment_editor(
         output.extend_from_slice(&investment.owned_share_count.to_be_bytes());
         output.extend_from_slice(&investment.base_value.to_bits().to_be_bytes());
     }
-    for investment in &editor.investments {
-        output.extend_from_slice(&investment.requirement_missing_date_ticks.to_be_bytes());
+    if editor.format_version >= 116_010 {
+        for investment in &editor.investments {
+            output.extend_from_slice(&investment.requirement_missing_date_ticks.to_be_bytes());
+        }
     }
-    for investment in &editor.investments {
-        output.extend_from_slice(&investment.current_state.to_be_bytes());
-        output.extend_from_slice(&investment.random_influence.to_bits().to_be_bytes());
+    if editor.format_version >= 116_012 {
+        for investment in &editor.investments {
+            output.extend_from_slice(&investment.current_state.to_be_bytes());
+            output.extend_from_slice(&investment.random_influence.to_bits().to_be_bytes());
+        }
     }
     let prefab_indices = editor
         .prefabs
@@ -6445,6 +6475,25 @@ mod manager_boundary_tests {
             )
             .is_err()
         );
+
+        let mut editor = decode_economy_manager_investment_editor(116_011, bytes, &table).unwrap();
+        editor.investments_mut()[7].player_spent = -123;
+        let encoded = editor.encode().unwrap();
+        assert_eq!(&encoded[..editor.flags_start], &bytes[..editor.flags_start]);
+        assert!(editor.original_body[editor.scope_end..].is_empty());
+        let (rewritten, _) = decode_economy_manager_investments(116_011, &encoded, &table).unwrap();
+        assert_eq!(rewritten[7].player_spent, -123);
+        assert_eq!(
+            rewritten[7].requirement_missing_date_ticks,
+            investments[7].requirement_missing_date_ticks
+        );
+        let (rewritten_prefabs, rewritten_end) =
+            decode_economy_manager_investment_prefabs_from_body(116_011, &encoded, &table).unwrap();
+        assert_eq!(rewritten_end, encoded.len());
+        assert_eq!(rewritten_prefabs, prefabs);
+
+        editor.investments_mut()[7].current_state = 1;
+        assert!(editor.encode().is_err());
     }
 
     #[test]
