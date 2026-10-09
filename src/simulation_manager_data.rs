@@ -3552,7 +3552,7 @@ impl SimulationManagerData {
             .serialized_object_graph
             .get(body_start..next_tag_start)
             .ok_or_else(|| invalid(body_start, "EventManager body range is invalid"))?;
-        let mut candidates = Vec::<(&str, Vec<NetObjectHeader>)>::new();
+        let mut candidates = Vec::<(&str, EventManagerReferenceData)>::new();
         let mut failures = Vec::new();
 
         for (layout, result) in [
@@ -3571,11 +3571,8 @@ impl SimulationManagerData {
         ] {
             match result {
                 Ok((data, consumed)) if consumed == bytes.len() => {
-                    if !candidates
-                        .iter()
-                        .any(|(_, existing)| *existing == data.object_headers)
-                    {
-                        candidates.push((layout, data.object_headers));
+                    if !candidates.iter().any(|(_, existing)| *existing == data) {
+                        candidates.push((layout, data));
                     }
                 }
                 Ok((_, consumed)) => failures.push(format!(
@@ -3587,7 +3584,19 @@ impl SimulationManagerData {
         }
 
         match candidates.as_slice() {
-            [(_, headers)] => Ok(headers.clone()),
+            [(_, data)] => {
+                if data
+                    .unidentified_counted_block
+                    .as_ref()
+                    .is_some_and(|block| !block.contains_only_null_headers)
+                {
+                    return Err(invalid(
+                        body_start,
+                        "EventManager has non-null entries in an unidentified counted block; its object-table effects are unknown",
+                    ));
+                }
+                Ok(data.object_headers.clone())
+            }
             [] => Err(invalid(
                 body_start,
                 format!(

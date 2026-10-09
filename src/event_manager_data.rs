@@ -9,10 +9,19 @@ const MAX_EVENT_SLOTS: usize = u16::MAX as usize + 1;
 ///
 /// Event and route records are currently unsupported. The DLL reader and
 /// writer candidates are both boundary-checked, alongside one counted
-/// reference-block variant observed in a local sample.
+/// block variant observed in a local sample. That block is retained as raw
+/// bytes because its field meaning and type are unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EventManagerReferenceData {
     pub(crate) object_headers: Vec<NetObjectHeader>,
+    pub(crate) unidentified_counted_block: Option<UnidentifiedCountedBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnidentifiedCountedBlock {
+    pub(crate) count: u16,
+    pub(crate) raw_headers: Vec<u8>,
+    pub(crate) contains_only_null_headers: bool,
 }
 
 impl EventManagerReferenceData {
@@ -23,10 +32,10 @@ impl EventManagerReferenceData {
         Self::decode_reader_layout(format_version, bytes, false)
     }
 
-    /// Tries the reader fields plus a corpus-observed counted reference block
-    /// immediately before its versioned tail fields. The block's meaning has
-    /// not been identified in the supplied DLL; the manager boundary is the
-    /// only acceptance check for this variant.
+    /// Tries the reader fields plus a corpus-observed counted block immediately
+    /// before its versioned tail fields. The block's meaning and type have not
+    /// been identified in the supplied DLL, so its count and encoded bytes are
+    /// retained separately from known object references.
     pub(crate) fn decode_reader_with_counted_references(
         format_version: u32,
         bytes: &[u8],
@@ -68,12 +77,26 @@ impl EventManagerReferenceData {
         if format_version >= 121_015 {
             skip_event_prefab_scope(&mut reader, 0, 0, 0)?;
         }
-        if counted_reference_block {
-            let count = usize::from(reader.read_u16_be()?);
-            object_headers.extend(read_object_headers(&mut reader, count)?);
-        }
+        let unidentified_counted_block = if counted_reference_block {
+            let count = reader.read_u16_be()?;
+            let block_start = reader.offset();
+            let headers = read_object_headers(&mut reader, usize::from(count))?;
+            let raw_headers = bytes
+                .get(block_start..reader.offset())
+                .ok_or_else(|| reader.invalid("EventManager counted block exceeds its body"))?
+                .to_vec();
+            Some(UnidentifiedCountedBlock {
+                count,
+                contains_only_null_headers: headers
+                    .iter()
+                    .all(|header| matches!(header, NetObjectHeader::Null)),
+                raw_headers,
+            })
+        } else {
+            None
+        };
         read_reader_tail(&mut reader, format_version, &mut object_headers)?;
-        finish(&mut reader, object_headers)
+        finish(&mut reader, object_headers, unidentified_counted_block)
     }
 
     pub(crate) fn decode_writer(bytes: &[u8]) -> Result<(Self, usize), CrpError> {
@@ -100,7 +123,7 @@ impl EventManagerReferenceData {
         object_headers.push(read_net_object_header(&mut reader)?);
         reader.read_i16_be()?;
         reader.read_i32_be()?;
-        finish(&mut reader, object_headers)
+        finish(&mut reader, object_headers, None)
     }
 }
 
@@ -202,10 +225,17 @@ fn read_reader_tail(
 fn finish(
     reader: &mut Reader<'_>,
     object_headers: Vec<NetObjectHeader>,
+    unidentified_counted_block: Option<UnidentifiedCountedBlock>,
 ) -> Result<(EventManagerReferenceData, usize), CrpError> {
     reader.read_u16_be()?;
     let consumed = reader.offset();
-    Ok((EventManagerReferenceData { object_headers }, consumed))
+    Ok((
+        EventManagerReferenceData {
+            object_headers,
+            unidentified_counted_block,
+        },
+        consumed,
+    ))
 }
 
 #[cfg(test)]
@@ -297,6 +327,7 @@ mod tests {
         let (decoded, consumed) = EventManagerReferenceData::decode_writer(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.object_headers, expected_refs);
+        assert_eq!(decoded.unidentified_counted_block, None);
 
         for end in 0..bytes.len() {
             assert!(
@@ -323,7 +354,53 @@ mod tests {
             EventManagerReferenceData::decode_reader_with_counted_references(109_011, &bytes)
                 .unwrap();
         assert_eq!(consumed, bytes.len());
-        assert_eq!(decoded.object_headers, vec![NetObjectHeader::Null; 4]);
+        assert_eq!(decoded.object_headers, vec![NetObjectHeader::Null; 3]);
+        let block = decoded.unidentified_counted_block.unwrap();
+        assert_eq!(block.count, 1);
+        assert_eq!(block.raw_headers, [0xff]);
+        assert!(block.contains_only_null_headers);
+    }
+
+    #[test]
+    fn unidentified_counted_block_retains_non_null_header_bytes() {
+        let bytes = [
+            0x00, 0x00, // One event slot.
+            0x00, 0x00, // No unlock milestones.
+            0x00, 0x00, // Empty prefab names.
+            0x00, 0x01, 0xfe, 0xfe, 0x80, 0x00, 0x00, // One new-type header.
+            0xff, 0xff, 0xff, // Match-preparing and two band references.
+            0x00, 0x00, // Band-popularity bonus.
+            0x12, 0x34, // Profiler end index.
+        ];
+        let (decoded, consumed) =
+            EventManagerReferenceData::decode_reader_with_counted_references(109_011, &bytes)
+                .unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.object_headers, vec![NetObjectHeader::Null; 3]);
+        let block = decoded.unidentified_counted_block.unwrap();
+        assert_eq!(block.count, 1);
+        assert_eq!(block.raw_headers, [0xfe, 0xfe, 0x80, 0x00, 0x00]);
+        assert!(!block.contains_only_null_headers);
+
+        for end in 0..bytes.len() {
+            assert!(
+                EventManagerReferenceData::decode_reader_with_counted_references(
+                    109_011,
+                    &bytes[..end]
+                )
+                .is_err(),
+                "truncated body at {end}"
+            );
+        }
+        let mut excessive_count = bytes;
+        excessive_count[6..8].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(
+            EventManagerReferenceData::decode_reader_with_counted_references(
+                109_011,
+                &excessive_count
+            )
+            .is_err()
+        );
     }
 
     #[test]
