@@ -267,7 +267,9 @@ impl EconomyManagerBudgetEditor {
 /// Editable income and expense history arrays at the start of `EconomyManager+Data`.
 ///
 /// Arrays absent at the selected inner version are represented by `None`. The
-/// editor preserves the rest of the bounded manager body verbatim.
+/// editor preserves the rest of the bounded manager body verbatim. The current
+/// count mapping is boundary-checked on modern files but remains uncertain for
+/// unobserved reader versions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EconomyManagerIncomeExpenseEditor {
     format_version: u32,
@@ -3581,7 +3583,11 @@ impl SimulationManagerData {
     /// Decodes EconomyManager's income and expense history arrays.
     ///
     /// The array lengths and optional loan, policy, and total fields follow the
-    /// inner DataSerializer version. Other EconomyManager bytes remain opaque.
+    /// inner DataSerializer version. For version 116000 and newer, decoding also
+    /// validates the scalar boundary against two or five newly declared
+    /// `GenericGuide` references and accepts only the observed zero- or one-byte
+    /// prefix before loans. Unsupported reference layouts or truncated fields
+    /// return an error. Other EconomyManager bytes remain opaque.
     pub fn decode_economy_manager_income_expense_editor(
         &self,
         save_app_version: Option<u32>,
@@ -3613,7 +3619,8 @@ impl SimulationManagerData {
     ///
     /// The editor must come from this manager's current body and use the same
     /// inner version. Replacement rewrites only the two encoded-array scopes,
-    /// validates the result, and restores the graph if validation fails.
+    /// emits those arrays as deterministic literal blocks, validates the
+    /// result, and restores the graph if validation fails.
     pub fn replace_economy_manager_income_expense(
         &mut self,
         edited: &EconomyManagerIncomeExpenseEditor,
@@ -3673,7 +3680,10 @@ impl SimulationManagerData {
     ///
     /// Optional fields follow their inner-version gates. The tax multiplier is
     /// returned in its raw serialized form, including the older scaled values.
-    /// Guide references and later investment bytes remain opaque.
+    /// Guide references and later investment bytes remain opaque. From version
+    /// 116000, decoding requires the two or five newly declared `GenericGuide`
+    /// references and a supported zero- or one-byte prefix before the loan
+    /// fields; unsupported layouts and truncation return an error.
     pub fn decode_economy_manager_loans_and_cash_editor(
         &self,
         save_app_version: Option<u32>,
