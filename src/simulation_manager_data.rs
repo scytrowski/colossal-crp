@@ -19,8 +19,9 @@ use crate::data_serializer::{
 use crate::disaster_manager_data::DisasterManagerReferenceData;
 use crate::encoded_array::{
     EncodedLongArrayReader, read_encoded_byte_array, read_encoded_float_array,
-    read_encoded_uint_array, read_encoded_ushort_array, write_encoded_byte_array,
-    write_encoded_float_array, write_encoded_long_array, write_encoded_ushort_array,
+    read_encoded_uint_array, read_encoded_ushort_array, skip_encoded_ushort_array,
+    write_encoded_byte_array, write_encoded_float_array, write_encoded_long_array,
+    write_encoded_ushort_array,
 };
 use crate::event_manager_data::EventManagerReferenceData;
 use crate::guide_data::{
@@ -3278,10 +3279,17 @@ impl SimulationManagerData {
         let mut prefix = self.zone_manager_guide_queue_prefix(save_app_version)?;
         let fields = self.decode_transport_manager_reference_headers(&prefix.object_table)?;
         prefix.transport_manager_object_ids = register_reference_headers(
-            &fields.object_headers,
+            &fields.milestone_object_headers,
             &mut prefix.object_table,
             &mut prefix.queued_objects,
         )?;
+        prefix
+            .transport_manager_object_ids
+            .extend(register_reference_headers(
+                &fields.object_headers,
+                &mut prefix.object_table,
+                &mut prefix.queued_objects,
+            )?);
         Ok(prefix)
     }
 
@@ -4098,13 +4106,15 @@ impl SimulationManagerData {
         )
     }
 
-    /// Resolves TransportManager's fixed object-reference fields in order.
+    /// Resolves TransportManager milestone and fixed object-reference fields in order.
     ///
-    /// This reader supports inner versions 164–115999 when line and milestone
-    /// buffers are empty. It follows the known queue through ZoneManager, then
-    /// reads the version-gated TransportManager tail, including the selection
-    /// table from version 114001. Active lines and milestones return an error.
-    /// Pass the saved application version for inner-version-221+
+    /// The resolver path is validated at inner versions 164–115999. It parses
+    /// milestone prefab indexes and reference headers, and returns those
+    /// references before the fixed tail references in serialized order. Active
+    /// line records remain unsupported. The reader follows the known queue
+    /// through ZoneManager, then reads the version-gated TransportManager tail,
+    /// including the selection table from version 114001. Pass the saved
+    /// application version for inner-version-221+
     /// NetNodeInstanceGuide fields in the earlier manager queue.
     pub fn resolve_transport_manager_references(
         &self,
@@ -7370,22 +7380,21 @@ fn decode_transport_manager_reference_body(
     } else {
         0
     };
-    if milestone_count != 0 {
-        let count_offset = reader
-            .offset()
-            .checked_sub(2)
-            .ok_or(CrpError::ArithmeticOverflow(
-                "TransportManager milestone count offset",
-            ))?;
-        return Err(invalid(
-            count_offset,
-            "TransportManager queue resolution currently requires an empty milestone list",
-        ));
-    }
+    skip_encoded_ushort_array(&mut reader, milestone_count)?;
 
     let prefab_name_count = usize::from(reader.read_u16_be()?);
     for _ in 0..prefab_name_count {
         reader.read_unique_string()?;
+    }
+    if milestone_count > reader.remaining() {
+        return Err(reader.invalid(format!(
+            "TransportManager declares {milestone_count} milestone references but only {} bytes remain",
+            reader.remaining()
+        )));
+    }
+    let mut milestone_object_headers = Vec::with_capacity(milestone_count);
+    for _ in 0..milestone_count {
+        milestone_object_headers.push(read_net_object_header(&mut reader)?);
     }
 
     let line_number_count = transport_manager_line_number_count(format_version);
@@ -7464,7 +7473,7 @@ fn decode_transport_manager_reference_body(
     }
     if let Some(object_table) = object_table {
         let mut checked_table = object_table.clone();
-        for header in &headers {
+        for header in milestone_object_headers.iter().chain(&headers) {
             checked_table.register(header)?;
         }
     }
@@ -7474,6 +7483,7 @@ fn decode_transport_manager_reference_body(
         serialized_prefix: reader.consumed_bytes()[selection_start..reader.offset()].to_vec(),
     });
     Ok(TransportManagerReferenceFields {
+        milestone_object_headers,
         object_headers: headers,
         selection_prefix,
         #[cfg(test)]
@@ -7483,6 +7493,7 @@ fn decode_transport_manager_reference_body(
 
 #[derive(Debug)]
 struct TransportManagerReferenceFields {
+    milestone_object_headers: Vec<NetObjectHeader>,
     object_headers: Vec<NetObjectHeader>,
     selection_prefix: Option<TransportManagerSelectionPrefix>,
     #[cfg(test)]
@@ -8816,12 +8827,39 @@ mod manager_boundary_tests {
         let selection_prefix = decoded.selection_prefix.unwrap();
         assert!(selection_prefix.selections().is_empty());
         assert!(selection_prefix.encode_unchanged().is_empty());
-        let mut nonempty_milestones = bytes.clone();
-        nonempty_milestones[3] = 1;
+        let mut nonempty_milestones = bytes[..2].to_vec();
+        nonempty_milestones.extend_from_slice(&1_u16.to_be_bytes());
+        let prefab_indices_start = nonempty_milestones.len();
+        nonempty_milestones.extend_from_slice(&[0x00, 0x00, 0x07]); // One literal UShort prefab index.
+        nonempty_milestones.extend_from_slice(&0_u16.to_be_bytes()); // Empty prefab names.
+        let milestone_reference_start = nonempty_milestones.len();
+        nonempty_milestones.extend_from_slice(&[0x00, 0x00, 0x01]); // Existing milestone object 1.
+        nonempty_milestones.extend_from_slice(&bytes[6..]);
+        let decoded = decode_transport_manager_reference_body(
+            112_004,
+            &nonempty_milestones,
+            Some(&table),
+            Some(&mut Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.milestone_object_headers,
+            [NetObjectHeader::Existing(1)]
+        );
+        assert_eq!(decoded.object_headers.len(), 7);
         assert!(
             decode_transport_manager_reference_body(
                 112_004,
-                &nonempty_milestones,
+                &nonempty_milestones[..prefab_indices_start + 1],
+                Some(&table),
+                Some(&mut Vec::new()),
+            )
+            .is_err()
+        );
+        assert!(
+            decode_transport_manager_reference_body(
+                112_004,
+                &nonempty_milestones[..milestone_reference_start],
                 Some(&table),
                 Some(&mut Vec::new()),
             )
