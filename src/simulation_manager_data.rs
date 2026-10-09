@@ -7883,8 +7883,8 @@ mod manager_boundary_tests {
         EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
         EconomyManagerBodyLayout, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
         QueuedDataObject, SimulationManagerData, TransportManagerSelection,
-        TransportManagerSharedStringValue, decode_economy_manager_budget_editor,
-        decode_economy_manager_income_expense_editor,
+        TransportManagerSharedStringValue, decode_economy_manager_body_layout,
+        decode_economy_manager_budget_editor, decode_economy_manager_income_expense_editor,
         decode_economy_manager_income_expense_editor_with_layout,
         decode_economy_manager_investment_editor,
         decode_economy_manager_investment_flags_from_body,
@@ -9969,6 +9969,28 @@ mod manager_boundary_tests {
                 references.len(),
                 if format_version >= 116_017 { 5 } else { 2 }
             );
+
+            let (selected_income, selected_loans) =
+                decode_economy_manager_body_layout(format_version, bytes, &table).unwrap();
+            assert!(
+                !selected_income.layout.segmented_long_arrays,
+                "{format_version} fixture should select the earlier Long-array layout"
+            );
+            assert!(
+                selected_loans.layout.has_additional_cash_value,
+                "{format_version} fixture should preserve the reader-only cash slot"
+            );
+            let rewritten_income = selected_income.encode().unwrap();
+            let (redecoded_income, _) =
+                decode_economy_manager_body_layout(format_version, &rewritten_income, &table)
+                    .unwrap();
+            assert_eq!(
+                redecoded_income.layout, selected_income.layout,
+                "{format_version} reselected Long-array layout"
+            );
+            assert_eq!(redecoded_income.income(), selected_income.income());
+            assert_eq!(redecoded_income.expenses(), selected_income.expenses());
+            assert_eq!(selected_loans.encode().unwrap(), bytes, "{format_version}");
 
             let mut edited = editor.clone();
             edited.loans_mut()[0].amount_taken = -765_432;

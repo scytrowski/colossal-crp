@@ -820,7 +820,7 @@ The previously reported 42 `FF` bytes and `00 19`/`00 1C` references occur after
 
 ## Next research steps
 
-1. Determine the version gate and writer behavior for the EconomyManager split-array candidate seen in version 117005–118011 samples, including whether the reader-only version-287 cash value is absent from those historical payloads. The version-116011/116019 samples align with the earlier Rust interpretation instead. Identify the meaning and version gate for EventManager's counted reference block. Active lines and nonempty milestones in TransportManager remain without game-produced sample coverage, and its active-line fields are not yet modeled for editing.
+1. Establish the historical gate and writer behavior for EconomyManager's split-array candidate. The available DLL directory contains only the current `Assembly-CSharp.dll`, whose reader and writer disagree; samples at 116011/116019 select the earlier layout, while selected samples at 117005–118011 select the segmented candidate and omit the reader-only version-287 cash value. Keep this selection sample-specific until an older writer DLL or a discriminating save is available. The EventManager counted block likewise needs an older DLL or a sample that identifies its type and gate. Active lines and nonempty milestones in TransportManager remain without game-produced sample coverage, and its active-line fields are not yet modeled for editing.
 2. Inspect representative non-map packages for type-53 nested packages and additional asset types.
 3. Compare payload-level behavior across outer package versions 4–10 and observed inner serializer versions where game-produced samples are available.
 
