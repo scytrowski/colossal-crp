@@ -91,7 +91,8 @@ pub struct EconomyInvestmentValueSeries {
 /// Modeled numeric fields for one active EconomyManager investment.
 ///
 /// Prefab assignments and names remain in the opaque bytes following these
-/// fields and are not represented here.
+/// fields and are not represented here. Fields introduced after the file's
+/// inner-version gate use their game defaults when they are absent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EconomyInvestmentData {
     /// Investment index in the game's serialized range 1–254.
@@ -3142,13 +3143,15 @@ impl SimulationManagerData {
             .collect()
     }
 
-    /// Decodes EconomyManager's investment activation flags for inner version 116017 and newer.
+    /// Decodes EconomyManager's investment activation flags from inner version 116009 onward.
     ///
     /// The returned vector contains 254 flags for investment indices 1–254;
     /// element zero corresponds to serialized investment index 1. This path
-    /// requires the five preceding guide references to be newly declared
-    /// `GenericGuide` objects and a resolvable preceding TransportManager
-    /// layout. Investment values and prefab assignments remain opaque. Pass
+    /// requires two newly declared `GenericGuide` references through version
+    /// 116016, or five from version 116017, plus a resolvable preceding
+    /// TransportManager layout. For versions 116009–116016, the bounded
+    /// investment payload must match a supported version layout. Investment
+    /// values and prefab assignments remain opaque. Pass
     /// the saved application version for earlier
     /// inner-version-221+ NetNodeInstanceGuide fields in the manager queue.
     pub fn decode_economy_manager_investment_flags(
@@ -3167,7 +3170,7 @@ impl SimulationManagerData {
 
     /// Decodes each active investment's `EncodedArray.Float` value history.
     ///
-    /// This supports inner version 116017 and newer and returns active entries
+    /// This supports inner version 116009 and newer and returns active entries
     /// in serialized investment-index order. Negative value counts and
     /// truncated arrays return errors. The same newly declared guide-reference
     /// and preceding TransportManager requirements as
@@ -3189,12 +3192,13 @@ impl SimulationManagerData {
 
     /// Decodes the modeled numeric fields for active investments.
     ///
-    /// This supports inner version 116017 and newer. It includes the float
+    /// This supports inner version 116009 and newer. It includes the float
     /// history, player-spent amount, owned-share count, base value, missing
     /// requirement date, current state, and random influence. Prefab
     /// assignments and names remain opaque. Negative history counts and
-    /// truncated fields return errors. The same queue and guide-reference
-    /// requirements as
+    /// truncated fields return errors. Fields not serialized before their
+    /// version gate are returned as zero defaults. The same queue and
+    /// guide-reference requirements as
     /// [`decode_economy_manager_investment_value_series`](Self::decode_economy_manager_investment_value_series)
     /// apply.
     pub fn decode_economy_manager_investments(
@@ -3209,7 +3213,7 @@ impl SimulationManagerData {
 
     /// Decodes active-investment prefab indices and the serialized name table.
     ///
-    /// Supports inner version 116017 and newer when the five investment guide
+    /// Supports inner version 116009 and newer when the version-gated guide
     /// references are newly declared `GenericGuide` objects. Assignments are
     /// returned in active-investment order, and null name entries are
     /// preserved. This method also validates the known investment numeric
@@ -3946,28 +3950,353 @@ fn find_economy_manager_guide_header_positions(
     Ok(matches)
 }
 
+fn economy_manager_investment_flags_start(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: &DataSerializerObjectTable,
+) -> Result<usize, CrpError> {
+    if format_version < 116_009 {
+        return Err(invalid(
+            0,
+            "EconomyManager investment data requires inner version 116009 or newer",
+        ));
+    }
+    let guide_headers =
+        find_economy_manager_guide_header_positions(format_version, bytes, object_table)?;
+    let guide_end = guide_headers
+        .last()
+        .map(|(_, end, _)| *end)
+        .ok_or_else(|| invalid(bytes.len(), "EconomyManager guide references are missing"))?;
+    if format_version >= 116_017 {
+        return Ok(guide_end);
+    }
+
+    let mut candidates = vec![(
+        parse_economy_manager_investment_scalar_prefix(format_version, bytes, guide_end, false)?,
+        "DLL reader layout",
+    )];
+    if format_version == 116_011 {
+        // NorthEurope2FINAL (116011) has a bounded, complete investment scope
+        // with the month field but without the two monthly-earnings i32s that
+        // the supplied DLL reader expects from 116010.
+        candidates.push((
+            parse_economy_manager_investment_scalar_prefix(format_version, bytes, guide_end, true)?,
+            "observed 116011 layout",
+        ));
+    }
+
+    let mut complete = Vec::new();
+    let mut failures = Vec::new();
+    for (flags_start, layout_name) in candidates {
+        match decode_economy_manager_investment_payload_end(format_version, bytes, flags_start) {
+            Ok(scope_end) if scope_end == bytes.len() => {
+                complete.push((flags_start, layout_name));
+            }
+            Ok(scope_end) => failures.push(format!(
+                "{layout_name} ended at {scope_end}, body ends at {}",
+                bytes.len()
+            )),
+            Err(error) => failures.push(format!("{layout_name}: {error}")),
+        }
+    }
+    match complete.as_slice() {
+        [(flags_start, _)] => Ok(*flags_start),
+        [] => Err(invalid(
+            bytes.len(),
+            format!(
+                "no supported EconomyManager investment layout reaches the body boundary ({})",
+                failures.join("; ")
+            ),
+        )),
+        _ => Err(invalid(
+            guide_end,
+            "EconomyManager investment prefix is ambiguous between supported layouts",
+        )),
+    }
+}
+
+fn parse_economy_manager_investment_scalar_prefix(
+    format_version: u32,
+    bytes: &[u8],
+    prefix_start: usize,
+    omit_monthly_earnings: bool,
+) -> Result<usize, CrpError> {
+    let prefix_bytes = bytes.get(prefix_start..).ok_or_else(|| {
+        invalid(
+            prefix_start,
+            "EconomyManager investment scalar prefix starts outside the body",
+        )
+    })?;
+    let mut reader = Reader::new(prefix_bytes);
+    if format_version >= 116_000 {
+        read_economy_investment_prefix_field(
+            &mut reader,
+            prefix_start,
+            "last-updated day",
+            Reader::read_i16_be,
+        )?;
+    }
+    if format_version >= 116_008 {
+        let transition_count = read_economy_investment_prefix_count(
+            &mut reader,
+            prefix_start,
+            "transition record count",
+        )?;
+        for transition_index in 0..transition_count {
+            let value_count = read_economy_investment_prefix_count(
+                &mut reader,
+                prefix_start,
+                &format!("transition {transition_index} integer count"),
+            )?;
+            let value_bytes = value_count
+                .checked_mul(4)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "EconomyManager investment transition values",
+                ))?;
+            read_economy_investment_prefix_bytes(
+                &mut reader,
+                prefix_start,
+                value_bytes,
+                &format!("transition {transition_index} integer values"),
+            )?;
+
+            let float_count = read_economy_investment_prefix_count(
+                &mut reader,
+                prefix_start,
+                &format!("transition {transition_index} float count"),
+            )?;
+            skip_economy_investment_float_array(
+                &mut reader,
+                prefix_start,
+                float_count,
+                &format!("transition {transition_index} float values"),
+            )?;
+            if format_version >= 116_010 {
+                read_economy_investment_prefix_field(
+                    &mut reader,
+                    prefix_start,
+                    &format!("transition {transition_index} trailing integer"),
+                    Reader::read_i32_be,
+                )?;
+                read_economy_investment_prefix_field(
+                    &mut reader,
+                    prefix_start,
+                    &format!("transition {transition_index} trailing unsigned integer"),
+                    Reader::read_u32_be,
+                )?;
+            }
+        }
+    }
+    if format_version >= 116_005 {
+        read_economy_investment_prefix_field(
+            &mut reader,
+            prefix_start,
+            "aggregate investment earnings",
+            Reader::read_i32_be,
+        )?;
+    }
+    if format_version >= 116_010 {
+        read_economy_investment_prefix_field(
+            &mut reader,
+            prefix_start,
+            "last-updated month",
+            Reader::read_i16_be,
+        )?;
+        if !omit_monthly_earnings {
+            read_economy_investment_prefix_field(
+                &mut reader,
+                prefix_start,
+                "temporary monthly earnings",
+                Reader::read_i32_be,
+            )?;
+            read_economy_investment_prefix_field(
+                &mut reader,
+                prefix_start,
+                "final monthly earnings",
+                Reader::read_i32_be,
+            )?;
+        }
+    }
+    if format_version >= 116_014 {
+        read_economy_investment_prefix_field(
+            &mut reader,
+            prefix_start,
+            "temporary cash collection",
+            Reader::read_i32_be,
+        )?;
+        read_economy_investment_prefix_field(
+            &mut reader,
+            prefix_start,
+            "final cash collection",
+            Reader::read_i32_be,
+        )?;
+    }
+    if format_version >= 116_015 {
+        for field_name in ["temporary investment spending", "final investment spending"] {
+            read_economy_investment_prefix_field(
+                &mut reader,
+                prefix_start,
+                field_name,
+                Reader::read_i32_be,
+            )?;
+        }
+        for field_name in ["last investment buy", "last investment sell"] {
+            read_economy_investment_prefix_field(
+                &mut reader,
+                prefix_start,
+                field_name,
+                Reader::read_i64_be,
+            )?;
+        }
+        read_economy_investment_prefix_field(
+            &mut reader,
+            prefix_start,
+            "all-in flag",
+            Reader::read_u8,
+        )?;
+    }
+    prefix_start
+        .checked_add(reader.offset())
+        .ok_or(CrpError::ArithmeticOverflow(
+            "EconomyManager investment flags start",
+        ))
+}
+
+fn read_economy_investment_prefix_field<'a, T>(
+    reader: &mut Reader<'a>,
+    prefix_start: usize,
+    field_name: &str,
+    read: impl FnOnce(&mut Reader<'a>) -> Result<T, CrpError>,
+) -> Result<T, CrpError> {
+    let field_offset =
+        prefix_start
+            .checked_add(reader.offset())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EconomyManager investment prefix field offset",
+            ))?;
+    read(reader).map_err(|error| {
+        invalid(
+            field_offset,
+            format!("EconomyManager investment {field_name}: {error}"),
+        )
+    })
+}
+
+fn read_economy_investment_prefix_count(
+    reader: &mut Reader<'_>,
+    prefix_start: usize,
+    field_name: &str,
+) -> Result<usize, CrpError> {
+    let field_offset =
+        prefix_start
+            .checked_add(reader.offset())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EconomyManager investment prefix count offset",
+            ))?;
+    let count = read_economy_investment_prefix_field(
+        reader,
+        prefix_start,
+        field_name,
+        Reader::read_i16_be,
+    )?;
+    if count < 0 {
+        return Err(invalid(
+            field_offset,
+            format!("negative EconomyManager investment {field_name} {count}"),
+        ));
+    }
+    usize::try_from(count).map_err(|_| {
+        invalid(
+            field_offset,
+            format!("{field_name} does not fit this platform"),
+        )
+    })
+}
+
+fn read_economy_investment_prefix_bytes(
+    reader: &mut Reader<'_>,
+    prefix_start: usize,
+    count: usize,
+    field_name: &str,
+) -> Result<(), CrpError> {
+    let field_offset =
+        prefix_start
+            .checked_add(reader.offset())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EconomyManager investment prefix data offset",
+            ))?;
+    reader.read_bytes(count).map(|_| ()).map_err(|error| {
+        invalid(
+            field_offset,
+            format!("EconomyManager investment {field_name}: {error}"),
+        )
+    })
+}
+
+fn skip_economy_investment_float_array(
+    reader: &mut Reader<'_>,
+    prefix_start: usize,
+    count: usize,
+    field_name: &str,
+) -> Result<(), CrpError> {
+    let mut remaining = count;
+    while remaining > 0 {
+        let control_offset =
+            prefix_start
+                .checked_add(reader.offset())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "EconomyManager transition float control offset",
+                ))?;
+        let control = reader.read_u8().map_err(|error| {
+            invalid(
+                control_offset,
+                format!("EconomyManager investment {field_name}: {error}"),
+            )
+        })?;
+        let run = if control >= 0x80 {
+            usize::from(control - 0x7f)
+        } else {
+            usize::from(control) + 1
+        };
+        let used = run.min(remaining);
+        if control < 0x80 {
+            let literal_bytes = used.checked_mul(4).ok_or(CrpError::ArithmeticOverflow(
+                "EconomyManager transition float bytes",
+            ))?;
+            read_economy_investment_prefix_bytes(reader, prefix_start, literal_bytes, field_name)?;
+        }
+        remaining -= used;
+    }
+    Ok(())
+}
+
+fn decode_economy_manager_investment_payload_end(
+    format_version: u32,
+    bytes: &[u8],
+    flags_start: usize,
+) -> Result<usize, CrpError> {
+    let (flags, values_start) = decode_economy_manager_investment_flags_at(bytes, flags_start)?;
+    let (series, values_end) =
+        decode_economy_manager_investment_value_series_at(bytes, flags, values_start)?;
+    let (investments, prefab_start) =
+        decode_economy_manager_investments_after_series(format_version, bytes, series, values_end)?;
+    decode_economy_manager_investment_prefabs_after_investments(bytes, investments, prefab_start)
+        .map(|(_, scope_end)| scope_end)
+}
+
 fn decode_economy_manager_investment_flags_from_body(
     format_version: u32,
     bytes: &[u8],
     object_table: &DataSerializerObjectTable,
 ) -> Result<(Vec<u16>, usize), CrpError> {
-    if format_version < 116_017 {
-        return Err(invalid(
-            0,
-            "investment flag decoding currently requires inner version 116017 or newer",
-        ));
-    }
-    let guide_headers =
-        find_economy_manager_guide_header_positions(format_version, bytes, object_table)?;
-    let flags_start = guide_headers
-        .last()
-        .map(|(_, end, _)| *end)
-        .ok_or_else(|| {
-            invalid(
-                bytes.len(),
-                "EconomyManager investment guide headers are missing",
-            )
-        })?;
+    let flags_start = economy_manager_investment_flags_start(format_version, bytes, object_table)?;
+    decode_economy_manager_investment_flags_at(bytes, flags_start)
+}
+
+fn decode_economy_manager_investment_flags_at(
+    bytes: &[u8],
+    flags_start: usize,
+) -> Result<(Vec<u16>, usize), CrpError> {
     let flag_bytes = bytes.get(flags_start..).ok_or_else(|| {
         invalid(
             flags_start,
@@ -3990,8 +4319,16 @@ fn decode_economy_manager_investment_value_series(
     bytes: &[u8],
     object_table: &DataSerializerObjectTable,
 ) -> Result<(Vec<EconomyInvestmentValueSeries>, usize), CrpError> {
-    let (flags, values_start) =
-        decode_economy_manager_investment_flags_from_body(format_version, bytes, object_table)?;
+    let flags_start = economy_manager_investment_flags_start(format_version, bytes, object_table)?;
+    let (flags, values_start) = decode_economy_manager_investment_flags_at(bytes, flags_start)?;
+    decode_economy_manager_investment_value_series_at(bytes, flags, values_start)
+}
+
+fn decode_economy_manager_investment_value_series_at(
+    bytes: &[u8],
+    flags: Vec<u16>,
+    values_start: usize,
+) -> Result<(Vec<EconomyInvestmentValueSeries>, usize), CrpError> {
     let value_bytes = bytes.get(values_start..).ok_or_else(|| {
         invalid(
             values_start,
@@ -4057,8 +4394,19 @@ fn decode_economy_manager_investments(
     bytes: &[u8],
     object_table: &DataSerializerObjectTable,
 ) -> Result<(Vec<EconomyInvestmentData>, usize), CrpError> {
+    let flags_start = economy_manager_investment_flags_start(format_version, bytes, object_table)?;
+    let (flags, values_start) = decode_economy_manager_investment_flags_at(bytes, flags_start)?;
     let (series, values_end) =
-        decode_economy_manager_investment_value_series(format_version, bytes, object_table)?;
+        decode_economy_manager_investment_value_series_at(bytes, flags, values_start)?;
+    decode_economy_manager_investments_after_series(format_version, bytes, series, values_end)
+}
+
+fn decode_economy_manager_investments_after_series(
+    format_version: u32,
+    bytes: &[u8],
+    series: Vec<EconomyInvestmentValueSeries>,
+    values_end: usize,
+) -> Result<(Vec<EconomyInvestmentData>, usize), CrpError> {
     let field_bytes = bytes.get(values_end..).ok_or_else(|| {
         invalid(
             values_end,
@@ -4080,53 +4428,59 @@ fn decode_economy_manager_investments(
         })
         .collect::<Vec<_>>();
 
-    for investment in &mut investments {
-        investment.player_spent = read_economy_investment_field(
-            &mut reader,
-            values_end,
-            investment.investment_index,
-            "player-spent amount",
-            Reader::read_i32_be,
-        )?;
-        investment.owned_share_count = read_economy_investment_field(
-            &mut reader,
-            values_end,
-            investment.investment_index,
-            "owned-share count",
-            Reader::read_u32_be,
-        )?;
-        investment.base_value = read_economy_investment_field(
-            &mut reader,
-            values_end,
-            investment.investment_index,
-            "base value",
-            Reader::read_f32_be,
-        )?;
+    if format_version >= 116_009 {
+        for investment in &mut investments {
+            investment.player_spent = read_economy_investment_field(
+                &mut reader,
+                values_end,
+                investment.investment_index,
+                "player-spent amount",
+                Reader::read_i32_be,
+            )?;
+            investment.owned_share_count = read_economy_investment_field(
+                &mut reader,
+                values_end,
+                investment.investment_index,
+                "owned-share count",
+                Reader::read_u32_be,
+            )?;
+            investment.base_value = read_economy_investment_field(
+                &mut reader,
+                values_end,
+                investment.investment_index,
+                "base value",
+                Reader::read_f32_be,
+            )?;
+        }
     }
-    for investment in &mut investments {
-        investment.requirement_missing_date_ticks = read_economy_investment_field(
-            &mut reader,
-            values_end,
-            investment.investment_index,
-            "requirement-missing date",
-            Reader::read_i64_be,
-        )?;
+    if format_version >= 116_010 {
+        for investment in &mut investments {
+            investment.requirement_missing_date_ticks = read_economy_investment_field(
+                &mut reader,
+                values_end,
+                investment.investment_index,
+                "requirement-missing date",
+                Reader::read_i64_be,
+            )?;
+        }
     }
-    for investment in &mut investments {
-        investment.current_state = read_economy_investment_field(
-            &mut reader,
-            values_end,
-            investment.investment_index,
-            "current state",
-            Reader::read_i16_be,
-        )?;
-        investment.random_influence = read_economy_investment_field(
-            &mut reader,
-            values_end,
-            investment.investment_index,
-            "random influence",
-            Reader::read_f32_be,
-        )?;
+    if format_version >= 116_012 {
+        for investment in &mut investments {
+            investment.current_state = read_economy_investment_field(
+                &mut reader,
+                values_end,
+                investment.investment_index,
+                "current state",
+                Reader::read_i16_be,
+            )?;
+            investment.random_influence = read_economy_investment_field(
+                &mut reader,
+                values_end,
+                investment.investment_index,
+                "random influence",
+                Reader::read_f32_be,
+            )?;
+        }
     }
     let fields_end =
         values_end
@@ -4142,8 +4496,20 @@ fn decode_economy_manager_investment_prefabs_from_body(
     bytes: &[u8],
     object_table: &DataSerializerObjectTable,
 ) -> Result<(EconomyInvestmentPrefabTable, usize), CrpError> {
+    let flags_start = economy_manager_investment_flags_start(format_version, bytes, object_table)?;
+    let (flags, values_start) = decode_economy_manager_investment_flags_at(bytes, flags_start)?;
+    let (series, values_end) =
+        decode_economy_manager_investment_value_series_at(bytes, flags, values_start)?;
     let (investments, prefab_start) =
-        decode_economy_manager_investments(format_version, bytes, object_table)?;
+        decode_economy_manager_investments_after_series(format_version, bytes, series, values_end)?;
+    decode_economy_manager_investment_prefabs_after_investments(bytes, investments, prefab_start)
+}
+
+fn decode_economy_manager_investment_prefabs_after_investments(
+    bytes: &[u8],
+    investments: Vec<EconomyInvestmentData>,
+    prefab_start: usize,
+) -> Result<(EconomyInvestmentPrefabTable, usize), CrpError> {
     let prefab_bytes = bytes.get(prefab_start..).ok_or_else(|| {
         invalid(
             prefab_start,
@@ -5585,6 +5951,272 @@ mod manager_boundary_tests {
         truncated.extend_from_slice(&[0x00, 0x00, 0x01, 0x00]);
         assert!(
             decode_economy_manager_investment_flags_from_body(116_017, &truncated, &table).is_err()
+        );
+    }
+
+    #[test]
+    fn economy_manager_investments_match_north_europe_116011_fixture() {
+        let bytes =
+            include_bytes!("../tests/fixtures/economy-investments-v116011-north-europe.bin");
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        for index in 0..29 {
+            table
+                .register(&NetObjectHeader::NewType(format!("FixtureType{index}")))
+                .unwrap();
+        }
+        table
+            .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+            .unwrap();
+        assert_eq!(
+            table.shared_types.get(30).map(String::as_str),
+            Some("GenericGuide")
+        );
+
+        let (flags, values_start) =
+            decode_economy_manager_investment_flags_from_body(116_011, bytes, &table).unwrap();
+        assert_eq!(values_start, 397);
+        assert_eq!(
+            flags
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, flag)| (*flag != 0).then_some(offset + 1))
+                .collect::<Vec<_>>(),
+            [8, 24, 27, 36, 54, 90, 122, 138, 157, 176]
+        );
+        assert!(
+            flags
+                .iter()
+                .filter(|flag| **flag != 0)
+                .all(|flag| *flag == 2)
+        );
+
+        let (series, values_end) =
+            decode_economy_manager_investment_value_series(116_011, bytes, &table).unwrap();
+        assert_eq!(values_end, 451);
+        assert_eq!(
+            series
+                .iter()
+                .map(|entry| entry.investment_index)
+                .collect::<Vec<_>>(),
+            [8, 24, 27, 36, 54, 90, 122, 138, 157, 176]
+        );
+        assert!(series.iter().all(|entry| entry.values.len() == 2));
+        assert_eq!(
+            series[0]
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            [0x447a_0000, 0x447a_0000]
+        );
+        assert_eq!(
+            series[7]
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            [0x4478_3eb8, 0x4476_7e14]
+        );
+
+        let (investments, fields_end) =
+            decode_economy_manager_investments(116_011, bytes, &table).unwrap();
+        assert_eq!(fields_end, 651);
+        assert!(investments.iter().all(|investment| {
+            investment.player_spent == 0
+                && investment.owned_share_count == 0
+                && investment.requirement_missing_date_ticks
+                    == if matches!(investment.investment_index, 138 | 176) {
+                        3_155_378_112_000_000_000
+                    } else {
+                        637_545_600_000_000_000
+                    }
+                && investment.current_state == 0
+                && investment.random_influence.to_bits() == 0
+        }));
+        assert_eq!(investments[7].base_value.to_bits(), 0x447a_0000);
+        assert!(
+            investments
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != 7)
+                .all(|(_, investment)| investment.base_value.to_bits() == 0)
+        );
+
+        let (prefabs, scope_end) =
+            decode_economy_manager_investment_prefabs_from_body(116_011, bytes, &table).unwrap();
+        assert_eq!(scope_end, bytes.len());
+        assert_eq!(
+            prefabs
+                .assignments
+                .iter()
+                .map(|assignment| (assignment.investment_index, assignment.prefab_index))
+                .collect::<Vec<_>>(),
+            [
+                (8, 1),
+                (24, 5),
+                (27, 9),
+                (36, 6),
+                (54, 3),
+                (90, 7),
+                (122, 8),
+                (138, 0),
+                (157, 4),
+                (176, 2),
+            ]
+        );
+        assert_eq!(
+            prefabs.names,
+            [
+                "Chirp Coin",
+                "Death Care Sector Investment",
+                "Fuel Company Investment",
+                "Health Care Sector Investment",
+                "Health Care Sector Random Investment",
+                "Farming Industry Investment",
+                "Forestry Industry Investment",
+                "Generic Industry Investment",
+                "Oil Industry Investment",
+                "Ore Industry Investment",
+            ]
+            .map(|name| Some(name.to_owned()))
+        );
+        assert!(
+            decode_economy_manager_investment_prefabs_from_body(
+                116_011,
+                &bytes[..bytes.len() - 1],
+                &table
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn economy_manager_investment_prefix_and_numeric_columns_follow_version_gates() {
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        for index in 0..29 {
+            table
+                .register(&NetObjectHeader::NewType(format!("FixtureType{index}")))
+                .unwrap();
+        }
+        table
+            .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+            .unwrap();
+
+        for format_version in [116_009, 116_010, 116_011, 116_012, 116_014, 116_015] {
+            let mut body = vec![0xfe, 0x00, 0x1e].repeat(2);
+            if format_version >= 116_000 {
+                body.extend_from_slice(&7_i16.to_be_bytes());
+            }
+            if format_version >= 116_008 {
+                if format_version == 116_010 {
+                    body.extend_from_slice(&1_i16.to_be_bytes()); // One transition.
+                    body.extend_from_slice(&1_i16.to_be_bytes()); // One integer value.
+                    body.extend_from_slice(&0x1122_3344_u32.to_be_bytes());
+                    body.extend_from_slice(&1_i16.to_be_bytes()); // One float value.
+                    body.extend_from_slice(&[0, 0x3f, 0x80, 0, 0]);
+                    body.extend_from_slice(&(-21_i32).to_be_bytes());
+                    body.extend_from_slice(&22_u32.to_be_bytes());
+                } else {
+                    body.extend_from_slice(&0_i16.to_be_bytes());
+                }
+            }
+            if format_version >= 116_005 {
+                body.extend_from_slice(&9_i32.to_be_bytes());
+            }
+            if format_version >= 116_010 {
+                body.extend_from_slice(&3_i16.to_be_bytes());
+                body.extend_from_slice(&11_i32.to_be_bytes());
+                body.extend_from_slice(&12_i32.to_be_bytes());
+            }
+            if format_version >= 116_014 {
+                body.extend_from_slice(&13_i32.to_be_bytes());
+                body.extend_from_slice(&14_i32.to_be_bytes());
+            }
+            if format_version >= 116_015 {
+                body.extend_from_slice(&15_i32.to_be_bytes());
+                body.extend_from_slice(&16_i32.to_be_bytes());
+                body.extend_from_slice(&17_i64.to_be_bytes());
+                body.extend_from_slice(&18_i64.to_be_bytes());
+                body.push(1);
+            }
+
+            let mut flags = vec![0_u16; 254];
+            flags[0] = 1;
+            write_encoded_ushort_array(&mut body, &flags);
+            body.extend_from_slice(&0_i16.to_be_bytes()); // Empty float history.
+            body.extend_from_slice(&(-5_i32).to_be_bytes());
+            body.extend_from_slice(&12_u32.to_be_bytes());
+            body.extend_from_slice(&5.5_f32.to_bits().to_be_bytes());
+            if format_version >= 116_010 {
+                body.extend_from_slice(&19_i64.to_be_bytes());
+            }
+            if format_version >= 116_012 {
+                body.extend_from_slice(&(-2_i16).to_be_bytes());
+                body.extend_from_slice(&0.25_f32.to_bits().to_be_bytes());
+            }
+            write_encoded_ushort_array(&mut body, &[4]);
+            body.extend_from_slice(&0_u16.to_be_bytes()); // No prefab names.
+
+            let (investments, fields_end) =
+                decode_economy_manager_investments(format_version, &body, &table).unwrap();
+            assert_eq!(investments.len(), 1, "version {format_version}");
+            assert_eq!(investments[0].investment_index, 1);
+            assert_eq!(investments[0].player_spent, -5);
+            assert_eq!(investments[0].owned_share_count, 12);
+            assert_eq!(investments[0].base_value.to_bits(), 5.5_f32.to_bits());
+            assert_eq!(
+                investments[0].requirement_missing_date_ticks,
+                if format_version >= 116_010 { 19 } else { 0 }
+            );
+            assert_eq!(
+                investments[0].current_state,
+                if format_version >= 116_012 { -2 } else { 0 }
+            );
+            assert_eq!(
+                investments[0].random_influence.to_bits(),
+                if format_version >= 116_012 {
+                    0.25_f32.to_bits()
+                } else {
+                    0
+                }
+            );
+            let (prefabs, scope_end) =
+                decode_economy_manager_investment_prefabs_from_body(format_version, &body, &table)
+                    .unwrap();
+            assert_eq!(fields_end + 5, scope_end, "version {format_version}");
+            assert_eq!(scope_end, body.len(), "version {format_version}");
+            assert_eq!(prefabs.assignments[0].prefab_index, 4);
+            assert!(prefabs.names.is_empty());
+        }
+    }
+
+    #[test]
+    fn economy_manager_investment_transition_prefix_rejects_negative_and_truncated_counts() {
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        for index in 0..29 {
+            table
+                .register(&NetObjectHeader::NewType(format!("FixtureType{index}")))
+                .unwrap();
+        }
+        table
+            .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+            .unwrap();
+
+        let mut negative_count = vec![0xfe, 0x00, 0x1e].repeat(2);
+        negative_count.extend_from_slice(&0_i16.to_be_bytes()); // Last-updated day.
+        negative_count.extend_from_slice(&(-1_i16).to_be_bytes());
+        assert!(
+            decode_economy_manager_investment_flags_from_body(116_010, &negative_count, &table)
+                .is_err()
+        );
+
+        let mut truncated_values = vec![0xfe, 0x00, 0x1e].repeat(2);
+        truncated_values.extend_from_slice(&0_i16.to_be_bytes()); // Last-updated day.
+        truncated_values.extend_from_slice(&1_i16.to_be_bytes()); // One transition.
+        truncated_values.extend_from_slice(&1_i16.to_be_bytes()); // One integer value.
+        assert!(
+            decode_economy_manager_investment_flags_from_body(116_010, &truncated_values, &table)
+                .is_err()
         );
     }
 

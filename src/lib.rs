@@ -4477,15 +4477,15 @@ mod tests {
 
     #[test]
     #[ignore = "reads the local NorthEurope2FINAL and CCMP2 Boreal Map 1 samples from data/maps"]
-    fn validates_modern_economy_manager_guide_references() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn validates_economy_manager_investments_and_district_references()
+    -> Result<(), Box<dyn std::error::Error>> {
         let samples = [
-            ("NorthEurope2FINAL.crp", 116_011, 2),
-            ("CCMP2 Boreal Map 1.crp", 116_019, 5),
+            ("NorthEurope2FINAL.crp", 116_011, 2, 10),
+            ("CCMP2 Boreal Map 1.crp", 116_019, 5, 13),
         ];
         let expected_type =
             "GenericGuide, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
-        for (file_name, expected_version, expected_count) in samples {
+        for (file_name, expected_version, expected_count, expected_active_count) in samples {
             let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("data/maps")
                 .join(file_name);
@@ -4520,45 +4520,43 @@ mod tests {
                 expected_district_count,
                 "{file_name}"
             );
-            if expected_version >= 116_017 {
-                let investment_flags =
-                    manager.decode_economy_manager_investment_flags(metadata.save_app_version)?;
-                assert_eq!(investment_flags.len(), 254, "{file_name}");
-                assert_eq!(
-                    investment_flags.iter().filter(|flag| **flag != 0).count(),
-                    13,
-                    "{file_name}"
-                );
-                let value_series = manager
-                    .decode_economy_manager_investment_value_series(metadata.save_app_version)?;
-                assert_eq!(value_series.len(), 13, "{file_name}");
-                assert!(
-                    value_series
-                        .iter()
-                        .map(|series| series.values.len())
-                        .sum::<usize>()
-                        > 0,
-                    "{file_name}"
-                );
-                let investments =
-                    manager.decode_economy_manager_investments(metadata.save_app_version)?;
-                assert_eq!(investments.len(), 13, "{file_name}");
-                assert_eq!(
-                    investments
-                        .iter()
-                        .map(|investment| investment.investment_index)
-                        .collect::<Vec<_>>(),
-                    value_series
-                        .iter()
-                        .map(|series| series.investment_index)
-                        .collect::<Vec<_>>(),
-                    "{file_name}"
-                );
-                let prefabs =
-                    manager.decode_economy_manager_investment_prefabs(metadata.save_app_version)?;
-                assert_eq!(prefabs.assignments.len(), investments.len(), "{file_name}");
-                assert!(!prefabs.names.is_empty(), "{file_name}");
-            }
+            let investment_flags =
+                manager.decode_economy_manager_investment_flags(metadata.save_app_version)?;
+            assert_eq!(investment_flags.len(), 254, "{file_name}");
+            assert_eq!(
+                investment_flags.iter().filter(|flag| **flag != 0).count(),
+                expected_active_count,
+                "{file_name}"
+            );
+            let value_series = manager
+                .decode_economy_manager_investment_value_series(metadata.save_app_version)?;
+            assert_eq!(value_series.len(), expected_active_count, "{file_name}");
+            assert!(
+                value_series
+                    .iter()
+                    .map(|series| series.values.len())
+                    .sum::<usize>()
+                    > 0,
+                "{file_name}"
+            );
+            let investments =
+                manager.decode_economy_manager_investments(metadata.save_app_version)?;
+            assert_eq!(investments.len(), expected_active_count, "{file_name}");
+            assert_eq!(
+                investments
+                    .iter()
+                    .map(|investment| investment.investment_index)
+                    .collect::<Vec<_>>(),
+                value_series
+                    .iter()
+                    .map(|series| series.investment_index)
+                    .collect::<Vec<_>>(),
+                "{file_name}"
+            );
+            let prefabs =
+                manager.decode_economy_manager_investment_prefabs(metadata.save_app_version)?;
+            assert_eq!(prefabs.assignments.len(), investments.len(), "{file_name}");
+            assert_eq!(prefabs.names.len(), expected_active_count, "{file_name}");
         }
         Ok(())
     }
