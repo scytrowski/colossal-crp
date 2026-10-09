@@ -4432,6 +4432,38 @@ mod tests {
             assert_eq!(consumed, 11);
         }
 
+        let zone_guides = manager.locate_zone_manager_guide_bodies(metadata.save_app_version)?;
+        assert_eq!(zone_guides.len(), 13);
+        let mut zone_type_guides = 0;
+        let mut generic_guides = 0;
+        for location in zone_guides {
+            let location = location
+                .ok_or_else(|| std::io::Error::other("Wolf Creek ZoneManager guide is null"))?;
+            assert_eq!(location.body_length, 11, "{location:?}");
+            let (guide, consumed) = GuideTriggerBasePrefix::decode(
+                &manager.serialized_object_graph()[location.graph_offset..],
+            )?;
+            assert_eq!(consumed, 11);
+            assert_eq!(
+                guide.encode(),
+                manager.serialized_object_graph()
+                    [location.graph_offset..location.graph_offset + 11]
+            );
+            if location.type_name.starts_with("ZoneTypeGuide,") {
+                zone_type_guides += 1;
+            } else if location.type_name.starts_with("GenericGuide,") {
+                generic_guides += 1;
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "unexpected Wolf Creek ZoneManager guide type: {}",
+                    location.type_name
+                ))
+                .into());
+            }
+        }
+        assert_eq!(zone_type_guides, 11);
+        assert_eq!(generic_guides, 2);
+
         let message = manager.decode_message_manager_data()?;
         assert_eq!(message.random_message_timers().len(), 26);
         let original_queue = message.message_queue().map(<[_]>::to_vec);

@@ -100,6 +100,7 @@ struct NetManagerGuideQueuePrefix {
     queued_objects: Vec<QueuedGuideObject>,
     net_manager_object_ids: Vec<Option<u32>>,
     water_manager_object_ids: Vec<Option<u32>>,
+    zone_manager_object_ids: Vec<Option<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2470,6 +2471,7 @@ impl SimulationManagerData {
             queued_objects,
             net_manager_object_ids,
             water_manager_object_ids: Vec::new(),
+            zone_manager_object_ids: Vec::new(),
         })
     }
 
@@ -2511,6 +2513,24 @@ impl SimulationManagerData {
                 .water_manager_object_ids
                 .push(register_queued_reference(
                     &header,
+                    &mut prefix.object_table,
+                    &mut prefix.queued_objects,
+                )?);
+        }
+        Ok(prefix)
+    }
+
+    fn zone_manager_guide_queue_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetManagerGuideQueuePrefix, CrpError> {
+        let mut prefix = self.water_manager_guide_queue_prefix(save_app_version)?;
+        let (zone, _) = self.decode_zone_manager_prefix()?;
+        for header in zone.object_references() {
+            prefix
+                .zone_manager_object_ids
+                .push(register_queued_reference(
+                    header,
                     &mut prefix.object_table,
                     &mut prefix.queued_objects,
                 )?);
@@ -2713,6 +2733,63 @@ impl SimulationManagerData {
             prefix.children_start,
             &prefix.queued_objects,
             &prefix.water_manager_object_ids,
+            self.format_version,
+            save_app_version,
+        )
+    }
+
+    /// Locates one queued ZoneManager guide body by its reference-field index.
+    ///
+    /// The queue replay follows the supported GameArea, Terrain, InstanceManager,
+    /// NetManager, BuildingManager, and WaterManager references before ZoneManager.
+    /// ZoneManager references are ordered as eight unused-zone entries, three demand
+    /// wrappers, options, and zones. The locator currently supports the base-only
+    /// `ZoneTypeGuide` and `GenericGuide` body layouts, and errors if an earlier
+    /// queued object has an unknown body schema. Pass the saved application version
+    /// for inner-version-221+ `NetNodeInstanceGuide` bodies in earlier queues.
+    pub fn locate_zone_manager_guide_body(
+        &self,
+        header_index: usize,
+        save_app_version: Option<u32>,
+    ) -> Result<GuideBodyLocation, CrpError> {
+        let prefix = self.zone_manager_guide_queue_prefix(save_app_version)?;
+        let object_id = prefix
+            .zone_manager_object_ids
+            .get(header_index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| {
+                invalid(
+                    header_index,
+                    "ZoneManager guide-header index is out of bounds or references null",
+                )
+            })?;
+        locate_queued_object_body(
+            &self.serialized_object_graph,
+            prefix.children_start,
+            &prefix.queued_objects,
+            object_id,
+            self.format_version,
+            save_app_version,
+        )
+    }
+
+    /// Locates all queued ZoneManager guide bodies in reference-field order.
+    ///
+    /// Null references remain `None`, and repeated references resolve to the same
+    /// body location. The locator supports `ZoneTypeGuide` and `GenericGuide` bodies
+    /// after the supported earlier queues; an unknown preceding body type returns an
+    /// error.
+    pub fn locate_zone_manager_guide_bodies(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<Option<GuideBodyLocation>>, CrpError> {
+        let prefix = self.zone_manager_guide_queue_prefix(save_app_version)?;
+        locate_queued_object_bodies(
+            &self.serialized_object_graph,
+            prefix.children_start,
+            &prefix.queued_objects,
+            &prefix.zone_manager_object_ids,
             self.format_version,
             save_app_version,
         )
@@ -3414,7 +3491,7 @@ fn guide_object_body_length(
     graph_offset: usize,
 ) -> Result<usize, CrpError> {
     match object_class_name(type_name) {
-        "GenericGuide" | "ServiceTypeGuide" | "BuildingTypeGuide" => {
+        "GenericGuide" | "ServiceTypeGuide" | "BuildingTypeGuide" | "ZoneTypeGuide" => {
             GuideTriggerBasePrefix::decode(bytes).map(|(_, consumed)| consumed)
         }
         "NetSegmentInstanceGuide" | "BuildingInstanceGuide" | "BuildingOnFireGuide" => {
@@ -4122,10 +4199,12 @@ mod manager_boundary_tests {
         let first = [0; 11];
         let second = [0; 17];
         let third = [0; 11];
+        let fourth = [0; 11];
         let mut graph = Vec::new();
         graph.extend_from_slice(&first);
         graph.extend_from_slice(&second);
         graph.extend_from_slice(&third);
+        graph.extend_from_slice(&fourth);
         let objects = vec![
             QueuedGuideObject {
                 object_id: 5,
@@ -4139,6 +4218,10 @@ mod manager_boundary_tests {
                 object_id: 7,
                 type_name: "ServiceTypeGuide, Assembly-CSharp".to_owned(),
             },
+            QueuedGuideObject {
+                object_id: 8,
+                type_name: "ZoneTypeGuide, Assembly-CSharp".to_owned(),
+            },
         ];
 
         let location = locate_queued_object_body(&graph, 0, &objects, 6, 112_004, None).unwrap();
@@ -4146,7 +4229,12 @@ mod manager_boundary_tests {
         assert_eq!(location.graph_offset, 11);
         assert_eq!(location.body_length, 17);
         assert_eq!(location.type_name, "BuildingInstanceGuide, Assembly-CSharp");
-        assert!(locate_queued_object_body(&graph, 0, &objects, 8, 112_004, None).is_err());
+        let zone_location =
+            locate_queued_object_body(&graph, 0, &objects, 8, 112_004, None).unwrap();
+        assert_eq!(zone_location.graph_offset, 39);
+        assert_eq!(zone_location.body_length, 11);
+        assert_eq!(zone_location.type_name, "ZoneTypeGuide, Assembly-CSharp");
+        assert!(locate_queued_object_body(&graph, 0, &objects, 9, 112_004, None).is_err());
         assert!(locate_queued_object_body(&graph[..20], 0, &objects, 6, 112_004, None).is_err());
     }
 
