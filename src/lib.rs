@@ -7,6 +7,7 @@ use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 mod asset_io;
+mod audio_manager_data;
 mod building_manager_data;
 mod data_serializer;
 mod district_manager_data;
@@ -31,6 +32,7 @@ mod unlock_manager_data;
 mod water_simulation_data;
 mod zone_manager_data;
 
+pub use audio_manager_data::{AudioManagerData, AudioRadioChannel, AudioRadioContent};
 pub use building_manager_data::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsEditor,
     BuildingEconomicFieldsPrefix, BuildingEffectValue, BuildingFacultyBonusesEditor,
@@ -4779,6 +4781,29 @@ mod tests {
         info.set_visited_info_views(info.visited_info_views())?;
         manager.replace_info_manager_data(&info)?;
         assert_eq!(manager.serialized_object_graph(), original_graph);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads the local CL Wolf Creek sample from data/maps"]
+    fn validates_wolf_creek_audio_manager_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
+        let mut file = File::open(path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("CL Wolf Creek has no type-52 asset"))?;
+        let (_, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 112_004);
+
+        let audio = manager.decode_audio_manager_data()?;
+        assert!(audio.radio_channels().is_empty());
+        assert!(audio.radio_contents().is_empty());
+        assert!(audio.unlock_milestone_references().is_empty());
+        assert!(audio.encoded_len() >= 20);
         Ok(())
     }
 

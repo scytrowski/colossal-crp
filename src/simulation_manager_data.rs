@@ -12,6 +12,7 @@ use crate::TreeManagerDataPrefix;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
+use crate::audio_manager_data::AudioManagerData;
 use crate::data_serializer::{
     DataSerializerStream, Reader, write_nullable_unique_string, write_u24_be, write_unique_string,
 };
@@ -881,6 +882,68 @@ impl SimulationManagerData {
         self.serialized_object_graph[field_range].copy_from_slice(&replacement);
         self.decode_info_manager_data()?;
         Ok(())
+    }
+
+    /// Decodes the versioned radio-channel and radio-content fields in
+    /// `AudioManager+Data`.
+    ///
+    /// Supports inner versions 164 and newer. The manager's closing two-byte
+    /// profiler reference must be followed by the next manager tag. This
+    /// locator supports the unique-string profiler tags observed in local maps
+    /// and returns an error for other tag forms.
+    pub fn decode_audio_manager_data(&self) -> Result<AudioManagerData, CrpError> {
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "AudioManager+Data")?;
+        let first_next_slot = slot
+            .checked_add(1)
+            .ok_or(CrpError::ArithmeticOverflow("AudioManager next slot"))?;
+        let (next_slot, next_manager) = managers
+            .iter()
+            .enumerate()
+            .skip(first_next_slot)
+            .find_map(|(next_slot, reference)| {
+                reference.as_ref().map(|reference| (next_slot, reference))
+            })
+            .ok_or_else(|| invalid(slot, "AudioManager has no following manager reference"))?;
+
+        let tag = new_profiler_tag_bytes("AudioManager")?;
+        let tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &tag,
+            "AudioManager profiler tag",
+        )?;
+        let body_start = tag_start
+            .checked_add(tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("AudioManager body start"))?;
+        let body = self
+            .serialized_object_graph
+            .get(body_start..)
+            .ok_or_else(|| invalid(body_start, "AudioManager body starts past graph end"))?;
+        let (data, consumed) = AudioManagerData::decode_prefix(self.format_version, body)?;
+        let body_end = body_start
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow("AudioManager body end"))?;
+        let next_tag_start = body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES).ok_or(
+            CrpError::ArithmeticOverflow("AudioManager profiler end position"),
+        )?;
+        let next_name = manager_profiler_name(next_manager, next_slot)?;
+        let next_tag = new_profiler_tag_bytes(&next_name)?;
+        if self
+            .serialized_object_graph
+            .get(next_tag_start..)
+            .is_none_or(|tail| !tail.starts_with(&next_tag))
+        {
+            return Err(invalid(
+                next_tag_start,
+                format!(
+                    "AudioManager fields do not end before the expected {next_name} profiler tag"
+                ),
+            ));
+        }
+        Ok(data)
     }
 
     fn info_manager_field_range(&self) -> Result<Range<usize>, CrpError> {
@@ -7338,6 +7401,34 @@ mod manager_boundary_tests {
         manager
     }
 
+    fn audio_manager_with_next(next_tag_name: &str) -> SimulationManagerData {
+        let mut graph = profiler_tag("AudioManager");
+        graph.extend_from_slice(&[
+            0x00, 0x01, // Two channel slots including reserved slot zero.
+            0x00, 0x01, // Two content slots including reserved slot zero.
+            0x00, 0x00, 0x00, 0x00, 0x00, // One inactive channel flag.
+            0x00, 0x00, // Empty channel prefab names.
+            0x00, 0x00, 0x00, 0x00, 0x00, // One inactive content flag.
+            0x00, 0x00, // No unlock milestones.
+            0x00, 0x00, // Empty content prefab names.
+        ]);
+        graph.extend_from_slice(&[0x12, 0x34]);
+        graph.extend(profiler_tag(next_tag_name));
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 293;
+        manager.manager_objects = Some(vec![
+            Some(ManagerObjectReference {
+                object_id: 1,
+                type_name: "AudioManager+Data, Assembly-CSharp".to_owned(),
+            }),
+            Some(ManagerObjectReference {
+                object_id: 2,
+                type_name: "StatisticsManager+Data, Assembly-CSharp".to_owned(),
+            }),
+        ]);
+        manager
+    }
+
     #[test]
     fn info_manager_mask_decodes_and_replaces_at_versioned_boundary() {
         for (version, original, replacement) in [
@@ -7410,6 +7501,29 @@ mod manager_boundary_tests {
         let field_start = profiler_tag("InfoManager").len();
         manager.serialized_object_graph[field_start] ^= 1;
         assert!(manager.replace_info_manager_data(&edited).is_err());
+    }
+
+    #[test]
+    fn audio_manager_decoder_checks_empty_body_boundary_and_preserves_fields() {
+        let manager = audio_manager_with_next("StatisticsManager");
+        let audio = manager.decode_audio_manager_data().unwrap();
+        assert_eq!(audio.format_version(), 293);
+        assert_eq!(audio.radio_channel_capacity(), 2);
+        assert_eq!(audio.channel_flags(), [0]);
+        assert!(audio.channel_prefab_indices().is_empty());
+        assert!(audio.channel_prefab_names().is_empty());
+        assert!(audio.radio_channels().is_empty());
+        assert_eq!(audio.radio_content_capacity(), 2);
+        assert_eq!(audio.content_flags(), [0]);
+        assert!(audio.content_prefab_indices().is_empty());
+        assert!(audio.content_prefab_names().is_empty());
+        assert!(audio.unlock_milestone_prefab_indices().is_empty());
+        assert!(audio.unlock_milestone_references().is_empty());
+        assert!(audio.radio_contents().is_empty());
+        assert_eq!(audio.encoded_len(), 20);
+
+        let manager = audio_manager_with_next("AudioManager");
+        assert!(manager.decode_audio_manager_data().is_err());
     }
 
     #[test]
