@@ -54,6 +54,12 @@ impl StatisticsManagerData {
         self.serialized_body.clone()
     }
 
+    /// Creates an editor for the start frame while preserving the array
+    /// reference and unresolved profiler end index.
+    pub fn into_editor(self) -> StatisticsManagerEditor {
+        StatisticsManagerEditor::from(self)
+    }
+
     pub(crate) fn decode(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         let mut reader = Reader::new(bytes);
         let start_frame = reader.read_u32_be()?;
@@ -70,6 +76,45 @@ impl StatisticsManagerData {
             },
             consumed,
         ))
+    }
+}
+
+/// Editable `StatisticsManager+Data` start-frame value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatisticsManagerEditor {
+    original: StatisticsManagerData,
+    start_frame: u32,
+}
+
+impl From<StatisticsManagerData> for StatisticsManagerEditor {
+    fn from(original: StatisticsManagerData) -> Self {
+        Self {
+            start_frame: original.start_frame,
+            original,
+        }
+    }
+}
+
+impl StatisticsManagerEditor {
+    /// Returns the inner DataSerializer version used for this body.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns mutable access to the statistics start frame.
+    pub fn start_frame_mut(&mut self) -> &mut u32 {
+        &mut self.start_frame
+    }
+
+    /// Encodes the edited frame and preserves every other body byte.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = self.original.serialized_body.clone();
+        bytes[..4].copy_from_slice(&self.start_frame.to_be_bytes());
+        bytes
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original.serialized_body
     }
 }
 

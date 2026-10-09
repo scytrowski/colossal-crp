@@ -20,7 +20,7 @@ use crate::guide_manager_data::GuideManagerReferences;
 use crate::net_manager_data::{
     NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader, read_net_object_header,
 };
-use crate::statistics_manager_data::StatisticsManagerData;
+use crate::statistics_manager_data::{StatisticsManagerData, StatisticsManagerEditor};
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
     BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlagsPrefix,
@@ -361,6 +361,59 @@ impl SimulationManagerData {
             .checked_add(consumed)
             .ok_or(CrpError::ArithmeticOverflow("StatisticsManager body end"))?;
         Ok((data, body_end))
+    }
+
+    /// Replaces the start frame in the queued `StatisticsManager+Data` body.
+    ///
+    /// Create `edited` from this manager's decoded statistics body. The inner
+    /// version and original bytes must still match. Only the four-byte start
+    /// frame changes, so the statistic-array reference, profiler index, queue
+    /// offsets, and object IDs remain unchanged.
+    pub fn replace_statistics_manager_data(
+        &mut self,
+        edited: &StatisticsManagerEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited StatisticsManager version does not match this stream",
+            ));
+        }
+        unique_manager_slot(self.manager_objects.as_deref(), "StatisticsManager+Data")?;
+        let tag = new_profiler_tag_bytes("StatisticsManager")?;
+        let tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &tag,
+            "StatisticsManager profiler tag",
+        )?;
+        let body_start = tag_start
+            .checked_add(tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("StatisticsManager body start"))?;
+        let original = edited.original_body_bytes();
+        let body_end = body_start
+            .checked_add(original.len())
+            .ok_or(CrpError::ArithmeticOverflow("StatisticsManager body end"))?;
+        let Some(current) = self.serialized_object_graph.get(body_start..body_end) else {
+            return Err(invalid(
+                body_start,
+                "StatisticsManager body extends past manager graph",
+            ));
+        };
+        if current != original {
+            return Err(invalid(
+                body_start,
+                "StatisticsManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode();
+        if replacement.len() != original.len() {
+            return Err(invalid(
+                body_start,
+                "StatisticsManager replacement must preserve the original length",
+            ));
+        }
+        self.serialized_object_graph[body_start..body_end].copy_from_slice(&replacement);
+        Ok(())
     }
 
     fn decode_guide_manager_references_at(
@@ -3226,6 +3279,29 @@ mod manager_boundary_tests {
             statistics.encode(),
             fixture[profiler_tag("StatisticsManager").len()..]
         );
+
+        let original_graph_len = manager.serialized_object_graph.len();
+        let mut edited = statistics.into_editor();
+        *edited.start_frame_mut() = 0x1234_5678;
+        let replacement = edited.encode();
+        let tag_len = profiler_tag("StatisticsManager").len();
+        assert_eq!(replacement.len(), fixture.len() - tag_len);
+        assert_eq!(&replacement[..4], &0x1234_5678_u32.to_be_bytes());
+        assert_eq!(&replacement[4..], &fixture[tag_len + 4..]);
+
+        manager.replace_statistics_manager_data(&edited).unwrap();
+        assert_eq!(manager.serialized_object_graph.len(), original_graph_len);
+        let rewritten = manager.decode_statistics_manager_data().unwrap();
+        assert_eq!(rewritten.start_frame(), 0x1234_5678);
+        assert_eq!(rewritten.profile_end_shared_string_index(), 30);
+        let mut wrong_version = manager.clone();
+        wrong_version.format_version = 114_008;
+        assert!(
+            wrong_version
+                .replace_statistics_manager_data(&edited)
+                .is_err()
+        );
+        assert!(manager.replace_statistics_manager_data(&edited).is_err());
 
         manager.serialized_object_graph.pop();
         assert!(manager.decode_statistics_manager_data().is_err());

@@ -83,7 +83,7 @@ pub use simulation_manager_data::{
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use statistics_manager_data::{
     StatisticArrayReferences, StatisticInt32Data, StatisticInt32Editor, StatisticInt64Data,
-    StatisticInt64Editor, StatisticsManagerData,
+    StatisticInt64Editor, StatisticsManagerData, StatisticsManagerEditor,
 };
 pub use terrain_manager_data::TerrainManagerData;
 pub use texture::TextureAsset;
