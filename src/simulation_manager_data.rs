@@ -16,11 +16,13 @@ use crate::audio_manager_data::{AudioManagerData, AudioManagerEditor};
 use crate::data_serializer::{
     DataSerializerStream, Reader, write_nullable_unique_string, write_u24_be, write_unique_string,
 };
+use crate::disaster_manager_data::DisasterManagerReferenceData;
 use crate::encoded_array::{
     EncodedLongArrayReader, read_encoded_byte_array, read_encoded_float_array,
     read_encoded_uint_array, read_encoded_ushort_array, write_encoded_byte_array,
     write_encoded_float_array, write_encoded_long_array, write_encoded_ushort_array,
 };
+use crate::event_manager_data::EventManagerReferenceData;
 use crate::guide_data::{
     GUIDE_INSTANCE_BODY_LEN, GUIDE_TRIGGER_BASE_PREFIX_LEN, GuideInstanceBody, GuideInstanceEditor,
     GuideTriggerBaseEditor, GuideTriggerBasePrefix,
@@ -32,7 +34,8 @@ use crate::net_manager_data::{
     NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader, read_net_object_header,
 };
 use crate::statistics_manager_data::{
-    StatisticInt32Editor, StatisticInt64Editor, StatisticsManagerData, StatisticsManagerEditor,
+    StatisticArrayReferences, StatisticInt32Editor, StatisticInt64Editor, StatisticsManagerData,
+    StatisticsManagerEditor,
 };
 use crate::unlock_manager_data::UnlockManagerReferences;
 use crate::{
@@ -490,10 +493,10 @@ pub struct SerializableDataEntry {
     pub data: Option<Vec<u8>>,
 }
 
-/// Location and declared type of one queued `BuildingManager` guide body.
+/// Location and declared type of one queued guide body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuideBodyLocation {
-    /// DataSerializer object-list ID referenced by BuildingManager.
+    /// DataSerializer object-list ID referenced by a manager field.
     pub object_id: u32,
     /// Byte offset relative to [`SimulationManagerData::serialized_object_graph`].
     pub graph_offset: usize,
@@ -564,7 +567,7 @@ impl TransportManagerSelectionPrefix {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct QueuedGuideObject {
+struct QueuedDataObject {
     object_id: u32,
     type_name: String,
 }
@@ -573,13 +576,14 @@ struct QueuedGuideObject {
 struct QueuedObjectReferencePrefix {
     children_start: usize,
     object_table: DataSerializerObjectTable,
-    queued_objects: Vec<QueuedGuideObject>,
+    queued_objects: Vec<QueuedDataObject>,
     net_manager_object_ids: Vec<Option<u32>>,
     water_manager_object_ids: Vec<Option<u32>>,
     zone_manager_object_ids: Vec<Option<u32>>,
     transport_manager_object_ids: Vec<Option<u32>>,
     economy_manager_object_ids: Vec<Option<u32>>,
     district_manager_object_ids: Vec<Option<u32>>,
+    guide_manager_object_ids: Vec<Option<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3191,6 +3195,7 @@ impl SimulationManagerData {
             transport_manager_object_ids: Vec::new(),
             economy_manager_object_ids: Vec::new(),
             district_manager_object_ids: Vec::new(),
+            guide_manager_object_ids: Vec::new(),
         })
     }
 
@@ -3313,6 +3318,270 @@ impl SimulationManagerData {
             &mut prefix.queued_objects,
         )?;
         Ok(prefix)
+    }
+
+    fn later_manager_guide_queue_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<QueuedObjectReferencePrefix, CrpError> {
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let guide_slot = unique_manager_slot(Some(managers), "GuideManager+Data")?;
+        let mut prefix = self.district_manager_queue_prefix(save_app_version)?;
+
+        for slot in 21..=guide_slot {
+            let Some(reference) = managers.get(slot).and_then(Option::as_ref) else {
+                continue;
+            };
+            let class_name = object_class_name(&reference.type_name);
+            match class_name {
+                "EventManager+Data" => {
+                    let headers = self.decode_event_manager_reference_headers_at(slot)?;
+                    register_reference_headers(
+                        &headers,
+                        &mut prefix.object_table,
+                        &mut prefix.queued_objects,
+                    )?;
+                }
+                "DisasterManager+Data" => {
+                    let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
+                    let bytes = self
+                        .serialized_object_graph
+                        .get(body_start..next_tag_start)
+                        .ok_or_else(|| {
+                            invalid(body_start, "DisasterManager body range is invalid")
+                        })?;
+                    let (data, consumed) =
+                        DisasterManagerReferenceData::decode(self.format_version, bytes)?;
+                    if consumed != bytes.len() {
+                        return Err(invalid(
+                            body_start + consumed,
+                            "DisasterManager fields do not end at the following manager tag",
+                        ));
+                    }
+                    register_reference_headers(
+                        &data.object_headers,
+                        &mut prefix.object_table,
+                        &mut prefix.queued_objects,
+                    )?;
+                }
+                "InfoManager+Data" => {
+                    self.decode_info_manager_data()?;
+                }
+                "AudioManager+Data" => {
+                    let audio = self.decode_audio_manager_data()?;
+                    register_reference_headers(
+                        audio.unlock_milestone_references(),
+                        &mut prefix.object_table,
+                        &mut prefix.queued_objects,
+                    )?;
+                }
+                "StatisticsManager+Data" => {
+                    let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
+                    let bytes = self
+                        .serialized_object_graph
+                        .get(body_start..next_tag_start)
+                        .ok_or_else(|| {
+                            invalid(body_start, "StatisticsManager body range is invalid")
+                        })?;
+                    let (statistics, consumed) =
+                        StatisticsManagerData::decode(self.format_version, bytes)?;
+                    if consumed != bytes.len() {
+                        return Err(invalid(
+                            body_start + consumed,
+                            "StatisticsManager fields do not end at the following manager tag",
+                        ));
+                    }
+                    register_queued_reference(
+                        statistics.statistic_array_header(),
+                        &mut prefix.object_table,
+                        &mut prefix.queued_objects,
+                    )?;
+                }
+                "UnlockManager+Data" => {
+                    let unlock = self.decode_unlock_manager_references()?;
+                    for array in unlock.arrays() {
+                        register_reference_headers(
+                            array.references(),
+                            &mut prefix.object_table,
+                            &mut prefix.queued_objects,
+                        )?;
+                    }
+                    register_reference_headers(
+                        unlock.scenario_trigger_references(),
+                        &mut prefix.object_table,
+                        &mut prefix.queued_objects,
+                    )?;
+                    // These two unused-guide references occur in the manager
+                    // fields, but the validated queued guide-body run begins
+                    // without body slots for them. Register their object IDs
+                    // and shared types while leaving their raw graph bytes
+                    // untouched and outside this locator's body walk.
+                    for header in [
+                        unlock.milestones_not_used(),
+                        unlock.scenario_goals_not_used(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        prefix.object_table.register(header)?;
+                    }
+                }
+                "MessageManager+Data" => {
+                    let message = self.decode_message_manager_data()?;
+                    let mut headers = Vec::new();
+                    if let Some(queue) = message.message_queue() {
+                        headers.extend(queue.iter().cloned());
+                    }
+                    if let Some(recent) = message.recent_messages() {
+                        headers.extend(recent.iter().cloned());
+                    }
+                    register_reference_headers(
+                        &headers,
+                        &mut prefix.object_table,
+                        &mut prefix.queued_objects,
+                    )?;
+                }
+                "GuideManager+Data" => {
+                    let guide = self.decode_guide_manager_references()?;
+                    let headers = guide
+                        .references()
+                        .iter()
+                        .map(|reference| reference.header().clone())
+                        .collect::<Vec<_>>();
+                    prefix.guide_manager_object_ids = register_reference_headers(
+                        &headers,
+                        &mut prefix.object_table,
+                        &mut prefix.queued_objects,
+                    )?;
+                }
+                _ => {
+                    return Err(invalid(
+                        slot,
+                        format!(
+                            "cannot continue queued-object traversal through unsupported manager {}",
+                            reference.type_name
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if prefix.guide_manager_object_ids.is_empty() {
+            let guide = self.decode_guide_manager_references()?;
+            let headers = guide
+                .references()
+                .iter()
+                .map(|reference| reference.header().clone())
+                .collect::<Vec<_>>();
+            prefix.guide_manager_object_ids = register_reference_headers(
+                &headers,
+                &mut prefix.object_table,
+                &mut prefix.queued_objects,
+            )?;
+        }
+        Ok(prefix)
+    }
+
+    fn manager_body_boundary(&self, slot: usize) -> Result<(usize, usize), CrpError> {
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(slot, "manager object array is null"))?;
+        let reference = managers
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| invalid(slot, "manager reference is null"))?;
+        let name = manager_profiler_name(reference, slot)?;
+        let tag = new_profiler_tag_bytes(&name)?;
+        let tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &tag,
+            &format!("{name} profiler tag"),
+        )?;
+        let body_start = tag_start
+            .checked_add(tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("manager body start"))?;
+        let next_slot_start = slot
+            .checked_add(1)
+            .ok_or(CrpError::ArithmeticOverflow("next manager slot"))?;
+        let next_reference = managers
+            .iter()
+            .enumerate()
+            .skip(next_slot_start)
+            .find_map(|(next_slot, reference)| {
+                reference.as_ref().map(|reference| (next_slot, reference))
+            })
+            .ok_or_else(|| invalid(slot, "manager has no following manager reference"))?;
+        let next_name = manager_profiler_name(next_reference.1, next_reference.0)?;
+        let next_tag = new_profiler_tag_bytes(&next_name)?;
+        let next_tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &next_tag,
+            &format!("{next_name} profiler tag"),
+        )?;
+        Ok((body_start, next_tag_start))
+    }
+
+    fn decode_event_manager_reference_headers_at(
+        &self,
+        slot: usize,
+    ) -> Result<Vec<NetObjectHeader>, CrpError> {
+        let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
+        let bytes = self
+            .serialized_object_graph
+            .get(body_start..next_tag_start)
+            .ok_or_else(|| invalid(body_start, "EventManager body range is invalid"))?;
+        let mut candidates = Vec::<(&str, Vec<NetObjectHeader>)>::new();
+        let mut failures = Vec::new();
+
+        for (layout, result) in [
+            (
+                "reader",
+                EventManagerReferenceData::decode_reader(self.format_version, bytes),
+            ),
+            (
+                "reader with counted references",
+                EventManagerReferenceData::decode_reader_with_counted_references(
+                    self.format_version,
+                    bytes,
+                ),
+            ),
+            ("writer", EventManagerReferenceData::decode_writer(bytes)),
+        ] {
+            match result {
+                Ok((data, consumed)) if consumed == bytes.len() => {
+                    if !candidates
+                        .iter()
+                        .any(|(_, existing)| *existing == data.object_headers)
+                    {
+                        candidates.push((layout, data.object_headers));
+                    }
+                }
+                Ok((_, consumed)) => failures.push(format!(
+                    "{layout} layout consumed {consumed} of {} bytes",
+                    bytes.len()
+                )),
+                Err(error) => failures.push(format!("{layout} layout failed: {error}")),
+            }
+        }
+
+        match candidates.as_slice() {
+            [(_, headers)] => Ok(headers.clone()),
+            [] => Err(invalid(
+                body_start,
+                format!(
+                    "EventManager has no supported empty-record layout ending at the next manager tag ({})",
+                    failures.join("; ")
+                ),
+            )),
+            _ => Err(invalid(
+                body_start,
+                "EventManager reader and writer layouts match the boundary but yield different references",
+            )),
+        }
     }
 
     fn decode_transport_manager_reference_headers(
@@ -4398,6 +4667,33 @@ impl SimulationManagerData {
                     .transpose()
             })
             .collect()
+    }
+
+    /// Locates every queued object referenced by `GuideManager+Data`.
+    ///
+    /// The queue walk now includes known reference fields from EventManager,
+    /// DisasterManager, AudioManager, StatisticsManager, UnlockManager, and
+    /// MessageManager before advancing through GuideManager's children. It
+    /// currently supports inner version 164 and newer, with empty EventManager
+    /// and DisasterManager record buffers. It returns an error if a preceding
+    /// manager layout or queued object body type is unknown. The two
+    /// `UnlockManager` unused-guide headers are registered but are not assigned
+    /// body locations; their position in the queued body stream remains
+    /// unresolved. Inner version-221+ `NetNodeInstanceGuide` bodies require the
+    /// saved application version.
+    pub fn locate_guide_manager_reference_bodies(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<Option<GuideBodyLocation>>, CrpError> {
+        let prefix = self.later_manager_guide_queue_prefix(save_app_version)?;
+        locate_queued_object_bodies(
+            &self.serialized_object_graph,
+            prefix.children_start,
+            &prefix.queued_objects,
+            &prefix.guide_manager_object_ids,
+            self.format_version,
+            save_app_version,
+        )
     }
 
     /// Locates a queued BuildingManager object body by its reference-header index.
@@ -6967,7 +7263,7 @@ fn skip_transport_manager_shared_string_value(reader: &mut Reader<'_>) -> Result
 fn register_raw_queued_reference(
     bytes: &[u8],
     object_table: &mut DataSerializerObjectTable,
-    queued_objects: &mut Vec<QueuedGuideObject>,
+    queued_objects: &mut Vec<QueuedDataObject>,
     description: &str,
 ) -> Result<(), CrpError> {
     if bytes.is_empty() {
@@ -6988,7 +7284,7 @@ fn register_raw_queued_reference(
 fn register_queued_reference(
     header: &NetObjectHeader,
     object_table: &mut DataSerializerObjectTable,
-    queued_objects: &mut Vec<QueuedGuideObject>,
+    queued_objects: &mut Vec<QueuedDataObject>,
 ) -> Result<Option<u32>, CrpError> {
     let previous_object_count = object_table.object_types.len();
     let object_id = object_table.register(header)?;
@@ -7001,7 +7297,7 @@ fn register_queued_reference(
             .type_name(object_id)
             .ok_or_else(|| invalid(0, "new object is missing from the object-list table"))?
             .to_owned();
-        queued_objects.push(QueuedGuideObject {
+        queued_objects.push(QueuedDataObject {
             object_id,
             type_name,
         });
@@ -7012,7 +7308,7 @@ fn register_queued_reference(
 fn register_reference_headers(
     headers: &[NetObjectHeader],
     object_table: &mut DataSerializerObjectTable,
-    queued_objects: &mut Vec<QueuedGuideObject>,
+    queued_objects: &mut Vec<QueuedDataObject>,
 ) -> Result<Vec<Option<u32>>, CrpError> {
     headers
         .iter()
@@ -7023,7 +7319,7 @@ fn register_reference_headers(
 fn locate_queued_object_body(
     graph: &[u8],
     start_offset: usize,
-    queued_objects: &[QueuedGuideObject],
+    queued_objects: &[QueuedDataObject],
     target_object_id: u32,
     format_version: u32,
     save_app_version: Option<u32>,
@@ -7047,7 +7343,7 @@ fn locate_queued_object_body(
 fn locate_queued_object_bodies(
     graph: &[u8],
     start_offset: usize,
-    queued_objects: &[QueuedGuideObject],
+    queued_objects: &[QueuedDataObject],
     target_object_ids: &[Option<u32>],
     format_version: u32,
     save_app_version: Option<u32>,
@@ -7071,14 +7367,14 @@ fn locate_queued_object_bodies(
         if object.object_id > last_target_id {
             break;
         }
-        let body_length = guide_object_body_length(
+        let body_length = queued_object_body_length(
             &object.type_name,
             format_version,
             save_app_version,
             graph.get(graph_offset..).ok_or_else(|| {
                 invalid(
                     graph_offset,
-                    "queued guide body starts outside the manager graph",
+                    "queued object body starts outside the manager graph",
                 )
             })?,
             graph_offset,
@@ -7096,7 +7392,7 @@ fn locate_queued_object_bodies(
         }
         graph_offset = graph_offset
             .checked_add(body_length)
-            .ok_or(CrpError::ArithmeticOverflow("queued guide body offset"))?;
+            .ok_or(CrpError::ArithmeticOverflow("queued object body offset"))?;
     }
 
     for (index, object_id) in target_object_ids.iter().enumerate() {
@@ -7112,7 +7408,7 @@ fn locate_queued_object_bodies(
     Ok(locations)
 }
 
-fn guide_object_body_length(
+fn queued_object_body_length(
     type_name: &str,
     format_version: u32,
     save_app_version: Option<u32>,
@@ -7130,10 +7426,11 @@ fn guide_object_body_length(
             NetNodeInstanceGuideBody::decode(format_version, save_app_version, bytes)
                 .map(|(_, consumed)| consumed)
         }
+        "StatisticArray" => StatisticArrayReferences::decode(bytes).map(|(_, consumed)| consumed),
         _ => Err(invalid(
             graph_offset,
             format!(
-                "cannot locate target guide because queued type {type_name} has no known body schema"
+                "cannot locate target object because queued type {type_name} has no known body schema"
             ),
         )),
     }
@@ -7249,7 +7546,7 @@ mod manager_boundary_tests {
     use super::{
         DataSerializerObjectTable, ECONOMY_MANAGER_CASH_VALUE_COUNT, ECONOMY_MANAGER_LOAN_COUNT,
         EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
-        GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference, QueuedGuideObject,
+        GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference, QueuedDataObject,
         SimulationManagerData, TransportManagerSelection, TransportManagerSharedStringValue,
         decode_economy_manager_budget_editor, decode_economy_manager_income_expense_editor,
         decode_economy_manager_investment_editor,
@@ -9903,11 +10200,11 @@ mod manager_boundary_tests {
         assert_eq!(
             queued,
             [
-                QueuedGuideObject {
+                QueuedDataObject {
                     object_id: 1,
                     type_name: "GenericGuide".to_owned(),
                 },
-                QueuedGuideObject {
+                QueuedDataObject {
                     object_id: 2,
                     type_name: "GenericGuide".to_owned(),
                 },
@@ -9927,19 +10224,19 @@ mod manager_boundary_tests {
         graph.extend_from_slice(&third);
         graph.extend_from_slice(&fourth);
         let objects = vec![
-            QueuedGuideObject {
+            QueuedDataObject {
                 object_id: 5,
                 type_name: "GenericGuide, Assembly-CSharp".to_owned(),
             },
-            QueuedGuideObject {
+            QueuedDataObject {
                 object_id: 6,
                 type_name: "BuildingInstanceGuide, Assembly-CSharp".to_owned(),
             },
-            QueuedGuideObject {
+            QueuedDataObject {
                 object_id: 7,
                 type_name: "ServiceTypeGuide, Assembly-CSharp".to_owned(),
             },
-            QueuedGuideObject {
+            QueuedDataObject {
                 object_id: 8,
                 type_name: "ZoneTypeGuide, Assembly-CSharp".to_owned(),
             },
@@ -9963,15 +10260,15 @@ mod manager_boundary_tests {
     fn batch_queued_body_locator_preserves_header_order_and_repeated_references() {
         let mut graph = vec![0; 11 + 17 + 11];
         let objects = vec![
-            QueuedGuideObject {
+            QueuedDataObject {
                 object_id: 5,
                 type_name: "GenericGuide, Assembly-CSharp".to_owned(),
             },
-            QueuedGuideObject {
+            QueuedDataObject {
                 object_id: 6,
                 type_name: "BuildingInstanceGuide, Assembly-CSharp".to_owned(),
             },
-            QueuedGuideObject {
+            QueuedDataObject {
                 object_id: 7,
                 type_name: "ServiceTypeGuide, Assembly-CSharp".to_owned(),
             },

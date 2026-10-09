@@ -10,8 +10,10 @@ mod asset_io;
 mod audio_manager_data;
 mod building_manager_data;
 mod data_serializer;
+mod disaster_manager_data;
 mod district_manager_data;
 mod encoded_array;
+mod event_manager_data;
 mod game_area_data;
 mod guide_data;
 mod guide_manager_data;
@@ -4954,6 +4956,34 @@ mod tests {
                 ))
                 .count(),
             1
+        );
+
+        let guide_objects =
+            manager.locate_guide_manager_reference_bodies(metadata.save_app_version)?;
+        assert_eq!(guide_objects.len(), guide_references.references().len());
+        let guide_objects = guide_objects
+            .into_iter()
+            .map(|location| {
+                location.ok_or_else(|| std::io::Error::other("null GuideManager child"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(guide_objects[0].graph_offset, 4_201_859);
+        assert!(
+            guide_objects
+                .iter()
+                .all(|location| location.body_length == 11)
+        );
+        assert_eq!(
+            guide_objects
+                .last()
+                .map(|location| location.graph_offset + location.body_length),
+            Some(4_202_387)
+        );
+        const GUIDE_BODY_FIXTURE: &[u8] =
+            include_bytes!("../tests/fixtures/guide-manager-bodies-v112004-wolf-creek.bin");
+        assert_eq!(
+            &manager.serialized_object_graph()[4_201_859..4_202_387],
+            GUIDE_BODY_FIXTURE
         );
 
         let net_locations = manager.locate_net_manager_guide_bodies(metadata.save_app_version)?;
