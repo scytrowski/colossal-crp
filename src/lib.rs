@@ -15,6 +15,7 @@ mod game_area_data;
 mod guide_data;
 mod guide_manager_data;
 mod instance_manager_data;
+mod message_manager_data;
 mod metadata;
 mod net_manager_data;
 mod path_manager_data;
@@ -65,6 +66,7 @@ pub use guide_manager_data::{
     GuideManagerReference, GuideManagerReferenceField, GuideManagerReferences,
 };
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
+pub use message_manager_data::{MessageDataEntry, MessageManagerData};
 pub use metadata::{DistrictStyleMetaData, MapMetaData, ModInfo, SystemMapMetaData};
 pub use net_manager_data::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLane, NetLanePrefix,
@@ -4358,6 +4360,40 @@ mod tests {
                 assert_eq!(
                     unlock.scenario_goals_not_used().is_some(),
                     manager.format_version() >= 295
+                );
+                let messages = manager.decode_message_manager_data().map_err(|error| {
+                    std::io::Error::other(format!(
+                        "{} asset {:?}: {error}",
+                        path.display(),
+                        asset.name
+                    ))
+                })?;
+                assert_eq!(messages.format_version(), manager.format_version());
+                assert!(
+                    messages
+                        .message_queue()
+                        .is_none_or(|references| references.is_empty())
+                );
+                let recent_messages = messages
+                    .recent_messages()
+                    .ok_or_else(|| std::io::Error::other("recent-message array is null"))?;
+                assert_eq!(recent_messages.len(), 16);
+                assert!(
+                    recent_messages
+                        .iter()
+                        .all(|reference| *reference == NetObjectHeader::Null)
+                );
+                assert!(
+                    messages
+                        .message_data()
+                        .is_some_and(|entries| entries.is_empty())
+                );
+                let timer_count = messages
+                    .random_message_timer_count()
+                    .ok_or_else(|| std::io::Error::other("timer count is absent"))?;
+                assert_eq!(
+                    usize::try_from(timer_count)?,
+                    messages.random_message_timers().len()
                 );
                 manager_record_count += 1;
             }

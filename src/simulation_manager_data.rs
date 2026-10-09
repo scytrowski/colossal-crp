@@ -17,6 +17,7 @@ use crate::guide_data::{
     GuideTriggerBaseEditor, GuideTriggerBasePrefix,
 };
 use crate::guide_manager_data::GuideManagerReferences;
+use crate::message_manager_data::MessageManagerData;
 use crate::net_manager_data::{
     NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader, read_net_object_header,
 };
@@ -421,6 +422,58 @@ impl SimulationManagerData {
             ));
         }
         Ok((references, body_end))
+    }
+
+    /// Decodes the versioned message arrays and counters in `MessageManager+Data`.
+    ///
+    /// Object references and message strings remain as decoded values, while
+    /// the original body is retained for exact unchanged writing. The body
+    /// boundary is checked against the following `GuideManager+Data` tag.
+    pub fn decode_message_manager_data(&self) -> Result<MessageManagerData, CrpError> {
+        let slot = unique_manager_slot(self.manager_objects.as_deref(), "MessageManager+Data")?;
+        let next_slot = slot
+            .checked_add(1)
+            .ok_or(CrpError::ArithmeticOverflow("MessageManager next slot"))?;
+        expect_manager_type(
+            self.manager_objects.as_deref(),
+            next_slot,
+            "GuideManager+Data",
+        )?;
+        self.decode_message_manager_data_at().map(|(data, _)| data)
+    }
+
+    fn decode_message_manager_data_at(&self) -> Result<(MessageManagerData, usize), CrpError> {
+        let tag = new_profiler_tag_bytes("MessageManager")?;
+        let tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &tag,
+            "MessageManager profiler tag",
+        )?;
+        let body_start = tag_start
+            .checked_add(tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("MessageManager body start"))?;
+        let (data, consumed) = MessageManagerData::decode(
+            self.format_version,
+            &self.serialized_object_graph[body_start..],
+        )?;
+        let body_end = body_start
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow("MessageManager body end"))?;
+        let next_tag = new_profiler_tag_bytes("GuideManager")?;
+        let next_tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &next_tag,
+            "GuideManager profiler tag",
+        )?;
+        if body_end != next_tag_start {
+            return Err(invalid(
+                body_end,
+                format!(
+                    "MessageManager ends at {body_end}, but GuideManager begins at {next_tag_start}"
+                ),
+            ));
+        }
+        Ok((data, body_end))
     }
 
     /// Replaces the start frame in the queued `StatisticsManager+Data` body.
@@ -3567,6 +3620,52 @@ mod manager_boundary_tests {
             .serialized_object_graph
             .insert(graph.len() - profiler_tag("MessageManager").len(), 0xaa);
         assert!(manager.decode_unlock_manager_references().is_err());
+    }
+
+    #[test]
+    fn message_manager_checks_versioned_fields_against_the_guide_tag() {
+        let mut graph = profiler_tag("MessageManager");
+        graph.push(0xff);
+        graph.extend_from_slice(&[0x00, 0x00, 0x10]);
+        graph.extend([0xff; 16]);
+        graph.extend_from_slice(&0x0007_i16.to_be_bytes());
+        graph.extend_from_slice(&[0, 0, 0]);
+        graph.extend_from_slice(&0x0102_0304_u32.to_be_bytes());
+        graph.extend_from_slice(&0_i16.to_be_bytes());
+        graph.extend_from_slice(&0x0009_u16.to_be_bytes());
+        graph.extend(profiler_tag("GuideManager"));
+
+        let mut manager = manager_with_graph(graph.clone());
+        manager.format_version = 194;
+        manager.manager_objects = Some(vec![
+            Some(ManagerObjectReference {
+                object_id: 1,
+                type_name: "MessageManager+Data, Assembly-CSharp".to_owned(),
+            }),
+            Some(ManagerObjectReference {
+                object_id: 2,
+                type_name: "GuideManager+Data, Assembly-CSharp".to_owned(),
+            }),
+        ]);
+        let data = manager.decode_message_manager_data().unwrap();
+        assert_eq!(data.message_queue(), None);
+        assert_eq!(data.recent_messages().unwrap().len(), 16);
+        assert_eq!(data.recent_message_index(), Some(7));
+        assert!(data.message_data().unwrap().is_empty());
+        assert_eq!(data.last_random_message_frame(), Some(0x0102_0304));
+        assert_eq!(data.random_message_timer_count(), Some(0));
+        assert!(data.random_message_timers().is_empty());
+        assert_eq!(data.profile_end_shared_string_index(), 9);
+        assert_eq!(
+            data.encode(),
+            graph[profiler_tag("MessageManager").len()
+                ..graph.len() - profiler_tag("GuideManager").len()]
+        );
+
+        manager
+            .serialized_object_graph
+            .insert(graph.len() - profiler_tag("GuideManager").len(), 0xaa);
+        assert!(manager.decode_message_manager_data().is_err());
     }
 
     #[test]
