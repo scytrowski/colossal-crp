@@ -331,23 +331,18 @@ impl SimulationManagerData {
     ///
     /// The result contains the start frame and raw `StatisticArray` reference
     /// header, with the original profiler end index retained for exact
-    /// writing. The reference is not resolved to a queued object ID.
+    /// writing. The index is not resolved against the full DataSerializer
+    /// shared-string table, and the reference is not resolved to a queued
+    /// object ID.
     pub fn decode_statistics_manager_data(&self) -> Result<StatisticsManagerData, CrpError> {
-        let statistics_slot =
-            unique_manager_slot(self.manager_objects.as_deref(), "StatisticsManager+Data")?;
-        self.decode_statistics_manager_data_at(statistics_slot)
+        unique_manager_slot(self.manager_objects.as_deref(), "StatisticsManager+Data")?;
+        self.decode_statistics_manager_data_at()
             .map(|(data, _)| data)
     }
 
     fn decode_statistics_manager_data_at(
         &self,
-        statistics_slot: usize,
     ) -> Result<(StatisticsManagerData, usize), CrpError> {
-        let expected_profile_index = manager_profile_string_index(
-            self.manager_objects.as_deref(),
-            statistics_slot,
-            "StatisticsManager",
-        )?;
         let tag = new_profiler_tag_bytes("StatisticsManager")?;
         let tag_start = find_unique_bytes(
             &self.serialized_object_graph,
@@ -359,7 +354,6 @@ impl SimulationManagerData {
             .ok_or(CrpError::ArithmeticOverflow("StatisticsManager body start"))?;
         let (data, consumed) = StatisticsManagerData::decode(
             self.format_version,
-            expected_profile_index,
             &self.serialized_object_graph[body_start..],
         )?;
         let body_end = body_start
@@ -3235,28 +3229,28 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn statistics_manager_decoder_follows_profiler_tag_and_preserves_fields() {
-        let mut graph = profiler_tag("StatisticsManager");
-        graph.extend_from_slice(&0x0102_0304_u32.to_be_bytes());
-        graph.extend_from_slice(&[0xfe, 0xfe]);
-        write_unique_string(&mut graph, "StatisticArray").unwrap();
-        graph.extend_from_slice(&[0x00, 0x01]);
-
-        let mut manager = manager_with_graph(graph.clone());
+    fn statistics_manager_preserves_game_profile_index_without_resolving_it() {
+        let fixture = include_bytes!("../tests/fixtures/statistics-manager-v114009-ap-hanami.bin");
+        let mut manager = manager_with_graph(fixture.to_vec());
+        manager.format_version = 114_009;
         manager.manager_objects = Some(vec![Some(ManagerObjectReference {
             object_id: 1,
             type_name: "StatisticsManager+Data, Assembly-CSharp".to_owned(),
         })]);
         let statistics = manager.decode_statistics_manager_data().unwrap();
-        assert_eq!(statistics.format_version(), 112_004);
-        assert_eq!(statistics.start_frame(), 0x0102_0304);
+        assert_eq!(statistics.format_version(), 114_009);
+        assert_eq!(statistics.start_frame(), 4_775);
         assert_eq!(
             statistics.statistic_array_header(),
-            &NetObjectHeader::NewType("StatisticArray".to_owned())
+            &NetObjectHeader::NewType(
+                "StatisticArray, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+                    .to_owned()
+            )
         );
+        assert_eq!(statistics.profile_end_shared_string_index(), 30);
         assert_eq!(
             statistics.encode(),
-            graph[profiler_tag("StatisticsManager").len()..]
+            fixture[profiler_tag("StatisticsManager").len()..]
         );
 
         manager.serialized_object_graph.pop();

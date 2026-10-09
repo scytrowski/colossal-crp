@@ -20,6 +20,7 @@ pub struct StatisticsManagerData {
     format_version: u32,
     start_frame: u32,
     statistic_array: NetObjectHeader,
+    profile_end_shared_string_index: u16,
     serialized_body: Vec<u8>,
 }
 
@@ -39,31 +40,32 @@ impl StatisticsManagerData {
         &self.statistic_array
     }
 
+    /// Returns the profiler end index stored by this manager body.
+    ///
+    /// The index is retained as serialized. Resolving it requires the full
+    /// DataSerializer shared-string table, which this manager-level decoder
+    /// does not reconstruct.
+    pub fn profile_end_shared_string_index(&self) -> u16 {
+        self.profile_end_shared_string_index
+    }
+
     /// Returns the original fields and profiler end index byte for byte.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_body.clone()
     }
 
-    pub(crate) fn decode(
-        format_version: u32,
-        expected_profile_index: u16,
-        bytes: &[u8],
-    ) -> Result<(Self, usize), CrpError> {
+    pub(crate) fn decode(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         let mut reader = Reader::new(bytes);
         let start_frame = reader.read_u32_be()?;
         let statistic_array = read_net_object_header(&mut reader)?;
         let profile_end = reader.read_u16_be()?;
-        if profile_end != expected_profile_index {
-            return Err(reader.invalid(format!(
-                "StatisticsManager end tag refers to profiler string {profile_end}, expected {expected_profile_index}"
-            )));
-        }
         let consumed = reader.offset();
         Ok((
             Self {
                 format_version,
                 start_frame,
                 statistic_array,
+                profile_end_shared_string_index: profile_end,
                 serialized_body: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -704,7 +706,7 @@ mod tests {
         write_unique_string(&mut bytes, "StatisticArray").unwrap();
         bytes.extend_from_slice(&[0x00, 0x07]);
 
-        let (manager, consumed) = StatisticsManagerData::decode(112_004, 7, &bytes).unwrap();
+        let (manager, consumed) = StatisticsManagerData::decode(112_004, &bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(manager.format_version(), 112_004);
         assert_eq!(manager.start_frame(), 0x0102_0304);
@@ -712,9 +714,13 @@ mod tests {
             manager.statistic_array_header(),
             &NetObjectHeader::NewType("StatisticArray".to_owned())
         );
+        assert_eq!(manager.profile_end_shared_string_index(), 7);
         assert_eq!(manager.encode(), bytes);
-        assert!(StatisticsManagerData::decode(112_004, 8, &bytes).is_err());
-        assert!(StatisticsManagerData::decode(112_004, 7, &bytes[..bytes.len() - 1]).is_err());
+        *bytes.last_mut().unwrap() = 8;
+        let (manager, consumed) = StatisticsManagerData::decode(112_004, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(manager.profile_end_shared_string_index(), 8);
+        assert!(StatisticsManagerData::decode(112_004, &bytes[..bytes.len() - 1]).is_err());
     }
 
     #[test]

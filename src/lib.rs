@@ -4291,6 +4291,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads the local data/maps corpus"]
+    fn validates_statistics_manager_in_local_map_corpus() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let maps_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps");
+        let mut paths = fs::read_dir(maps_dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.retain(|path| path.extension().is_some_and(|extension| extension == "crp"));
+        paths.sort();
+
+        let mut statistics_manager_count = 0;
+        for path in paths {
+            let mut file = File::open(&path)?;
+            let package = Package::read_from(&mut file)?;
+            for asset in package.assets.iter().filter(|asset| asset.asset_type == 52) {
+                let (_, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+                let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+                let statistics = manager.decode_statistics_manager_data().map_err(|error| {
+                    std::io::Error::other(format!(
+                        "{} asset {:?}: {error}",
+                        path.display(),
+                        asset.name
+                    ))
+                })?;
+                assert_eq!(statistics.format_version(), manager.format_version());
+                statistics_manager_count += 1;
+            }
+        }
+
+        assert_eq!(statistics_manager_count, 110);
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "reads the local CL Wolf Creek game map from data/maps"]
     fn validates_wolf_creek_building_manager_guide_locator()
     -> Result<(), Box<dyn std::error::Error>> {
