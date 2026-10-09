@@ -4519,6 +4519,16 @@ mod tests {
                 expected_district_count,
                 "{file_name}"
             );
+            if expected_version >= 116_017 {
+                let investment_flags =
+                    manager.decode_economy_manager_investment_flags(metadata.save_app_version)?;
+                assert_eq!(investment_flags.len(), 254, "{file_name}");
+                assert_eq!(
+                    investment_flags.iter().filter(|flag| **flag != 0).count(),
+                    13,
+                    "{file_name}"
+                );
+            }
         }
         Ok(())
     }

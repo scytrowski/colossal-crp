@@ -12,7 +12,7 @@ use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
-use crate::encoded_array::read_encoded_uint_array;
+use crate::encoded_array::{read_encoded_uint_array, read_encoded_ushort_array};
 use crate::guide_data::{
     GUIDE_INSTANCE_BODY_LEN, GUIDE_TRIGGER_BASE_PREFIX_LEN, GuideInstanceBody, GuideInstanceEditor,
     GuideTriggerBaseEditor, GuideTriggerBasePrefix,
@@ -57,6 +57,7 @@ const MAX_OBJECT_ID: u32 = 0xfe_0000;
 const MAX_SHARED_TYPES: usize = 65_024;
 const LOADING_PROFILER_END_TAG_BYTES: usize = 2;
 const MAX_TRAILING_HEADER_CANDIDATES: usize = 64;
+const ECONOMY_INVESTMENT_FLAG_COUNT: usize = 254;
 
 /// A non-null reference in `SimulationManager+Data`'s manager-data array.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2689,10 +2690,10 @@ impl SimulationManagerData {
         decode_transport_manager_reference_body(self.format_version, body, object_table)
     }
 
-    fn decode_economy_manager_reference_headers(
+    fn economy_manager_body(
         &self,
         object_table: &DataSerializerObjectTable,
-    ) -> Result<Vec<NetObjectHeader>, CrpError> {
+    ) -> Result<&[u8], CrpError> {
         expect_manager_type(self.manager_objects.as_deref(), 19, "EconomyManager+Data")?;
         expect_manager_type(self.manager_objects.as_deref(), 20, "DistrictManager+Data")?;
         if self.format_version < 164 {
@@ -2746,7 +2747,14 @@ impl SimulationManagerData {
             ));
         }
 
-        let body = &self.serialized_object_graph[body_start..end_tag_start];
+        Ok(&self.serialized_object_graph[body_start..end_tag_start])
+    }
+
+    fn decode_economy_manager_reference_headers(
+        &self,
+        object_table: &DataSerializerObjectTable,
+    ) -> Result<Vec<NetObjectHeader>, CrpError> {
+        let body = self.economy_manager_body(object_table)?;
         if self.format_version >= 116_000 {
             return find_economy_manager_guide_headers(self.format_version, body, object_table);
         }
@@ -3079,6 +3087,24 @@ impl SimulationManagerData {
                     .transpose()
             })
             .collect()
+    }
+
+    /// Decodes EconomyManager's investment activation flags for inner version 116017 and newer.
+    ///
+    /// The returned vector contains 254 flags for investment indices 1–254;
+    /// element zero corresponds to serialized investment index 1. This path
+    /// requires the five preceding guide references to be newly declared
+    /// `GenericGuide` objects and a resolvable preceding TransportManager
+    /// layout. Investment values and prefab assignments remain opaque. Pass
+    /// the saved application version for earlier
+    /// inner-version-221+ NetNodeInstanceGuide fields in the manager queue.
+    pub fn decode_economy_manager_investment_flags(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<u16>, CrpError> {
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        let body = self.economy_manager_body(&prefix.object_table)?;
+        decode_economy_manager_investment_flags(self.format_version, body, &prefix.object_table)
     }
 
     /// Resolves the version-gated object references at the end of DistrictManager.
@@ -3739,6 +3765,19 @@ fn find_economy_manager_guide_headers(
     bytes: &[u8],
     object_table: &DataSerializerObjectTable,
 ) -> Result<Vec<NetObjectHeader>, CrpError> {
+    Ok(
+        find_economy_manager_guide_header_positions(format_version, bytes, object_table)?
+            .into_iter()
+            .map(|(_, _, header)| header)
+            .collect(),
+    )
+}
+
+fn find_economy_manager_guide_header_positions(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: &DataSerializerObjectTable,
+) -> Result<Vec<(usize, usize, NetObjectHeader)>, CrpError> {
     let expected_count = if format_version >= 116_017 { 5 } else { 2 };
     let mut matches = Vec::new();
     for start in 0..bytes.len() {
@@ -3767,7 +3806,7 @@ fn find_economy_manager_guide_headers(
             continue;
         }
         if data_serializer_class_name(type_name) == "GenericGuide" {
-            matches.push((start, header));
+            matches.push((start, end, header));
         }
     }
     if matches.len() != expected_count {
@@ -3778,12 +3817,44 @@ fn find_economy_manager_guide_headers(
                 matches.len(),
                 matches
                     .iter()
-                    .map(|(offset, header)| (*offset, header))
+                    .map(|(offset, _, header)| (*offset, header))
                     .collect::<Vec<_>>()
             ),
         ));
     }
-    Ok(matches.into_iter().map(|(_, header)| header).collect())
+    Ok(matches)
+}
+
+fn decode_economy_manager_investment_flags(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: &DataSerializerObjectTable,
+) -> Result<Vec<u16>, CrpError> {
+    if format_version < 116_017 {
+        return Err(invalid(
+            0,
+            "investment flag decoding currently requires inner version 116017 or newer",
+        ));
+    }
+    let guide_headers =
+        find_economy_manager_guide_header_positions(format_version, bytes, object_table)?;
+    let flags_start = guide_headers
+        .last()
+        .map(|(_, end, _)| *end)
+        .ok_or_else(|| {
+            invalid(
+                bytes.len(),
+                "EconomyManager investment guide headers are missing",
+            )
+        })?;
+    let flag_bytes = bytes.get(flags_start..).ok_or_else(|| {
+        invalid(
+            flags_start,
+            "investment flag scope starts outside EconomyManager",
+        )
+    })?;
+    let mut reader = Reader::new(flag_bytes);
+    read_encoded_ushort_array(&mut reader, ECONOMY_INVESTMENT_FLAG_COUNT)
 }
 
 fn data_serializer_class_name(type_name: &str) -> &str {
@@ -4310,11 +4381,11 @@ fn find_unique_bytes(haystack: &[u8], needle: &[u8], description: &str) -> Resul
 mod manager_boundary_tests {
     use super::{
         DataSerializerObjectTable, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
-        QueuedGuideObject, SimulationManagerData, decode_transport_manager_reference_body,
-        economy_manager_object_header_count, find_economy_manager_guide_headers,
-        find_trailing_object_headers, locate_queued_object_bodies, locate_queued_object_body,
-        register_reference_headers, transport_manager_line_number_count,
-        transport_manager_object_header_count,
+        QueuedGuideObject, SimulationManagerData, decode_economy_manager_investment_flags,
+        decode_transport_manager_reference_body, economy_manager_object_header_count,
+        find_economy_manager_guide_headers, find_trailing_object_headers,
+        locate_queued_object_bodies, locate_queued_object_body, register_reference_headers,
+        transport_manager_line_number_count, transport_manager_object_header_count,
     };
     use crate::data_serializer::write_unique_string;
     use crate::district_manager_data::{
@@ -5115,6 +5186,24 @@ mod manager_boundary_tests {
                 NetObjectHeader::NewSharedType(1)
             ]
         );
+    }
+
+    #[test]
+    fn economy_manager_investment_flags_follow_modern_guide_references() {
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        table
+            .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+            .unwrap();
+        let mut body = vec![0xfe, 0x00, 0x01].repeat(5);
+        body.extend_from_slice(&[0x00, 0x00, 0x01, 0xff, 0xff]);
+
+        let flags = decode_economy_manager_investment_flags(116_017, &body, &table).unwrap();
+        assert_eq!(flags, (1_u16..=254).collect::<Vec<_>>());
+        assert!(decode_economy_manager_investment_flags(116_016, &body, &table).is_err());
+
+        let mut truncated = vec![0xfe, 0x00, 0x01].repeat(5);
+        truncated.extend_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+        assert!(decode_economy_manager_investment_flags(116_017, &truncated, &table).is_err());
     }
 
     #[test]
