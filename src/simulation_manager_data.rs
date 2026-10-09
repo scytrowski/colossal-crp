@@ -500,6 +500,62 @@ pub struct GuideBodyLocation {
     pub type_name: String,
 }
 
+/// One shared-string value in the TransportManager vehicle-selection table.
+///
+/// New strings carry their decoded nullable text. Existing entries retain the
+/// stream-wide table index because earlier shared-string values are not fully
+/// traversed by this decoder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportManagerSharedStringValue {
+    /// A value introduced by the `FE` marker and followed by a unique string.
+    New(Option<String>),
+    /// A two-byte index into the stream-wide shared-string table.
+    ExistingIndex(u16),
+}
+
+/// One key and shared-string value in the TransportManager selection table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportManagerSelection {
+    /// Signed key stored by the game.
+    pub key: i16,
+    /// Decoded new string or preserved index to an earlier shared string.
+    pub value: TransportManagerSharedStringValue,
+}
+
+/// Version-gated TransportManager vehicle-selection table.
+///
+/// The original field bytes are retained for exact unchanged writing. Existing
+/// shared-string indexes remain unresolved until preceding serialized strings
+/// are traversed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportManagerSelectionPrefix {
+    format_version: u32,
+    selections: Vec<TransportManagerSelection>,
+    serialized_prefix: Vec<u8>,
+}
+
+impl TransportManagerSelectionPrefix {
+    /// Returns the inner DataSerializer version used to decode this table.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns selection entries in serialized order.
+    pub fn selections(&self) -> &[TransportManagerSelection] {
+        &self.selections
+    }
+
+    /// Returns the original field bytes unchanged.
+    pub fn encode_unchanged(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+
+    /// Returns the number of serialized table bytes.
+    pub fn encoded_len(&self) -> usize {
+        self.serialized_prefix.len()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueuedGuideObject {
     object_id: u32,
@@ -515,6 +571,7 @@ struct QueuedObjectReferencePrefix {
     water_manager_object_ids: Vec<Option<u32>>,
     zone_manager_object_ids: Vec<Option<u32>>,
     transport_manager_object_ids: Vec<Option<u32>>,
+    transport_manager_selection_prefix: Option<TransportManagerSelectionPrefix>,
     economy_manager_object_ids: Vec<Option<u32>>,
     district_manager_object_ids: Vec<Option<u32>>,
 }
@@ -2889,6 +2946,7 @@ impl SimulationManagerData {
             water_manager_object_ids: Vec::new(),
             zone_manager_object_ids: Vec::new(),
             transport_manager_object_ids: Vec::new(),
+            transport_manager_selection_prefix: None,
             economy_manager_object_ids: Vec::new(),
             district_manager_object_ids: Vec::new(),
         })
@@ -2962,12 +3020,13 @@ impl SimulationManagerData {
         save_app_version: Option<u32>,
     ) -> Result<QueuedObjectReferencePrefix, CrpError> {
         let mut prefix = self.zone_manager_guide_queue_prefix(save_app_version)?;
-        let headers = self.decode_transport_manager_reference_headers(&prefix.object_table)?;
+        let fields = self.decode_transport_manager_reference_headers(&prefix.object_table)?;
         prefix.transport_manager_object_ids = register_reference_headers(
-            &headers,
+            &fields.object_headers,
             &mut prefix.object_table,
             &mut prefix.queued_objects,
         )?;
+        prefix.transport_manager_selection_prefix = Some(fields.selection_prefix);
         Ok(prefix)
     }
 
@@ -3018,7 +3077,7 @@ impl SimulationManagerData {
     fn decode_transport_manager_reference_headers(
         &self,
         object_table: &DataSerializerObjectTable,
-    ) -> Result<Vec<NetObjectHeader>, CrpError> {
+    ) -> Result<TransportManagerReferenceFields, CrpError> {
         expect_manager_type(self.manager_objects.as_deref(), 15, "TreeManager+Data")?;
         expect_manager_type(self.manager_objects.as_deref(), 17, "VehicleManager+Data")?;
         let weather_type = self
@@ -3435,8 +3494,7 @@ impl SimulationManagerData {
     /// This reader supports inner versions 164–115999 when line and milestone
     /// buffers are empty. It follows the known queue through ZoneManager, then
     /// reads the version-gated TransportManager tail, including the selection
-    /// table from version 114001. Selection values are consumed for boundary
-    /// validation but remain opaque; active lines and milestones return an error.
+    /// table from version 114001. Active lines and milestones return an error.
     /// Pass the saved application version for inner-version-221+
     /// NetNodeInstanceGuide fields in the earlier manager queue.
     pub fn resolve_transport_manager_references(
@@ -3462,6 +3520,23 @@ impl SimulationManagerData {
                     .transpose()
             })
             .collect()
+    }
+
+    /// Decodes TransportManager's final vehicle-selection table from version 114001.
+    ///
+    /// New shared strings are decoded; references to earlier shared strings are
+    /// returned as their original table indexes because this queue walk does not
+    /// traverse every preceding shared-string value. The returned prefix retains
+    /// the field bytes for exact unchanged writing. Active line buffers and
+    /// nonempty milestone lists remain unsupported by the current queue walk.
+    pub fn decode_transport_manager_selection_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<TransportManagerSelectionPrefix, CrpError> {
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        prefix
+            .transport_manager_selection_prefix
+            .ok_or_else(|| invalid(18, "TransportManager selection table was not decoded"))
     }
 
     /// Resolves EconomyManager's trailing guide object references.
@@ -6368,7 +6443,7 @@ fn decode_transport_manager_reference_body(
     format_version: u32,
     bytes: &[u8],
     object_table: &DataSerializerObjectTable,
-) -> Result<Vec<NetObjectHeader>, CrpError> {
+) -> Result<TransportManagerReferenceFields, CrpError> {
     if format_version < 164 {
         return Err(invalid(
             0,
@@ -6429,6 +6504,8 @@ fn decode_transport_manager_reference_body(
     for _ in 0..header_count {
         headers.push(read_net_object_header(&mut reader)?);
     }
+    let selection_start = reader.offset();
+    let mut selections = Vec::new();
     if format_version >= 114_001 {
         let selection_count = reader.read_i16_be()?;
         if selection_count < 0 {
@@ -6451,9 +6528,11 @@ fn decode_transport_manager_reference_body(
                 reader.invalid("TransportManager selection count cannot fit in remaining bytes")
             );
         }
+        selections.reserve(selection_count);
         for _ in 0..selection_count {
-            reader.read_i16_be()?;
-            skip_shared_string_value(&mut reader)?;
+            let key = reader.read_i16_be()?;
+            let value = read_transport_manager_shared_string_value(&mut reader)?;
+            selections.push(TransportManagerSelection { key, value });
         }
     }
     if reader.remaining() != 0 {
@@ -6466,22 +6545,34 @@ fn decode_transport_manager_reference_body(
     for header in &headers {
         checked_table.register(header)?;
     }
-    Ok(headers)
+    let selection_prefix = TransportManagerSelectionPrefix {
+        format_version,
+        selections,
+        serialized_prefix: reader.consumed_bytes()[selection_start..reader.offset()].to_vec(),
+    };
+    Ok(TransportManagerReferenceFields {
+        object_headers: headers,
+        selection_prefix,
+    })
 }
 
-fn skip_shared_string_value(reader: &mut Reader<'_>) -> Result<(), CrpError> {
-    // Earlier managers seed this shared-string table; their values are opaque
-    // here, so consume the wire form without resolving an existing table index.
+#[derive(Debug)]
+struct TransportManagerReferenceFields {
+    object_headers: Vec<NetObjectHeader>,
+    selection_prefix: TransportManagerSelectionPrefix,
+}
+
+fn read_transport_manager_shared_string_value(
+    reader: &mut Reader<'_>,
+) -> Result<TransportManagerSharedStringValue, CrpError> {
     match reader.read_u8()? {
-        0xfe => {
-            reader.read_unique_string()?;
-            Ok(())
-        }
+        0xfe => Ok(TransportManagerSharedStringValue::New(
+            reader.read_unique_string()?,
+        )),
         0xff => Err(reader.invalid("shared-string reference uses a reserved marker")),
-        _ => {
-            reader.read_u8()?;
-            Ok(())
-        }
+        high => Ok(TransportManagerSharedStringValue::ExistingIndex(
+            u16::from_be_bytes([high, reader.read_u8()?]),
+        )),
     }
 }
 
@@ -6750,8 +6841,9 @@ mod manager_boundary_tests {
         DataSerializerObjectTable, ECONOMY_MANAGER_CASH_VALUE_COUNT, ECONOMY_MANAGER_LOAN_COUNT,
         EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
         GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference, QueuedGuideObject,
-        SimulationManagerData, decode_economy_manager_budget_editor,
-        decode_economy_manager_income_expense_editor, decode_economy_manager_investment_editor,
+        SimulationManagerData, TransportManagerSelection, TransportManagerSharedStringValue,
+        decode_economy_manager_budget_editor, decode_economy_manager_income_expense_editor,
+        decode_economy_manager_investment_editor,
         decode_economy_manager_investment_flags_from_body,
         decode_economy_manager_investment_prefabs_from_body,
         decode_economy_manager_investment_value_series, decode_economy_manager_investments,
@@ -7460,9 +7552,9 @@ mod manager_boundary_tests {
             0x00, 0x00, 0x02, // Existing object 2.
         ]);
 
-        let headers = decode_transport_manager_reference_body(112_004, &bytes, &table).unwrap();
+        let decoded = decode_transport_manager_reference_body(112_004, &bytes, &table).unwrap();
         assert_eq!(
-            headers,
+            decoded.object_headers,
             [
                 NetObjectHeader::NewSharedType(1),
                 NetObjectHeader::Existing(1),
@@ -7473,6 +7565,8 @@ mod manager_boundary_tests {
                 NetObjectHeader::Existing(2),
             ]
         );
+        assert!(decoded.selection_prefix.selections().is_empty());
+        assert!(decoded.selection_prefix.encode_unchanged().is_empty());
         let mut nonempty_milestones = bytes.clone();
         nonempty_milestones[3] = 1;
         assert!(
@@ -7501,14 +7595,30 @@ mod manager_boundary_tests {
         selection_bytes.extend_from_slice(&5_i16.to_be_bytes());
         let second_shared_string_offset = selection_bytes.len();
         selection_bytes.extend_from_slice(&[0x00, 0x00]);
+        let decoded = decode_transport_manager_reference_body(
+            114_001,
+            &selection_bytes,
+            &DataSerializerObjectTable::new("SimulationManager+Data"),
+        )
+        .unwrap();
+        assert_eq!(decoded.object_headers, vec![NetObjectHeader::Null; 7]);
+        assert_eq!(decoded.selection_prefix.format_version(), 114_001);
         assert_eq!(
-            decode_transport_manager_reference_body(
-                114_001,
-                &selection_bytes,
-                &DataSerializerObjectTable::new("SimulationManager+Data"),
-            )
-            .unwrap(),
-            vec![NetObjectHeader::Null; 7]
+            decoded.selection_prefix.selections(),
+            [
+                TransportManagerSelection {
+                    key: -3,
+                    value: TransportManagerSharedStringValue::New(Some("TramVehicle".to_owned())),
+                },
+                TransportManagerSelection {
+                    key: 5,
+                    value: TransportManagerSharedStringValue::ExistingIndex(0),
+                },
+            ]
+        );
+        assert_eq!(
+            decoded.selection_prefix.encode_unchanged(),
+            selection_bytes[count_offset..]
         );
 
         let mut negative_count = selection_bytes.clone();

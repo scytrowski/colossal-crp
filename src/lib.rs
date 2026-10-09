@@ -86,6 +86,7 @@ pub use simulation_manager_data::{
     EconomyManagerIncomeExpenseEditor, EconomyManagerInvestmentsEditor,
     EconomyManagerLoansAndCashEditor, GuideBodyLocation, ManagerObjectReference,
     ResolvedObjectReference, SerializableDataEntry, SimulationManagerData,
+    TransportManagerSelection, TransportManagerSelectionPrefix, TransportManagerSharedStringValue,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use statistics_manager_data::{
@@ -4718,6 +4719,15 @@ mod tests {
         for reference in &references[3..] {
             assert!(reference.type_name.starts_with("GenericGuide,"));
         }
+        let selections =
+            manager.decode_transport_manager_selection_prefix(metadata.save_app_version)?;
+        assert_eq!(selections.format_version(), 116_020);
+        assert!(selections.selections().is_empty());
+        assert_eq!(
+            selections.encoded_len(),
+            selections.encode_unchanged().len()
+        );
+        assert_eq!(selections.encode_unchanged(), [0, 0]);
         let investments = manager.decode_economy_manager_investments(metadata.save_app_version)?;
         assert!(!investments.is_empty());
         let prefabs =
