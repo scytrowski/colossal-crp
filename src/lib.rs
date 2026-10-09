@@ -4419,6 +4419,41 @@ mod tests {
         let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
         assert_eq!(manager.format_version(), 112_004);
 
+        let message = manager.decode_message_manager_data()?;
+        assert_eq!(message.random_message_timers().len(), 26);
+        let original_queue = message.message_queue().map(<[_]>::to_vec);
+        let original_recent = message.recent_messages().map(<[_]>::to_vec);
+        let original_profile_index = message.profile_end_shared_string_index();
+        let mut message_editor = message.into_editor();
+        *message_editor
+            .recent_message_index_mut()
+            .ok_or_else(|| std::io::Error::other("Wolf Creek has no recent-message index"))? = 1;
+        message_editor.random_message_timers_mut()[0] = 1;
+        let expected_message_body = message_editor.encode();
+        let mut rewritten_message = manager.clone();
+        rewritten_message.replace_message_manager_data(&message_editor)?;
+        assert_eq!(
+            rewritten_message.serialized_object_graph().len(),
+            manager.serialized_object_graph().len()
+        );
+        let rewritten_message_data = rewritten_message.decode_message_manager_data()?;
+        assert_eq!(rewritten_message_data.encode(), expected_message_body);
+        assert_eq!(rewritten_message_data.recent_message_index(), Some(1));
+        assert_eq!(rewritten_message_data.random_message_timers()[0], 1);
+        assert_eq!(rewritten_message_data.random_message_timers().len(), 26);
+        assert_eq!(
+            rewritten_message_data.message_queue(),
+            original_queue.as_deref()
+        );
+        assert_eq!(
+            rewritten_message_data.recent_messages(),
+            original_recent.as_deref()
+        );
+        assert_eq!(
+            rewritten_message_data.profile_end_shared_string_index(),
+            original_profile_index
+        );
+
         let statistics = manager.decode_statistics_manager_data()?;
         assert!(statistics.start_frame() <= 4_775);
         assert_ne!(statistics.statistic_array_header(), &NetObjectHeader::Null);
