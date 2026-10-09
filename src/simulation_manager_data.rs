@@ -8032,6 +8032,30 @@ mod manager_boundary_tests {
                 references.len(),
                 if format_version >= 116_017 { 5 } else { 2 }
             );
+
+            let mut edited = editor.clone();
+            edited.loans_mut()[0].amount_taken = -765_432;
+            edited.cash_values_mut()[3] = 0x0102_0304_0506_0708;
+            let rewritten = edited.encode().unwrap();
+            assert_eq!(rewritten.len(), bytes.len(), "{format_version}");
+            assert_eq!(
+                &rewritten[..edited.prefix_start],
+                &bytes[..edited.prefix_start],
+                "{format_version}"
+            );
+            assert_eq!(
+                &rewritten[edited.prefix_end..],
+                &bytes[edited.prefix_end..],
+                "{format_version}"
+            );
+            let decoded = decode_economy_manager_loans_and_cash_editor_with_prefix(
+                format_version,
+                &rewritten,
+                scalar_prefix_bytes,
+            )
+            .unwrap();
+            assert_eq!(decoded.loans()[0].amount_taken, -765_432);
+            assert_eq!(decoded.cash_values()[3], 0x0102_0304_0506_0708);
         }
     }
 
