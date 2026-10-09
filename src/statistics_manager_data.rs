@@ -329,6 +329,11 @@ impl From<StatisticInt32Data> for StatisticInt32Editor {
 }
 
 impl StatisticInt32Editor {
+    /// Returns the inner DataSerializer version used for this body.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
     /// Returns mutable access to the start frame.
     pub fn start_frame_mut(&mut self) -> &mut u32 {
         &mut self.start_frame
@@ -402,6 +407,10 @@ impl StatisticInt32Editor {
             write_encoded_int_array(&mut output, &self.history);
         }
         output
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original.serialized_body
     }
 }
 
@@ -569,6 +578,11 @@ impl From<StatisticInt64Data> for StatisticInt64Editor {
 }
 
 impl StatisticInt64Editor {
+    /// Returns the inner DataSerializer version used for this body.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
     /// Returns mutable access to the start frame.
     pub fn start_frame_mut(&mut self) -> &mut u32 {
         &mut self.start_frame
@@ -647,6 +661,10 @@ impl StatisticInt64Editor {
             write_encoded_ulong_array(&mut output, &history);
         }
         output
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original.serialized_body
     }
 }
 

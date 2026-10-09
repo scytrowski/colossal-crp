@@ -20,7 +20,9 @@ use crate::guide_manager_data::GuideManagerReferences;
 use crate::net_manager_data::{
     NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader, read_net_object_header,
 };
-use crate::statistics_manager_data::{StatisticsManagerData, StatisticsManagerEditor};
+use crate::statistics_manager_data::{
+    StatisticInt32Editor, StatisticInt64Editor, StatisticsManagerData, StatisticsManagerEditor,
+};
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
     BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlagsPrefix,
@@ -414,6 +416,62 @@ impl SimulationManagerData {
         }
         self.serialized_object_graph[body_start..body_end].copy_from_slice(&replacement);
         Ok(())
+    }
+
+    /// Replaces one already-located `StatisticInt32` body in the queued graph.
+    ///
+    /// `graph_offset` is relative to [`serialized_object_graph`](Self::serialized_object_graph),
+    /// after the root fields. Create `edited` from the body at that offset.
+    /// The source bytes and inner version must still match. Editing the encoded
+    /// history can change the body's length and shifts all later queued bytes;
+    /// this method does not locate the record or validate its declared object
+    /// type, so callers must derive the offset from the preceding queue.
+    pub fn replace_statistic_int32_at(
+        &mut self,
+        graph_offset: usize,
+        edited: &StatisticInt32Editor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                graph_offset,
+                "StatisticInt32 editor uses a different DataSerializer version",
+            ));
+        }
+        self.replace_queued_bytes_at(
+            graph_offset,
+            edited.original_body_bytes(),
+            &edited.encode(),
+            "StatisticInt32 body",
+            false,
+        )
+    }
+
+    /// Replaces one already-located `StatisticInt64` body in the queued graph.
+    ///
+    /// `graph_offset` is relative to [`serialized_object_graph`](Self::serialized_object_graph),
+    /// after the root fields. Create `edited` from the body at that offset.
+    /// The source bytes and inner version must still match. Editing the encoded
+    /// history can change the body's length and shifts all later queued bytes;
+    /// this method does not locate the record or validate its declared object
+    /// type, so callers must derive the offset from the preceding queue.
+    pub fn replace_statistic_int64_at(
+        &mut self,
+        graph_offset: usize,
+        edited: &StatisticInt64Editor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                graph_offset,
+                "StatisticInt64 editor uses a different DataSerializer version",
+            ));
+        }
+        self.replace_queued_bytes_at(
+            graph_offset,
+            edited.original_body_bytes(),
+            &edited.encode(),
+            "StatisticInt64 body",
+            false,
+        )
     }
 
     fn decode_guide_manager_references_at(
@@ -2060,6 +2118,7 @@ impl SimulationManagerData {
             edited.original_body_bytes(),
             &edited.encode(),
             "guide body",
+            true,
         )
     }
 
@@ -2081,6 +2140,7 @@ impl SimulationManagerData {
             edited.original_prefix_bytes(),
             &edited.encode(),
             "guide trigger prefix",
+            true,
         )
     }
 
@@ -2090,8 +2150,9 @@ impl SimulationManagerData {
         original: &[u8],
         replacement: &[u8],
         description: &str,
+        preserve_length: bool,
     ) -> Result<(), CrpError> {
-        if original.len() != replacement.len() {
+        if preserve_length && original.len() != replacement.len() {
             return Err(invalid(
                 graph_offset,
                 format!("{description} replacement must preserve the original length"),
@@ -2100,7 +2161,7 @@ impl SimulationManagerData {
         let end = graph_offset
             .checked_add(original.len())
             .ok_or(CrpError::ArithmeticOverflow(
-                "queued guide replacement range",
+                "queued object replacement range",
             ))?;
         let Some(current) = self.serialized_object_graph.get(graph_offset..end) else {
             return Err(invalid(
@@ -2114,7 +2175,12 @@ impl SimulationManagerData {
                 format!("queued bytes do not match the editor's original {description}"),
             ));
         }
-        self.serialized_object_graph[graph_offset..end].copy_from_slice(replacement);
+        if preserve_length {
+            self.serialized_object_graph[graph_offset..end].copy_from_slice(replacement);
+        } else {
+            self.serialized_object_graph
+                .splice(graph_offset..end, replacement.iter().copied());
+        }
         Ok(())
     }
 
@@ -2532,6 +2598,7 @@ impl SimulationManagerData {
             original,
             &replacement,
             "NetNodeInstanceGuide body",
+            true,
         )
     }
 
@@ -3112,7 +3179,9 @@ mod manager_boundary_tests {
         write_encoded_bool_array, write_encoded_uint_array, write_encoded_ushort_array,
     };
     use crate::net_manager_data::NetObjectHeader;
-    use crate::{GuideInstanceBody, GuideTriggerBasePrefix};
+    use crate::{
+        GuideInstanceBody, GuideTriggerBasePrefix, StatisticInt32Data, StatisticInt64Data,
+    };
 
     fn manager_with_graph(graph: Vec<u8>) -> SimulationManagerData {
         SimulationManagerData {
@@ -3252,6 +3321,104 @@ mod manager_boundary_tests {
         assert_eq!(
             guide.encode(),
             fixture[profiler_tag("GuideManager").len()..]
+        );
+    }
+
+    #[test]
+    fn statistic_replacements_splice_edited_histories_and_validate_source() {
+        const INT32: &[u8] =
+            include_bytes!("../tests/fixtures/statistic-int32-v112004-wolf-creek.bin");
+        const INT64: &[u8] =
+            include_bytes!("../tests/fixtures/statistic-int64-v112004-wolf-creek.bin");
+        let prefix = [0xa1, 0xb2, 0xc3];
+        let suffix = [0xd4, 0xe5];
+
+        let mut graph = prefix.to_vec();
+        graph.extend_from_slice(INT32);
+        graph.extend_from_slice(INT64);
+        graph.extend_from_slice(&suffix);
+        let int32_offset = prefix.len();
+        let (int32, int32_len) =
+            StatisticInt32Data::decode(112_004, &graph[int32_offset..]).unwrap();
+        assert_eq!(int32_len, INT32.len());
+        let int64_offset = int32_offset + int32_len;
+        let (int64, int64_len) =
+            StatisticInt64Data::decode(112_004, &graph[int64_offset..]).unwrap();
+        assert_eq!(int64_len, INT64.len());
+
+        let mut int32_editor = int32.into_editor();
+        int32_editor.history_mut().fill(0);
+        let edited_int32 = int32_editor.encode();
+        assert_ne!(edited_int32.len(), INT32.len());
+
+        let mut manager = manager_with_graph(graph.clone());
+        manager
+            .replace_statistic_int32_at(int32_offset, &int32_editor)
+            .unwrap();
+        assert_eq!(&manager.serialized_object_graph[..prefix.len()], &prefix);
+        assert_eq!(
+            &manager.serialized_object_graph[int32_offset..int32_offset + edited_int32.len()],
+            edited_int32
+        );
+        let int64_offset_after_edit = int32_offset + edited_int32.len();
+        assert_eq!(
+            &manager.serialized_object_graph
+                [int64_offset_after_edit..int64_offset_after_edit + INT64.len()],
+            INT64
+        );
+        assert_eq!(
+            &manager.serialized_object_graph
+                [manager.serialized_object_graph.len() - suffix.len()..],
+            &suffix
+        );
+
+        let mut int64_editor = int64.into_editor();
+        *int64_editor.latest_value_mut() = -17;
+        int64_editor.history_mut().fill(0);
+        let edited_int64 = int64_editor.encode();
+        assert_ne!(edited_int64.len(), INT64.len());
+        manager
+            .replace_statistic_int64_at(int64_offset_after_edit, &int64_editor)
+            .unwrap();
+        let int64_body_start = int64_offset_after_edit;
+        assert_eq!(
+            &manager.serialized_object_graph
+                [int64_body_start..int64_body_start + edited_int64.len()],
+            edited_int64
+        );
+        assert_eq!(
+            &manager.serialized_object_graph
+                [manager.serialized_object_graph.len() - suffix.len()..],
+            &suffix
+        );
+        let (rewritten_int64, rewritten_int64_len) = StatisticInt64Data::decode(
+            112_004,
+            &manager.serialized_object_graph[int64_body_start..],
+        )
+        .unwrap();
+        assert_eq!(rewritten_int64_len, edited_int64.len());
+        assert_eq!(rewritten_int64.latest_value(), -17);
+        assert_eq!(rewritten_int64.history(), &[0; 256]);
+
+        let mut wrong_version = manager.clone();
+        wrong_version.format_version = 112_005;
+        assert!(
+            wrong_version
+                .replace_statistic_int64_at(int64_body_start, &int64_editor)
+                .is_err()
+        );
+
+        let mut stale = manager.clone();
+        stale.serialized_object_graph[int64_body_start] ^= 1;
+        assert!(
+            stale
+                .replace_statistic_int64_at(int64_body_start, &int64_editor)
+                .is_err()
+        );
+        assert!(
+            manager
+                .replace_statistic_int64_at(manager.serialized_object_graph.len(), &int64_editor)
+                .is_err()
         );
     }
 
