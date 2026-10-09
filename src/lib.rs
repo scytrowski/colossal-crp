@@ -81,7 +81,8 @@ pub use net_manager_data::{
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use prop_manager_data::PropManagerDataPrefix;
 pub use simulation_manager_data::{
-    EconomyInvestmentData, EconomyInvestmentValueSeries, GuideBodyLocation, ManagerObjectReference,
+    EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
+    EconomyInvestmentValueSeries, GuideBodyLocation, ManagerObjectReference,
     ResolvedObjectReference, SerializableDataEntry, SimulationManagerData,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
@@ -4553,6 +4554,10 @@ mod tests {
                         .collect::<Vec<_>>(),
                     "{file_name}"
                 );
+                let prefabs =
+                    manager.decode_economy_manager_investment_prefabs(metadata.save_app_version)?;
+                assert_eq!(prefabs.assignments.len(), investments.len(), "{file_name}");
+                assert!(!prefabs.names.is_empty(), "{file_name}");
             }
         }
         Ok(())
@@ -4607,6 +4612,9 @@ mod tests {
         }
         let investments = manager.decode_economy_manager_investments(metadata.save_app_version)?;
         assert!(!investments.is_empty());
+        let prefabs =
+            manager.decode_economy_manager_investment_prefabs(metadata.save_app_version)?;
+        assert_eq!(prefabs.assignments.len(), investments.len());
         Ok(())
     }
 

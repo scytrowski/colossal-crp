@@ -112,6 +112,24 @@ pub struct EconomyInvestmentData {
     pub random_influence: f32,
 }
 
+/// A prefab index associated with one active EconomyManager investment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EconomyInvestmentPrefabAssignment {
+    /// Investment index in the game's serialized range 1–254.
+    pub investment_index: u16,
+    /// Index in the serialized prefab collection.
+    pub prefab_index: u16,
+}
+
+/// Prefab assignments and the serialized investment-prefab name table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EconomyInvestmentPrefabTable {
+    /// One assignment for each active investment, in investment order.
+    pub assignments: Vec<EconomyInvestmentPrefabAssignment>,
+    /// Names in the game's serialized table order; null entries are retained.
+    pub names: Vec<Option<String>>,
+}
+
 /// One entry in `SimulationManager.m_serializableDataStorage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerializableDataEntry {
@@ -3189,6 +3207,27 @@ impl SimulationManagerData {
             .map(|(investments, _)| investments)
     }
 
+    /// Decodes active-investment prefab indices and the serialized name table.
+    ///
+    /// Supports inner version 116017 and newer when the five investment guide
+    /// references are newly declared `GenericGuide` objects. Assignments are
+    /// returned in active-investment order, and null name entries are
+    /// preserved. This method also validates the known investment numeric
+    /// prefix before reading the prefab scope.
+    pub fn decode_economy_manager_investment_prefabs(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<EconomyInvestmentPrefabTable, CrpError> {
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        let body = self.economy_manager_body(&prefix.object_table)?;
+        decode_economy_manager_investment_prefabs_from_body(
+            self.format_version,
+            body,
+            &prefix.object_table,
+        )
+        .map(|(prefabs, _)| prefabs)
+    }
+
     /// Resolves the version-gated object references at the end of DistrictManager.
     ///
     /// This reader supports inner version 164 and newer when the preceding
@@ -4098,6 +4137,80 @@ fn decode_economy_manager_investments(
     Ok((investments, fields_end))
 }
 
+fn decode_economy_manager_investment_prefabs_from_body(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: &DataSerializerObjectTable,
+) -> Result<(EconomyInvestmentPrefabTable, usize), CrpError> {
+    let (investments, prefab_start) =
+        decode_economy_manager_investments(format_version, bytes, object_table)?;
+    let prefab_bytes = bytes.get(prefab_start..).ok_or_else(|| {
+        invalid(
+            prefab_start,
+            "investment prefab scope starts outside EconomyManager",
+        )
+    })?;
+    let mut reader = Reader::new(prefab_bytes);
+    let prefab_indices = read_encoded_ushort_array(&mut reader, investments.len())
+        .map_err(|error| invalid(prefab_start, format!("investment prefab indices: {error}")))?;
+    let name_count_offset =
+        prefab_start
+            .checked_add(reader.offset())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EconomyManager investment prefab-name count offset",
+            ))?;
+    let name_count = usize::from(reader.read_u16_be().map_err(|error| {
+        invalid(
+            name_count_offset,
+            format!("investment prefab-name count: {error}"),
+        )
+    })?);
+    if name_count > reader.remaining() {
+        return Err(invalid(
+            name_count_offset,
+            format!(
+                "investment prefab-name count {name_count} cannot fit in {} remaining bytes",
+                reader.remaining()
+            ),
+        ));
+    }
+    let mut names = Vec::with_capacity(name_count);
+    for name_index in 0..name_count {
+        let name_offset =
+            prefab_start
+                .checked_add(reader.offset())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "EconomyManager investment prefab-name offset",
+                ))?;
+        names.push(reader.read_unique_string().map_err(|error| {
+            invalid(
+                name_offset,
+                format!("investment prefab name {name_index}: {error}"),
+            )
+        })?);
+    }
+    let assignments = investments
+        .iter()
+        .zip(prefab_indices)
+        .map(
+            |(investment, prefab_index)| EconomyInvestmentPrefabAssignment {
+                investment_index: investment.investment_index,
+                prefab_index,
+            },
+        )
+        .collect();
+    let scope_end =
+        prefab_start
+            .checked_add(reader.offset())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EconomyManager investment prefab scope end",
+            ))?;
+    Ok((
+        EconomyInvestmentPrefabTable { assignments, names },
+        scope_end,
+    ))
+}
+
 fn read_economy_investment_field<'a, T>(
     reader: &mut Reader<'a>,
     fields_start: usize,
@@ -4641,9 +4754,11 @@ fn find_unique_bytes(haystack: &[u8], needle: &[u8], description: &str) -> Resul
 #[cfg(test)]
 mod manager_boundary_tests {
     use super::{
-        DataSerializerObjectTable, EconomyInvestmentData, GUIDE_TRIGGER_BASE_PREFIX_LEN,
-        ManagerObjectReference, QueuedGuideObject, SimulationManagerData,
+        DataSerializerObjectTable, EconomyInvestmentData, EconomyInvestmentPrefabAssignment,
+        EconomyInvestmentPrefabTable, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
+        QueuedGuideObject, SimulationManagerData,
         decode_economy_manager_investment_flags_from_body,
+        decode_economy_manager_investment_prefabs_from_body,
         decode_economy_manager_investment_value_series, decode_economy_manager_investments,
         decode_transport_manager_reference_body, economy_manager_object_header_count,
         find_economy_manager_guide_headers, find_trailing_object_headers,
@@ -5520,8 +5635,7 @@ mod manager_boundary_tests {
 
     #[test]
     fn economy_manager_investment_value_series_matches_boreal_fixture() {
-        let bytes =
-            include_bytes!("../tests/fixtures/economy-investment-values-v116019-boreal.bin");
+        let bytes = include_bytes!("../tests/fixtures/economy-investments-v116019-boreal.bin");
         let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
         for index in 0..29 {
             table
@@ -5534,7 +5648,7 @@ mod manager_boundary_tests {
 
         let (series, values_end) =
             decode_economy_manager_investment_value_series(116_019, bytes, &table).unwrap();
-        assert_eq!(values_end, bytes.len());
+        assert_eq!(values_end, 607);
         assert_eq!(
             series
                 .iter()
@@ -5591,11 +5705,16 @@ mod manager_boundary_tests {
             0x00, 0x02, 0x3e, 0x80, 0x00, 0x00, // state 2, influence 0.25
             0xff, 0xfc, 0xbf, 0x00, 0x00, 0x00, // state -4, influence -0.5
         ]);
-        body.extend_from_slice(&[0xaa, 0xbb]);
+        let numeric_fields_end = body.len();
+        write_encoded_ushort_array(&mut body, &[1, 0]);
+        body.extend_from_slice(&2_u16.to_be_bytes());
+        write_unique_string(&mut body, "A").unwrap();
+        body.push(0xff); // Null prefab name.
+        body.push(0xaa); // Following manager bytes are outside this scope.
 
         let (investments, fields_end) =
             decode_economy_manager_investments(116_017, &body, &table).unwrap();
-        assert_eq!(fields_end, body.len() - 2);
+        assert_eq!(fields_end, numeric_fields_end);
         assert_eq!(
             investments,
             [
@@ -5621,19 +5740,45 @@ mod manager_boundary_tests {
                 },
             ]
         );
-        for truncated_end in 15..body.len() - 2 {
+        for truncated_end in 15..fields_end {
             assert!(
                 decode_economy_manager_investments(116_017, &body[..truncated_end], &table)
                     .is_err(),
                 "truncated EconomyManager body unexpectedly parsed through byte {truncated_end}"
             );
         }
+        let (prefabs, prefab_end) =
+            decode_economy_manager_investment_prefabs_from_body(116_017, &body, &table).unwrap();
+        assert_eq!(prefab_end, body.len() - 1);
+        assert_eq!(
+            prefabs,
+            EconomyInvestmentPrefabTable {
+                assignments: vec![
+                    EconomyInvestmentPrefabAssignment {
+                        investment_index: 1,
+                        prefab_index: 1,
+                    },
+                    EconomyInvestmentPrefabAssignment {
+                        investment_index: 3,
+                        prefab_index: 0,
+                    },
+                ],
+                names: [Some("A".to_owned()), None].to_vec(),
+            }
+        );
+        assert!(
+            decode_economy_manager_investment_prefabs_from_body(
+                116_017,
+                &body[..body.len() - 2],
+                &table
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn economy_manager_investment_numeric_fields_match_boreal_fixture() {
-        let bytes =
-            include_bytes!("../tests/fixtures/economy-investment-records-v116019-boreal.bin");
+        let bytes = include_bytes!("../tests/fixtures/economy-investments-v116019-boreal.bin");
         let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
         for index in 0..29 {
             table
@@ -5646,7 +5791,7 @@ mod manager_boundary_tests {
 
         let (investments, fields_end) =
             decode_economy_manager_investments(116_019, bytes, &table).unwrap();
-        assert_eq!(fields_end, bytes.len());
+        assert_eq!(fields_end, 945);
         assert_eq!(
             investments
                 .iter()
@@ -5671,6 +5816,68 @@ mod manager_boundary_tests {
                 assert_eq!(entry.random_influence.to_bits(), 0);
             }
         }
+    }
+
+    #[test]
+    fn economy_manager_investment_prefab_table_matches_boreal_fixture() {
+        let bytes = include_bytes!("../tests/fixtures/economy-investments-v116019-boreal.bin");
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        for index in 0..29 {
+            table
+                .register(&NetObjectHeader::NewType(format!("FixtureType{index}")))
+                .unwrap();
+        }
+        table
+            .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+            .unwrap();
+
+        let (prefabs, scope_end) =
+            decode_economy_manager_investment_prefabs_from_body(116_019, bytes, &table).unwrap();
+        assert_eq!(scope_end, bytes.len());
+        assert_eq!(
+            prefabs,
+            EconomyInvestmentPrefabTable {
+                assignments: vec![
+                    (8, 8),
+                    (16, 9),
+                    (19, 10),
+                    (34, 0),
+                    (69, 5),
+                    (81, 1),
+                    (85, 2),
+                    (124, 7),
+                    (158, 3),
+                    (162, 11),
+                    (185, 4),
+                    (187, 6),
+                    (250, 12),
+                ]
+                .into_iter()
+                .map(
+                    |(investment_index, prefab_index)| EconomyInvestmentPrefabAssignment {
+                        investment_index,
+                        prefab_index,
+                    }
+                )
+                .collect(),
+                names: [
+                    Some("Chirp Coin".to_owned()),
+                    Some("Death Care Sector Investment".to_owned()),
+                    Some("Fuel Company Investment".to_owned()),
+                    Some("Health Care Sector Investment".to_owned()),
+                    Some("Farming Industry Investment".to_owned()),
+                    Some("Forestry Industry Investment".to_owned()),
+                    Some("Generic Industry Investment".to_owned()),
+                    Some("Oil Industry Investment".to_owned()),
+                    Some("Ore Industry Investment".to_owned()),
+                    Some("TrafficJelly".to_owned()),
+                    Some("VeryLegitCompany".to_owned()),
+                    Some("AirplaneInvestment".to_owned()),
+                    Some("ShipInvestment".to_owned()),
+                ]
+                .to_vec(),
+            }
+        );
     }
 
     #[test]
