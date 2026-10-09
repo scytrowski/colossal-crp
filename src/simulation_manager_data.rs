@@ -7564,13 +7564,15 @@ mod manager_boundary_tests {
         register_reference_headers, transport_manager_line_number_count,
         transport_manager_object_header_count,
     };
+    use crate::data_serializer::Reader;
     use crate::data_serializer::write_unique_string;
     use crate::district_manager_data::{
         DistrictParkIndustryResource, DistrictParkIndustryResourceKind,
         DistrictParkIndustryTradeData,
     };
     use crate::encoded_array::{
-        write_encoded_bool_array, write_encoded_uint_array, write_encoded_ushort_array,
+        EncodedLongArrayReader, write_encoded_bool_array, write_encoded_uint_array,
+        write_encoded_ushort_array,
     };
     use crate::net_manager_data::NetObjectHeader;
     use crate::{
@@ -9328,6 +9330,97 @@ mod manager_boundary_tests {
                 redecoded_income.total_expenses(),
                 income_expenses.total_expenses()
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads selected local economy-manager samples from data/maps"]
+    fn observed_economy_manager_long_layout_candidate_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let maps_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps");
+        for (
+            file_name,
+            expected_version,
+            expected_first_reference,
+            expected_old_gap,
+            expected_split_gap,
+        ) in [
+            ("NorthEurope2FINAL.crp", 116_011, 326, 1, -17),
+            ("CCMP2 Boreal Map 1.crp", 116_019, 393, 0, -17),
+            ("CCMP2 Temperate Map 1.crp", 116_019, 424, 0, -17),
+            ("MM Shifting Sands.crp", 117_005, 289, 3, -8),
+            ("MP23_Map02.crp", 117_013, 402, 9, -8),
+            ("MP27_Map01.crp", 118_011, 305, 9, -8),
+        ] {
+            let mut file = File::open(maps_dir.join(file_name))?;
+            let package = Package::read_from(&mut file)?;
+            let asset = package
+                .assets
+                .iter()
+                .find(|asset| asset.asset_type == 52)
+                .ok_or_else(|| std::io::Error::other("map has no type-52 asset"))?;
+            let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+            let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+            let version = manager.format_version();
+            assert_eq!(version, expected_version, "{file_name}");
+            let queue_prefix = manager.transport_manager_queue_prefix(metadata.save_app_version)?;
+            let body_range = manager.economy_manager_body_range(&queue_prefix.object_table)?;
+            let body = manager
+                .serialized_object_graph
+                .get(body_range)
+                .ok_or_else(|| std::io::Error::other("EconomyManager body exceeds graph"))?;
+            let budget = decode_economy_manager_budget_editor(version, body)?;
+            let old = decode_economy_manager_income_expense_editor(version, body)?;
+            let first_reference = find_economy_manager_guide_header_positions(
+                version,
+                body,
+                &queue_prefix.object_table,
+            )?[0]
+                .0;
+
+            let mut source_reader = Reader::new(body);
+            source_reader.read_bytes(budget.prefix_end)?;
+            let first_count = economy_manager_income_count(version);
+            let second_count = economy_manager_expense_count(version);
+            let mut income_scope = EncodedLongArrayReader::default();
+            income_scope.read_array(&mut source_reader, first_count)?;
+            income_scope.read_array(&mut source_reader, second_count)?;
+            if let Some(total_count) = economy_manager_total_array_count(version) {
+                income_scope.read_array(&mut source_reader, total_count)?;
+            }
+            let mut expense_scope = EncodedLongArrayReader::default();
+            expense_scope.read_array(&mut source_reader, first_count)?;
+            expense_scope.read_array(&mut source_reader, second_count)?;
+            let loan_count = if version >= 120_002 { 20 } else { 19 };
+            expense_scope.read_array(&mut source_reader, loan_count)?;
+            let policy_count = if version >= 120_002 {
+                20
+            } else if version >= 117_001 {
+                19
+            } else if version >= 115_005 {
+                18
+            } else {
+                17
+            };
+            expense_scope.read_array(&mut source_reader, policy_count)?;
+            if let Some(total_count) = economy_manager_total_array_count(version) {
+                expense_scope.read_array(&mut source_reader, total_count)?;
+            }
+            let source_end = source_reader.offset();
+            let scalar_length = decode_economy_manager_loan_scalar_length(version);
+            let old_gap =
+                first_reference as isize - old.prefix_end as isize - scalar_length as isize;
+            let split_gap = first_reference as isize - source_end as isize - scalar_length as isize;
+            assert_eq!(first_reference, expected_first_reference, "{file_name}");
+            assert_eq!(old_gap, expected_old_gap, "{file_name} previous layout");
+            assert_eq!(
+                split_gap, expected_split_gap,
+                "{file_name} DLL reader layout"
+            );
+            if version >= 117_001 {
+                assert_eq!(split_gap + 8, 0, "{file_name} without the reader-only i64");
+            }
         }
         Ok(())
     }
