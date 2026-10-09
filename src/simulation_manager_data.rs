@@ -88,6 +88,30 @@ pub struct EconomyInvestmentValueSeries {
     pub values: Vec<f32>,
 }
 
+/// Modeled numeric fields for one active EconomyManager investment.
+///
+/// Prefab assignments and names remain in the opaque bytes following these
+/// fields and are not represented here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EconomyInvestmentData {
+    /// Investment index in the game's serialized range 1–254.
+    pub investment_index: u16,
+    /// Float history values retained in serialized order.
+    pub value_history: Vec<f32>,
+    /// Amount of money spent on the investment.
+    pub player_spent: i32,
+    /// Number of owned shares.
+    pub owned_share_count: u32,
+    /// Base value recorded for the investment.
+    pub base_value: f32,
+    /// .NET `DateTime` ticks for the missing requirement date.
+    pub requirement_missing_date_ticks: i64,
+    /// Serialized investment state.
+    pub current_state: i16,
+    /// Random influence value.
+    pub random_influence: f32,
+}
+
 /// One entry in `SimulationManager.m_serializableDataStorage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerializableDataEntry {
@@ -3145,6 +3169,26 @@ impl SimulationManagerData {
         .map(|(series, _)| series)
     }
 
+    /// Decodes the modeled numeric fields for active investments.
+    ///
+    /// This supports inner version 116017 and newer. It includes the float
+    /// history, player-spent amount, owned-share count, base value, missing
+    /// requirement date, current state, and random influence. Prefab
+    /// assignments and names remain opaque. Negative history counts and
+    /// truncated fields return errors. The same queue and guide-reference
+    /// requirements as
+    /// [`decode_economy_manager_investment_value_series`](Self::decode_economy_manager_investment_value_series)
+    /// apply.
+    pub fn decode_economy_manager_investments(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<EconomyInvestmentData>, CrpError> {
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        let body = self.economy_manager_body(&prefix.object_table)?;
+        decode_economy_manager_investments(self.format_version, body, &prefix.object_table)
+            .map(|(investments, _)| investments)
+    }
+
     /// Resolves the version-gated object references at the end of DistrictManager.
     ///
     /// This reader supports inner version 164 and newer when the preceding
@@ -3969,6 +4013,111 @@ fn decode_economy_manager_investment_value_series(
     Ok((series, values_end))
 }
 
+fn decode_economy_manager_investments(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: &DataSerializerObjectTable,
+) -> Result<(Vec<EconomyInvestmentData>, usize), CrpError> {
+    let (series, values_end) =
+        decode_economy_manager_investment_value_series(format_version, bytes, object_table)?;
+    let field_bytes = bytes.get(values_end..).ok_or_else(|| {
+        invalid(
+            values_end,
+            "investment numeric fields start outside EconomyManager",
+        )
+    })?;
+    let mut reader = Reader::new(field_bytes);
+    let mut investments = series
+        .into_iter()
+        .map(|entry| EconomyInvestmentData {
+            investment_index: entry.investment_index,
+            value_history: entry.values,
+            player_spent: 0,
+            owned_share_count: 0,
+            base_value: 0.0,
+            requirement_missing_date_ticks: 0,
+            current_state: 0,
+            random_influence: 0.0,
+        })
+        .collect::<Vec<_>>();
+
+    for investment in &mut investments {
+        investment.player_spent = read_economy_investment_field(
+            &mut reader,
+            values_end,
+            investment.investment_index,
+            "player-spent amount",
+            Reader::read_i32_be,
+        )?;
+        investment.owned_share_count = read_economy_investment_field(
+            &mut reader,
+            values_end,
+            investment.investment_index,
+            "owned-share count",
+            Reader::read_u32_be,
+        )?;
+        investment.base_value = read_economy_investment_field(
+            &mut reader,
+            values_end,
+            investment.investment_index,
+            "base value",
+            Reader::read_f32_be,
+        )?;
+    }
+    for investment in &mut investments {
+        investment.requirement_missing_date_ticks = read_economy_investment_field(
+            &mut reader,
+            values_end,
+            investment.investment_index,
+            "requirement-missing date",
+            Reader::read_i64_be,
+        )?;
+    }
+    for investment in &mut investments {
+        investment.current_state = read_economy_investment_field(
+            &mut reader,
+            values_end,
+            investment.investment_index,
+            "current state",
+            Reader::read_i16_be,
+        )?;
+        investment.random_influence = read_economy_investment_field(
+            &mut reader,
+            values_end,
+            investment.investment_index,
+            "random influence",
+            Reader::read_f32_be,
+        )?;
+    }
+    let fields_end =
+        values_end
+            .checked_add(reader.offset())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EconomyManager investment fields end",
+            ))?;
+    Ok((investments, fields_end))
+}
+
+fn read_economy_investment_field<'a, T>(
+    reader: &mut Reader<'a>,
+    fields_start: usize,
+    investment_index: u16,
+    field_name: &str,
+    read: impl FnOnce(&mut Reader<'a>) -> Result<T, CrpError>,
+) -> Result<T, CrpError> {
+    let offset = fields_start
+        .checked_add(reader.offset())
+        .ok_or(CrpError::ArithmeticOverflow(
+            "EconomyManager investment field offset",
+        ))?;
+    read(reader).map_err(|error| {
+        invalid(
+            offset,
+            format!("investment {investment_index} {field_name}: {error}"),
+        )
+    })
+}
+
 fn data_serializer_class_name(type_name: &str) -> &str {
     type_name
         .split(',')
@@ -4492,14 +4641,14 @@ fn find_unique_bytes(haystack: &[u8], needle: &[u8], description: &str) -> Resul
 #[cfg(test)]
 mod manager_boundary_tests {
     use super::{
-        DataSerializerObjectTable, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
-        QueuedGuideObject, SimulationManagerData,
+        DataSerializerObjectTable, EconomyInvestmentData, GUIDE_TRIGGER_BASE_PREFIX_LEN,
+        ManagerObjectReference, QueuedGuideObject, SimulationManagerData,
         decode_economy_manager_investment_flags_from_body,
-        decode_economy_manager_investment_value_series, decode_transport_manager_reference_body,
-        economy_manager_object_header_count, find_economy_manager_guide_headers,
-        find_trailing_object_headers, locate_queued_object_bodies, locate_queued_object_body,
-        register_reference_headers, transport_manager_line_number_count,
-        transport_manager_object_header_count,
+        decode_economy_manager_investment_value_series, decode_economy_manager_investments,
+        decode_transport_manager_reference_body, economy_manager_object_header_count,
+        find_economy_manager_guide_headers, find_trailing_object_headers,
+        locate_queued_object_bodies, locate_queued_object_body, register_reference_headers,
+        transport_manager_line_number_count, transport_manager_object_header_count,
     };
     use crate::data_serializer::write_unique_string;
     use crate::district_manager_data::{
@@ -5415,6 +5564,113 @@ mod manager_boundary_tests {
                 0x4455_0000,
             ]
         );
+    }
+
+    #[test]
+    fn economy_manager_investment_numeric_fields_follow_independent_wire_order() {
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        table
+            .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+            .unwrap();
+
+        let mut body = vec![0xfe, 0x00, 0x01].repeat(5);
+        let mut flags = vec![0_u16; 254];
+        flags[0] = 1;
+        flags[2] = 1;
+        write_encoded_ushort_array(&mut body, &flags);
+        body.extend_from_slice(&[
+            0x00, 0x02, 0x01, 0x3f, 0x80, 0x00, 0x00, 0xc0, 0x20, 0x00,
+            0x00, // investment 1 history
+            0x00, 0x01, 0x00, 0x40, 0xa0, 0x00, 0x00, // investment 3 history
+            0xff, 0xff, 0xff, 0xfb, 0x00, 0x00, 0x00, 0x0c, 0x40, 0xb0, 0x00,
+            0x00, // -5, 12, 5.5
+            0x00, 0x00, 0x00, 0x07, 0x80, 0x00, 0x00, 0x01, 0x80, 0x00, 0x00,
+            0x00, // 7, shares, -0.0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // first requirement date
+            0x2b, 0xca, 0x27, 0xac, 0xc9, 0xcd, 0x80, 0x00, // second requirement date
+            0x00, 0x02, 0x3e, 0x80, 0x00, 0x00, // state 2, influence 0.25
+            0xff, 0xfc, 0xbf, 0x00, 0x00, 0x00, // state -4, influence -0.5
+        ]);
+        body.extend_from_slice(&[0xaa, 0xbb]);
+
+        let (investments, fields_end) =
+            decode_economy_manager_investments(116_017, &body, &table).unwrap();
+        assert_eq!(fields_end, body.len() - 2);
+        assert_eq!(
+            investments,
+            [
+                EconomyInvestmentData {
+                    investment_index: 1,
+                    value_history: [1.0, -2.5].to_vec(),
+                    player_spent: -5,
+                    owned_share_count: 12,
+                    base_value: 5.5,
+                    requirement_missing_date_ticks: 1,
+                    current_state: 2,
+                    random_influence: 0.25,
+                },
+                EconomyInvestmentData {
+                    investment_index: 3,
+                    value_history: [5.0].to_vec(),
+                    player_spent: 7,
+                    owned_share_count: 0x8000_0001,
+                    base_value: -0.0,
+                    requirement_missing_date_ticks: 0x2bca_27ac_c9cd_8000,
+                    current_state: -4,
+                    random_influence: -0.5,
+                },
+            ]
+        );
+        for truncated_end in 15..body.len() - 2 {
+            assert!(
+                decode_economy_manager_investments(116_017, &body[..truncated_end], &table)
+                    .is_err(),
+                "truncated EconomyManager body unexpectedly parsed through byte {truncated_end}"
+            );
+        }
+    }
+
+    #[test]
+    fn economy_manager_investment_numeric_fields_match_boreal_fixture() {
+        let bytes =
+            include_bytes!("../tests/fixtures/economy-investment-records-v116019-boreal.bin");
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        for index in 0..29 {
+            table
+                .register(&NetObjectHeader::NewType(format!("FixtureType{index}")))
+                .unwrap();
+        }
+        table
+            .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+            .unwrap();
+
+        let (investments, fields_end) =
+            decode_economy_manager_investments(116_019, bytes, &table).unwrap();
+        assert_eq!(fields_end, bytes.len());
+        assert_eq!(
+            investments
+                .iter()
+                .map(|entry| entry.investment_index)
+                .collect::<Vec<_>>(),
+            [8, 16, 19, 34, 69, 81, 85, 124, 158, 162, 185, 187, 250]
+        );
+        assert!(investments.iter().all(|entry| {
+            entry.value_history.len() == 1
+                && entry.player_spent == 0
+                && entry.owned_share_count == 0
+                && entry.requirement_missing_date_ticks == 0x2bca_27ac_c9cd_8000
+        }));
+        for entry in &investments {
+            if entry.investment_index == 34 {
+                assert_eq!(entry.base_value.to_bits(), 1000.0_f32.to_bits());
+                assert_eq!(entry.current_state, 1);
+                assert_eq!(entry.random_influence.to_bits(), 0x3f15_c290);
+            } else {
+                assert_eq!(entry.base_value.to_bits(), 0);
+                assert_eq!(entry.current_state, 0);
+                assert_eq!(entry.random_influence.to_bits(), 0);
+            }
+        }
     }
 
     #[test]

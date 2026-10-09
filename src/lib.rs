@@ -81,7 +81,7 @@ pub use net_manager_data::{
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use prop_manager_data::PropManagerDataPrefix;
 pub use simulation_manager_data::{
-    EconomyInvestmentValueSeries, GuideBodyLocation, ManagerObjectReference,
+    EconomyInvestmentData, EconomyInvestmentValueSeries, GuideBodyLocation, ManagerObjectReference,
     ResolvedObjectReference, SerializableDataEntry, SimulationManagerData,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
@@ -4539,6 +4539,20 @@ mod tests {
                         > 0,
                     "{file_name}"
                 );
+                let investments =
+                    manager.decode_economy_manager_investments(metadata.save_app_version)?;
+                assert_eq!(investments.len(), 13, "{file_name}");
+                assert_eq!(
+                    investments
+                        .iter()
+                        .map(|investment| investment.investment_index)
+                        .collect::<Vec<_>>(),
+                    value_series
+                        .iter()
+                        .map(|series| series.investment_index)
+                        .collect::<Vec<_>>(),
+                    "{file_name}"
+                );
             }
         }
         Ok(())
@@ -4591,6 +4605,8 @@ mod tests {
         for reference in &references[3..] {
             assert!(reference.type_name.starts_with("GenericGuide,"));
         }
+        let investments = manager.decode_economy_manager_investments(metadata.save_app_version)?;
+        assert!(!investments.is_empty());
         Ok(())
     }
 

@@ -149,6 +149,13 @@ impl<'a> Reader<'a> {
         ]))
     }
 
+    pub(crate) fn read_i64_be(&mut self) -> Result<i64, CrpError> {
+        let bytes = self.read_bytes(8)?;
+        Ok(i64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
     pub(crate) fn read_u16_be(&mut self) -> Result<u16, CrpError> {
         let bytes = self.read_bytes(2)?;
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
