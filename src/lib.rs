@@ -4453,6 +4453,56 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads the local CCMP2 Desert Map 1 game map from data/maps"]
+    fn validates_desert_transport_manager_selection_suffix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CCMP2 Desert Map 1.crp");
+        let mut file = File::open(&path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("Desert Map 1 has no type-52 asset"))?;
+        let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 116_020);
+
+        let references = manager.resolve_transport_manager_references(metadata.save_app_version)?;
+        let references = references
+            .into_iter()
+            .map(|reference| {
+                reference.ok_or_else(|| {
+                    std::io::Error::other("unexpected null TransportManager reference")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            references
+                .iter()
+                .map(|reference| reference.object_id)
+                .collect::<Vec<_>>(),
+            [128, 129, 130, 131, 132, 133, 134]
+        );
+        assert!(references[0].type_name.starts_with("GenericGuide,"));
+        assert!(
+            references[1]
+                .type_name
+                .starts_with("BuildingInstanceGuide,")
+        );
+        assert!(
+            references[2]
+                .type_name
+                .starts_with("BuildingInstanceGuide,")
+        );
+        for reference in &references[3..] {
+            assert!(reference.type_name.starts_with("GenericGuide,"));
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "reads the local CL Wolf Creek game map from data/maps"]
     fn validates_wolf_creek_building_manager_guide_locator()
     -> Result<(), Box<dyn std::error::Error>> {

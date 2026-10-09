@@ -2642,13 +2642,6 @@ impl SimulationManagerData {
                 "TransportManager reference resolution requires inner version 164 or newer",
             ));
         }
-        if self.format_version >= 114_001 {
-            return Err(invalid(
-                0,
-                "TransportManager selection-table suffix from version 114001 is not yet supported",
-            ));
-        }
-
         let manager_slot = self
             .manager_objects
             .as_deref()
@@ -3023,12 +3016,13 @@ impl SimulationManagerData {
 
     /// Resolves TransportManager's fixed object-reference fields in order.
     ///
-    /// This reader supports inner versions 164–114000 when line and milestone
+    /// This reader supports inner versions 164–115999 when line and milestone
     /// buffers are empty. It follows the known queue through ZoneManager, then
-    /// reads the version-gated TransportManager tail. Active lines, milestones,
-    /// and the version-114001 selection-table suffix return an error. Pass the
-    /// saved application version for inner-version-221+ NetNodeInstanceGuide
-    /// fields in the earlier manager queue.
+    /// reads the version-gated TransportManager tail, including the selection
+    /// table from version 114001. Selection values are consumed for boundary
+    /// validation but remain opaque; active lines and milestones return an error.
+    /// Pass the saved application version for inner-version-221+
+    /// NetNodeInstanceGuide fields in the earlier manager queue.
     pub fn resolve_transport_manager_references(
         &self,
         save_app_version: Option<u32>,
@@ -3056,7 +3050,7 @@ impl SimulationManagerData {
 
     /// Resolves EconomyManager's trailing guide object references.
     ///
-    /// The reader supports inner versions 164–114000. One reference is read
+    /// The reader supports inner versions 164–115999. One reference is read
     /// from version 94 and a second is added at 166; these are the final
     /// EconomyManager fields before the version-116000 investment extension.
     /// The method requires an unambiguous sequence of object headers at the
@@ -3089,7 +3083,7 @@ impl SimulationManagerData {
 
     /// Resolves the version-gated object references at the end of DistrictManager.
     ///
-    /// This reader supports inner versions 164–114000, following the currently
+    /// This reader supports inner versions 164–115999, following the currently
     /// supported TransportManager and EconomyManager reference layouts. It
     /// decodes DistrictManager's grid boundary and versioned tail, but leaves
     /// referenced object bodies opaque. Pass the saved application version
@@ -3878,13 +3872,6 @@ fn decode_transport_manager_reference_body(
             "TransportManager reference resolution requires inner version 164 or newer",
         ));
     }
-    if format_version >= 114_001 {
-        return Err(invalid(
-            0,
-            "TransportManager selection-table suffix from version 114001 is not yet supported",
-        ));
-    }
-
     let mut reader = Reader::new(bytes);
     let line_flags = read_encoded_uint_array(&mut reader, 255)?;
     if line_flags.iter().any(|flag| *flag != 0) {
@@ -3939,6 +3926,33 @@ fn decode_transport_manager_reference_body(
     for _ in 0..header_count {
         headers.push(read_net_object_header(&mut reader)?);
     }
+    if format_version >= 114_001 {
+        let selection_count = reader.read_i16_be()?;
+        if selection_count < 0 {
+            let count_offset =
+                reader
+                    .offset()
+                    .checked_sub(2)
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "TransportManager selection-count offset",
+                    ))?;
+            return Err(invalid(
+                count_offset,
+                format!("negative TransportManager selection count {selection_count}"),
+            ));
+        }
+        let selection_count = usize::try_from(selection_count)
+            .map_err(|_| reader.invalid("selection count does not fit this platform"))?;
+        if selection_count > reader.remaining() / 4 {
+            return Err(
+                reader.invalid("TransportManager selection count cannot fit in remaining bytes")
+            );
+        }
+        for _ in 0..selection_count {
+            reader.read_i16_be()?;
+            skip_shared_string_value(&mut reader)?;
+        }
+    }
     if reader.remaining() != 0 {
         return Err(invalid(
             reader.offset(),
@@ -3950,6 +3964,22 @@ fn decode_transport_manager_reference_body(
         checked_table.register(header)?;
     }
     Ok(headers)
+}
+
+fn skip_shared_string_value(reader: &mut Reader<'_>) -> Result<(), CrpError> {
+    // Earlier managers seed this shared-string table; their values are opaque
+    // here, so consume the wire form without resolving an existing table index.
+    match reader.read_u8()? {
+        0xfe => {
+            reader.read_unique_string()?;
+            Ok(())
+        }
+        0xff => Err(reader.invalid("shared-string reference uses a reserved marker")),
+        _ => {
+            reader.read_u8()?;
+            Ok(())
+        }
+    }
 }
 
 fn register_raw_queued_reference(
@@ -4850,7 +4880,6 @@ mod manager_boundary_tests {
                 NetObjectHeader::Existing(2),
             ]
         );
-        assert!(decode_transport_manager_reference_body(114_001, &bytes, &table).is_err());
         let mut nonempty_milestones = bytes.clone();
         nonempty_milestones[3] = 1;
         assert!(
@@ -4864,6 +4893,60 @@ mod manager_boundary_tests {
         assert!(
             decode_transport_manager_reference_body(112_004, &bytes[..bytes.len() - 1], &table)
                 .is_err()
+        );
+
+        let mut selection_bytes = vec![0xff, 0xfe];
+        selection_bytes.extend_from_slice(&0_u16.to_be_bytes());
+        selection_bytes.extend_from_slice(&0_u16.to_be_bytes());
+        selection_bytes.extend_from_slice(&[0; 17 * 2 + 17 * 8 * 9]);
+        selection_bytes.extend([0xff; 7]);
+        let count_offset = selection_bytes.len();
+        selection_bytes.extend_from_slice(&2_i16.to_be_bytes());
+        selection_bytes.extend_from_slice(&(-3_i16).to_be_bytes());
+        selection_bytes.push(0xfe);
+        write_unique_string(&mut selection_bytes, "TramVehicle").unwrap();
+        selection_bytes.extend_from_slice(&5_i16.to_be_bytes());
+        let second_shared_string_offset = selection_bytes.len();
+        selection_bytes.extend_from_slice(&[0x00, 0x00]);
+        assert_eq!(
+            decode_transport_manager_reference_body(
+                114_001,
+                &selection_bytes,
+                &DataSerializerObjectTable::new("SimulationManager+Data"),
+            )
+            .unwrap(),
+            vec![NetObjectHeader::Null; 7]
+        );
+
+        let mut negative_count = selection_bytes.clone();
+        negative_count[count_offset..count_offset + 2].copy_from_slice(&(-1_i16).to_be_bytes());
+        assert!(
+            decode_transport_manager_reference_body(
+                114_001,
+                &negative_count,
+                &DataSerializerObjectTable::new("SimulationManager+Data"),
+            )
+            .is_err()
+        );
+
+        let mut reserved_shared_marker = selection_bytes.clone();
+        reserved_shared_marker[second_shared_string_offset] = 0xff;
+        assert!(
+            decode_transport_manager_reference_body(
+                114_001,
+                &reserved_shared_marker,
+                &DataSerializerObjectTable::new("SimulationManager+Data"),
+            )
+            .is_err()
+        );
+
+        assert!(
+            decode_transport_manager_reference_body(
+                114_001,
+                &selection_bytes[..selection_bytes.len() - 1],
+                &DataSerializerObjectTable::new("SimulationManager+Data"),
+            )
+            .is_err()
         );
     }
 
