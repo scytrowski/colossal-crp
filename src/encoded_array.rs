@@ -320,14 +320,63 @@ pub(crate) fn read_encoded_ulong_array(
 }
 
 /// Decodes `EncodedArray.Long` using the ULong control layout and signed bit patterns.
+#[cfg(test)]
 pub(crate) fn read_encoded_long_array(
     reader: &mut Reader<'_>,
     count: usize,
 ) -> Result<Vec<i64>, CrpError> {
-    Ok(read_encoded_ulong_array(reader, count)?
-        .into_iter()
-        .map(|bits| bits as i64)
-        .collect())
+    EncodedLongArrayReader::default().read_array(reader, count)
+}
+
+/// Reads consecutive signed `EncodedArray.Long` arrays in one shared scope.
+///
+/// `BeginRead` resets the delta state once, while multiple array fields can be
+/// read before `EndRead`. Keep one reader for all fields in that scope.
+#[derive(Debug, Default)]
+pub(crate) struct EncodedLongArrayReader {
+    previous_value: i64,
+    previous_delta: i64,
+    full_count: usize,
+    close_count: usize,
+    same_count: usize,
+}
+
+impl EncodedLongArrayReader {
+    pub(crate) fn read_array(
+        &mut self,
+        reader: &mut Reader<'_>,
+        count: usize,
+    ) -> Result<Vec<i64>, CrpError> {
+        let mut values = Vec::with_capacity(count);
+        while values.len() < count {
+            if self.same_count > 0 {
+                self.previous_value = self.previous_value.wrapping_add(self.previous_delta);
+                self.same_count -= 1;
+            } else if self.close_count > 0 {
+                let adjustment = i64::from(reader.read_i32_be()?);
+                self.previous_delta = self.previous_delta.wrapping_add(adjustment);
+                self.previous_value = self.previous_value.wrapping_add(self.previous_delta);
+                self.close_count -= 1;
+            } else if self.full_count > 0 {
+                let value = reader.read_i64_be()?;
+                self.previous_delta = value.wrapping_sub(self.previous_value);
+                self.previous_value = self.previous_value.wrapping_add(self.previous_delta);
+                self.full_count -= 1;
+            } else {
+                let control = reader.read_u8()?;
+                if control >= 0x80 {
+                    self.same_count = usize::from(control - 0x7f);
+                } else if control >= 0x40 {
+                    self.close_count = usize::from(control - 0x3f);
+                } else {
+                    self.full_count = usize::from(control) + 1;
+                }
+                continue;
+            }
+            values.push(self.previous_value);
+        }
+        Ok(values)
+    }
 }
 
 // Explicit canonical writer: literal blocks and repeated signed deltas.
@@ -379,10 +428,10 @@ fn repeated_delta_run(values: &[u16], start: usize, previous: u16, delta: i16) -
 #[cfg(test)]
 mod tests {
     use super::{
-        read_encoded_bool_array, read_encoded_byte_array, read_encoded_float_array,
-        read_encoded_long_array, read_encoded_uint_array, read_encoded_ulong_array,
-        read_encoded_ushort_array, skip_encoded_ushort_array, write_encoded_bool_array,
-        write_encoded_float_array, write_encoded_long_array,
+        EncodedLongArrayReader, read_encoded_bool_array, read_encoded_byte_array,
+        read_encoded_float_array, read_encoded_long_array, read_encoded_uint_array,
+        read_encoded_ulong_array, read_encoded_ushort_array, skip_encoded_ushort_array,
+        write_encoded_bool_array, write_encoded_float_array, write_encoded_long_array,
     };
     use crate::data_serializer::Reader;
 
@@ -451,6 +500,20 @@ mod tests {
             [5, 10, 15, 18]
         );
         assert_eq!(reader.offset(), bytes.len());
+    }
+
+    #[test]
+    fn long_array_fields_in_one_scope_share_delta_state() {
+        let bytes = [
+            0x01, // Two literal values follow.
+            0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 10,
+            0x80, // Repeat the previous delta once in the next field.
+        ];
+        let mut reader = Reader::new(&bytes);
+        let mut scope = EncodedLongArrayReader::default();
+        assert_eq!(scope.read_array(&mut reader, 2).unwrap(), [5, 10]);
+        assert_eq!(scope.read_array(&mut reader, 1).unwrap(), [15]);
+        assert_eq!(reader.remaining(), 0);
     }
 
     #[test]

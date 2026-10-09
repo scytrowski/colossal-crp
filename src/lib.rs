@@ -82,8 +82,9 @@ pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use prop_manager_data::PropManagerDataPrefix;
 pub use simulation_manager_data::{
     EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
-    EconomyInvestmentValueSeries, EconomyManagerBudgetEditor, EconomyManagerIncomeExpenseEditor,
-    EconomyManagerInvestmentsEditor, GuideBodyLocation, ManagerObjectReference,
+    EconomyInvestmentValueSeries, EconomyLoanRecord, EconomyManagerBudgetEditor,
+    EconomyManagerIncomeExpenseEditor, EconomyManagerInvestmentsEditor,
+    EconomyManagerLoansAndCashEditor, GuideBodyLocation, ManagerObjectReference,
     ResolvedObjectReference, SerializableDataEntry, SimulationManagerData,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
@@ -4514,7 +4515,7 @@ mod tests {
                 manager.decode_economy_manager_income_expense_editor(metadata.save_app_version)?;
             assert_eq!(income_expenses.income().len(), 2_380, "{file_name}");
             assert_eq!(income_expenses.total_income().map(<[i64]>::len), Some(18));
-            assert_eq!(income_expenses.expenses().len(), 680, "{file_name}");
+            assert_eq!(income_expenses.expenses().len(), 2_380, "{file_name}");
             assert_eq!(
                 income_expenses.loan_expenses().map(<[i64]>::len),
                 Some(680),
@@ -4645,6 +4646,28 @@ mod tests {
             })?[0],
             changed_policy_expense
         );
+
+        let mut loans_and_cash =
+            manager.decode_economy_manager_loans_and_cash_editor(metadata.save_app_version)?;
+        loans_and_cash.loans_mut()[0].amount_taken = -765_432;
+        loans_and_cash.cash_values_mut()[0] = 0x0102_0304_0506_0708;
+        *loans_and_cash.starting_money_mut().ok_or_else(|| {
+            std::io::Error::other("Boreal has no version-gated starting-money field")
+        })? = 7_654_321;
+        *loans_and_cash
+            .unmodeled_cash_value_raw_mut()
+            .ok_or_else(|| std::io::Error::other("Boreal has no additional cash field"))? = -9;
+        manager
+            .replace_economy_manager_loans_and_cash(&loans_and_cash, metadata.save_app_version)?;
+        let decoded_loans_and_cash =
+            manager.decode_economy_manager_loans_and_cash_editor(metadata.save_app_version)?;
+        assert_eq!(decoded_loans_and_cash.loans()[0].amount_taken, -765_432);
+        assert_eq!(
+            decoded_loans_and_cash.cash_values()[0],
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(decoded_loans_and_cash.starting_money(), Some(7_654_321));
+        assert_eq!(decoded_loans_and_cash.unmodeled_cash_value_raw(), Some(-9));
         Ok(())
     }
 

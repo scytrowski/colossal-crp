@@ -16,7 +16,7 @@ use crate::data_serializer::{
     DataSerializerStream, Reader, write_nullable_unique_string, write_u24_be, write_unique_string,
 };
 use crate::encoded_array::{
-    read_encoded_byte_array, read_encoded_float_array, read_encoded_long_array,
+    EncodedLongArrayReader, read_encoded_byte_array, read_encoded_float_array,
     read_encoded_uint_array, read_encoded_ushort_array, write_encoded_byte_array,
     write_encoded_float_array, write_encoded_long_array, write_encoded_ushort_array,
 };
@@ -65,6 +65,8 @@ const MAX_SHARED_TYPES: usize = 65_024;
 const LOADING_PROFILER_END_TAG_BYTES: usize = 2;
 const MAX_TRAILING_HEADER_CANDIDATES: usize = 64;
 const ECONOMY_INVESTMENT_FLAG_COUNT: usize = 254;
+const ECONOMY_MANAGER_LOAN_COUNT: usize = 3;
+const ECONOMY_MANAGER_CASH_VALUE_COUNT: usize = 4;
 
 /// A non-null reference in `SimulationManager+Data`'s manager-data array.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,6 +351,128 @@ impl EconomyManagerIncomeExpenseEditor {
     /// Encodes the arrays and copies all remaining EconomyManager bytes unchanged.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         encode_economy_manager_income_expense_editor(self)
+    }
+}
+
+/// One of the three serialized EconomyManager loan records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EconomyLoanRecord {
+    /// Amount taken out for this loan.
+    pub amount_taken: i32,
+    /// Remaining principal for this loan.
+    pub amount_left: i32,
+    /// Serialized interest rate.
+    pub interest_rate: i16,
+    /// Serialized loan term.
+    pub term: i16,
+    /// Interest paid, serialized from inner version 193.
+    ///
+    /// Older readers derive this value from the other loan fields.
+    pub interest_paid: Option<i32>,
+}
+
+/// Editable loan records and following cash and tax scalars in `EconomyManager+Data`.
+///
+/// The editor retains all bytes before the loan block and after the modeled
+/// scalar fields, including version-gated guide references and investment data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EconomyManagerLoansAndCashEditor {
+    format_version: u32,
+    loans: [EconomyLoanRecord; ECONOMY_MANAGER_LOAN_COUNT],
+    cash_values: [i64; ECONOMY_MANAGER_CASH_VALUE_COUNT],
+    starting_money: Option<i64>,
+    unmodeled_cash_value_raw: Option<i64>,
+    tax_multiplier_raw: Option<i16>,
+    bailout_accepted: Option<i16>,
+    last_bailout_frame: Option<u32>,
+    original_body: Vec<u8>,
+    prefix_start: usize,
+    prefix_end: usize,
+}
+
+impl EconomyManagerLoansAndCashEditor {
+    /// Returns the inner DataSerializer version used to decode this editor.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns the three loan records in serialized order.
+    pub fn loans(&self) -> &[EconomyLoanRecord; ECONOMY_MANAGER_LOAN_COUNT] {
+        &self.loans
+    }
+
+    /// Returns mutable access to the three loan records.
+    pub fn loans_mut(&mut self) -> &mut [EconomyLoanRecord; ECONOMY_MANAGER_LOAN_COUNT] {
+        &mut self.loans
+    }
+
+    /// Returns the four modeled raw signed cash values in serialized order.
+    pub fn cash_values(&self) -> &[i64; ECONOMY_MANAGER_CASH_VALUE_COUNT] {
+        &self.cash_values
+    }
+
+    /// Returns mutable access to the four modeled raw signed cash values.
+    pub fn cash_values_mut(&mut self) -> &mut [i64; ECONOMY_MANAGER_CASH_VALUE_COUNT] {
+        &mut self.cash_values
+    }
+
+    /// Returns starting money from inner version 287, if present.
+    pub fn starting_money(&self) -> Option<i64> {
+        self.starting_money
+    }
+
+    /// Returns mutable access to starting money from version 287, if present.
+    pub fn starting_money_mut(&mut self) -> Option<&mut i64> {
+        self.starting_money.as_mut()
+    }
+
+    /// Returns the additional version-287 `i64` consumed and discarded by the
+    /// supplied reader before its four modeled cash fields.
+    pub fn unmodeled_cash_value_raw(&self) -> Option<i64> {
+        self.unmodeled_cash_value_raw
+    }
+
+    /// Returns mutable access to the additional version-287 serialized value.
+    pub fn unmodeled_cash_value_raw_mut(&mut self) -> Option<&mut i64> {
+        self.unmodeled_cash_value_raw.as_mut()
+    }
+
+    /// Returns the raw serialized tax multiplier from version 106, if present.
+    ///
+    /// Versions 106–195 use an older scaled representation; this API does not
+    /// multiply or otherwise normalize the stored value.
+    pub fn tax_multiplier_raw(&self) -> Option<i16> {
+        self.tax_multiplier_raw
+    }
+
+    /// Returns mutable access to the raw tax multiplier from version 106.
+    pub fn tax_multiplier_raw_mut(&mut self) -> Option<&mut i16> {
+        self.tax_multiplier_raw.as_mut()
+    }
+
+    /// Returns the bailout-accepted value from version 152, if present.
+    pub fn bailout_accepted(&self) -> Option<i16> {
+        self.bailout_accepted
+    }
+
+    /// Returns mutable access to the bailout-accepted value from version 152.
+    pub fn bailout_accepted_mut(&mut self) -> Option<&mut i16> {
+        self.bailout_accepted.as_mut()
+    }
+
+    /// Returns the last-bailout frame from version 159, if present.
+    pub fn last_bailout_frame(&self) -> Option<u32> {
+        self.last_bailout_frame
+    }
+
+    /// Returns mutable access to the last-bailout frame from version 159.
+    pub fn last_bailout_frame_mut(&mut self) -> Option<&mut u32> {
+        self.last_bailout_frame.as_mut()
+    }
+
+    /// Encodes the loans and scalars and copies all remaining body bytes unchanged.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        encode_economy_manager_loans_and_cash_editor(self)
     }
 }
 
@@ -3468,7 +3592,21 @@ impl SimulationManagerData {
             .serialized_object_graph
             .get(body_range)
             .ok_or_else(|| invalid(0, "EconomyManager body range exceeds manager graph"))?;
-        decode_economy_manager_income_expense_editor(self.format_version, body)
+        let editor = decode_economy_manager_income_expense_editor(self.format_version, body)?;
+        if self.format_version >= 116_000 {
+            let scalar_prefix_bytes = economy_manager_scalar_prefix_from_reference(
+                self.format_version,
+                body,
+                &prefix.object_table,
+                editor.prefix_end,
+            )?;
+            decode_economy_manager_loans_and_cash_editor_with_prefix(
+                self.format_version,
+                body,
+                scalar_prefix_bytes,
+            )?;
+        }
+        Ok(editor)
     }
 
     /// Replaces EconomyManager's income and expense history arrays.
@@ -3526,6 +3664,99 @@ impl SimulationManagerData {
                 format!(
                     "rewritten EconomyManager income/expense prefix failed validation: {error}"
                 ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Decodes EconomyManager's three loans and following cash and tax scalars.
+    ///
+    /// Optional fields follow their inner-version gates. The tax multiplier is
+    /// returned in its raw serialized form, including the older scaled values.
+    /// Guide references and later investment bytes remain opaque.
+    pub fn decode_economy_manager_loans_and_cash_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<EconomyManagerLoansAndCashEditor, CrpError> {
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        let body_range = self.economy_manager_body_range(&prefix.object_table)?;
+        let body = self
+            .serialized_object_graph
+            .get(body_range)
+            .ok_or_else(|| invalid(0, "EconomyManager body range exceeds manager graph"))?;
+        let scalar_prefix_bytes = if self.format_version >= 116_000 {
+            let income_expense =
+                decode_economy_manager_income_expense_editor(self.format_version, body)?;
+            economy_manager_scalar_prefix_from_reference(
+                self.format_version,
+                body,
+                &prefix.object_table,
+                income_expense.prefix_end,
+            )?
+        } else {
+            0
+        };
+        decode_economy_manager_loans_and_cash_editor_with_prefix(
+            self.format_version,
+            body,
+            scalar_prefix_bytes,
+        )
+    }
+
+    /// Replaces EconomyManager's loans and following cash and tax scalars.
+    ///
+    /// The editor must come from this manager's current body and use the same
+    /// inner version. Replacement preserves guide references and later bytes,
+    /// validates the rewritten fields, and restores the graph on failure.
+    pub fn replace_economy_manager_loans_and_cash(
+        &mut self,
+        edited: &EconomyManagerLoansAndCashEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version != self.format_version {
+            return Err(invalid(
+                0,
+                "EconomyManager loans/cash editor uses a different DataSerializer version",
+            ));
+        }
+        let current = self.decode_economy_manager_loans_and_cash_editor(save_app_version)?;
+        if current.original_body != edited.original_body {
+            return Err(invalid(
+                0,
+                "EconomyManager loans/cash editor does not match this manager body",
+            ));
+        }
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        let body_range = self.economy_manager_body_range(&prefix.object_table)?;
+        let replacement = edited.encode()?;
+        let replacement_start = body_range.start;
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_range, replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+
+        let validation = self
+            .decode_economy_manager_loans_and_cash_editor(save_app_version)
+            .and_then(|decoded| {
+                if decoded.loans != edited.loans
+                    || decoded.cash_values != edited.cash_values
+                    || decoded.starting_money != edited.starting_money
+                    || decoded.unmodeled_cash_value_raw != edited.unmodeled_cash_value_raw
+                    || decoded.tax_multiplier_raw != edited.tax_multiplier_raw
+                    || decoded.bailout_accepted != edited.bailout_accepted
+                    || decoded.last_bailout_frame != edited.last_bailout_frame
+                {
+                    return Err(invalid(
+                        replacement_start,
+                        "rewritten EconomyManager loans/cash fields do not match the editor",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                replacement_start,
+                format!("rewritten EconomyManager loans/cash fields failed validation: {error}"),
             ));
         }
         Ok(())
@@ -4528,32 +4759,40 @@ fn decode_economy_manager_income_expense_editor(
         .read_bytes(budget_prefix.prefix_end)
         .map_err(|error| invalid(0, format!("EconomyManager budget prefix: {error}")))?;
 
-    let income_count = economy_manager_income_count(format_version);
+    let primary_count = economy_manager_income_count(format_version);
+    let secondary_count = economy_manager_expense_count(format_version);
     let income_offset = reader.offset();
-    let income = read_encoded_long_array(&mut reader, income_count)
+    let mut income_scope = EncodedLongArrayReader::default();
+    let income = income_scope
+        .read_array(&mut reader, primary_count)
         .map_err(|error| invalid(income_offset, format!("EconomyManager income: {error}")))?;
     let total_count = economy_manager_total_array_count(format_version);
     let total_income = if let Some(count) = total_count {
         let offset = reader.offset();
         Some(
-            read_encoded_long_array(&mut reader, count).map_err(|error| {
-                invalid(offset, format!("EconomyManager total income: {error}"))
-            })?,
+            income_scope
+                .read_array(&mut reader, count)
+                .map_err(|error| {
+                    invalid(offset, format!("EconomyManager total income: {error}"))
+                })?,
         )
     } else {
         None
     };
 
-    let expense_count = economy_manager_expense_count(format_version);
+    let mut expense_scope = EncodedLongArrayReader::default();
     let expenses_offset = reader.offset();
-    let expenses = read_encoded_long_array(&mut reader, expense_count)
+    let expenses = expense_scope
+        .read_array(&mut reader, primary_count)
         .map_err(|error| invalid(expenses_offset, format!("EconomyManager expenses: {error}")))?;
     let loan_expenses = if format_version >= 101 {
         let offset = reader.offset();
         Some(
-            read_encoded_long_array(&mut reader, expense_count).map_err(|error| {
-                invalid(offset, format!("EconomyManager loan expenses: {error}"))
-            })?,
+            expense_scope
+                .read_array(&mut reader, secondary_count)
+                .map_err(|error| {
+                    invalid(offset, format!("EconomyManager loan expenses: {error}"))
+                })?,
         )
     } else {
         None
@@ -4561,9 +4800,11 @@ fn decode_economy_manager_income_expense_editor(
     let policy_expenses = if format_version >= 152 {
         let offset = reader.offset();
         Some(
-            read_encoded_long_array(&mut reader, expense_count).map_err(|error| {
-                invalid(offset, format!("EconomyManager policy expenses: {error}"))
-            })?,
+            expense_scope
+                .read_array(&mut reader, secondary_count)
+                .map_err(|error| {
+                    invalid(offset, format!("EconomyManager policy expenses: {error}"))
+                })?,
         )
     } else {
         None
@@ -4571,9 +4812,11 @@ fn decode_economy_manager_income_expense_editor(
     let total_expenses = if let Some(count) = total_count {
         let offset = reader.offset();
         Some(
-            read_encoded_long_array(&mut reader, count).map_err(|error| {
-                invalid(offset, format!("EconomyManager total expenses: {error}"))
-            })?,
+            expense_scope
+                .read_array(&mut reader, count)
+                .map_err(|error| {
+                    invalid(offset, format!("EconomyManager total expenses: {error}"))
+                })?,
         )
     } else {
         None
@@ -4602,7 +4845,9 @@ fn encode_economy_manager_income_expense_editor(
             "EconomyManager income/expense boundaries exceed their source body",
         ));
     }
-    let expected_income_count = economy_manager_income_count(editor.format_version);
+    let primary_count = economy_manager_income_count(editor.format_version);
+    let secondary_count = economy_manager_expense_count(editor.format_version);
+    let expected_income_count = primary_count;
     if editor.income.len() != expected_income_count {
         return Err(invalid(
             0,
@@ -4612,7 +4857,7 @@ fn encode_economy_manager_income_expense_editor(
             ),
         ));
     }
-    let expected_expense_count = economy_manager_expense_count(editor.format_version);
+    let expected_expense_count = primary_count;
     if editor.expenses.len() != expected_expense_count {
         return Err(invalid(
             0,
@@ -4631,12 +4876,12 @@ fn encode_economy_manager_income_expense_editor(
     validate_economy_manager_optional_array(
         "loan expenses",
         editor.loan_expenses.as_deref(),
-        (editor.format_version >= 101).then_some(expected_expense_count),
+        (editor.format_version >= 101).then_some(secondary_count),
     )?;
     validate_economy_manager_optional_array(
         "policy expenses",
         editor.policy_expenses.as_deref(),
-        (editor.format_version >= 152).then_some(expected_expense_count),
+        (editor.format_version >= 152).then_some(secondary_count),
     )?;
     validate_economy_manager_optional_array(
         "total expenses",
@@ -4686,6 +4931,287 @@ fn validate_economy_manager_optional_array(
             0,
             format!("EconomyManager {field} are required in this version"),
         )),
+    }
+}
+
+#[cfg(test)]
+fn decode_economy_manager_loans_and_cash_editor(
+    format_version: u32,
+    bytes: &[u8],
+) -> Result<EconomyManagerLoansAndCashEditor, CrpError> {
+    decode_economy_manager_loans_and_cash_editor_with_prefix(format_version, bytes, 0)
+}
+
+fn economy_manager_scalar_prefix_from_reference(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: &DataSerializerObjectTable,
+    income_expense_end: usize,
+) -> Result<usize, CrpError> {
+    let references =
+        find_economy_manager_guide_header_positions(format_version, bytes, object_table)?;
+    let first_reference = references
+        .first()
+        .map(|(offset, _, _)| *offset)
+        .ok_or_else(|| invalid(bytes.len(), "EconomyManager guide references are absent"))?;
+    let scalar_end = income_expense_end
+        .checked_add(decode_economy_manager_loan_scalar_length(format_version))
+        .ok_or(CrpError::ArithmeticOverflow(
+            "EconomyManager scalar boundary",
+        ))?;
+    let prefix_bytes = first_reference.checked_sub(scalar_end).ok_or_else(|| {
+        invalid(
+            first_reference,
+            "EconomyManager scalar fields overlap the first guide reference",
+        )
+    })?;
+    if prefix_bytes > 1 {
+        return Err(invalid(
+            income_expense_end,
+            format!("unsupported {prefix_bytes}-byte gap before EconomyManager loan fields"),
+        ));
+    }
+    Ok(prefix_bytes)
+}
+
+fn decode_economy_manager_loan_scalar_length(format_version: u32) -> usize {
+    let loan_length = if format_version >= 193 { 16 } else { 12 };
+    (ECONOMY_MANAGER_LOAN_COUNT * loan_length)
+        + (if format_version >= 287 { 16 } else { 0 })
+        + (ECONOMY_MANAGER_CASH_VALUE_COUNT * 8)
+        + (if format_version >= 106 { 2 } else { 0 })
+        + (if format_version >= 152 { 2 } else { 0 })
+        + (if format_version >= 159 { 4 } else { 0 })
+}
+
+fn decode_economy_manager_loans_and_cash_editor_with_prefix(
+    format_version: u32,
+    bytes: &[u8],
+    scalar_prefix_bytes: usize,
+) -> Result<EconomyManagerLoansAndCashEditor, CrpError> {
+    let income_expense_prefix =
+        decode_economy_manager_income_expense_editor(format_version, bytes)?;
+    let mut reader = Reader::new(bytes);
+    reader
+        .read_bytes(income_expense_prefix.prefix_end)
+        .map_err(|error| invalid(0, format!("EconomyManager income/expense prefix: {error}")))?;
+    let scalar_prefix_offset = reader.offset();
+    reader.read_bytes(scalar_prefix_bytes).map_err(|error| {
+        invalid(
+            scalar_prefix_offset,
+            format!("EconomyManager scalar prefix: {error}"),
+        )
+    })?;
+    let scalar_fields_start = reader.offset();
+
+    let mut loans = std::array::from_fn(|_| EconomyLoanRecord {
+        amount_taken: 0,
+        amount_left: 0,
+        interest_rate: 0,
+        term: 0,
+        interest_paid: None,
+    });
+    for (index, loan) in loans.iter_mut().enumerate() {
+        loan.amount_taken = read_economy_manager_scalar_field(
+            &mut reader,
+            &format!("loan {index} amount taken"),
+            Reader::read_i32_be,
+        )?;
+        loan.amount_left = read_economy_manager_scalar_field(
+            &mut reader,
+            &format!("loan {index} amount left"),
+            Reader::read_i32_be,
+        )?;
+        loan.interest_rate = read_economy_manager_scalar_field(
+            &mut reader,
+            &format!("loan {index} interest rate"),
+            Reader::read_i16_be,
+        )?;
+        loan.term = read_economy_manager_scalar_field(
+            &mut reader,
+            &format!("loan {index} term"),
+            Reader::read_i16_be,
+        )?;
+        loan.interest_paid = if format_version >= 193 {
+            Some(read_economy_manager_scalar_field(
+                &mut reader,
+                &format!("loan {index} interest paid"),
+                Reader::read_i32_be,
+            )?)
+        } else {
+            None
+        };
+    }
+
+    let starting_money = if format_version >= 287 {
+        Some(read_economy_manager_scalar_field(
+            &mut reader,
+            "starting money",
+            Reader::read_i64_be,
+        )?)
+    } else {
+        None
+    };
+    let unmodeled_cash_value_raw = if format_version >= 287 {
+        Some(read_economy_manager_scalar_field(
+            &mut reader,
+            "additional version-287 cash value",
+            Reader::read_i64_be,
+        )?)
+    } else {
+        None
+    };
+    let mut cash_values = [0_i64; ECONOMY_MANAGER_CASH_VALUE_COUNT];
+    for (index, value) in cash_values.iter_mut().enumerate() {
+        *value = read_economy_manager_scalar_field(
+            &mut reader,
+            &format!("cash value {index}"),
+            Reader::read_i64_be,
+        )?;
+    }
+    let tax_multiplier_raw = if format_version >= 106 {
+        Some(read_economy_manager_scalar_field(
+            &mut reader,
+            "tax multiplier",
+            Reader::read_i16_be,
+        )?)
+    } else {
+        None
+    };
+    let bailout_accepted = if format_version >= 152 {
+        Some(read_economy_manager_scalar_field(
+            &mut reader,
+            "bailout accepted",
+            Reader::read_i16_be,
+        )?)
+    } else {
+        None
+    };
+    let last_bailout_frame = if format_version >= 159 {
+        Some(read_economy_manager_scalar_field(
+            &mut reader,
+            "last bailout frame",
+            Reader::read_u32_be,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(EconomyManagerLoansAndCashEditor {
+        format_version,
+        loans,
+        cash_values,
+        starting_money,
+        unmodeled_cash_value_raw,
+        tax_multiplier_raw,
+        bailout_accepted,
+        last_bailout_frame,
+        original_body: bytes.to_vec(),
+        prefix_start: scalar_fields_start,
+        prefix_end: reader.offset(),
+    })
+}
+
+fn encode_economy_manager_loans_and_cash_editor(
+    editor: &EconomyManagerLoansAndCashEditor,
+) -> Result<Vec<u8>, CrpError> {
+    if editor.prefix_start > editor.prefix_end || editor.prefix_end > editor.original_body.len() {
+        return Err(invalid(
+            editor.prefix_end,
+            "EconomyManager loans/cash boundaries exceed their source body",
+        ));
+    }
+    for (index, loan) in editor.loans.iter().enumerate() {
+        validate_economy_manager_scalar_option(
+            &format!("loan {index} interest paid"),
+            loan.interest_paid,
+            editor.format_version >= 193,
+        )?;
+    }
+    validate_economy_manager_scalar_option(
+        "starting money",
+        editor.starting_money,
+        editor.format_version >= 287,
+    )?;
+    validate_economy_manager_scalar_option(
+        "additional version-287 cash value",
+        editor.unmodeled_cash_value_raw,
+        editor.format_version >= 287,
+    )?;
+    validate_economy_manager_scalar_option(
+        "tax multiplier",
+        editor.tax_multiplier_raw,
+        editor.format_version >= 106,
+    )?;
+    validate_economy_manager_scalar_option(
+        "bailout accepted",
+        editor.bailout_accepted,
+        editor.format_version >= 152,
+    )?;
+    validate_economy_manager_scalar_option(
+        "last bailout frame",
+        editor.last_bailout_frame,
+        editor.format_version >= 159,
+    )?;
+
+    let mut output = editor.original_body[..editor.prefix_start].to_vec();
+    for loan in &editor.loans {
+        output.extend_from_slice(&loan.amount_taken.to_be_bytes());
+        output.extend_from_slice(&loan.amount_left.to_be_bytes());
+        output.extend_from_slice(&loan.interest_rate.to_be_bytes());
+        output.extend_from_slice(&loan.term.to_be_bytes());
+        if let Some(interest_paid) = loan.interest_paid {
+            output.extend_from_slice(&interest_paid.to_be_bytes());
+        }
+    }
+    if let Some(starting_money) = editor.starting_money {
+        output.extend_from_slice(&starting_money.to_be_bytes());
+    }
+    if let Some(unmodeled_cash_value_raw) = editor.unmodeled_cash_value_raw {
+        output.extend_from_slice(&unmodeled_cash_value_raw.to_be_bytes());
+    }
+    for value in &editor.cash_values {
+        output.extend_from_slice(&value.to_be_bytes());
+    }
+    if let Some(tax_multiplier) = editor.tax_multiplier_raw {
+        output.extend_from_slice(&tax_multiplier.to_be_bytes());
+    }
+    if let Some(bailout_accepted) = editor.bailout_accepted {
+        output.extend_from_slice(&bailout_accepted.to_be_bytes());
+    }
+    if let Some(last_bailout_frame) = editor.last_bailout_frame {
+        output.extend_from_slice(&last_bailout_frame.to_be_bytes());
+    }
+    output.extend_from_slice(&editor.original_body[editor.prefix_end..]);
+    Ok(output)
+}
+
+fn read_economy_manager_scalar_field<'a, T>(
+    reader: &mut Reader<'a>,
+    field_name: &str,
+    read: impl FnOnce(&mut Reader<'a>) -> Result<T, CrpError>,
+) -> Result<T, CrpError> {
+    let offset = reader.offset();
+    read(reader).map_err(|error| invalid(offset, format!("EconomyManager {field_name}: {error}")))
+}
+
+fn validate_economy_manager_scalar_option<T>(
+    field: &str,
+    value: Option<T>,
+    is_available: bool,
+) -> Result<(), CrpError> {
+    if value.is_some() == is_available {
+        Ok(())
+    } else if is_available {
+        Err(invalid(
+            0,
+            format!("EconomyManager {field} is required in this version"),
+        ))
+    } else {
+        Err(invalid(
+            0,
+            format!("EconomyManager {field} is unavailable in this version"),
+        ))
     }
 }
 
@@ -6218,13 +6744,15 @@ mod manager_boundary_tests {
         decode_economy_manager_investment_flags_from_body,
         decode_economy_manager_investment_prefabs_from_body,
         decode_economy_manager_investment_value_series, decode_economy_manager_investments,
+        decode_economy_manager_loan_scalar_length, decode_economy_manager_loans_and_cash_editor,
+        decode_economy_manager_loans_and_cash_editor_with_prefix,
         decode_transport_manager_reference_body, economy_manager_expense_count,
         economy_manager_income_count, economy_manager_object_header_count,
         economy_manager_service_budget_count, economy_manager_tax_rate_count,
-        economy_manager_total_array_count, find_economy_manager_guide_headers,
-        find_trailing_object_headers, locate_queued_object_bodies, locate_queued_object_body,
-        register_reference_headers, transport_manager_line_number_count,
-        transport_manager_object_header_count,
+        economy_manager_total_array_count, find_economy_manager_guide_header_positions,
+        find_economy_manager_guide_headers, find_trailing_object_headers,
+        locate_queued_object_bodies, locate_queued_object_body, register_reference_headers,
+        transport_manager_line_number_count, transport_manager_object_header_count,
     };
     use crate::data_serializer::write_unique_string;
     use crate::district_manager_data::{
@@ -6264,6 +6792,63 @@ mod manager_boundary_tests {
             output.push(0x7f + run as u8);
             count -= run;
         }
+    }
+
+    fn append_zero_encoded_byte_array(output: &mut Vec<u8>, mut count: usize) {
+        while count > 0 {
+            let run = count.min(128);
+            output.push((run - 1) as u8);
+            output.resize(output.len() + run, 0);
+            count -= run;
+        }
+    }
+
+    fn synthetic_economy_manager_scalar_body(format_version: u32) -> Vec<u8> {
+        let tax_count = economy_manager_tax_rate_count(format_version);
+        let budget_count = economy_manager_service_budget_count(format_version);
+        let budget_value_count = budget_count * if format_version >= 214 { 2 } else { 1 };
+        let mut body = Vec::new();
+        append_zero_encoded_byte_array(&mut body, tax_count);
+        append_zero_encoded_byte_array(&mut body, budget_value_count);
+
+        let primary_count = economy_manager_income_count(format_version);
+        let secondary_count = economy_manager_expense_count(format_version);
+        append_zero_encoded_long_array(&mut body, primary_count);
+        if let Some(count) = economy_manager_total_array_count(format_version) {
+            append_zero_encoded_long_array(&mut body, count);
+        }
+        append_zero_encoded_long_array(&mut body, primary_count);
+        if format_version >= 101 {
+            append_zero_encoded_long_array(&mut body, secondary_count);
+        }
+        if format_version >= 152 {
+            append_zero_encoded_long_array(&mut body, secondary_count);
+        }
+        if let Some(count) = economy_manager_total_array_count(format_version) {
+            append_zero_encoded_long_array(&mut body, count);
+        }
+
+        for _ in 0..3 {
+            body.extend_from_slice(&[0; 12]);
+            if format_version >= 193 {
+                body.extend_from_slice(&[0; 4]);
+            }
+        }
+        if format_version >= 287 {
+            body.extend_from_slice(&[0; 8]);
+            body.extend_from_slice(&[0; 8]);
+        }
+        body.extend_from_slice(&[0; 4 * 8]);
+        if format_version >= 106 {
+            body.extend_from_slice(&[0; 2]);
+        }
+        if format_version >= 152 {
+            body.extend_from_slice(&[0; 2]);
+        }
+        if format_version >= 159 {
+            body.extend_from_slice(&[0; 4]);
+        }
+        body
     }
 
     fn append_expected_long_literals(output: &mut Vec<u8>, values: &[i64]) {
@@ -7103,7 +7688,7 @@ mod manager_boundary_tests {
         body.extend([0; 17]);
         append_zero_encoded_long_array(&mut body, 1_445);
         append_zero_encoded_long_array(&mut body, 17);
-        append_zero_encoded_long_array(&mut body, 289);
+        append_zero_encoded_long_array(&mut body, 1_445);
         append_zero_encoded_long_array(&mut body, 289);
         append_zero_encoded_long_array(&mut body, 289);
         append_zero_encoded_long_array(&mut body, 17);
@@ -7114,7 +7699,7 @@ mod manager_boundary_tests {
         assert_eq!(editor.income().len(), 1_445);
         assert!(editor.income().iter().all(|value| *value == 0));
         assert_eq!(editor.total_income().unwrap().len(), 17);
-        assert_eq!(editor.expenses().len(), 289);
+        assert_eq!(editor.expenses().len(), 1_445);
         assert_eq!(editor.loan_expenses().unwrap().len(), 289);
         assert_eq!(editor.policy_expenses().unwrap().len(), 289);
         assert_eq!(editor.total_expenses().unwrap().len(), 17);
@@ -7148,13 +7733,14 @@ mod manager_boundary_tests {
         let mut totals = vec![0_i64; 17];
         totals[0] = 11;
         append_expected_long_literals(&mut expected, &totals);
-        let mut values = vec![0_i64; 289];
+        let mut values = vec![0_i64; 1_445];
         values[0] = 22;
         append_expected_long_literals(&mut expected, &values);
-        values[0] = -33;
-        append_expected_long_literals(&mut expected, &values);
-        values[0] = 44;
-        append_expected_long_literals(&mut expected, &values);
+        let mut secondary_values = vec![0_i64; 289];
+        secondary_values[0] = -33;
+        append_expected_long_literals(&mut expected, &secondary_values);
+        secondary_values[0] = 44;
+        append_expected_long_literals(&mut expected, &secondary_values);
         totals[0] = 55;
         append_expected_long_literals(&mut expected, &totals);
         expected.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
@@ -7191,7 +7777,7 @@ mod manager_boundary_tests {
             if has_total {
                 append_zero_encoded_long_array(&mut body, 17);
             }
-            append_zero_encoded_long_array(&mut body, 289);
+            append_zero_encoded_long_array(&mut body, 1_445);
             if has_loan {
                 append_zero_encoded_long_array(&mut body, 289);
             }
@@ -7226,6 +7812,236 @@ mod manager_boundary_tests {
             );
             assert_eq!(editor.encode().unwrap()[..2], [0x54, 0]);
         }
+    }
+
+    #[test]
+    fn economy_manager_loans_and_cash_editor_writes_exact_ordered_scalars() {
+        let format_version = 287;
+        let mut body = synthetic_economy_manager_scalar_body(format_version);
+        body.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        let mut editor =
+            decode_economy_manager_loans_and_cash_editor(format_version, &body).unwrap();
+
+        *editor.loans_mut() = [
+            super::EconomyLoanRecord {
+                amount_taken: -0x0102_0304,
+                amount_left: 0x1122_3344,
+                interest_rate: -1_234,
+                term: 5_678,
+                interest_paid: Some(-7_654_321),
+            },
+            super::EconomyLoanRecord {
+                amount_taken: 0x2233_4455,
+                amount_left: -0x0203_0405,
+                interest_rate: 2_345,
+                term: -6_789,
+                interest_paid: Some(0x3344_5566),
+            },
+            super::EconomyLoanRecord {
+                amount_taken: -17,
+                amount_left: 29,
+                interest_rate: -31,
+                term: 43,
+                interest_paid: Some(-59),
+            },
+        ];
+        editor
+            .cash_values_mut()
+            .copy_from_slice(&[i64::MIN, -1, 0, i64::MAX]);
+        *editor.starting_money_mut().unwrap() = -88;
+        *editor.unmodeled_cash_value_raw_mut().unwrap() = 0x0102_0304_0506_0708;
+        *editor.tax_multiplier_raw_mut().unwrap() = 73;
+        *editor.bailout_accepted_mut().unwrap() = -4;
+        *editor.last_bailout_frame_mut().unwrap() = 0x1234_5678;
+
+        let encoded = editor.encode().unwrap();
+        let mut expected = body[..editor.prefix_start].to_vec();
+        for loan in editor.loans() {
+            expected.extend_from_slice(&loan.amount_taken.to_be_bytes());
+            expected.extend_from_slice(&loan.amount_left.to_be_bytes());
+            expected.extend_from_slice(&loan.interest_rate.to_be_bytes());
+            expected.extend_from_slice(&loan.term.to_be_bytes());
+            expected.extend_from_slice(&loan.interest_paid.unwrap().to_be_bytes());
+        }
+        expected.extend_from_slice(&(-88_i64).to_be_bytes());
+        expected.extend_from_slice(&0x0102_0304_0506_0708_i64.to_be_bytes());
+        for value in editor.cash_values() {
+            expected.extend_from_slice(&value.to_be_bytes());
+        }
+        expected.extend_from_slice(&73_i16.to_be_bytes());
+        expected.extend_from_slice(&(-4_i16).to_be_bytes());
+        expected.extend_from_slice(&0x1234_5678_u32.to_be_bytes());
+        expected.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        assert_eq!(encoded, expected);
+
+        let decoded =
+            decode_economy_manager_loans_and_cash_editor(format_version, &encoded).unwrap();
+        assert_eq!(decoded.loans(), editor.loans());
+        assert_eq!(decoded.cash_values(), editor.cash_values());
+        assert_eq!(decoded.starting_money(), Some(-88));
+        assert_eq!(
+            decoded.unmodeled_cash_value_raw(),
+            Some(0x0102_0304_0506_0708)
+        );
+        assert_eq!(decoded.tax_multiplier_raw(), Some(73));
+        assert_eq!(decoded.bailout_accepted(), Some(-4));
+        assert_eq!(decoded.last_bailout_frame(), Some(0x1234_5678));
+    }
+
+    #[test]
+    fn economy_manager_loans_and_cash_editor_applies_version_gates() {
+        for (format_version, has_tax, has_bailout, has_frame, has_interest, has_starting_money) in [
+            (105, false, false, false, false, false),
+            (106, true, false, false, false, false),
+            (151, true, false, false, false, false),
+            (152, true, true, false, false, false),
+            (158, true, true, false, false, false),
+            (159, true, true, true, false, false),
+            (192, true, true, true, false, false),
+            (193, true, true, true, true, false),
+            (286, true, true, true, true, false),
+            (287, true, true, true, true, true),
+        ] {
+            let body = synthetic_economy_manager_scalar_body(format_version);
+            let editor =
+                decode_economy_manager_loans_and_cash_editor(format_version, &body).unwrap();
+            assert_eq!(
+                editor.tax_multiplier_raw().is_some(),
+                has_tax,
+                "{format_version}"
+            );
+            assert_eq!(
+                editor.bailout_accepted().is_some(),
+                has_bailout,
+                "{format_version}"
+            );
+            assert_eq!(
+                editor.last_bailout_frame().is_some(),
+                has_frame,
+                "{format_version}"
+            );
+            assert_eq!(
+                editor.loans()[0].interest_paid.is_some(),
+                has_interest,
+                "{format_version}"
+            );
+            assert_eq!(
+                editor.starting_money().is_some(),
+                has_starting_money,
+                "{format_version}"
+            );
+            assert_eq!(
+                editor.unmodeled_cash_value_raw().is_some(),
+                has_starting_money,
+                "{format_version}"
+            );
+            assert_eq!(editor.encode().unwrap(), body, "{format_version}");
+        }
+
+        let legacy = synthetic_economy_manager_scalar_body(152);
+        let mut legacy_editor = decode_economy_manager_loans_and_cash_editor(152, &legacy).unwrap();
+        legacy_editor.unmodeled_cash_value_raw = Some(1);
+        assert!(legacy_editor.encode().is_err());
+        legacy_editor.unmodeled_cash_value_raw = None;
+        *legacy_editor.tax_multiplier_raw_mut().unwrap() = 15;
+        let encoded_legacy = legacy_editor.encode().unwrap();
+        let tax_offset = legacy_editor.prefix_start + 3 * 12 + 4 * 8;
+        assert_eq!(
+            &encoded_legacy[tax_offset..tax_offset + 2],
+            &15_i16.to_be_bytes()
+        );
+        assert_eq!(
+            decode_economy_manager_loans_and_cash_editor(152, &encoded_legacy)
+                .unwrap()
+                .tax_multiplier_raw(),
+            Some(15)
+        );
+
+        let mut modern_before_interest = decode_economy_manager_loans_and_cash_editor(
+            192,
+            &synthetic_economy_manager_scalar_body(192),
+        )
+        .unwrap();
+        modern_before_interest.loans_mut()[0].interest_paid = Some(1);
+        assert!(modern_before_interest.encode().is_err());
+    }
+
+    #[test]
+    fn economy_manager_loans_and_cash_editor_stops_before_fixture_references() {
+        for (format_version, bytes) in [
+            (
+                116_011,
+                include_bytes!("../tests/fixtures/economy-investments-v116011-north-europe.bin")
+                    .as_slice(),
+            ),
+            (
+                116_019,
+                include_bytes!("../tests/fixtures/economy-investments-v116019-boreal.bin")
+                    .as_slice(),
+            ),
+        ] {
+            let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+            for index in 0..29 {
+                table
+                    .register(&NetObjectHeader::NewType(format!("FixtureType{index}")))
+                    .unwrap();
+            }
+            table
+                .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+                .unwrap();
+
+            let income_expenses =
+                decode_economy_manager_income_expense_editor(format_version, bytes).unwrap();
+            let references =
+                find_economy_manager_guide_header_positions(format_version, bytes, &table).unwrap();
+            let first_reference = references.first().unwrap().0;
+            let scalar_length = decode_economy_manager_loan_scalar_length(format_version);
+            let scalar_prefix_bytes = first_reference
+                .checked_sub(income_expenses.prefix_end + scalar_length)
+                .unwrap();
+            assert!(scalar_prefix_bytes <= 1, "{format_version}");
+            assert_eq!(
+                scalar_prefix_bytes,
+                usize::from(format_version == 116_011),
+                "{format_version}"
+            );
+            let editor = decode_economy_manager_loans_and_cash_editor_with_prefix(
+                format_version,
+                bytes,
+                scalar_prefix_bytes,
+            )
+            .unwrap();
+            assert_eq!(
+                editor.prefix_start,
+                income_expenses.prefix_end + scalar_prefix_bytes,
+                "{format_version}"
+            );
+            assert_eq!(editor.prefix_end, first_reference, "{format_version}");
+            assert_eq!(editor.encode().unwrap(), bytes, "{format_version}");
+            assert_eq!(editor.loans().len(), 3);
+            assert!(
+                editor
+                    .loans()
+                    .iter()
+                    .all(|loan| loan.interest_paid.is_some())
+            );
+            assert!(editor.starting_money().is_some());
+            assert!(editor.unmodeled_cash_value_raw().is_some());
+            assert!(editor.tax_multiplier_raw().is_some());
+            assert_eq!(
+                references.len(),
+                if format_version >= 116_017 { 5 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn economy_manager_loans_and_cash_editor_rejects_truncated_scalar_fields() {
+        let format_version = 287;
+        let mut body = synthetic_economy_manager_scalar_body(format_version);
+        let complete = decode_economy_manager_loans_and_cash_editor(format_version, &body).unwrap();
+        body.truncate(complete.prefix_end - 1);
+        assert!(decode_economy_manager_loans_and_cash_editor(format_version, &body).is_err());
     }
 
     #[test]
