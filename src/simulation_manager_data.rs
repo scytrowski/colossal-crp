@@ -4111,11 +4111,11 @@ impl SimulationManagerData {
     /// The resolver path is validated at inner versions 164–115999. It parses
     /// milestone prefab indexes and reference headers, and returns those
     /// references before the fixed tail references in serialized order. Active
-    /// line records remain unsupported. The reader follows the known queue
-    /// through ZoneManager, then reads the version-gated TransportManager tail,
-    /// including the selection table from version 114001. Pass the saved
-    /// application version for inner-version-221+
-    /// NetNodeInstanceGuide fields in the earlier manager queue.
+    /// line records are traversed according to DLL-derived version gates but
+    /// are not exposed as editable values. The reader follows the known queue
+    /// through ZoneManager, then reads the TransportManager tail, including the
+    /// selection table from version 114001. Pass the saved application version
+    /// for inner-version-221+ NetNodeInstanceGuide fields in the earlier queue.
     pub fn resolve_transport_manager_references(
         &self,
         save_app_version: Option<u32>,
