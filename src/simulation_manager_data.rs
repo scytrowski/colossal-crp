@@ -12,6 +12,7 @@ use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
 use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
+use crate::encoded_array::read_encoded_uint_array;
 use crate::guide_data::{
     GUIDE_INSTANCE_BODY_LEN, GUIDE_TRIGGER_BASE_PREFIX_LEN, GuideInstanceBody, GuideInstanceEditor,
     GuideTriggerBaseEditor, GuideTriggerBasePrefix,
@@ -65,6 +66,15 @@ pub struct ManagerObjectReference {
     pub type_name: String,
 }
 
+/// One non-null queued DataSerializer reference resolved to its object ID and type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedObjectReference {
+    /// Object-list ID assigned by DataSerializer.
+    pub object_id: u32,
+    /// Assembly-qualified runtime type name resolved from the shared-type list.
+    pub type_name: String,
+}
+
 /// One entry in `SimulationManager.m_serializableDataStorage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerializableDataEntry {
@@ -94,13 +104,14 @@ struct QueuedGuideObject {
 }
 
 #[derive(Debug)]
-struct NetManagerGuideQueuePrefix {
+struct QueuedObjectReferencePrefix {
     children_start: usize,
     object_table: DataSerializerObjectTable,
     queued_objects: Vec<QueuedGuideObject>,
     net_manager_object_ids: Vec<Option<u32>>,
     water_manager_object_ids: Vec<Option<u32>>,
     zone_manager_object_ids: Vec<Option<u32>>,
+    transport_manager_object_ids: Vec<Option<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2353,7 +2364,7 @@ impl SimulationManagerData {
     fn net_manager_guide_queue_prefix(
         &self,
         save_app_version: Option<u32>,
-    ) -> Result<NetManagerGuideQueuePrefix, CrpError> {
+    ) -> Result<QueuedObjectReferencePrefix, CrpError> {
         let managers = self
             .manager_objects
             .as_deref()
@@ -2465,20 +2476,21 @@ impl SimulationManagerData {
             )?);
         }
 
-        Ok(NetManagerGuideQueuePrefix {
+        Ok(QueuedObjectReferencePrefix {
             children_start,
             object_table,
             queued_objects,
             net_manager_object_ids,
             water_manager_object_ids: Vec::new(),
             zone_manager_object_ids: Vec::new(),
+            transport_manager_object_ids: Vec::new(),
         })
     }
 
     fn water_manager_guide_queue_prefix(
         &self,
         save_app_version: Option<u32>,
-    ) -> Result<NetManagerGuideQueuePrefix, CrpError> {
+    ) -> Result<QueuedObjectReferencePrefix, CrpError> {
         let managers = self
             .manager_objects
             .as_deref()
@@ -2523,7 +2535,7 @@ impl SimulationManagerData {
     fn zone_manager_guide_queue_prefix(
         &self,
         save_app_version: Option<u32>,
-    ) -> Result<NetManagerGuideQueuePrefix, CrpError> {
+    ) -> Result<QueuedObjectReferencePrefix, CrpError> {
         let mut prefix = self.water_manager_guide_queue_prefix(save_app_version)?;
         let (zone, _) = self.decode_zone_manager_prefix()?;
         for header in zone.object_references() {
@@ -2536,6 +2548,107 @@ impl SimulationManagerData {
                 )?);
         }
         Ok(prefix)
+    }
+
+    fn transport_manager_queue_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<QueuedObjectReferencePrefix, CrpError> {
+        let mut prefix = self.zone_manager_guide_queue_prefix(save_app_version)?;
+        let headers = self.decode_transport_manager_reference_headers(&prefix.object_table)?;
+        for header in &headers {
+            prefix
+                .transport_manager_object_ids
+                .push(register_queued_reference(
+                    header,
+                    &mut prefix.object_table,
+                    &mut prefix.queued_objects,
+                )?);
+        }
+        Ok(prefix)
+    }
+
+    fn decode_transport_manager_reference_headers(
+        &self,
+        object_table: &DataSerializerObjectTable,
+    ) -> Result<Vec<NetObjectHeader>, CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 15, "TreeManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 17, "VehicleManager+Data")?;
+        let weather_type = self
+            .manager_objects
+            .as_deref()
+            .and_then(|managers| managers.get(16))
+            .and_then(Option::as_ref)
+            .map(|reference| reference.type_name.as_str());
+        if !weather_type.is_some_and(|type_name| {
+            type_name.starts_with("WeatherManager+Data")
+                || type_name.starts_with("WindManager+Data")
+        }) {
+            return Err(invalid(
+                16,
+                "expected WeatherManager+Data or WindManager+Data before VehicleManager",
+            ));
+        }
+        expect_manager_type(self.manager_objects.as_deref(), 18, "TransportManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 19, "EconomyManager+Data")?;
+        if self.format_version < 164 {
+            return Err(invalid(
+                0,
+                "TransportManager reference resolution requires inner version 164 or newer",
+            ));
+        }
+        if self.format_version >= 114_001 {
+            return Err(invalid(
+                0,
+                "TransportManager selection-table suffix from version 114001 is not yet supported",
+            ));
+        }
+
+        let manager_slot = self
+            .manager_objects
+            .as_deref()
+            .and_then(|managers| managers.get(18))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| invalid(18, "TransportManager reference is null"))?;
+        if object_table.type_name(manager_slot.object_id) != Some(manager_slot.type_name.as_str()) {
+            return Err(invalid(
+                18,
+                "TransportManager root reference disagrees with the replayed object table",
+            ));
+        }
+        let transport_tag = new_profiler_tag_bytes("TransportManager")?;
+        let transport_tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &transport_tag,
+            "TransportManager profiler tag",
+        )?;
+        let body_start = transport_tag_start
+            .checked_add(transport_tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("TransportManager body start"))?;
+
+        let economy_tag = new_profiler_tag_bytes("EconomyManager")?;
+        let economy_tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &economy_tag,
+            "EconomyManager profiler tag",
+        )?;
+        let end_tag_start = economy_tag_start
+            .checked_sub(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or_else(|| invalid(economy_tag_start, "TransportManager end tag is truncated"))?;
+        if end_tag_start < body_start
+            || self
+                .serialized_object_graph
+                .get(end_tag_start)
+                .is_none_or(|marker| *marker >= 0xfe)
+        {
+            return Err(invalid(
+                end_tag_start,
+                "TransportManager fields are not followed by a valid closing tag and EconomyManager",
+            ));
+        }
+
+        let body = &self.serialized_object_graph[body_start..end_tag_start];
+        decode_transport_manager_reference_body(self.format_version, body, object_table)
     }
 
     fn decode_water_manager_guide_reference_headers(
@@ -2793,6 +2906,39 @@ impl SimulationManagerData {
             self.format_version,
             save_app_version,
         )
+    }
+
+    /// Resolves TransportManager's fixed object-reference fields in order.
+    ///
+    /// This reader supports inner versions 164–114000 when line and milestone
+    /// buffers are empty. It follows the known queue through ZoneManager, then
+    /// reads the version-gated TransportManager tail. Active lines, milestones,
+    /// and the version-114001 selection-table suffix return an error. Pass the
+    /// saved application version for inner-version-221+ NetNodeInstanceGuide
+    /// fields in the earlier manager queue.
+    pub fn resolve_transport_manager_references(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<Option<ResolvedObjectReference>>, CrpError> {
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        prefix
+            .transport_manager_object_ids
+            .iter()
+            .map(|object_id| {
+                object_id
+                    .map(|object_id| {
+                        let type_name =
+                            prefix.object_table.type_name(object_id).ok_or_else(|| {
+                                invalid(0, "TransportManager object type is unresolved")
+                            })?;
+                        Ok(ResolvedObjectReference {
+                            object_id,
+                            type_name: type_name.to_owned(),
+                        })
+                    })
+                    .transpose()
+            })
+            .collect()
     }
 
     /// Locates a queued BuildingManager object body by its reference-header index.
@@ -3346,6 +3492,125 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
     }
 }
 
+fn transport_manager_object_header_count(format_version: u32) -> usize {
+    if format_version >= 318 {
+        7
+    } else if format_version >= 317 {
+        3
+    } else if format_version >= 316 {
+        2
+    } else {
+        0
+    }
+}
+
+fn transport_manager_line_number_count(format_version: u32) -> usize {
+    if format_version >= 113_008 {
+        17
+    } else if format_version >= 113_000 {
+        16
+    } else if format_version >= 111_006 {
+        14
+    } else if format_version >= 110_021 {
+        13
+    } else if format_version >= 110_000 {
+        12
+    } else if format_version >= 310 {
+        10
+    } else if format_version >= 211 {
+        8
+    } else if format_version >= 122 {
+        5
+    } else {
+        0
+    }
+}
+
+fn decode_transport_manager_reference_body(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: &DataSerializerObjectTable,
+) -> Result<Vec<NetObjectHeader>, CrpError> {
+    if format_version < 164 {
+        return Err(invalid(
+            0,
+            "TransportManager reference resolution requires inner version 164 or newer",
+        ));
+    }
+    if format_version >= 114_001 {
+        return Err(invalid(
+            0,
+            "TransportManager selection-table suffix from version 114001 is not yet supported",
+        ));
+    }
+
+    let mut reader = Reader::new(bytes);
+    let line_flags = read_encoded_uint_array(&mut reader, 255)?;
+    if line_flags.iter().any(|flag| *flag != 0) {
+        return Err(invalid(
+            reader.offset(),
+            "TransportManager queue resolution currently requires an empty line buffer",
+        ));
+    }
+    let milestone_count = if format_version >= 151 {
+        usize::from(reader.read_u16_be()?)
+    } else {
+        0
+    };
+    if milestone_count != 0 {
+        let count_offset = reader
+            .offset()
+            .checked_sub(2)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager milestone count offset",
+            ))?;
+        return Err(invalid(
+            count_offset,
+            "TransportManager queue resolution currently requires an empty milestone list",
+        ));
+    }
+
+    let prefab_name_count = usize::from(reader.read_u16_be()?);
+    for _ in 0..prefab_name_count {
+        reader.read_unique_string()?;
+    }
+
+    let line_number_count = transport_manager_line_number_count(format_version);
+    if format_version >= 153 {
+        for _ in 0..line_number_count {
+            reader.read_u16_be()?;
+        }
+    }
+    if format_version >= 122 {
+        let passenger_group_count = if format_version >= 176 { 8_usize } else { 7 };
+        let passenger_record_count = line_number_count;
+        let passenger_bytes = passenger_record_count
+            .checked_mul(passenger_group_count)
+            .and_then(|groups| groups.checked_mul(9))
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager passenger record length",
+            ))?;
+        reader.read_bytes(passenger_bytes)?;
+    }
+
+    let header_count = transport_manager_object_header_count(format_version);
+    let mut headers = Vec::with_capacity(header_count);
+    for _ in 0..header_count {
+        headers.push(read_net_object_header(&mut reader)?);
+    }
+    if reader.remaining() != 0 {
+        return Err(invalid(
+            reader.offset(),
+            "TransportManager reference fields do not end at the manager boundary",
+        ));
+    }
+    let mut checked_table = object_table.clone();
+    for header in &headers {
+        checked_table.register(header)?;
+    }
+    Ok(headers)
+}
+
 fn register_raw_queued_reference(
     bytes: &[u8],
     object_table: &mut DataSerializerObjectTable,
@@ -3598,8 +3863,9 @@ fn find_unique_bytes(haystack: &[u8], needle: &[u8], description: &str) -> Resul
 mod manager_boundary_tests {
     use super::{
         DataSerializerObjectTable, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
-        QueuedGuideObject, SimulationManagerData, locate_queued_object_bodies,
-        locate_queued_object_body,
+        QueuedGuideObject, SimulationManagerData, decode_transport_manager_reference_body,
+        locate_queued_object_bodies, locate_queued_object_body,
+        transport_manager_line_number_count, transport_manager_object_header_count,
     };
     use crate::data_serializer::write_unique_string;
     use crate::district_manager_data::{
@@ -4192,6 +4458,79 @@ mod manager_boundary_tests {
         assert_eq!(table.type_name(2), Some("GenericGuide"));
         assert!(table.register(&NetObjectHeader::Existing(3)).is_err());
         assert!(table.register(&NetObjectHeader::NewSharedType(9)).is_err());
+    }
+
+    #[test]
+    fn transport_manager_resolves_fixed_tail_headers_for_empty_buffers() {
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        table
+            .register(&NetObjectHeader::NewType(
+                "TransportLine+Data, Assembly-CSharp".to_owned(),
+            ))
+            .unwrap();
+
+        let mut bytes = vec![0xff, 0xfe]; // 255 zero line flags.
+        bytes.extend_from_slice(&0_u16.to_be_bytes()); // No unlock milestones.
+        bytes.extend_from_slice(&0_u16.to_be_bytes()); // Empty prefab-name table.
+        bytes.extend_from_slice(&[0; 14 * 2]); // Version 112004 line numbers.
+        bytes.extend_from_slice(&[0; 14 * 8 * 9]); // Global passenger records.
+        bytes.extend_from_slice(&[
+            0xfe, 0x00, 0x01, // New TransportLine object.
+            0x00, 0x00, 0x01, // Existing object 1.
+            0xff, // Null.
+            0x00, 0x00, 0x00, // Existing root object 0.
+            0xff, // Null.
+            0xfe, 0x00, 0x01, // Another new object with the same type.
+            0x00, 0x00, 0x02, // Existing object 2.
+        ]);
+
+        let headers = decode_transport_manager_reference_body(112_004, &bytes, &table).unwrap();
+        assert_eq!(
+            headers,
+            [
+                NetObjectHeader::NewSharedType(1),
+                NetObjectHeader::Existing(1),
+                NetObjectHeader::Null,
+                NetObjectHeader::Existing(0),
+                NetObjectHeader::Null,
+                NetObjectHeader::NewSharedType(1),
+                NetObjectHeader::Existing(2),
+            ]
+        );
+        assert!(decode_transport_manager_reference_body(114_001, &bytes, &table).is_err());
+        let mut nonempty_milestones = bytes.clone();
+        nonempty_milestones[3] = 1;
+        assert!(
+            decode_transport_manager_reference_body(112_004, &nonempty_milestones, &table).is_err()
+        );
+        let mut active_lines = Vec::new();
+        write_encoded_uint_array(&mut active_lines, &[1, 0, 0, 0]);
+        write_encoded_uint_array(&mut active_lines, &[0; 251]);
+        active_lines.extend_from_slice(&bytes[2..]);
+        assert!(decode_transport_manager_reference_body(112_004, &active_lines, &table).is_err());
+        assert!(
+            decode_transport_manager_reference_body(112_004, &bytes[..bytes.len() - 1], &table)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn transport_manager_reference_counts_follow_il_gates() {
+        assert_eq!(transport_manager_object_header_count(315), 0);
+        assert_eq!(transport_manager_object_header_count(316), 2);
+        assert_eq!(transport_manager_object_header_count(317), 3);
+        assert_eq!(transport_manager_object_header_count(318), 7);
+
+        assert_eq!(transport_manager_line_number_count(121), 0);
+        assert_eq!(transport_manager_line_number_count(122), 5);
+        assert_eq!(transport_manager_line_number_count(210), 5);
+        assert_eq!(transport_manager_line_number_count(211), 8);
+        assert_eq!(transport_manager_line_number_count(310), 10);
+        assert_eq!(transport_manager_line_number_count(110_000), 12);
+        assert_eq!(transport_manager_line_number_count(110_021), 13);
+        assert_eq!(transport_manager_line_number_count(111_006), 14);
+        assert_eq!(transport_manager_line_number_count(113_000), 16);
+        assert_eq!(transport_manager_line_number_count(113_008), 17);
     }
 
     #[test]

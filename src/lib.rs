@@ -81,7 +81,8 @@ pub use net_manager_data::{
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use prop_manager_data::PropManagerDataPrefix;
 pub use simulation_manager_data::{
-    GuideBodyLocation, ManagerObjectReference, SerializableDataEntry, SimulationManagerData,
+    GuideBodyLocation, ManagerObjectReference, ResolvedObjectReference, SerializableDataEntry,
+    SimulationManagerData,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use statistics_manager_data::{
@@ -4463,6 +4464,15 @@ mod tests {
         }
         assert_eq!(zone_type_guides, 11);
         assert_eq!(generic_guides, 2);
+
+        let transport_references =
+            manager.resolve_transport_manager_references(metadata.save_app_version)?;
+        assert_eq!(transport_references.len(), 7);
+        assert!(transport_references.iter().all(|reference| {
+            reference
+                .as_ref()
+                .is_none_or(|reference| !reference.type_name.is_empty())
+        }));
 
         let message = manager.decode_message_manager_data()?;
         assert_eq!(message.random_message_timers().len(), 26);
