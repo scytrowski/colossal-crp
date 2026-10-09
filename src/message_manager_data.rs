@@ -41,10 +41,14 @@ pub struct MessageManagerData {
     message_queue: Option<Vec<NetObjectHeader>>,
     recent_messages: Option<Vec<NetObjectHeader>>,
     recent_message_index: Option<i16>,
+    recent_message_index_offset: Option<usize>,
     message_data: Option<Vec<MessageDataEntry>>,
+    message_data_frame_offsets: Vec<usize>,
     last_random_message_frame: Option<u32>,
+    last_random_message_frame_offset: Option<usize>,
     random_message_timer_count: Option<i16>,
     random_message_timers: Vec<u8>,
+    random_message_timers_offset: Option<usize>,
     profile_end_shared_string_index: u16,
     serialized_body: Vec<u8>,
 }
@@ -100,15 +104,27 @@ impl MessageManagerData {
         self.serialized_body.clone()
     }
 
+    /// Creates an editor for the versioned message counters and timers.
+    ///
+    /// Object-reference arrays, message keys, timer count, and profiler index
+    /// stay byte-for-byte as read. This keeps the DataSerializer object queue
+    /// and all following body offsets unchanged.
+    pub fn into_editor(self) -> MessageManagerDataEditor {
+        MessageManagerDataEditor::from(self)
+    }
+
     pub(crate) fn decode(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         let mut reader = Reader::new(bytes);
         let message_queue = read_object_array(&mut reader, "message queue")?;
         let recent_messages = read_object_array(&mut reader, "recent messages")?;
-        let recent_message_index = if format_version >= RECENT_MESSAGE_INDEX_VERSION {
+        let recent_message_index_offset =
+            (format_version >= RECENT_MESSAGE_INDEX_VERSION).then_some(reader.offset());
+        let recent_message_index = if recent_message_index_offset.is_some() {
             Some(reader.read_i16_be()?)
         } else {
             None
         };
+        let mut message_data_frame_offsets = Vec::new();
         let message_data = if format_version >= MESSAGE_DATA_VERSION {
             let count = reader.read_u24_be()?;
             if count > MAX_MESSAGE_ENTRIES {
@@ -123,8 +139,10 @@ impl MessageManagerData {
                 .map_err(|_| reader.invalid("message-data count does not fit this platform"))?;
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
+                let key = reader.read_unique_string()?;
+                message_data_frame_offsets.push(reader.offset());
                 entries.push(MessageDataEntry {
-                    key: reader.read_unique_string()?,
+                    key,
                     last_created_frame: reader.read_u32_be()?,
                 });
             }
@@ -132,25 +150,38 @@ impl MessageManagerData {
         } else {
             None
         };
-        let (last_random_message_frame, random_message_timer_count, random_message_timers) =
-            if format_version >= RANDOM_MESSAGE_TIMERS_VERSION {
-                let last_frame = reader.read_u32_be()?;
-                let timer_count = reader.read_i16_be()?;
-                if timer_count < 0 {
-                    return Err(reader.invalid("random-message timer count is negative"));
-                }
-                let timer_count_usize = usize::try_from(timer_count)
-                    .map_err(|_| reader.invalid("timer count does not fit this platform"))?;
-                if timer_count_usize > RANDOM_MESSAGE_TIMER_COUNT {
-                    return Err(reader.invalid(format!(
+        let (
+            last_random_message_frame,
+            last_random_message_frame_offset,
+            random_message_timer_count,
+            random_message_timers_offset,
+            random_message_timers,
+        ) = if format_version >= RANDOM_MESSAGE_TIMERS_VERSION {
+            let last_frame_offset = reader.offset();
+            let last_frame = reader.read_u32_be()?;
+            let timer_count = reader.read_i16_be()?;
+            if timer_count < 0 {
+                return Err(reader.invalid("random-message timer count is negative"));
+            }
+            let timer_count_usize = usize::try_from(timer_count)
+                .map_err(|_| reader.invalid("timer count does not fit this platform"))?;
+            if timer_count_usize > RANDOM_MESSAGE_TIMER_COUNT {
+                return Err(reader.invalid(format!(
                         "random-message timer count {timer_count_usize} exceeds {RANDOM_MESSAGE_TIMER_COUNT}"
                     )));
-                }
-                let timers = reader.read_bytes(timer_count_usize)?.to_vec();
-                (Some(last_frame), Some(timer_count), timers)
-            } else {
-                (None, None, Vec::new())
-            };
+            }
+            let timers_offset = reader.offset();
+            let timers = reader.read_bytes(timer_count_usize)?.to_vec();
+            (
+                Some(last_frame),
+                Some(last_frame_offset),
+                Some(timer_count),
+                Some(timers_offset),
+                timers,
+            )
+        } else {
+            (None, None, None, None, Vec::new())
+        };
         let profile_end_shared_string_index = reader.read_u16_be()?;
         let consumed = reader.offset();
         Ok((
@@ -159,15 +190,123 @@ impl MessageManagerData {
                 message_queue,
                 recent_messages,
                 recent_message_index,
+                recent_message_index_offset,
                 message_data,
+                message_data_frame_offsets,
                 last_random_message_frame,
+                last_random_message_frame_offset,
                 random_message_timer_count,
                 random_message_timers,
+                random_message_timers_offset,
                 profile_end_shared_string_index,
                 serialized_body: bytes[..consumed].to_vec(),
             },
             consumed,
         ))
+    }
+}
+
+/// Edits scalar fields in a `MessageManager+Data` body without changing its
+/// length or DataSerializer object references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageManagerDataEditor {
+    original: MessageManagerData,
+    recent_message_index: Option<i16>,
+    message_data_last_created_frames: Vec<u32>,
+    last_random_message_frame: Option<u32>,
+    random_message_timers: Vec<u8>,
+}
+
+impl From<MessageManagerData> for MessageManagerDataEditor {
+    fn from(original: MessageManagerData) -> Self {
+        let message_data_last_created_frames = original
+            .message_data
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(MessageDataEntry::last_created_frame)
+            .collect();
+        Self {
+            recent_message_index: original.recent_message_index,
+            message_data_last_created_frames,
+            last_random_message_frame: original.last_random_message_frame,
+            random_message_timers: original.random_message_timers.clone(),
+            original,
+        }
+    }
+}
+
+impl MessageManagerDataEditor {
+    /// Returns the inner DataSerializer version used for this body.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns mutable access to the recent-message index when present.
+    pub fn recent_message_index_mut(&mut self) -> Option<&mut i16> {
+        self.recent_message_index.as_mut()
+    }
+
+    /// Returns mutable access to one message's last-created frame.
+    pub fn message_data_last_created_frame_mut(&mut self, index: usize) -> Option<&mut u32> {
+        self.message_data_last_created_frames.get_mut(index)
+    }
+
+    /// Returns mutable access to the last random-message frame when present.
+    pub fn last_random_message_frame_mut(&mut self) -> Option<&mut u32> {
+        self.last_random_message_frame.as_mut()
+    }
+
+    /// Returns the timer bytes physically stored in this body.
+    ///
+    /// The returned slice has a fixed length. Timer count changes would alter
+    /// the body layout and are therefore not supported by this editor.
+    pub fn random_message_timers_mut(&mut self) -> &mut [u8] {
+        &mut self.random_message_timers
+    }
+
+    /// Encodes edited scalar fields and preserves all other body bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = self.original.serialized_body.clone();
+        if let (Some(offset), Some(value)) = (
+            self.original.recent_message_index_offset,
+            self.recent_message_index,
+        ) && let Some(end) = offset.checked_add(2)
+            && let Some(target) = bytes.get_mut(offset..end)
+        {
+            target.copy_from_slice(&value.to_be_bytes());
+        }
+        for (offset, value) in self
+            .original
+            .message_data_frame_offsets
+            .iter()
+            .zip(&self.message_data_last_created_frames)
+        {
+            if let Some(end) = offset.checked_add(4)
+                && let Some(target) = bytes.get_mut(*offset..end)
+            {
+                target.copy_from_slice(&value.to_be_bytes());
+            }
+        }
+        if let (Some(offset), Some(value)) = (
+            self.original.last_random_message_frame_offset,
+            self.last_random_message_frame,
+        ) && let Some(end) = offset.checked_add(4)
+            && let Some(target) = bytes.get_mut(offset..end)
+        {
+            target.copy_from_slice(&value.to_be_bytes());
+        }
+        if let Some(offset) = self.original.random_message_timers_offset
+            && let Some(end) = offset.checked_add(self.random_message_timers.len())
+            && let Some(target) = bytes.get_mut(offset..end)
+        {
+            target.copy_from_slice(&self.random_message_timers);
+        }
+        bytes
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original.serialized_body
     }
 }
 
@@ -248,6 +387,7 @@ mod tests {
             );
             assert_eq!(manager.profile_end_shared_string_index(), 0x1234);
             assert_eq!(manager.encode(), bytes);
+            assert_eq!(manager.into_editor().encode(), bytes);
         }
     }
 
@@ -294,6 +434,46 @@ mod tests {
         assert_eq!(manager.random_message_timer_count(), Some(2));
         assert_eq!(manager.random_message_timers(), &[7, 8]);
         assert_eq!(manager.encode(), bytes);
+    }
+
+    #[test]
+    fn editor_changes_only_versioned_scalar_and_timer_bytes() {
+        let mut bytes = vec![0xff, 0xff];
+        bytes.extend_from_slice(&0x1234_i16.to_be_bytes());
+        bytes.extend_from_slice(&[0, 0, 1]);
+        bytes.extend_from_slice(&[0x80, 0x00, 0x01, 0xc1]);
+        bytes.extend_from_slice(&0x0102_0304_u32.to_be_bytes());
+        bytes.extend_from_slice(&0xaabb_ccdd_u32.to_be_bytes());
+        bytes.extend_from_slice(&2_i16.to_be_bytes());
+        bytes.extend_from_slice(&[7, 8]);
+        bytes.extend_from_slice(&0x1234_u16.to_be_bytes());
+
+        let (manager, consumed) = MessageManagerData::decode(155, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        let mut editor = manager.into_editor();
+        *editor.recent_message_index_mut().unwrap() = -2;
+        *editor.message_data_last_created_frame_mut(0).unwrap() = 0x1122_3344;
+        assert!(editor.message_data_last_created_frame_mut(1).is_none());
+        *editor.last_random_message_frame_mut().unwrap() = 0x5566_7788;
+        editor.random_message_timers_mut().copy_from_slice(&[9, 10]);
+        let encoded = editor.encode();
+
+        let mut expected = bytes;
+        expected[2..4].copy_from_slice(&(-2_i16).to_be_bytes());
+        expected[11..15].copy_from_slice(&0x1122_3344_u32.to_be_bytes());
+        expected[15..19].copy_from_slice(&0x5566_7788_u32.to_be_bytes());
+        expected[21..23].copy_from_slice(&[9, 10]);
+        assert_eq!(encoded, expected);
+
+        let (rewritten, rewritten_len) = MessageManagerData::decode(155, &encoded).unwrap();
+        assert_eq!(rewritten_len, encoded.len());
+        assert_eq!(rewritten.recent_message_index(), Some(-2));
+        assert_eq!(
+            rewritten.message_data().unwrap()[0].last_created_frame(),
+            0x1122_3344
+        );
+        assert_eq!(rewritten.last_random_message_frame(), Some(0x5566_7788));
+        assert_eq!(rewritten.random_message_timers(), &[9, 10]);
     }
 
     #[test]

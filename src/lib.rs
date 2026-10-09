@@ -66,7 +66,7 @@ pub use guide_manager_data::{
     GuideManagerReference, GuideManagerReferenceField, GuideManagerReferences,
 };
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
-pub use message_manager_data::{MessageDataEntry, MessageManagerData};
+pub use message_manager_data::{MessageDataEntry, MessageManagerData, MessageManagerDataEditor};
 pub use metadata::{DistrictStyleMetaData, MapMetaData, ModInfo, SystemMapMetaData};
 pub use net_manager_data::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLane, NetLanePrefix,

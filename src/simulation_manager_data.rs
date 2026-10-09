@@ -17,7 +17,7 @@ use crate::guide_data::{
     GuideTriggerBaseEditor, GuideTriggerBasePrefix,
 };
 use crate::guide_manager_data::GuideManagerReferences;
-use crate::message_manager_data::MessageManagerData;
+use crate::message_manager_data::{MessageManagerData, MessageManagerDataEditor};
 use crate::net_manager_data::{
     NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader, read_net_object_header,
 };
@@ -523,6 +523,59 @@ impl SimulationManagerData {
             return Err(invalid(
                 body_start,
                 "StatisticsManager replacement must preserve the original length",
+            ));
+        }
+        self.serialized_object_graph[body_start..body_end].copy_from_slice(&replacement);
+        Ok(())
+    }
+
+    /// Replaces editable fields in the queued `MessageManager+Data` body.
+    ///
+    /// Create `edited` from this manager's decoded message body. The inner
+    /// version and original bytes must still match. The editor changes only
+    /// fixed-width counters and stored timer bytes, leaving object references,
+    /// body length, queue offsets, and object IDs unchanged.
+    pub fn replace_message_manager_data(
+        &mut self,
+        edited: &MessageManagerDataEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited MessageManager version does not match this stream",
+            ));
+        }
+        self.decode_message_manager_data()?;
+        let tag = new_profiler_tag_bytes("MessageManager")?;
+        let tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &tag,
+            "MessageManager profiler tag",
+        )?;
+        let body_start = tag_start
+            .checked_add(tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("MessageManager body start"))?;
+        let original = edited.original_body_bytes();
+        let body_end = body_start
+            .checked_add(original.len())
+            .ok_or(CrpError::ArithmeticOverflow("MessageManager body end"))?;
+        let Some(current) = self.serialized_object_graph.get(body_start..body_end) else {
+            return Err(invalid(
+                body_start,
+                "MessageManager body extends past manager graph",
+            ));
+        };
+        if current != original {
+            return Err(invalid(
+                body_start,
+                "MessageManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode();
+        if replacement.len() != original.len() {
+            return Err(invalid(
+                body_start,
+                "MessageManager replacement must preserve the original length",
             ));
         }
         self.serialized_object_graph[body_start..body_end].copy_from_slice(&replacement);
@@ -3666,6 +3719,55 @@ mod manager_boundary_tests {
             .serialized_object_graph
             .insert(graph.len() - profiler_tag("GuideManager").len(), 0xaa);
         assert!(manager.decode_message_manager_data().is_err());
+    }
+
+    #[test]
+    fn message_manager_editor_replaces_only_fixed_width_body_fields() {
+        let mut body = vec![0xff, 0x00, 0x00, 0x10];
+        body.extend([0xff; 16]);
+        body.extend_from_slice(&0x0007_i16.to_be_bytes());
+        body.extend_from_slice(&[0, 0, 0]);
+        body.extend_from_slice(&0x0102_0304_u32.to_be_bytes());
+        body.extend_from_slice(&0_i16.to_be_bytes());
+        body.extend_from_slice(&0x0009_u16.to_be_bytes());
+
+        let mut graph = profiler_tag("MessageManager");
+        graph.extend_from_slice(&body);
+        graph.extend(profiler_tag("GuideManager"));
+        let mut manager = manager_with_graph(graph.clone());
+        manager.format_version = 194;
+        manager.manager_objects = Some(vec![
+            Some(ManagerObjectReference {
+                object_id: 1,
+                type_name: "MessageManager+Data, Assembly-CSharp".to_owned(),
+            }),
+            Some(ManagerObjectReference {
+                object_id: 2,
+                type_name: "GuideManager+Data, Assembly-CSharp".to_owned(),
+            }),
+        ]);
+
+        let mut edited = manager.decode_message_manager_data().unwrap().into_editor();
+        *edited.recent_message_index_mut().unwrap() = -2;
+        *edited.last_random_message_frame_mut().unwrap() = 0x5566_7788;
+        manager.replace_message_manager_data(&edited).unwrap();
+
+        let tag = profiler_tag("MessageManager");
+        let body_start = tag.len();
+        let mut expected = graph;
+        expected[body_start + 20..body_start + 22].copy_from_slice(&(-2_i16).to_be_bytes());
+        expected[body_start + 25..body_start + 29].copy_from_slice(&0x5566_7788_u32.to_be_bytes());
+        assert_eq!(manager.serialized_object_graph(), expected);
+        assert_eq!(manager.serialized_object_graph().len(), expected.len());
+        let rewritten = manager.decode_message_manager_data().unwrap();
+        assert_eq!(rewritten.recent_message_index(), Some(-2));
+        assert_eq!(rewritten.last_random_message_frame(), Some(0x5566_7788));
+        assert_eq!(rewritten.profile_end_shared_string_index(), 9);
+
+        assert!(manager.replace_message_manager_data(&edited).is_err());
+        let mut wrong_version = manager.clone();
+        wrong_version.format_version += 1;
+        assert!(wrong_version.replace_message_manager_data(&edited).is_err());
     }
 
     #[test]
