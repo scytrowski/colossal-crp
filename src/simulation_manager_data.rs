@@ -114,6 +114,7 @@ struct QueuedObjectReferencePrefix {
     zone_manager_object_ids: Vec<Option<u32>>,
     transport_manager_object_ids: Vec<Option<u32>>,
     economy_manager_object_ids: Vec<Option<u32>>,
+    district_manager_object_ids: Vec<Option<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2487,6 +2488,7 @@ impl SimulationManagerData {
             zone_manager_object_ids: Vec::new(),
             transport_manager_object_ids: Vec::new(),
             economy_manager_object_ids: Vec::new(),
+            district_manager_object_ids: Vec::new(),
         })
     }
 
@@ -2559,15 +2561,11 @@ impl SimulationManagerData {
     ) -> Result<QueuedObjectReferencePrefix, CrpError> {
         let mut prefix = self.zone_manager_guide_queue_prefix(save_app_version)?;
         let headers = self.decode_transport_manager_reference_headers(&prefix.object_table)?;
-        for header in &headers {
-            prefix
-                .transport_manager_object_ids
-                .push(register_queued_reference(
-                    header,
-                    &mut prefix.object_table,
-                    &mut prefix.queued_objects,
-                )?);
-        }
+        prefix.transport_manager_object_ids = register_reference_headers(
+            &headers,
+            &mut prefix.object_table,
+            &mut prefix.queued_objects,
+        )?;
         Ok(prefix)
     }
 
@@ -2577,15 +2575,41 @@ impl SimulationManagerData {
     ) -> Result<QueuedObjectReferencePrefix, CrpError> {
         let mut prefix = self.transport_manager_queue_prefix(save_app_version)?;
         let headers = self.decode_economy_manager_reference_headers(&prefix.object_table)?;
-        for header in &headers {
-            prefix
-                .economy_manager_object_ids
-                .push(register_queued_reference(
-                    header,
-                    &mut prefix.object_table,
-                    &mut prefix.queued_objects,
-                )?);
+        prefix.economy_manager_object_ids = register_reference_headers(
+            &headers,
+            &mut prefix.object_table,
+            &mut prefix.queued_objects,
+        )?;
+        Ok(prefix)
+    }
+
+    fn district_manager_queue_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<QueuedObjectReferencePrefix, CrpError> {
+        let mut prefix = self.economy_manager_queue_prefix(save_app_version)?;
+        expect_manager_type(self.manager_objects.as_deref(), 20, "DistrictManager+Data")?;
+        let manager_slot = self
+            .manager_objects
+            .as_deref()
+            .and_then(|managers| managers.get(20))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| invalid(20, "DistrictManager reference is null"))?;
+        if prefix.object_table.type_name(manager_slot.object_id)
+            != Some(manager_slot.type_name.as_str())
+        {
+            return Err(invalid(
+                20,
+                "DistrictManager root reference disagrees with the replayed object table",
+            ));
         }
+
+        let (tail, _) = self.decode_district_manager_tail()?;
+        prefix.district_manager_object_ids = register_reference_headers(
+            tail.object_headers(),
+            &mut prefix.object_table,
+            &mut prefix.queued_objects,
+        )?;
         Ok(prefix)
     }
 
@@ -3052,6 +3076,38 @@ impl SimulationManagerData {
                         let type_name =
                             prefix.object_table.type_name(object_id).ok_or_else(|| {
                                 invalid(0, "EconomyManager object type is unresolved")
+                            })?;
+                        Ok(ResolvedObjectReference {
+                            object_id,
+                            type_name: type_name.to_owned(),
+                        })
+                    })
+                    .transpose()
+            })
+            .collect()
+    }
+
+    /// Resolves the version-gated object references at the end of DistrictManager.
+    ///
+    /// This reader supports inner versions 164–114000, following the currently
+    /// supported TransportManager and EconomyManager reference layouts. It
+    /// decodes DistrictManager's grid boundary and versioned tail, but leaves
+    /// referenced object bodies opaque. Pass the saved application version
+    /// for earlier inner-version-221+ NetNodeInstanceGuide fields.
+    pub fn resolve_district_manager_references(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<Option<ResolvedObjectReference>>, CrpError> {
+        let prefix = self.district_manager_queue_prefix(save_app_version)?;
+        prefix
+            .district_manager_object_ids
+            .iter()
+            .map(|object_id| {
+                object_id
+                    .map(|object_id| {
+                        let type_name =
+                            prefix.object_table.type_name(object_id).ok_or_else(|| {
+                                invalid(0, "DistrictManager object type is unresolved")
                             })?;
                         Ok(ResolvedObjectReference {
                             object_id,
@@ -3941,6 +3997,17 @@ fn register_queued_reference(
     Ok(object_id)
 }
 
+fn register_reference_headers(
+    headers: &[NetObjectHeader],
+    object_table: &mut DataSerializerObjectTable,
+    queued_objects: &mut Vec<QueuedGuideObject>,
+) -> Result<Vec<Option<u32>>, CrpError> {
+    headers
+        .iter()
+        .map(|header| register_queued_reference(header, object_table, queued_objects))
+        .collect()
+}
+
 fn locate_queued_object_body(
     graph: &[u8],
     start_offset: usize,
@@ -4150,7 +4217,7 @@ mod manager_boundary_tests {
         DataSerializerObjectTable, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
         QueuedGuideObject, SimulationManagerData, decode_transport_manager_reference_body,
         economy_manager_object_header_count, find_trailing_object_headers,
-        locate_queued_object_bodies, locate_queued_object_body,
+        locate_queued_object_bodies, locate_queued_object_body, register_reference_headers,
         transport_manager_line_number_count, transport_manager_object_header_count,
     };
     use crate::data_serializer::write_unique_string;
@@ -4869,6 +4936,36 @@ mod manager_boundary_tests {
             .object_types
             .resize(65_536, "SimulationManager+Data".to_owned());
         assert!(find_trailing_object_headers(&[0xff, 0x00, 0xff, 0xff], 2, &large_table).is_err());
+    }
+
+    #[test]
+    fn manager_reference_registration_preserves_header_order_and_queues_new_objects() {
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        let mut queued = Vec::new();
+        let headers = [
+            NetObjectHeader::NewType("GenericGuide".to_owned()),
+            NetObjectHeader::Existing(1),
+            NetObjectHeader::Null,
+            NetObjectHeader::NewSharedType(1),
+        ];
+
+        let object_ids = register_reference_headers(&headers, &mut table, &mut queued).unwrap();
+        assert_eq!(object_ids, [Some(1), Some(1), None, Some(2)]);
+        assert_eq!(table.type_name(1), Some("GenericGuide"));
+        assert_eq!(table.type_name(2), Some("GenericGuide"));
+        assert_eq!(
+            queued,
+            [
+                QueuedGuideObject {
+                    object_id: 1,
+                    type_name: "GenericGuide".to_owned(),
+                },
+                QueuedGuideObject {
+                    object_id: 2,
+                    type_name: "GenericGuide".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]

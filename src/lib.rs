@@ -4435,6 +4435,20 @@ mod tests {
                 }),
             ]
         );
+
+        let district_references =
+            manager.resolve_district_manager_references(metadata.save_app_version)?;
+        assert_eq!(
+            district_references,
+            (114..120)
+                .map(|object_id| {
+                    Some(ResolvedObjectReference {
+                        object_id,
+                        type_name: guide_type.to_owned(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 
