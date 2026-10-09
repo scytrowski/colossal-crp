@@ -4145,8 +4145,9 @@ impl SimulationManagerData {
     ///
     /// New shared strings are decoded, and existing indexes are resolved against
     /// preceding manager profiler tags and BuildingManager selection tables. The
-    /// returned prefix retains the field bytes for exact unchanged writing. Active
-    /// line buffers and nonempty milestone lists remain unsupported by this decoder.
+    /// returned prefix retains the field bytes for exact unchanged writing. The
+    /// decoder traverses active-line records and milestone lists to reach this
+    /// table, but does not expose active-line fields for editing.
     pub fn decode_transport_manager_selection_prefix(
         &self,
         save_app_version: Option<u32>,
@@ -7369,18 +7370,19 @@ fn decode_transport_manager_reference_body(
     }
     let mut reader = Reader::new(bytes);
     let line_flags = read_encoded_uint_array(&mut reader, 255)?;
-    if line_flags.iter().any(|flag| *flag != 0) {
-        return Err(invalid(
-            reader.offset(),
-            "TransportManager queue resolution currently requires an empty line buffer",
-        ));
-    }
+    let active_line_count = line_flags.iter().filter(|flag| **flag != 0).count();
     let milestone_count = if format_version >= 151 {
         usize::from(reader.read_u16_be()?)
     } else {
         0
     };
-    skip_encoded_ushort_array(&mut reader, milestone_count)?;
+    let prefab_index_count =
+        active_line_count
+            .checked_add(milestone_count)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager prefab index count",
+            ))?;
+    skip_encoded_ushort_array(&mut reader, prefab_index_count)?;
 
     let prefab_name_count = usize::from(reader.read_u16_be()?);
     for _ in 0..prefab_name_count {
@@ -7403,12 +7405,47 @@ fn decode_transport_manager_reference_body(
             reader.read_u16_be()?;
         }
     }
+    let passenger_group_count = if format_version >= 176 { 8_usize } else { 7 };
+    let passenger_record_bytes =
+        passenger_group_count
+            .checked_mul(9)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager passenger record length",
+            ))?;
+    for _ in 0..active_line_count {
+        if format_version >= 153 {
+            reader.read_u16_be()?;
+        }
+        reader.read_u16_be()?;
+        if format_version >= 121 {
+            reader.read_bytes(3)?;
+        }
+        if format_version >= 288 {
+            reader.read_u16_be()?;
+        }
+        if format_version >= 314 {
+            reader.read_u16_be()?;
+            reader.read_f32_be()?;
+        }
+        if format_version >= 320 {
+            reader.read_u8()?;
+        }
+        if format_version >= 110_023 {
+            reader.read_u16_be()?;
+        }
+        if format_version >= 122 {
+            reader.read_bytes(passenger_record_bytes)?;
+        }
+        if (112_004..112_022).contains(&format_version) {
+            reader.read_u16_be()?;
+        } else if (112_022..114_001).contains(&format_version) {
+            reader.read_unique_string()?;
+        }
+    }
     if format_version >= 122 {
-        let passenger_group_count = if format_version >= 176 { 8_usize } else { 7 };
         let passenger_record_count = line_number_count;
         let passenger_bytes = passenger_record_count
-            .checked_mul(passenger_group_count)
-            .and_then(|groups| groups.checked_mul(9))
+            .checked_mul(passenger_record_bytes)
             .ok_or(CrpError::ArithmeticOverflow(
                 "TransportManager passenger record length",
             ))?;
@@ -8865,19 +8902,6 @@ mod manager_boundary_tests {
             )
             .is_err()
         );
-        let mut active_lines = Vec::new();
-        write_encoded_uint_array(&mut active_lines, &[1, 0, 0, 0]);
-        write_encoded_uint_array(&mut active_lines, &[0; 251]);
-        active_lines.extend_from_slice(&bytes[2..]);
-        assert!(
-            decode_transport_manager_reference_body(
-                112_004,
-                &active_lines,
-                Some(&table),
-                Some(&mut Vec::new()),
-            )
-            .is_err()
-        );
         assert!(
             decode_transport_manager_reference_body(
                 112_004,
@@ -8975,6 +8999,152 @@ mod manager_boundary_tests {
                 &selection_bytes[..selection_bytes.len() - 1],
                 Some(&DataSerializerObjectTable::new("SimulationManager+Data")),
                 Some(&mut vec![Some("SimulationManager".to_owned())]),
+            )
+            .is_err()
+        );
+    }
+
+    fn active_transport_manager_reference_body(
+        format_version: u32,
+        line_number_count: usize,
+        milestone_count: usize,
+        object_header_count: usize,
+    ) -> (Vec<u8>, usize) {
+        // One active line followed by 254 zero flags in EncodedArray.UInt form.
+        let mut bytes = vec![
+            0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // Full values: 1, 0.
+            0x40, 0x00, 0x01, // Close delta: reset the running delta to zero.
+            0xff, 0xfb, // Repeat zero 128 + 124 times.
+        ];
+        bytes.extend_from_slice(&(milestone_count as u16).to_be_bytes());
+        let prefab_index_count = milestone_count + 1;
+        bytes.push((prefab_index_count - 1) as u8);
+        for index in 0..prefab_index_count {
+            bytes.extend_from_slice(&(index as u16 + 7).to_be_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_be_bytes()); // Empty prefab-name table.
+        for _ in 0..milestone_count {
+            bytes.extend_from_slice(&[0x00, 0x00, 0x01]); // Existing object 1.
+        }
+        for _ in 0..line_number_count {
+            bytes.extend_from_slice(&0_u16.to_be_bytes());
+        }
+
+        let line_record_start = bytes.len();
+        bytes.extend_from_slice(&0x1234_u16.to_be_bytes()); // Line number.
+        bytes.extend_from_slice(&0x0009_u16.to_be_bytes()); // Stop count.
+        if format_version >= 121 {
+            bytes.extend_from_slice(&[0x12, 0x34, 0x56]); // RGB.
+        }
+        if format_version >= 288 {
+            bytes.extend_from_slice(&0x2345_u16.to_be_bytes()); // Building.
+        }
+        if format_version >= 314 {
+            bytes.extend_from_slice(&0x3456_u16.to_be_bytes()); // Budget.
+            bytes.extend_from_slice(&1.5_f32.to_be_bytes()); // Total length.
+        }
+        if format_version >= 320 {
+            bytes.push(0x45); // Average interval.
+        }
+        if format_version >= 110_023 {
+            bytes.extend_from_slice(&0x4567_u16.to_be_bytes()); // Ticket price.
+        }
+        let passenger_groups = if format_version >= 176 { 8 } else { 7 };
+        let passenger_record_bytes = passenger_groups * 9;
+        if format_version >= 122 {
+            bytes.extend(std::iter::repeat_n(0x5a, passenger_record_bytes));
+        }
+        if (112_004..112_022).contains(&format_version) {
+            bytes.extend_from_slice(&0x5678_u16.to_be_bytes()); // Legacy vehicle selection.
+        } else if (112_022..114_001).contains(&format_version) {
+            write_unique_string(&mut bytes, "TramVehicle").unwrap();
+        }
+
+        bytes.extend(std::iter::repeat_n(
+            0,
+            line_number_count * passenger_record_bytes,
+        ));
+        bytes.extend(std::iter::repeat_n(0xff, object_header_count)); // Null references.
+        if format_version >= 114_001 {
+            bytes.extend_from_slice(&0_i16.to_be_bytes()); // Empty selection table.
+        }
+        (bytes, line_record_start)
+    }
+
+    #[test]
+    fn transport_manager_skips_active_line_records_across_version_gates() {
+        let cases = [
+            (175, 5, 0),
+            (176, 5, 0),
+            (211, 8, 0),
+            (287, 8, 0),
+            (288, 8, 0),
+            (313, 10, 0),
+            (314, 10, 0),
+            (319, 10, 7),
+            (320, 10, 7),
+            (110_022, 13, 7),
+            (110_023, 13, 7),
+            (112_003, 14, 7),
+            (112_004, 14, 7),
+            (112_021, 14, 7),
+            (112_022, 14, 7),
+            (114_000, 17, 7),
+            (114_001, 17, 7),
+        ];
+
+        for (format_version, line_number_count, object_header_count) in cases {
+            let (bytes, _) = active_transport_manager_reference_body(
+                format_version,
+                line_number_count,
+                0,
+                object_header_count,
+            );
+            let mut shared_strings = Vec::new();
+            let decoded = decode_transport_manager_reference_body(
+                format_version,
+                &bytes,
+                None,
+                Some(&mut shared_strings),
+            )
+            .unwrap_or_else(|error| {
+                panic!("version {format_version} active-line record failed: {error}")
+            });
+            assert_eq!(decoded.object_headers.len(), object_header_count);
+            if format_version >= 114_001 {
+                assert!(decoded.selection_prefix.unwrap().selections().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn transport_manager_active_line_prefab_indexes_precede_milestone_references() {
+        let (bytes, line_record_start) = active_transport_manager_reference_body(112_004, 14, 1, 7);
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        table
+            .register(&NetObjectHeader::NewType(
+                "TransportLine+Data, Assembly-CSharp".to_owned(),
+            ))
+            .unwrap();
+        let decoded = decode_transport_manager_reference_body(
+            112_004,
+            &bytes,
+            Some(&table),
+            Some(&mut Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.milestone_object_headers,
+            [NetObjectHeader::Existing(1)]
+        );
+        assert_eq!(decoded.object_headers, vec![NetObjectHeader::Null; 7]);
+
+        assert!(
+            decode_transport_manager_reference_body(
+                112_004,
+                &bytes[..line_record_start + 1],
+                Some(&table),
+                Some(&mut Vec::new()),
             )
             .is_err()
         );
