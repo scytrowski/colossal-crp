@@ -82,8 +82,8 @@ pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use prop_manager_data::PropManagerDataPrefix;
 pub use simulation_manager_data::{
     EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
-    EconomyInvestmentValueSeries, GuideBodyLocation, ManagerObjectReference,
-    ResolvedObjectReference, SerializableDataEntry, SimulationManagerData,
+    EconomyInvestmentValueSeries, EconomyManagerInvestmentsEditor, GuideBodyLocation,
+    ManagerObjectReference, ResolvedObjectReference, SerializableDataEntry, SimulationManagerData,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use statistics_manager_data::{
@@ -4558,6 +4558,34 @@ mod tests {
             assert_eq!(prefabs.assignments.len(), investments.len(), "{file_name}");
             assert_eq!(prefabs.names.len(), expected_active_count, "{file_name}");
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads the local CCMP2 Boreal Map 1 sample from data/maps"]
+    fn rewrites_boreal_economy_manager_investments() -> Result<(), Box<dyn std::error::Error>> {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CCMP2 Boreal Map 1.crp");
+        let mut file = File::open(path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("Boreal has no type-52 asset"))?;
+        let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let mut manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 116_019);
+
+        let mut editor =
+            manager.decode_economy_manager_investments_editor(metadata.save_app_version)?;
+        let changed_spent = -123_456;
+        editor.investments_mut()[0].player_spent = changed_spent;
+        manager.replace_economy_manager_investments(&editor, metadata.save_app_version)?;
+        assert_eq!(
+            manager.decode_economy_manager_investments(metadata.save_app_version)?[0].player_spent,
+            changed_spent
+        );
         Ok(())
     }
 

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use crate::CrpError;
 use crate::GameAreaManagerData;
@@ -11,9 +12,12 @@ use crate::TreeManagerDataPrefix;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
-use crate::data_serializer::{DataSerializerStream, Reader, write_u24_be, write_unique_string};
+use crate::data_serializer::{
+    DataSerializerStream, Reader, write_nullable_unique_string, write_u24_be, write_unique_string,
+};
 use crate::encoded_array::{
     read_encoded_float_array, read_encoded_uint_array, read_encoded_ushort_array,
+    write_encoded_float_array, write_encoded_ushort_array,
 };
 use crate::guide_data::{
     GUIDE_INSTANCE_BODY_LEN, GUIDE_TRIGGER_BASE_PREFIX_LEN, GuideInstanceBody, GuideInstanceEditor,
@@ -129,6 +133,70 @@ pub struct EconomyInvestmentPrefabTable {
     pub assignments: Vec<EconomyInvestmentPrefabAssignment>,
     /// Names in the game's serialized table order; null entries are retained.
     pub names: Vec<Option<String>>,
+}
+
+/// Editable investment data for a bounded `EconomyManager+Data` body.
+///
+/// This editor supports inner version 116017 and newer. It retains the
+/// original body so replacement can reject stale editors and preserve bytes
+/// before the investment flags and after the decoded prefab table. The
+/// encoded arrays are rewritten using deterministic valid encodings; their
+/// original compression choices are not preserved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EconomyManagerInvestmentsEditor {
+    format_version: u32,
+    flags: Vec<u16>,
+    investments: Vec<EconomyInvestmentData>,
+    prefabs: EconomyInvestmentPrefabTable,
+    original_body: Vec<u8>,
+    flags_start: usize,
+    scope_end: usize,
+}
+
+impl EconomyManagerInvestmentsEditor {
+    /// Returns the inner DataSerializer version used to decode this editor.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns all 254 raw investment flags, including non-boolean values.
+    pub fn flags(&self) -> &[u16] {
+        &self.flags
+    }
+
+    /// Returns mutable access to all 254 raw investment flags.
+    pub fn flags_mut(&mut self) -> &mut [u16] {
+        &mut self.flags
+    }
+
+    /// Returns decoded active investments in serialized index order.
+    pub fn investments(&self) -> &[EconomyInvestmentData] {
+        &self.investments
+    }
+
+    /// Returns mutable access to decoded active investments.
+    pub fn investments_mut(&mut self) -> &mut Vec<EconomyInvestmentData> {
+        &mut self.investments
+    }
+
+    /// Returns the decoded investment-prefab assignments and name table.
+    pub fn prefabs(&self) -> &EconomyInvestmentPrefabTable {
+        &self.prefabs
+    }
+
+    /// Returns mutable access to investment-prefab assignments and names.
+    pub fn prefabs_mut(&mut self) -> &mut EconomyInvestmentPrefabTable {
+        &mut self.prefabs
+    }
+
+    /// Encodes the full bounded EconomyManager body represented by this editor.
+    ///
+    /// The original prefix and any bytes after the decoded prefab table are
+    /// copied byte-for-byte. Invalid flag, investment, or prefab cardinalities
+    /// return an error.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        encode_economy_manager_investment_editor(self)
+    }
 }
 
 /// One entry in `SimulationManager.m_serializableDataStorage`.
@@ -2748,6 +2816,16 @@ impl SimulationManagerData {
         &self,
         object_table: &DataSerializerObjectTable,
     ) -> Result<&[u8], CrpError> {
+        let range = self.economy_manager_body_range(object_table)?;
+        self.serialized_object_graph
+            .get(range)
+            .ok_or_else(|| invalid(0, "EconomyManager body range exceeds manager graph"))
+    }
+
+    fn economy_manager_body_range(
+        &self,
+        object_table: &DataSerializerObjectTable,
+    ) -> Result<Range<usize>, CrpError> {
         expect_manager_type(self.manager_objects.as_deref(), 19, "EconomyManager+Data")?;
         expect_manager_type(self.manager_objects.as_deref(), 20, "DistrictManager+Data")?;
         if self.format_version < 164 {
@@ -2801,7 +2879,7 @@ impl SimulationManagerData {
             ));
         }
 
-        Ok(&self.serialized_object_graph[body_start..end_tag_start])
+        Ok(body_start..end_tag_start)
     }
 
     fn decode_economy_manager_reference_headers(
@@ -3230,6 +3308,90 @@ impl SimulationManagerData {
             &prefix.object_table,
         )
         .map(|(prefabs, _)| prefabs)
+    }
+
+    /// Creates an editor for the bounded EconomyManager investment body.
+    ///
+    /// Supports inner version 116017 and newer when the required versioned
+    /// `GenericGuide` references resolve. The editor retains all bytes before
+    /// the investment flags and after the decoded prefab table. Its encoded
+    /// arrays may use different valid compression controls after writing.
+    pub fn decode_economy_manager_investments_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<EconomyManagerInvestmentsEditor, CrpError> {
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        let body_range = self.economy_manager_body_range(&prefix.object_table)?;
+        let body = self
+            .serialized_object_graph
+            .get(body_range)
+            .ok_or_else(|| invalid(0, "EconomyManager body range exceeds manager graph"))?;
+        decode_economy_manager_investment_editor(self.format_version, body, &prefix.object_table)
+    }
+
+    /// Replaces the modeled EconomyManager investment body from an editor.
+    ///
+    /// The editor must come from this manager's current bytes and use the same
+    /// inner version. Only versions 116017 and newer are supported. The method
+    /// validates the rewritten body before keeping it and restores the graph
+    /// if that validation fails.
+    pub fn replace_economy_manager_investments(
+        &mut self,
+        edited: &EconomyManagerInvestmentsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version != self.format_version {
+            return Err(invalid(
+                0,
+                "EconomyManager investment editor uses a different DataSerializer version",
+            ));
+        }
+        let current = self.decode_economy_manager_investments_editor(save_app_version)?;
+        if current.original_body != edited.original_body {
+            return Err(invalid(
+                0,
+                "EconomyManager investment editor does not match this manager body",
+            ));
+        }
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        let body_range = self.economy_manager_body_range(&prefix.object_table)?;
+        let replacement = edited.encode()?;
+        let replacement_start = body_range.start;
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_range, replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+
+        let validation = self
+            .decode_economy_manager_investments_editor(save_app_version)
+            .and_then(|decoded| {
+                if decoded.flags != edited.flags {
+                    return Err(invalid(
+                        replacement_start,
+                        "rewritten EconomyManager investment flags do not match the editor",
+                    ));
+                }
+                if !economy_investments_wire_equal(&decoded.investments, &edited.investments) {
+                    return Err(invalid(
+                        replacement_start,
+                        "rewritten EconomyManager investment numeric fields do not match the editor",
+                    ));
+                }
+                if decoded.prefabs != edited.prefabs {
+                    return Err(invalid(
+                        replacement_start,
+                        "rewritten EconomyManager prefab data does not match the editor",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                replacement_start,
+                format!("rewritten EconomyManager investment body failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolves the version-gated object references at the end of DistrictManager.
@@ -4577,6 +4739,201 @@ fn decode_economy_manager_investment_prefabs_after_investments(
     ))
 }
 
+fn decode_economy_manager_investment_editor(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: &DataSerializerObjectTable,
+) -> Result<EconomyManagerInvestmentsEditor, CrpError> {
+    if format_version < 116_017 {
+        return Err(invalid(
+            0,
+            "EconomyManager investment editing requires inner version 116017 or newer",
+        ));
+    }
+    let flags_start = economy_manager_investment_flags_start(format_version, bytes, object_table)?;
+    let (flags, values_start) = decode_economy_manager_investment_flags_at(bytes, flags_start)?;
+    let (series, values_end) =
+        decode_economy_manager_investment_value_series_at(bytes, flags.clone(), values_start)?;
+    let (investments, prefab_start) =
+        decode_economy_manager_investments_after_series(format_version, bytes, series, values_end)?;
+    let (prefabs, scope_end) = decode_economy_manager_investment_prefabs_after_investments(
+        bytes,
+        investments.clone(),
+        prefab_start,
+    )?;
+    Ok(EconomyManagerInvestmentsEditor {
+        format_version,
+        flags,
+        investments,
+        prefabs,
+        original_body: bytes.to_vec(),
+        flags_start,
+        scope_end,
+    })
+}
+
+fn encode_economy_manager_investment_editor(
+    editor: &EconomyManagerInvestmentsEditor,
+) -> Result<Vec<u8>, CrpError> {
+    if editor.format_version < 116_017 {
+        return Err(invalid(
+            0,
+            "EconomyManager investment editing requires inner version 116017 or newer",
+        ));
+    }
+    if editor.flags.len() != ECONOMY_INVESTMENT_FLAG_COUNT {
+        return Err(invalid(
+            editor.flags_start,
+            format!(
+                "expected {ECONOMY_INVESTMENT_FLAG_COUNT} investment flags, found {}",
+                editor.flags.len()
+            ),
+        ));
+    }
+    if editor.flags_start > editor.scope_end || editor.scope_end > editor.original_body.len() {
+        return Err(invalid(
+            editor.flags_start,
+            "investment editor source boundaries are invalid",
+        ));
+    }
+
+    let active_indices = editor
+        .flags
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, flag)| {
+            (*flag != 0)
+                .then(|| u16::try_from(offset + 1).ok())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if active_indices.len() != editor.investments.len() {
+        return Err(invalid(
+            editor.flags_start,
+            format!(
+                "{} nonzero investment flags require matching data, found {} records",
+                active_indices.len(),
+                editor.investments.len()
+            ),
+        ));
+    }
+    for (expected_index, investment) in active_indices.iter().zip(&editor.investments) {
+        if investment.investment_index != *expected_index {
+            return Err(invalid(
+                editor.flags_start,
+                format!(
+                    "active investment records must follow flag order: expected index {expected_index}, found {}",
+                    investment.investment_index
+                ),
+            ));
+        }
+        if investment.value_history.len() > i16::MAX as usize {
+            return Err(invalid(
+                editor.flags_start,
+                format!(
+                    "investment {} history has {} values, exceeding the signed 16-bit count",
+                    investment.investment_index,
+                    investment.value_history.len()
+                ),
+            ));
+        }
+    }
+    if editor.prefabs.assignments.len() != editor.investments.len() {
+        return Err(invalid(
+            editor.flags_start,
+            format!(
+                "{} active investments require prefab assignments, found {}",
+                editor.investments.len(),
+                editor.prefabs.assignments.len()
+            ),
+        ));
+    }
+    for (investment, assignment) in editor.investments.iter().zip(&editor.prefabs.assignments) {
+        if investment.investment_index != assignment.investment_index {
+            return Err(invalid(
+                editor.flags_start,
+                format!(
+                    "prefab assignment order does not match investment {}",
+                    investment.investment_index
+                ),
+            ));
+        }
+    }
+    let name_count = u16::try_from(editor.prefabs.names.len()).map_err(|_| {
+        invalid(
+            editor.flags_start,
+            format!(
+                "investment prefab name table has {} entries, exceeding the unsigned 16-bit count",
+                editor.prefabs.names.len()
+            ),
+        )
+    })?;
+
+    let mut output = Vec::new();
+    output.extend_from_slice(&editor.original_body[..editor.flags_start]);
+    write_encoded_ushort_array(&mut output, &editor.flags);
+    for investment in &editor.investments {
+        let value_count = i16::try_from(investment.value_history.len()).map_err(|_| {
+            invalid(
+                editor.flags_start,
+                format!(
+                    "investment {} history count does not fit a signed 16-bit field",
+                    investment.investment_index
+                ),
+            )
+        })?;
+        output.extend_from_slice(&value_count.to_be_bytes());
+        write_encoded_float_array(&mut output, &investment.value_history);
+    }
+    for investment in &editor.investments {
+        output.extend_from_slice(&investment.player_spent.to_be_bytes());
+        output.extend_from_slice(&investment.owned_share_count.to_be_bytes());
+        output.extend_from_slice(&investment.base_value.to_bits().to_be_bytes());
+    }
+    for investment in &editor.investments {
+        output.extend_from_slice(&investment.requirement_missing_date_ticks.to_be_bytes());
+    }
+    for investment in &editor.investments {
+        output.extend_from_slice(&investment.current_state.to_be_bytes());
+        output.extend_from_slice(&investment.random_influence.to_bits().to_be_bytes());
+    }
+    let prefab_indices = editor
+        .prefabs
+        .assignments
+        .iter()
+        .map(|assignment| assignment.prefab_index)
+        .collect::<Vec<_>>();
+    write_encoded_ushort_array(&mut output, &prefab_indices);
+    output.extend_from_slice(&name_count.to_be_bytes());
+    for name in &editor.prefabs.names {
+        write_nullable_unique_string(&mut output, name.as_deref())?;
+    }
+    output.extend_from_slice(&editor.original_body[editor.scope_end..]);
+    Ok(output)
+}
+
+fn economy_investments_wire_equal(
+    left: &[EconomyInvestmentData],
+    right: &[EconomyInvestmentData],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.investment_index == right.investment_index
+                && left.value_history.len() == right.value_history.len()
+                && left
+                    .value_history
+                    .iter()
+                    .zip(&right.value_history)
+                    .all(|(left, right)| left.to_bits() == right.to_bits())
+                && left.player_spent == right.player_spent
+                && left.owned_share_count == right.owned_share_count
+                && left.base_value.to_bits() == right.base_value.to_bits()
+                && left.requirement_missing_date_ticks == right.requirement_missing_date_ticks
+                && left.current_state == right.current_state
+                && left.random_influence.to_bits() == right.random_influence.to_bits()
+        })
+}
+
 fn read_economy_investment_field<'a, T>(
     reader: &mut Reader<'a>,
     fields_start: usize,
@@ -5122,7 +5479,7 @@ mod manager_boundary_tests {
     use super::{
         DataSerializerObjectTable, EconomyInvestmentData, EconomyInvestmentPrefabAssignment,
         EconomyInvestmentPrefabTable, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
-        QueuedGuideObject, SimulationManagerData,
+        QueuedGuideObject, SimulationManagerData, decode_economy_manager_investment_editor,
         decode_economy_manager_investment_flags_from_body,
         decode_economy_manager_investment_prefabs_from_body,
         decode_economy_manager_investment_value_series, decode_economy_manager_investments,
@@ -6406,6 +6763,71 @@ mod manager_boundary_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn economy_manager_investment_editor_writes_fields_and_preserves_unknown_edges() {
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        table
+            .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+            .unwrap();
+
+        let mut body = vec![0xfe, 0x00, 0x01].repeat(5);
+        let flags_start = body.len();
+        let mut flags = vec![0_u16; 254];
+        flags[0] = 2;
+        flags[2] = 1;
+        write_encoded_ushort_array(&mut body, &flags);
+        body.extend_from_slice(&[
+            0x00, 0x02, 0x01, 0x3f, 0x80, 0x00, 0x00, 0xc0, 0x20, 0x00, 0x00,
+            // investment 1 has history [1.0, -2.5]
+            0x00, 0x01, 0x00, 0x40, 0xa0, 0x00, 0x00, // investment 3 has history [5.0]
+            0x00, 0x00, 0x00, 0x05, // player spent
+            0x10, 0x20, 0x30, 0x40, // owned shares
+            0x80, 0x00, 0x00, 0x00, // negative zero base value
+            0xff, 0xff, 0xff, 0xfa, // second investment player spent
+            0x00, 0x00, 0x00, 0x07, // second investment owned shares
+            0x40, 0xb0, 0x00, 0x00, // second investment base value 5.5
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, // requirement date
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, // second requirement date
+            0xff, 0xfd, 0x3e, 0x80, 0x00, 0x00, // state -3, influence 0.25
+            0x00, 0x04, 0xbf, 0x00, 0x00, 0x00, // state 4, influence -0.5
+        ]);
+        write_encoded_ushort_array(&mut body, &[0x1234, 0]);
+        body.extend_from_slice(&2_u16.to_be_bytes());
+        write_unique_string(&mut body, "A").unwrap();
+        body.push(0xff);
+        let scope_end = body.len();
+        body.extend_from_slice(&[0xcc, 0xdd]);
+
+        let mut editor = decode_economy_manager_investment_editor(116_019, &body, &table).unwrap();
+        assert_eq!(editor.flags()[0], 2);
+        assert_eq!(editor.investments().len(), 2);
+        assert_eq!(editor.investments()[0].base_value.to_bits(), 0x8000_0000);
+        assert_eq!(editor.prefabs().names, [Some("A".to_owned()), None]);
+        assert_eq!(editor.scope_end, scope_end);
+        editor.investments_mut()[0].player_spent = -7;
+
+        let encoded = editor.encode().unwrap();
+        let mut expected = body[..flags_start].to_vec();
+        write_encoded_ushort_array(&mut expected, &flags);
+        expected.extend_from_slice(&[
+            0x00, 0x02, 0x01, 0x3f, 0x80, 0x00, 0x00, 0xc0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x40, 0xa0, 0x00, 0x00, 0xff, 0xff, 0xff, 0xf9, 0x10, 0x20, 0x30, 0x40, 0x80, 0x00,
+            0x00, 0x00, 0xff, 0xff, 0xff, 0xfa, 0x00, 0x00, 0x00, 0x07, 0x40, 0xb0, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0a, 0xff, 0xfd, 0x3e, 0x80, 0x00, 0x00, 0x00, 0x04, 0xbf, 0x00, 0x00, 0x00,
+        ]);
+        write_encoded_ushort_array(&mut expected, &[0x1234, 0]);
+        expected.extend_from_slice(&2_u16.to_be_bytes());
+        write_unique_string(&mut expected, "A").unwrap();
+        expected.push(0xff);
+        expected.extend_from_slice(&[0xcc, 0xdd]);
+        assert_eq!(encoded, expected);
+
+        let mut invalid = editor.clone();
+        invalid.investments_mut()[0].investment_index = 2;
+        assert!(invalid.encode().is_err());
     }
 
     #[test]

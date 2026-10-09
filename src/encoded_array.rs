@@ -93,6 +93,20 @@ pub(crate) fn read_encoded_float_array(
     Ok(values)
 }
 
+/// Writes float values as literal blocks of at most 128 items.
+///
+/// This deterministic encoding is accepted by `EncodedArray.Float.Read`; it
+/// does not reproduce the game's choice of repeat controls.
+pub(crate) fn write_encoded_float_array(output: &mut Vec<u8>, values: &[f32]) {
+    for chunk in values.chunks(128) {
+        // `chunks(128)` guarantees a nonempty block of at most 128 values.
+        output.push((chunk.len() - 1) as u8);
+        for value in chunk {
+            output.extend_from_slice(&value.to_bits().to_be_bytes());
+        }
+    }
+}
+
 pub(crate) fn write_encoded_bool_array(output: &mut Vec<u8>, values: &[bool]) {
     let mut packed = vec![0_u8; values.len().div_ceil(8)];
     for (index, value) in values.iter().copied().enumerate() {
@@ -346,7 +360,7 @@ mod tests {
     use super::{
         read_encoded_bool_array, read_encoded_byte_array, read_encoded_float_array,
         read_encoded_uint_array, read_encoded_ulong_array, read_encoded_ushort_array,
-        skip_encoded_ushort_array, write_encoded_bool_array,
+        skip_encoded_ushort_array, write_encoded_bool_array, write_encoded_float_array,
     };
     use crate::data_serializer::Reader;
 
@@ -490,6 +504,36 @@ mod tests {
         let mut empty = Reader::new(&[]);
         assert!(read_encoded_float_array(&mut empty, 0).unwrap().is_empty());
         assert_eq!(empty.offset(), 0);
+    }
+
+    #[test]
+    fn float_array_writer_emits_exact_literal_blocks() {
+        let values = [1.0_f32, -2.5, -0.0];
+        let mut encoded = Vec::new();
+        write_encoded_float_array(&mut encoded, &values);
+        assert_eq!(
+            encoded,
+            [
+                0x02, 0x3f, 0x80, 0x00, 0x00, 0xc0, 0x20, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+            ]
+        );
+        let mut reader = Reader::new(&encoded);
+        let decoded = read_encoded_float_array(&mut reader, 3).unwrap();
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reader.remaining(), 0);
+
+        let mut empty = Vec::new();
+        write_encoded_float_array(&mut empty, &[]);
+        assert!(empty.is_empty());
     }
 
     #[test]
