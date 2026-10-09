@@ -82,8 +82,9 @@ pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
 pub use prop_manager_data::PropManagerDataPrefix;
 pub use simulation_manager_data::{
     EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
-    EconomyInvestmentValueSeries, EconomyManagerInvestmentsEditor, GuideBodyLocation,
-    ManagerObjectReference, ResolvedObjectReference, SerializableDataEntry, SimulationManagerData,
+    EconomyInvestmentValueSeries, EconomyManagerBudgetEditor, EconomyManagerInvestmentsEditor,
+    GuideBodyLocation, ManagerObjectReference, ResolvedObjectReference, SerializableDataEntry,
+    SimulationManagerData,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use statistics_manager_data::{
@@ -4585,6 +4586,18 @@ mod tests {
         assert_eq!(
             manager.decode_economy_manager_investments(metadata.save_app_version)?[0].player_spent,
             changed_spent
+        );
+
+        let mut budget_editor =
+            manager.decode_economy_manager_budget_editor(metadata.save_app_version)?;
+        let changed_tax_rate = 73;
+        budget_editor.tax_rates_mut()[0] = changed_tax_rate;
+        manager.replace_economy_manager_budget(&budget_editor, metadata.save_app_version)?;
+        assert_eq!(
+            manager
+                .decode_economy_manager_budget_editor(metadata.save_app_version)?
+                .tax_rates()[0],
+            changed_tax_rate
         );
         Ok(())
     }

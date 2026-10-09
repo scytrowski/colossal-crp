@@ -16,8 +16,9 @@ use crate::data_serializer::{
     DataSerializerStream, Reader, write_nullable_unique_string, write_u24_be, write_unique_string,
 };
 use crate::encoded_array::{
-    read_encoded_float_array, read_encoded_uint_array, read_encoded_ushort_array,
-    write_encoded_float_array, write_encoded_ushort_array,
+    read_encoded_byte_array, read_encoded_float_array, read_encoded_uint_array,
+    read_encoded_ushort_array, write_encoded_byte_array, write_encoded_float_array,
+    write_encoded_ushort_array,
 };
 use crate::guide_data::{
     GUIDE_INSTANCE_BODY_LEN, GUIDE_TRIGGER_BASE_PREFIX_LEN, GuideInstanceBody, GuideInstanceEditor,
@@ -198,6 +199,66 @@ impl EconomyManagerInvestmentsEditor {
     /// return an error.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         encode_economy_manager_investment_editor(self)
+    }
+}
+
+/// Editable tax and service-budget arrays at the start of `EconomyManager+Data`.
+///
+/// The editor preserves the remainder of the bounded manager body verbatim.
+/// Service budgets have no separate night array before inner version 214; the
+/// game copies the decoded day values to its runtime night buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EconomyManagerBudgetEditor {
+    format_version: u32,
+    tax_rates: Vec<u8>,
+    service_budget_day: Vec<u8>,
+    service_budget_night: Option<Vec<u8>>,
+    original_body: Vec<u8>,
+    prefix_end: usize,
+}
+
+impl EconomyManagerBudgetEditor {
+    /// Returns the inner DataSerializer version used to decode this editor.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns the decoded tax-rate values.
+    pub fn tax_rates(&self) -> &[u8] {
+        &self.tax_rates
+    }
+
+    /// Returns mutable access to decoded tax-rate values.
+    pub fn tax_rates_mut(&mut self) -> &mut [u8] {
+        &mut self.tax_rates
+    }
+
+    /// Returns daytime service-budget values in serialized order.
+    pub fn service_budget_day(&self) -> &[u8] {
+        &self.service_budget_day
+    }
+
+    /// Returns mutable access to daytime service-budget values.
+    pub fn service_budget_day_mut(&mut self) -> &mut [u8] {
+        &mut self.service_budget_day
+    }
+
+    /// Returns nighttime service-budget values from version 214, if present.
+    pub fn service_budget_night(&self) -> Option<&[u8]> {
+        self.service_budget_night.as_deref()
+    }
+
+    /// Returns mutable access to nighttime values from version 214, if present.
+    pub fn service_budget_night_mut(&mut self) -> Option<&mut [u8]> {
+        self.service_budget_night.as_deref_mut()
+    }
+
+    /// Encodes the full bounded EconomyManager body represented by this editor.
+    ///
+    /// The known tax and budget arrays are rewritten with deterministic valid
+    /// byte-array controls. All bytes after those arrays are copied unchanged.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        encode_economy_manager_budget_editor(self)
     }
 }
 
@@ -3223,6 +3284,86 @@ impl SimulationManagerData {
             .collect()
     }
 
+    /// Decodes EconomyManager's tax and service-budget arrays.
+    ///
+    /// Tax-rate and budget counts follow the inner DataSerializer version.
+    /// Before version 214, nighttime values are not stored and the decoded
+    /// daytime values stand in for the game's copied runtime values. All other
+    /// EconomyManager body bytes remain opaque.
+    pub fn decode_economy_manager_budget_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<EconomyManagerBudgetEditor, CrpError> {
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        let body_range = self.economy_manager_body_range(&prefix.object_table)?;
+        let body = self
+            .serialized_object_graph
+            .get(body_range)
+            .ok_or_else(|| invalid(0, "EconomyManager body range exceeds manager graph"))?;
+        decode_economy_manager_budget_editor(self.format_version, body)
+    }
+
+    /// Replaces EconomyManager's tax and service-budget arrays.
+    ///
+    /// The editor must come from this manager's current body and use the same
+    /// inner version. The method changes only the first two encoded arrays,
+    /// validates the rewritten prefix, and restores the graph if validation
+    /// fails.
+    pub fn replace_economy_manager_budget(
+        &mut self,
+        edited: &EconomyManagerBudgetEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version != self.format_version {
+            return Err(invalid(
+                0,
+                "EconomyManager budget editor uses a different DataSerializer version",
+            ));
+        }
+        let current = self.decode_economy_manager_budget_editor(save_app_version)?;
+        if current.original_body != edited.original_body {
+            return Err(invalid(
+                0,
+                "EconomyManager budget editor does not match this manager body",
+            ));
+        }
+        let prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        let body_range = self.economy_manager_body_range(&prefix.object_table)?;
+        let replacement = edited.encode()?;
+        let replacement_start = body_range.start;
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_range, replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+
+        let validation = self
+            .decode_economy_manager_budget_editor(save_app_version)
+            .and_then(|decoded| {
+                if decoded.tax_rates != edited.tax_rates {
+                    return Err(invalid(
+                        replacement_start,
+                        "rewritten EconomyManager tax rates do not match the editor",
+                    ));
+                }
+                if decoded.service_budget_day != edited.service_budget_day
+                    || decoded.service_budget_night != edited.service_budget_night
+                {
+                    return Err(invalid(
+                        replacement_start,
+                        "rewritten EconomyManager service budgets do not match the editor",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                replacement_start,
+                format!("rewritten EconomyManager budget prefix failed validation: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Decodes EconomyManager's investment activation flags from inner version 116009 onward.
     ///
     /// The returned vector contains 254 flags for investment indices 1–254;
@@ -3983,6 +4124,171 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
         offset,
         reason: reason.into(),
     }
+}
+
+fn economy_manager_tax_rate_count(format_version: u32) -> usize {
+    if format_version >= 116_003 {
+        140
+    } else if format_version >= 115_006 {
+        135
+    } else if format_version >= 109_000 {
+        120
+    } else if format_version >= 213 {
+        95
+    } else if format_version >= 53 {
+        85
+    } else {
+        80
+    }
+}
+
+fn economy_manager_service_budget_count(format_version: u32) -> usize {
+    if format_version >= 120_002 {
+        42
+    } else if format_version >= 117_001 {
+        41
+    } else if format_version >= 116_002 {
+        40
+    } else if format_version >= 115_019 {
+        39
+    } else if format_version >= 115_005 {
+        38
+    } else if format_version >= 113_000 {
+        37
+    } else if format_version >= 112_010 {
+        35
+    } else if format_version >= 112_002 {
+        34
+    } else if format_version >= 111_006 {
+        30
+    } else if format_version >= 110_010 {
+        24
+    } else if format_version >= 310 {
+        22
+    } else if format_version >= 211 {
+        20
+    } else if format_version >= 79 {
+        17
+    } else if format_version >= 53 {
+        15
+    } else {
+        9
+    }
+}
+
+fn decode_economy_manager_budget_editor(
+    format_version: u32,
+    bytes: &[u8],
+) -> Result<EconomyManagerBudgetEditor, CrpError> {
+    let mut reader = Reader::new(bytes);
+    let tax_rate_count = economy_manager_tax_rate_count(format_version);
+    let tax_rates = read_encoded_byte_array(&mut reader, tax_rate_count)
+        .map_err(|error| invalid(0, format!("EconomyManager tax-rate array: {error}")))?;
+    let budget_count = economy_manager_service_budget_count(format_version);
+    let stored_budget_value_count = budget_count
+        .checked_mul(if format_version >= 214 { 2 } else { 1 })
+        .ok_or(CrpError::ArithmeticOverflow(
+            "EconomyManager stored service-budget count",
+        ))?;
+    let budgets_offset = reader.offset();
+    let stored_budgets =
+        read_encoded_byte_array(&mut reader, stored_budget_value_count).map_err(|error| {
+            invalid(
+                budgets_offset,
+                format!("EconomyManager service budgets: {error}"),
+            )
+        })?;
+    let (service_budget_day, service_budget_night) = if format_version >= 214 {
+        let mut day = Vec::with_capacity(budget_count);
+        let mut night = Vec::with_capacity(budget_count);
+        for (day_value, night_value) in stored_budgets
+            .iter()
+            .step_by(2)
+            .zip(stored_budgets.iter().skip(1).step_by(2))
+        {
+            day.push(*day_value);
+            night.push(*night_value);
+        }
+        (day, Some(night))
+    } else {
+        (stored_budgets, None)
+    };
+    Ok(EconomyManagerBudgetEditor {
+        format_version,
+        tax_rates,
+        service_budget_day,
+        service_budget_night,
+        original_body: bytes.to_vec(),
+        prefix_end: reader.offset(),
+    })
+}
+
+fn encode_economy_manager_budget_editor(
+    editor: &EconomyManagerBudgetEditor,
+) -> Result<Vec<u8>, CrpError> {
+    if editor.prefix_end > editor.original_body.len() {
+        return Err(invalid(
+            editor.prefix_end,
+            "EconomyManager budget prefix boundary exceeds its source body",
+        ));
+    }
+    let expected_tax_rate_count = economy_manager_tax_rate_count(editor.format_version);
+    if editor.tax_rates.len() != expected_tax_rate_count {
+        return Err(invalid(
+            0,
+            format!(
+                "expected {expected_tax_rate_count} EconomyManager tax rates, found {}",
+                editor.tax_rates.len()
+            ),
+        ));
+    }
+    let expected_budget_count = economy_manager_service_budget_count(editor.format_version);
+    if editor.service_budget_day.len() != expected_budget_count {
+        return Err(invalid(
+            0,
+            format!(
+                "expected {expected_budget_count} daytime service budgets, found {}",
+                editor.service_budget_day.len()
+            ),
+        ));
+    }
+    if editor.format_version >= 214 {
+        let night = editor.service_budget_night.as_deref().ok_or_else(|| {
+            invalid(
+                0,
+                "nighttime service budgets are required from inner version 214",
+            )
+        })?;
+        if night.len() != expected_budget_count {
+            return Err(invalid(
+                0,
+                format!(
+                    "expected {expected_budget_count} nighttime service budgets, found {}",
+                    night.len()
+                ),
+            ));
+        }
+    } else if editor.service_budget_night.is_some() {
+        return Err(invalid(
+            0,
+            "nighttime service budgets are not serialized below inner version 214",
+        ));
+    }
+
+    let mut output = Vec::new();
+    write_encoded_byte_array(&mut output, &editor.tax_rates);
+    if let Some(night) = &editor.service_budget_night {
+        let mut interleaved = Vec::with_capacity(expected_budget_count * 2);
+        for (day, night) in editor.service_budget_day.iter().zip(night) {
+            interleaved.push(*day);
+            interleaved.push(*night);
+        }
+        write_encoded_byte_array(&mut output, &interleaved);
+    } else {
+        write_encoded_byte_array(&mut output, &editor.service_budget_day);
+    }
+    output.extend_from_slice(&editor.original_body[editor.prefix_end..]);
+    Ok(output)
 }
 
 fn economy_manager_object_header_count(format_version: u32) -> usize {
@@ -5509,11 +5815,13 @@ mod manager_boundary_tests {
     use super::{
         DataSerializerObjectTable, EconomyInvestmentData, EconomyInvestmentPrefabAssignment,
         EconomyInvestmentPrefabTable, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
-        QueuedGuideObject, SimulationManagerData, decode_economy_manager_investment_editor,
+        QueuedGuideObject, SimulationManagerData, decode_economy_manager_budget_editor,
+        decode_economy_manager_investment_editor,
         decode_economy_manager_investment_flags_from_body,
         decode_economy_manager_investment_prefabs_from_body,
         decode_economy_manager_investment_value_series, decode_economy_manager_investments,
         decode_transport_manager_reference_body, economy_manager_object_header_count,
+        economy_manager_service_budget_count, economy_manager_tax_rate_count,
         find_economy_manager_guide_headers, find_trailing_object_headers,
         locate_queued_object_bodies, locate_queued_object_body, register_reference_headers,
         transport_manager_line_number_count, transport_manager_object_header_count,
@@ -6243,6 +6551,138 @@ mod manager_boundary_tests {
         assert_eq!(economy_manager_object_header_count(94), 1);
         assert_eq!(economy_manager_object_header_count(165), 1);
         assert_eq!(economy_manager_object_header_count(166), 2);
+    }
+
+    #[test]
+    fn economy_manager_tax_and_budget_counts_follow_reader_gates() {
+        for (version, expected) in [
+            (52, 80),
+            (53, 85),
+            (212, 85),
+            (213, 95),
+            (108_999, 95),
+            (109_000, 120),
+            (115_005, 120),
+            (115_006, 135),
+            (116_002, 135),
+            (116_003, 140),
+        ] {
+            assert_eq!(
+                economy_manager_tax_rate_count(version),
+                expected,
+                "{version}"
+            );
+        }
+        for (version, expected) in [
+            (52, 9),
+            (53, 15),
+            (78, 15),
+            (79, 17),
+            (210, 17),
+            (211, 20),
+            (309, 20),
+            (310, 22),
+            (110_009, 22),
+            (110_010, 24),
+            (111_005, 24),
+            (111_006, 30),
+            (112_001, 30),
+            (112_002, 34),
+            (112_009, 34),
+            (112_010, 35),
+            (112_999, 35),
+            (113_000, 37),
+            (115_004, 37),
+            (115_005, 38),
+            (115_018, 38),
+            (115_019, 39),
+            (116_001, 39),
+            (116_002, 40),
+            (117_000, 40),
+            (117_001, 41),
+            (120_001, 41),
+            (120_002, 42),
+        ] {
+            assert_eq!(
+                economy_manager_service_budget_count(version),
+                expected,
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn economy_manager_tax_and_budget_editor_writes_exact_bytes_and_keeps_suffix() {
+        let mut taxes = vec![0_u8; 95];
+        taxes[0] = 10;
+        let mut day = (0_u8..20).collect::<Vec<_>>();
+        let night = (100_u8..120).collect::<Vec<_>>();
+        let mut interleaved = Vec::with_capacity(40);
+        for (day_value, night_value) in day.iter().zip(&night) {
+            interleaved.push(*day_value);
+            interleaved.push(*night_value);
+        }
+        let mut body = vec![0x5e];
+        body.extend_from_slice(&taxes);
+        body.push(0x27);
+        body.extend_from_slice(&interleaved);
+        body.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+
+        let mut editor = decode_economy_manager_budget_editor(214, &body).unwrap();
+        assert_eq!(editor.tax_rates(), taxes);
+        assert_eq!(editor.service_budget_day(), day);
+        assert_eq!(editor.service_budget_night(), Some(night.as_slice()));
+        editor.tax_rates_mut()[0] = 7;
+        editor.service_budget_day_mut()[0] = 3;
+        editor.service_budget_night_mut().unwrap()[0] = 4;
+
+        taxes[0] = 7;
+        day[0] = 3;
+        let mut expected_night = night.clone();
+        expected_night[0] = 4;
+        let mut expected_interleaved = Vec::with_capacity(40);
+        for (day_value, night_value) in day.iter().zip(&expected_night) {
+            expected_interleaved.push(*day_value);
+            expected_interleaved.push(*night_value);
+        }
+        let mut expected = vec![0x5e];
+        expected.extend_from_slice(&taxes);
+        expected.push(0x27);
+        expected.extend_from_slice(&expected_interleaved);
+        expected.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = decode_economy_manager_budget_editor(214, &encoded).unwrap();
+        assert_eq!(decoded.tax_rates(), taxes);
+        assert_eq!(decoded.service_budget_day(), day);
+        assert_eq!(
+            decoded.service_budget_night(),
+            Some(expected_night.as_slice())
+        );
+
+        let mut legacy_taxes = vec![0_u8; 85];
+        legacy_taxes[0] = 7;
+        let mut legacy_body = vec![0x54];
+        legacy_body.extend_from_slice(&legacy_taxes);
+        legacy_body.push(0x13);
+        legacy_body.extend(0_u8..20);
+        legacy_body.push(0xdd);
+        let mut legacy = decode_economy_manager_budget_editor(212, &legacy_body).unwrap();
+        assert!(legacy.service_budget_night().is_none());
+        legacy.service_budget_day_mut()[0] = 9;
+        let mut legacy_expected = vec![0x54];
+        legacy_expected.extend_from_slice(&legacy_taxes);
+        legacy_expected.extend_from_slice(&[0x13, 9]);
+        legacy_expected.extend(1_u8..20);
+        legacy_expected.push(0xdd);
+        let legacy_encoded = legacy.encode().unwrap();
+        assert_eq!(legacy_encoded, legacy_expected);
+        let legacy_decoded = decode_economy_manager_budget_editor(212, &legacy_encoded).unwrap();
+        assert_eq!(legacy_decoded.tax_rates(), legacy_taxes);
+        assert_eq!(legacy_decoded.service_budget_day()[0], 9);
+        assert!(legacy_decoded.service_budget_night().is_none());
+
+        assert!(decode_economy_manager_budget_editor(214, &[0x54]).is_err());
     }
 
     #[test]
