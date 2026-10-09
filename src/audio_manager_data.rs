@@ -50,6 +50,7 @@ pub struct AudioManagerData {
     channel_prefab_indices: Vec<u16>,
     channel_prefab_names: Vec<Option<String>>,
     radio_channels: Vec<AudioRadioChannel>,
+    channel_record_offsets: Vec<usize>,
     radio_content_capacity: u32,
     content_flags: Vec<u32>,
     content_prefab_indices: Vec<u16>,
@@ -57,6 +58,7 @@ pub struct AudioManagerData {
     unlock_milestone_prefab_indices: Vec<u16>,
     unlock_milestone_references: Vec<NetObjectHeader>,
     radio_contents: Vec<AudioRadioContent>,
+    content_cooldown_offsets: Vec<usize>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -82,6 +84,7 @@ impl AudioManagerData {
         let channel_prefab_names = read_prefab_names(&mut reader)?;
 
         let mut radio_channels = Vec::with_capacity(channel_count);
+        let mut channel_record_offsets = Vec::with_capacity(channel_count);
         let mut prefab_indices = channel_prefab_indices.iter().copied();
         for (index, flags) in channel_flags.iter().enumerate() {
             if *flags == 0 {
@@ -89,6 +92,7 @@ impl AudioManagerData {
             }
             let slot_index = u16::try_from(index + 1)
                 .map_err(|_| CrpError::ArithmeticOverflow("AudioManager channel slot index"))?;
+            channel_record_offsets.push(reader.offset());
             radio_channels.push(AudioRadioChannel {
                 slot_index,
                 prefab_index: prefab_indices
@@ -126,6 +130,7 @@ impl AudioManagerData {
         }
 
         let mut radio_contents = Vec::with_capacity(content_count);
+        let mut content_cooldown_offsets = Vec::with_capacity(content_count);
         let mut prefab_indices = content_prefab_indices.iter().copied();
         for (index, flags) in content_flags.iter().enumerate() {
             if *flags == 0 {
@@ -133,6 +138,7 @@ impl AudioManagerData {
             }
             let slot_index = u16::try_from(index + 1)
                 .map_err(|_| CrpError::ArithmeticOverflow("AudioManager content slot index"))?;
+            content_cooldown_offsets.push(reader.offset());
             radio_contents.push(AudioRadioContent {
                 slot_index,
                 prefab_index: prefab_indices
@@ -151,6 +157,7 @@ impl AudioManagerData {
                 channel_prefab_indices,
                 channel_prefab_names,
                 radio_channels,
+                channel_record_offsets,
                 radio_content_capacity,
                 content_flags,
                 content_prefab_indices,
@@ -158,6 +165,7 @@ impl AudioManagerData {
                 unlock_milestone_prefab_indices,
                 unlock_milestone_references,
                 radio_contents,
+                content_cooldown_offsets,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -237,6 +245,174 @@ impl AudioManagerData {
     /// Returns the number of decoded field bytes, excluding the profiler end tag.
     pub fn encoded_len(&self) -> usize {
         self.serialized_prefix.len()
+    }
+
+    /// Creates an editor for fixed-width fields in existing channels and content.
+    ///
+    /// Active-slot counts and prefab assignments stay fixed, so edits preserve
+    /// the manager body length and every name-table and reference byte.
+    pub fn into_editor(self) -> AudioManagerEditor {
+        AudioManagerEditor::from(self)
+    }
+}
+
+/// Fixed-width edits for existing AudioManager radio records.
+///
+/// The editor can change channel playback state and content cooldowns. Slot
+/// indices, prefab assignments, active flags, and all opaque scope bytes are
+/// retained from the source. Encoding preserves the original body length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioManagerEditor {
+    original: AudioManagerData,
+    radio_channels: Vec<AudioRadioChannel>,
+    radio_contents: Vec<AudioRadioContent>,
+}
+
+impl From<AudioManagerData> for AudioManagerEditor {
+    fn from(original: AudioManagerData) -> Self {
+        Self {
+            radio_channels: original.radio_channels.clone(),
+            radio_contents: original.radio_contents.clone(),
+            original,
+        }
+    }
+}
+
+impl AudioManagerEditor {
+    /// Returns the inner DataSerializer version used for the source fields.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns the existing radio channels in serialized slot order.
+    pub fn radio_channels(&self) -> &[AudioRadioChannel] {
+        &self.radio_channels
+    }
+
+    /// Returns mutable access to existing radio channels.
+    ///
+    /// Slot indices and prefab assignments must remain unchanged when encoded.
+    pub fn radio_channels_mut(&mut self) -> &mut [AudioRadioChannel] {
+        &mut self.radio_channels
+    }
+
+    /// Returns the existing radio contents in serialized slot order.
+    pub fn radio_contents(&self) -> &[AudioRadioContent] {
+        &self.radio_contents
+    }
+
+    /// Returns mutable access to existing radio contents.
+    ///
+    /// Slot indices and prefab assignments must remain unchanged when encoded.
+    pub fn radio_contents_mut(&mut self) -> &mut [AudioRadioContent] {
+        &mut self.radio_contents
+    }
+
+    /// Encodes the edited records into a copy of their original AudioManager bytes.
+    ///
+    /// The output has the original length. Any attempt to change active slots,
+    /// prefab assignments, or the version-selected play-position presence is
+    /// rejected.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.radio_channels.len() != self.original.radio_channels.len()
+            || self.radio_channels.len() != self.original.channel_record_offsets.len()
+            || self.radio_contents.len() != self.original.radio_contents.len()
+            || self.radio_contents.len() != self.original.content_cooldown_offsets.len()
+        {
+            return Err(invalid(0, "AudioManager active record count changed"));
+        }
+
+        let mut bytes = self.original.serialized_prefix.clone();
+        for (index, ((edited, original), offset)) in self
+            .radio_channels
+            .iter()
+            .zip(&self.original.radio_channels)
+            .zip(&self.original.channel_record_offsets)
+            .enumerate()
+        {
+            if edited.slot_index != original.slot_index
+                || edited.prefab_index != original.prefab_index
+            {
+                return Err(invalid(
+                    *offset,
+                    format!("radio channel {index} changed its slot or prefab assignment"),
+                ));
+            }
+            if edited.play_position.is_some() != original.play_position.is_some() {
+                return Err(invalid(
+                    *offset,
+                    format!("radio channel {index} changed its versioned play-position field"),
+                ));
+            }
+            let mut field_offset = *offset;
+            write_u16_at(&mut bytes, field_offset, edited.current_content_index)?;
+            field_offset = field_offset
+                .checked_add(2)
+                .ok_or(CrpError::ArithmeticOverflow("AudioManager field offset"))?;
+            write_u16_at(&mut bytes, field_offset, edited.next_content_index)?;
+            field_offset = field_offset
+                .checked_add(2)
+                .ok_or(CrpError::ArithmeticOverflow("AudioManager field offset"))?;
+            write_u8_at(&mut bytes, field_offset, edited.state_chain_index)?;
+            field_offset = field_offset
+                .checked_add(1)
+                .ok_or(CrpError::ArithmeticOverflow("AudioManager field offset"))?;
+            write_u8_at(&mut bytes, field_offset, edited.state_repeat_count)?;
+            field_offset += 1;
+            if let Some(play_position) = edited.play_position {
+                write_u16_at(&mut bytes, field_offset, play_position)?;
+            }
+        }
+
+        for (index, ((edited, original), offset)) in self
+            .radio_contents
+            .iter()
+            .zip(&self.original.radio_contents)
+            .zip(&self.original.content_cooldown_offsets)
+            .enumerate()
+        {
+            if edited.slot_index != original.slot_index
+                || edited.prefab_index != original.prefab_index
+            {
+                return Err(invalid(
+                    *offset,
+                    format!("radio content {index} changed its slot or prefab assignment"),
+                ));
+            }
+            write_u16_at(&mut bytes, *offset, edited.cooldown)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original.serialized_prefix
+    }
+}
+
+fn write_u16_at(bytes: &mut [u8], offset: usize, value: u16) -> Result<(), CrpError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or(CrpError::ArithmeticOverflow("AudioManager field end"))?;
+    let target = bytes
+        .get_mut(offset..end)
+        .ok_or_else(|| invalid(offset, "AudioManager field extends past its original bytes"))?;
+    target.copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+fn write_u8_at(bytes: &mut [u8], offset: usize, value: u8) -> Result<(), CrpError> {
+    let target = bytes
+        .get_mut(offset)
+        .ok_or_else(|| invalid(offset, "AudioManager field extends past its original bytes"))?;
+    *target = value;
+    Ok(())
+}
+
+fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "AudioManager+Data".to_owned(),
+        offset,
+        reason: reason.into(),
     }
 }
 
@@ -337,6 +513,59 @@ mod tests {
         let (decoded, consumed) = AudioManagerData::decode_prefix(280, &bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.radio_channels()[0].play_position, None);
+    }
+
+    #[test]
+    fn editor_changes_only_existing_channel_and_content_values() {
+        let bytes = one_channel_one_content_body(281);
+        let (decoded, _) = AudioManagerData::decode_prefix(281, &bytes).unwrap();
+        let mut editor = decoded.into_editor();
+        let channel = &mut editor.radio_channels_mut()[0];
+        channel.current_content_index = 12;
+        channel.next_content_index = 13;
+        channel.state_chain_index = 14;
+        channel.state_repeat_count = 15;
+        channel.play_position = Some(0x1234);
+        editor.radio_contents_mut()[0].cooldown = 0x5678;
+
+        let mut expected = bytes;
+        expected[32..40].copy_from_slice(&[0, 12, 0, 13, 14, 15, 0x12, 0x34]);
+        expected[81..83].copy_from_slice(&[0x56, 0x78]);
+        assert_eq!(editor.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn editor_preserves_the_pre_281_channel_record_width() {
+        let bytes = one_channel_one_content_body(280);
+        let (decoded, _) = AudioManagerData::decode_prefix(280, &bytes).unwrap();
+        let mut editor = decoded.into_editor();
+        let channel = &mut editor.radio_channels_mut()[0];
+        channel.current_content_index = 0x1234;
+        channel.next_content_index = 0x5678;
+        channel.state_chain_index = 9;
+        channel.state_repeat_count = 10;
+
+        let mut expected = bytes;
+        expected[32..38].copy_from_slice(&[0x12, 0x34, 0x56, 0x78, 9, 10]);
+        assert_eq!(editor.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn editor_rejects_changes_to_slots_prefabs_or_versioned_fields() {
+        let bytes = one_channel_one_content_body(281);
+        let (decoded, _) = AudioManagerData::decode_prefix(281, &bytes).unwrap();
+
+        let mut changed_slot = decoded.clone().into_editor();
+        changed_slot.radio_channels_mut()[0].slot_index = 3;
+        assert!(changed_slot.encode().is_err());
+
+        let mut changed_prefab = decoded.clone().into_editor();
+        changed_prefab.radio_contents_mut()[0].prefab_index = 11;
+        assert!(changed_prefab.encode().is_err());
+
+        let mut changed_play_position = decoded.into_editor();
+        changed_play_position.radio_channels_mut()[0].play_position = None;
+        assert!(changed_play_position.encode().is_err());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::TreeManagerDataPrefix;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
-use crate::audio_manager_data::AudioManagerData;
+use crate::audio_manager_data::{AudioManagerData, AudioManagerEditor};
 use crate::data_serializer::{
     DataSerializerStream, Reader, write_nullable_unique_string, write_u24_be, write_unique_string,
 };
@@ -892,6 +892,69 @@ impl SimulationManagerData {
     /// locator supports the unique-string profiler tags observed in local maps
     /// and returns an error for other tag forms.
     pub fn decode_audio_manager_data(&self) -> Result<AudioManagerData, CrpError> {
+        let field_range = self.audio_manager_field_range()?;
+        let bytes = self
+            .serialized_object_graph
+            .get(field_range)
+            .ok_or_else(|| invalid(0, "AudioManager field range exceeds manager graph"))?;
+        let (data, consumed) = AudioManagerData::decode_prefix(self.format_version, bytes)?;
+        if consumed != bytes.len() {
+            return Err(invalid(
+                consumed,
+                "AudioManager field length disagrees with its versioned layout",
+            ));
+        }
+        Ok(data)
+    }
+
+    /// Replaces fixed-width channel playback and content cooldown fields.
+    ///
+    /// The editor must come from this manager graph and preserve its active
+    /// slots and prefab assignments. The replacement keeps the body length,
+    /// profiler references, and adjacent manager bytes fixed.
+    pub fn replace_audio_manager_data(
+        &mut self,
+        edited: &AudioManagerEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited AudioManager version does not match this stream",
+            ));
+        }
+        let field_range = self.audio_manager_field_range()?;
+        let current = self
+            .serialized_object_graph
+            .get(field_range.clone())
+            .ok_or_else(|| invalid(0, "AudioManager field range exceeds manager graph"))?;
+        if current != edited.original_prefix() {
+            return Err(invalid(
+                field_range.start,
+                "AudioManager bytes do not match the editor's source fields",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != field_range.len() {
+            return Err(invalid(
+                field_range.start,
+                "AudioManager replacement must preserve the original field length",
+            ));
+        }
+
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate[field_range.clone()].copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        if let Err(error) = self.decode_audio_manager_data() {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                field_range.start,
+                format!("edited AudioManager fields failed boundary validation: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn audio_manager_field_range(&self) -> Result<Range<usize>, CrpError> {
         let managers = self
             .manager_objects
             .as_deref()
@@ -922,7 +985,7 @@ impl SimulationManagerData {
             .serialized_object_graph
             .get(body_start..)
             .ok_or_else(|| invalid(body_start, "AudioManager body starts past graph end"))?;
-        let (data, consumed) = AudioManagerData::decode_prefix(self.format_version, body)?;
+        let (_, consumed) = AudioManagerData::decode_prefix(self.format_version, body)?;
         let body_end = body_start
             .checked_add(consumed)
             .ok_or(CrpError::ArithmeticOverflow("AudioManager body end"))?;
@@ -943,7 +1006,7 @@ impl SimulationManagerData {
                 ),
             ));
         }
-        Ok(data)
+        Ok(body_start..body_end)
     }
 
     fn info_manager_field_range(&self) -> Result<Range<usize>, CrpError> {
@@ -7429,6 +7492,36 @@ mod manager_boundary_tests {
         manager
     }
 
+    fn audio_manager_with_active_channel() -> SimulationManagerData {
+        let body = [
+            0x00, 0x01, // Two channel slots, including reserved index zero.
+            0x00, 0x00, // One content slot, including reserved index zero.
+            0x00, 0x00, 0x00, 0x00, 0x01, // One active channel flag.
+            0x00, 0x00, 0x00, // One channel prefab index, zero.
+            0x00, 0x00, // Empty channel prefab-name table.
+            0x00, 0x01, 0x00, 0x02, 0x03, 0x04, 0x00, 0x05, // Channel state.
+            0x00, 0x00, // No unlock milestones.
+            0x00, 0x00, // Empty content prefab-name table.
+        ];
+        let mut graph = profiler_tag("AudioManager");
+        graph.extend_from_slice(&body);
+        graph.extend_from_slice(&[0x12, 0x34]);
+        graph.extend(profiler_tag("StatisticsManager"));
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 293;
+        manager.manager_objects = Some(vec![
+            Some(ManagerObjectReference {
+                object_id: 1,
+                type_name: "AudioManager+Data, Assembly-CSharp".to_owned(),
+            }),
+            Some(ManagerObjectReference {
+                object_id: 2,
+                type_name: "StatisticsManager+Data, Assembly-CSharp".to_owned(),
+            }),
+        ]);
+        manager
+    }
+
     #[test]
     fn info_manager_mask_decodes_and_replaces_at_versioned_boundary() {
         for (version, original, replacement) in [
@@ -7524,6 +7617,43 @@ mod manager_boundary_tests {
 
         let manager = audio_manager_with_next("AudioManager");
         assert!(manager.decode_audio_manager_data().is_err());
+    }
+
+    #[test]
+    fn audio_manager_editor_replaces_channel_fields_and_preserves_adjacent_bytes() {
+        let mut manager = audio_manager_with_active_channel();
+        let audio_tag_len = profiler_tag("AudioManager").len();
+        let body_start = audio_tag_len;
+        let body_len = 26;
+        let following_bytes = manager.serialized_object_graph[body_start + body_len..].to_vec();
+        let graph_len = manager.serialized_object_graph.len();
+
+        let mut edited = manager.decode_audio_manager_data().unwrap().into_editor();
+        let channel = &mut edited.radio_channels_mut()[0];
+        channel.current_content_index = 100;
+        channel.next_content_index = 200;
+        channel.state_chain_index = 6;
+        channel.state_repeat_count = 7;
+        channel.play_position = Some(0x3456);
+        manager.replace_audio_manager_data(&edited).unwrap();
+
+        let decoded = manager.decode_audio_manager_data().unwrap();
+        let channel = &decoded.radio_channels()[0];
+        assert_eq!(channel.current_content_index, 100);
+        assert_eq!(channel.next_content_index, 200);
+        assert_eq!(channel.state_chain_index, 6);
+        assert_eq!(channel.state_repeat_count, 7);
+        assert_eq!(channel.play_position, Some(0x3456));
+        assert_eq!(manager.serialized_object_graph.len(), graph_len);
+        assert_eq!(
+            &manager.serialized_object_graph[body_start + body_len..],
+            following_bytes
+        );
+
+        let mut stale = audio_manager_with_active_channel();
+        let stale_editor = stale.decode_audio_manager_data().unwrap().into_editor();
+        stale.serialized_object_graph[body_start + 14] ^= 1;
+        assert!(stale.replace_audio_manager_data(&stale_editor).is_err());
     }
 
     #[test]

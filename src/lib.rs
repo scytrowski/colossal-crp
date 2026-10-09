@@ -32,7 +32,9 @@ mod unlock_manager_data;
 mod water_simulation_data;
 mod zone_manager_data;
 
-pub use audio_manager_data::{AudioManagerData, AudioRadioChannel, AudioRadioContent};
+pub use audio_manager_data::{
+    AudioManagerData, AudioManagerEditor, AudioRadioChannel, AudioRadioContent,
+};
 pub use building_manager_data::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsEditor,
     BuildingEconomicFieldsPrefix, BuildingEffectValue, BuildingFacultyBonusesEditor,
