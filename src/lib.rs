@@ -4419,6 +4419,19 @@ mod tests {
         let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
         assert_eq!(manager.format_version(), 112_004);
 
+        let water_guides = manager.locate_water_manager_guide_bodies(metadata.save_app_version)?;
+        assert_eq!(water_guides.len(), 2);
+        for location in water_guides {
+            let location = location
+                .ok_or_else(|| std::io::Error::other("Wolf Creek WaterManager guide is null"))?;
+            assert_eq!(location.body_length, 11);
+            assert!(location.type_name.starts_with("BuildingTypeGuide,"));
+            let (_, consumed) = GuideTriggerBasePrefix::decode(
+                &manager.serialized_object_graph()[location.graph_offset..],
+            )?;
+            assert_eq!(consumed, 11);
+        }
+
         let message = manager.decode_message_manager_data()?;
         assert_eq!(message.random_message_timers().len(), 26);
         let original_queue = message.message_queue().map(<[_]>::to_vec);

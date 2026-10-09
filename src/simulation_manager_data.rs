@@ -99,6 +99,7 @@ struct NetManagerGuideQueuePrefix {
     object_table: DataSerializerObjectTable,
     queued_objects: Vec<QueuedGuideObject>,
     net_manager_object_ids: Vec<Option<u32>>,
+    water_manager_object_ids: Vec<Option<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2468,6 +2469,139 @@ impl SimulationManagerData {
             object_table,
             queued_objects,
             net_manager_object_ids,
+            water_manager_object_ids: Vec::new(),
+        })
+    }
+
+    fn water_manager_guide_queue_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetManagerGuideQueuePrefix, CrpError> {
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        for (slot, manager_type) in [
+            "CitizenManager+Data",
+            "TransferManager+Data",
+            "NaturalResourceManager+Data",
+            "ImmaterialResourceManager+Data",
+            "ElectricityManager+Data",
+            "WaterManager+Data",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, manager_type)| (index + 7, manager_type))
+        {
+            expect_manager_type(Some(managers), slot, manager_type)?;
+        }
+
+        let mut prefix = self.net_manager_guide_queue_prefix(save_app_version)?;
+        let (building, _) = self.decode_building_object_headers_prefix(save_app_version)?;
+        for header in building.object_headers() {
+            register_queued_reference(
+                header,
+                &mut prefix.object_table,
+                &mut prefix.queued_objects,
+            )?;
+        }
+
+        for header in self.decode_water_manager_guide_reference_headers(&prefix.object_table)? {
+            prefix
+                .water_manager_object_ids
+                .push(register_queued_reference(
+                    &header,
+                    &mut prefix.object_table,
+                    &mut prefix.queued_objects,
+                )?);
+        }
+        Ok(prefix)
+    }
+
+    fn decode_water_manager_guide_reference_headers(
+        &self,
+        object_table: &DataSerializerObjectTable,
+    ) -> Result<Vec<NetObjectHeader>, CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 12, "WaterManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 13, "ZoneManager+Data")?;
+        if self.format_version < 94 {
+            return Ok(vec![NetObjectHeader::Null; 2]);
+        }
+
+        let zone_tag = new_profiler_tag_bytes("ZoneManager")?;
+        let zone_tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &zone_tag,
+            "ZoneManager profiler tag",
+        )?;
+        let end_tag_start = zone_tag_start
+            .checked_sub(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or_else(|| invalid(zone_tag_start, "WaterManager closing tag is truncated"))?;
+        if self
+            .serialized_object_graph
+            .get(end_tag_start)
+            .is_none_or(|marker| *marker >= 0xfe)
+        {
+            return Err(invalid(
+                end_tag_start,
+                "WaterManager closing profiler reference is malformed",
+            ));
+        }
+
+        let mut matches = Vec::new();
+        for encoded_length in [2_usize, 4, 6] {
+            let Some(start) = end_tag_start.checked_sub(encoded_length) else {
+                continue;
+            };
+            let Some(header_bytes) = self.serialized_object_graph.get(start..end_tag_start) else {
+                continue;
+            };
+            let mut reader = Reader::new(header_bytes);
+            let Ok(first) = read_net_object_header(&mut reader) else {
+                continue;
+            };
+            let Ok(second) = read_net_object_header(&mut reader) else {
+                continue;
+            };
+            if reader.remaining() != 0 || start < 9 {
+                continue;
+            }
+            let fields_start = start - 9;
+            let mut fields = Reader::new(&self.serialized_object_graph[fields_start..start]);
+            let Ok(processed_cells) = fields.read_i32_be() else {
+                continue;
+            };
+            let Ok(conductive_cells) = fields.read_i32_be() else {
+                continue;
+            };
+            if !(0..=65_536).contains(&processed_cells)
+                || !(0..=65_536).contains(&conductive_cells)
+                || fields.read_u8().is_err()
+            {
+                continue;
+            }
+            let mut candidate_table = object_table.clone();
+            if candidate_table.register(&first).is_err()
+                || candidate_table.register(&second).is_err()
+            {
+                continue;
+            }
+            matches.push(vec![first, second]);
+        }
+        if matches.len() != 1 {
+            return Err(invalid(
+                end_tag_start,
+                format!(
+                    "WaterManager guide-reference tail has {} valid interpretations",
+                    matches.len()
+                ),
+            ));
+        }
+        matches.pop().ok_or_else(|| {
+            invalid(
+                end_tag_start,
+                "WaterManager guide-reference tail could not be resolved",
+            )
         })
     }
 
@@ -2523,6 +2657,62 @@ impl SimulationManagerData {
             prefix.children_start,
             &prefix.queued_objects,
             &prefix.net_manager_object_ids,
+            self.format_version,
+            save_app_version,
+        )
+    }
+
+    /// Locates a queued WaterManager guide body by its reference-field index.
+    ///
+    /// The queue replay follows GameArea, Terrain, InstanceManager, NetManager,
+    /// BuildingManager, and WaterManager references. In the supported root
+    /// layout, CitizenManager through ElectricityManager (slots 7–11) declare
+    /// no DataSerializer child objects. WaterManager's two version-94 guide
+    /// headers are read immediately before its closing profiler reference.
+    /// The manager array must contain WaterManager in slot 12 and GuideManager
+    /// as the last populated reference. Pass the saved application version
+    /// for inner-version-221+ NetNodeInstanceGuide bodies in earlier queues.
+    pub fn locate_water_manager_guide_body(
+        &self,
+        header_index: usize,
+        save_app_version: Option<u32>,
+    ) -> Result<GuideBodyLocation, CrpError> {
+        let prefix = self.water_manager_guide_queue_prefix(save_app_version)?;
+        let object_id = prefix
+            .water_manager_object_ids
+            .get(header_index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| {
+                invalid(
+                    header_index,
+                    "WaterManager guide-header index is out of bounds or references null",
+                )
+            })?;
+        locate_queued_object_body(
+            &self.serialized_object_graph,
+            prefix.children_start,
+            &prefix.queued_objects,
+            object_id,
+            self.format_version,
+            save_app_version,
+        )
+    }
+
+    /// Locates both queued WaterManager guide bodies in header order.
+    ///
+    /// Null references remain `None`; repeated references return the same
+    /// body location. Earlier unsupported queued guide types return an error.
+    pub fn locate_water_manager_guide_bodies(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<Option<GuideBodyLocation>>, CrpError> {
+        let prefix = self.water_manager_guide_queue_prefix(save_app_version)?;
+        locate_queued_object_bodies(
+            &self.serialized_object_graph,
+            prefix.children_start,
+            &prefix.queued_objects,
+            &prefix.water_manager_object_ids,
             self.format_version,
             save_app_version,
         )
@@ -3768,6 +3958,65 @@ mod manager_boundary_tests {
         let mut wrong_version = manager.clone();
         wrong_version.format_version += 1;
         assert!(wrong_version.replace_message_manager_data(&edited).is_err());
+    }
+
+    #[test]
+    fn water_manager_guide_headers_align_with_the_zone_boundary() {
+        let mut graph = vec![0; 9]; // Two counters and the can-continue byte.
+        graph.extend_from_slice(&[0xfe, 0x00, 0x24, 0xfe, 0x00, 0x24]);
+        graph.extend_from_slice(&[0x00, 0x0d]); // WaterManager profiler end index.
+        graph.extend(profiler_tag("ZoneManager"));
+
+        let mut manager = manager_with_graph(graph.clone());
+        manager.format_version = 112_004;
+        manager.manager_objects = Some(
+            (0..14)
+                .map(|slot| match slot {
+                    12 => Some(ManagerObjectReference {
+                        object_id: 13,
+                        type_name: "WaterManager+Data, Assembly-CSharp".to_owned(),
+                    }),
+                    13 => Some(ManagerObjectReference {
+                        object_id: 14,
+                        type_name: "ZoneManager+Data, Assembly-CSharp".to_owned(),
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        );
+        let mut object_table = DataSerializerObjectTable::new(super::ROOT_TYPE);
+        for index in 1..=36 {
+            object_table.shared_types.push(format!("TestType{index}"));
+        }
+
+        let headers = manager
+            .decode_water_manager_guide_reference_headers(&object_table)
+            .unwrap();
+        assert_eq!(
+            headers,
+            [
+                NetObjectHeader::NewSharedType(36),
+                NetObjectHeader::NewSharedType(36)
+            ]
+        );
+
+        let mut null_graph = vec![0; 9];
+        null_graph.extend_from_slice(&[0xff, 0xff, 0x00, 0x0d]);
+        null_graph.extend(profiler_tag("ZoneManager"));
+        manager.serialized_object_graph = null_graph;
+        assert_eq!(
+            manager
+                .decode_water_manager_guide_reference_headers(&object_table)
+                .unwrap(),
+            [NetObjectHeader::Null, NetObjectHeader::Null]
+        );
+
+        manager.serialized_object_graph[11] = 0xfe;
+        assert!(
+            manager
+                .decode_water_manager_guide_reference_headers(&object_table)
+                .is_err()
+        );
     }
 
     #[test]
