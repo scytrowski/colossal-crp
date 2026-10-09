@@ -4200,10 +4200,10 @@ mod tests {
         const STATISTIC_ARRAY_TYPE_INDEX: u16 = 38;
         const STATISTIC_INT64_TYPE_INDEX: u16 = 39;
         const STATISTIC_INT32_TYPE_INDEX: u16 = 40;
-        const CHILDREN_START: usize = 4_202_391;
-        const CHILDREN_END: usize = 4_204_993;
-        const NESTED_CHILDREN_START: usize = 4_204_997;
-        const NESTED_CHILDREN_END: usize = 4_211_673;
+        const CHILDREN_START: usize = 4_202_413;
+        const CHILDREN_END: usize = 4_205_015;
+        const NESTED_CHILDREN_START: usize = 4_205_019;
+        const NESTED_CHILDREN_END: usize = 4_211_695;
 
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
         let mut file = File::open(path)?;
@@ -4967,7 +4967,7 @@ mod tests {
                 location.ok_or_else(|| std::io::Error::other("null GuideManager child"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(guide_objects[0].graph_offset, 4_201_859);
+        assert_eq!(guide_objects[0].graph_offset, 4_201_881);
         assert!(
             guide_objects
                 .iter()
@@ -4977,12 +4977,12 @@ mod tests {
             guide_objects
                 .last()
                 .map(|location| location.graph_offset + location.body_length),
-            Some(4_202_387)
+            Some(4_202_409)
         );
         const GUIDE_BODY_FIXTURE: &[u8] =
             include_bytes!("../tests/fixtures/guide-manager-bodies-v112004-wolf-creek.bin");
         assert_eq!(
-            &manager.serialized_object_graph()[4_201_859..4_202_387],
+            &manager.serialized_object_graph()[4_201_881..4_202_409],
             GUIDE_BODY_FIXTURE
         );
 

@@ -295,6 +295,8 @@ mod tests {
 
     const GUIDE_MANAGER_BODIES: &[u8] =
         include_bytes!("../tests/fixtures/guide-manager-bodies-v112004-wolf-creek.bin");
+    const UNLOCK_UNUSED_GUIDE_BODIES: &[u8] =
+        include_bytes!("../tests/fixtures/unlock-unused-guides-v112004-wolf-creek.bin");
     const BUILDING_MANAGER_GUIDE_BODIES: &[u8] =
         include_bytes!("../tests/fixtures/building-manager-guide-bodies-v112004-wolf-creek.bin");
 
@@ -320,7 +322,25 @@ mod tests {
                 disabled.push(index);
             }
         }
-        assert_eq!(disabled, [2, 8, 22, 30, 31, 32, 33, 34, 39]);
+        assert_eq!(disabled, [0, 6, 20, 28, 29, 30, 31, 32, 37]);
+    }
+
+    #[test]
+    fn wolf_creek_unlock_manager_guides_match_generic_guide_bodies() {
+        assert_eq!(
+            UNLOCK_UNUSED_GUIDE_BODIES.len(),
+            2 * GUIDE_TRIGGER_BASE_PREFIX_LEN
+        );
+        for bytes in UNLOCK_UNUSED_GUIDE_BODIES.chunks_exact(GUIDE_TRIGGER_BASE_PREFIX_LEN) {
+            let (guide, consumed) = GuideTriggerBasePrefix::decode(bytes).unwrap();
+            assert_eq!(consumed, GUIDE_TRIGGER_BASE_PREFIX_LEN);
+            assert_eq!(guide.encode(), bytes);
+            assert_eq!(guide.next_repeat(), 0);
+            assert_eq!(guide.activation_frame(), 0);
+            assert_eq!(guide.activation_count(), 0);
+            assert_eq!(guide.display_count(), 0);
+            assert!(!guide.disabled());
+        }
     }
 
     #[test]

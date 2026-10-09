@@ -593,6 +593,7 @@ struct QueuedObjectReferencePrefix {
     transport_manager_object_ids: Vec<Option<u32>>,
     economy_manager_object_ids: Vec<Option<u32>>,
     district_manager_object_ids: Vec<Option<u32>>,
+    unlock_unused_guide_object_ids: Vec<Option<u32>>,
     guide_manager_object_ids: Vec<Option<u32>>,
 }
 
@@ -3205,6 +3206,7 @@ impl SimulationManagerData {
             transport_manager_object_ids: Vec::new(),
             economy_manager_object_ids: Vec::new(),
             district_manager_object_ids: Vec::new(),
+            unlock_unused_guide_object_ids: Vec::new(),
             guide_manager_object_ids: Vec::new(),
         })
     }
@@ -3431,20 +3433,19 @@ impl SimulationManagerData {
                         &mut prefix.object_table,
                         &mut prefix.queued_objects,
                     )?;
-                    // These two unused-guide references occur in the manager
-                    // fields, but the validated queued guide-body run begins
-                    // without body slots for them. Register their object IDs
-                    // and shared types while leaving their raw graph bytes
-                    // untouched and outside this locator's body walk.
-                    for header in [
+                    let unused_guide_headers = [
                         unlock.milestones_not_used(),
                         unlock.scenario_goals_not_used(),
                     ]
                     .into_iter()
                     .flatten()
-                    {
-                        prefix.object_table.register(header)?;
-                    }
+                    .cloned()
+                    .collect::<Vec<_>>();
+                    prefix.unlock_unused_guide_object_ids = register_reference_headers(
+                        &unused_guide_headers,
+                        &mut prefix.object_table,
+                        &mut prefix.queued_objects,
+                    )?;
                 }
                 "MessageManager+Data" => {
                     let message = self.decode_message_manager_data()?;
@@ -4685,11 +4686,8 @@ impl SimulationManagerData {
     /// MessageManager before advancing through GuideManager's children. It
     /// currently supports inner version 164 and newer, with empty EventManager
     /// and DisasterManager record buffers. It returns an error if a preceding
-    /// manager layout or queued object body type is unknown. The two
-    /// `UnlockManager` unused-guide headers are registered but are not assigned
-    /// body locations; their position in the queued body stream remains
-    /// unresolved. Inner version-221+ `NetNodeInstanceGuide` bodies require the
-    /// saved application version.
+    /// manager layout or queued object body type is unknown. Inner version-221+
+    /// `NetNodeInstanceGuide` bodies require the saved application version.
     pub fn locate_guide_manager_reference_bodies(
         &self,
         save_app_version: Option<u32>,
@@ -4700,6 +4698,27 @@ impl SimulationManagerData {
             prefix.children_start,
             &prefix.queued_objects,
             &prefix.guide_manager_object_ids,
+            self.format_version,
+            save_app_version,
+        )
+    }
+
+    /// Locates the version-gated `GenericGuide` bodies referenced by UnlockManager.
+    ///
+    /// The two references are present from inner versions 134 and 295. Their
+    /// object bodies are located in serialized queue order before GuideManager
+    /// bodies. Null references remain `None`; unknown preceding body types or
+    /// malformed guide bodies return an error.
+    pub fn locate_unlock_manager_unused_guide_bodies(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<Option<GuideBodyLocation>>, CrpError> {
+        let prefix = self.later_manager_guide_queue_prefix(save_app_version)?;
+        locate_queued_object_bodies(
+            &self.serialized_object_graph,
+            prefix.children_start,
+            &prefix.queued_objects,
+            &prefix.unlock_unused_guide_object_ids,
             self.format_version,
             save_app_version,
         )
@@ -9148,6 +9167,72 @@ mod manager_boundary_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    #[ignore = "reads the local CL Wolf Creek sample from data/maps"]
+    fn unlock_manager_unused_guides_match_wolf_creek_queued_bodies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
+        let mut file = File::open(path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("Wolf Creek has no type-52 asset"))?;
+        let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 112_004);
+
+        let unlock_locations = manager
+            .locate_unlock_manager_unused_guide_bodies(metadata.save_app_version)?
+            .into_iter()
+            .map(|location| {
+                location.ok_or_else(|| std::io::Error::other("Wolf Creek unused guide is null"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(unlock_locations.iter().all(|location| {
+            location.type_name.starts_with("GenericGuide,") && location.body_length == 11
+        }));
+        assert_eq!(
+            unlock_locations
+                .iter()
+                .map(|location| location.graph_offset)
+                .collect::<Vec<_>>(),
+            [4_201_859, 4_201_870]
+        );
+
+        let guide_locations = manager
+            .locate_guide_manager_reference_bodies(metadata.save_app_version)?
+            .into_iter()
+            .map(|location| {
+                location
+                    .ok_or_else(|| std::io::Error::other("Wolf Creek GuideManager child is null"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(guide_locations.len(), 48);
+        assert!(
+            guide_locations
+                .iter()
+                .all(|location| location.body_length == 11)
+        );
+        assert_eq!(guide_locations[0].graph_offset, 4_201_881);
+        assert_eq!(
+            guide_locations
+                .last()
+                .map(|location| location.graph_offset + location.body_length),
+            Some(4_202_409)
+        );
+
+        let graph = manager.serialized_object_graph();
+        const UNLOCK_GUIDE_FIXTURE: &[u8] =
+            include_bytes!("../tests/fixtures/unlock-unused-guides-v112004-wolf-creek.bin");
+        const GUIDE_BODY_FIXTURE: &[u8] =
+            include_bytes!("../tests/fixtures/guide-manager-bodies-v112004-wolf-creek.bin");
+        assert_eq!(&graph[4_201_859..4_201_881], UNLOCK_GUIDE_FIXTURE);
+        assert_eq!(&graph[4_201_881..4_202_409], GUIDE_BODY_FIXTURE);
+        Ok(())
     }
 
     #[test]
