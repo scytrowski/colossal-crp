@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::CrpError;
 use crate::GameAreaManagerData;
@@ -56,6 +56,7 @@ const MAX_STORAGE_ENTRIES: u32 = 1_000_000;
 const MAX_OBJECT_ID: u32 = 0xfe_0000;
 const MAX_SHARED_TYPES: usize = 65_024;
 const LOADING_PROFILER_END_TAG_BYTES: usize = 2;
+const MAX_TRAILING_HEADER_CANDIDATES: usize = 64;
 
 /// A non-null reference in `SimulationManager+Data`'s manager-data array.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +113,7 @@ struct QueuedObjectReferencePrefix {
     water_manager_object_ids: Vec<Option<u32>>,
     zone_manager_object_ids: Vec<Option<u32>>,
     transport_manager_object_ids: Vec<Option<u32>>,
+    economy_manager_object_ids: Vec<Option<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2484,6 +2486,7 @@ impl SimulationManagerData {
             water_manager_object_ids: Vec::new(),
             zone_manager_object_ids: Vec::new(),
             transport_manager_object_ids: Vec::new(),
+            economy_manager_object_ids: Vec::new(),
         })
     }
 
@@ -2559,6 +2562,24 @@ impl SimulationManagerData {
         for header in &headers {
             prefix
                 .transport_manager_object_ids
+                .push(register_queued_reference(
+                    header,
+                    &mut prefix.object_table,
+                    &mut prefix.queued_objects,
+                )?);
+        }
+        Ok(prefix)
+    }
+
+    fn economy_manager_queue_prefix(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<QueuedObjectReferencePrefix, CrpError> {
+        let mut prefix = self.transport_manager_queue_prefix(save_app_version)?;
+        let headers = self.decode_economy_manager_reference_headers(&prefix.object_table)?;
+        for header in &headers {
+            prefix
+                .economy_manager_object_ids
                 .push(register_queued_reference(
                     header,
                     &mut prefix.object_table,
@@ -2649,6 +2670,74 @@ impl SimulationManagerData {
 
         let body = &self.serialized_object_graph[body_start..end_tag_start];
         decode_transport_manager_reference_body(self.format_version, body, object_table)
+    }
+
+    fn decode_economy_manager_reference_headers(
+        &self,
+        object_table: &DataSerializerObjectTable,
+    ) -> Result<Vec<NetObjectHeader>, CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 19, "EconomyManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 20, "DistrictManager+Data")?;
+        if self.format_version >= 116_000 {
+            return Err(invalid(
+                0,
+                "EconomyManager investment extension from version 116000 is not yet supported",
+            ));
+        }
+        if self.format_version < 164 {
+            return Err(invalid(
+                0,
+                "EconomyManager reference resolution requires inner version 164 or newer",
+            ));
+        }
+
+        let manager_slot = self
+            .manager_objects
+            .as_deref()
+            .and_then(|managers| managers.get(19))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| invalid(19, "EconomyManager reference is null"))?;
+        if object_table.type_name(manager_slot.object_id) != Some(manager_slot.type_name.as_str()) {
+            return Err(invalid(
+                19,
+                "EconomyManager root reference disagrees with the replayed object table",
+            ));
+        }
+
+        let economy_tag = new_profiler_tag_bytes("EconomyManager")?;
+        let economy_tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &economy_tag,
+            "EconomyManager profiler tag",
+        )?;
+        let body_start = economy_tag_start
+            .checked_add(economy_tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("EconomyManager body start"))?;
+
+        let district_tag = new_profiler_tag_bytes("DistrictManager")?;
+        let district_tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &district_tag,
+            "DistrictManager profiler tag",
+        )?;
+        let end_tag_start = district_tag_start
+            .checked_sub(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or_else(|| invalid(district_tag_start, "EconomyManager end tag is truncated"))?;
+        if end_tag_start < body_start
+            || self
+                .serialized_object_graph
+                .get(end_tag_start)
+                .is_none_or(|marker| *marker >= 0xfe)
+        {
+            return Err(invalid(
+                end_tag_start,
+                "EconomyManager fields are not followed by a valid closing tag and DistrictManager",
+            ));
+        }
+
+        let body = &self.serialized_object_graph[body_start..end_tag_start];
+        let reference_count = economy_manager_object_header_count(self.format_version);
+        find_trailing_object_headers(body, reference_count, object_table)
     }
 
     fn decode_water_manager_guide_reference_headers(
@@ -2930,6 +3019,39 @@ impl SimulationManagerData {
                         let type_name =
                             prefix.object_table.type_name(object_id).ok_or_else(|| {
                                 invalid(0, "TransportManager object type is unresolved")
+                            })?;
+                        Ok(ResolvedObjectReference {
+                            object_id,
+                            type_name: type_name.to_owned(),
+                        })
+                    })
+                    .transpose()
+            })
+            .collect()
+    }
+
+    /// Resolves EconomyManager's trailing guide object references.
+    ///
+    /// The reader supports inner versions 164–114000. One reference is read
+    /// from version 94 and a second is added at 166; these are the final
+    /// EconomyManager fields before the version-116000 investment extension.
+    /// The method requires an unambiguous sequence of object headers at the
+    /// manager boundary. Pass the saved application version for earlier
+    /// inner-version-221+ NetNodeInstanceGuide fields in the manager queue.
+    pub fn resolve_economy_manager_references(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<Vec<Option<ResolvedObjectReference>>, CrpError> {
+        let prefix = self.economy_manager_queue_prefix(save_app_version)?;
+        prefix
+            .economy_manager_object_ids
+            .iter()
+            .map(|object_id| {
+                object_id
+                    .map(|object_id| {
+                        let type_name =
+                            prefix.object_table.type_name(object_id).ok_or_else(|| {
+                                invalid(0, "EconomyManager object type is unresolved")
                             })?;
                         Ok(ResolvedObjectReference {
                             object_id,
@@ -3492,6 +3614,169 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
     }
 }
 
+fn economy_manager_object_header_count(format_version: u32) -> usize {
+    if format_version >= 166 {
+        2
+    } else if format_version >= 94 {
+        1
+    } else {
+        0
+    }
+}
+
+fn serialized_net_object_header_end(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
+    let marker = *bytes.get(start)?;
+    let after_marker = start.checked_add(1)?;
+    match marker {
+        0xff => Some(after_marker),
+        0xfe => {
+            let type_marker = *bytes.get(after_marker)?;
+            match type_marker {
+                0xff => None,
+                0xfe => {
+                    let string_start = after_marker.checked_add(1)?;
+                    let first = *bytes.get(string_start)?;
+                    if first == 0xff {
+                        return None;
+                    }
+                    let length_end = string_start.checked_add(3)?;
+                    if length_end > limit {
+                        return None;
+                    }
+                    let encoded_length = (u32::from(first) << 16)
+                        | (u32::from(*bytes.get(string_start.checked_add(1)?)?) << 8)
+                        | u32::from(*bytes.get(string_start.checked_add(2)?)?);
+                    let compact = encoded_length & 0x80_0000 != 0;
+                    let character_count = usize::try_from(encoded_length & !0x80_0000).ok()?;
+                    if character_count > 16 * 1024 * 1024 {
+                        return None;
+                    }
+                    let encoded_data_length = if compact {
+                        character_count
+                    } else {
+                        character_count.checked_mul(2)?
+                    };
+                    let end = length_end.checked_add(encoded_data_length)?;
+                    (end <= limit).then_some(end)
+                }
+                _ => {
+                    let end = start.checked_add(3)?;
+                    (end <= limit).then_some(end)
+                }
+            }
+        }
+        _ => {
+            let end = start.checked_add(3)?;
+            (end <= limit).then_some(end)
+        }
+    }
+}
+
+fn parse_exact_net_object_header(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+) -> Option<NetObjectHeader> {
+    let mut reader = Reader::new(bytes.get(start..end)?);
+    let header = read_net_object_header(&mut reader).ok()?;
+    (reader.remaining() == 0).then_some(header)
+}
+
+fn find_trailing_object_headers(
+    bytes: &[u8],
+    header_count: usize,
+    object_table: &DataSerializerObjectTable,
+) -> Result<Vec<NetObjectHeader>, CrpError> {
+    if header_count == 0 {
+        return Ok(Vec::new());
+    }
+    if header_count > 2 {
+        return Err(invalid(
+            bytes.len(),
+            "EconomyManager has more trailing object references than this reader supports",
+        ));
+    }
+
+    let mut trailing_headers = Vec::new();
+    for start in 0..bytes.len() {
+        if serialized_net_object_header_end(bytes, start, bytes.len()) == Some(bytes.len())
+            && let Some(header) = parse_exact_net_object_header(bytes, start, bytes.len())
+        {
+            trailing_headers.push((start, header));
+            if trailing_headers.len() > MAX_TRAILING_HEADER_CANDIDATES {
+                return Err(invalid(
+                    start,
+                    "EconomyManager trailing reference boundary is too ambiguous",
+                ));
+            }
+        }
+    }
+
+    if header_count == 1 {
+        let mut valid = trailing_headers.into_iter().filter_map(|(start, header)| {
+            let mut table = object_table.clone();
+            table.register(&header).ok().map(|_| (start, header))
+        });
+        let Some((_, first)) = valid.next() else {
+            return Err(invalid(
+                bytes.len(),
+                "EconomyManager trailing object reference is missing or invalid",
+            ));
+        };
+        if valid.next().is_some() {
+            return Err(invalid(
+                bytes.len(),
+                "EconomyManager trailing object reference is ambiguous",
+            ));
+        }
+        return Ok(vec![first]);
+    }
+
+    let prior_ends = trailing_headers
+        .iter()
+        .map(|(start, _)| *start)
+        .collect::<HashSet<_>>();
+    let mut prior_headers = HashMap::<usize, Vec<(usize, NetObjectHeader)>>::new();
+    for start in 0..bytes.len() {
+        if let Some(end) = serialized_net_object_header_end(bytes, start, bytes.len())
+            && prior_ends.contains(&end)
+            && let Some(header) = parse_exact_net_object_header(bytes, start, end)
+        {
+            let candidates = prior_headers.entry(end).or_default();
+            candidates.push((start, header));
+            if candidates.len() > MAX_TRAILING_HEADER_CANDIDATES {
+                return Err(invalid(
+                    end,
+                    "EconomyManager trailing reference boundary is too ambiguous",
+                ));
+            }
+        }
+    }
+
+    let mut valid_pairs = Vec::new();
+    for (second_start, second) in trailing_headers {
+        for (first_start, first) in prior_headers.get(&second_start).into_iter().flatten() {
+            let mut table = object_table.clone();
+            if table.register(first).is_ok() && table.register(&second).is_ok() {
+                valid_pairs.push((*first_start, second_start, first.clone(), second.clone()));
+                if valid_pairs.len() > 1 {
+                    return Err(invalid(
+                        bytes.len(),
+                        "EconomyManager trailing object references are ambiguous",
+                    ));
+                }
+            }
+        }
+    }
+    match valid_pairs.pop() {
+        Some((_, _, first, second)) => Ok(vec![first, second]),
+        None => Err(invalid(
+            bytes.len(),
+            "EconomyManager trailing object references are missing or invalid",
+        )),
+    }
+}
+
 fn transport_manager_object_header_count(format_version: u32) -> usize {
     if format_version >= 318 {
         7
@@ -3864,6 +4149,7 @@ mod manager_boundary_tests {
     use super::{
         DataSerializerObjectTable, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
         QueuedGuideObject, SimulationManagerData, decode_transport_manager_reference_body,
+        economy_manager_object_header_count, find_trailing_object_headers,
         locate_queued_object_bodies, locate_queued_object_body,
         transport_manager_line_number_count, transport_manager_object_header_count,
     };
@@ -4531,6 +4817,58 @@ mod manager_boundary_tests {
         assert_eq!(transport_manager_line_number_count(111_006), 14);
         assert_eq!(transport_manager_line_number_count(113_000), 16);
         assert_eq!(transport_manager_line_number_count(113_008), 17);
+    }
+
+    #[test]
+    fn economy_manager_reference_count_follows_reader_gates() {
+        assert_eq!(economy_manager_object_header_count(93), 0);
+        assert_eq!(economy_manager_object_header_count(94), 1);
+        assert_eq!(economy_manager_object_header_count(165), 1);
+        assert_eq!(economy_manager_object_header_count(166), 2);
+    }
+
+    #[test]
+    fn economy_manager_trailing_references_resolve_null_shared_and_inline_headers() {
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        assert_eq!(
+            find_trailing_object_headers(&[0xff, 0xff], 2, &table).unwrap(),
+            [NetObjectHeader::Null, NetObjectHeader::Null]
+        );
+
+        table
+            .register(&NetObjectHeader::NewType("GenericGuide".to_owned()))
+            .unwrap();
+        assert_eq!(
+            find_trailing_object_headers(&[0xfe, 0x00, 0x01, 0x00, 0x00, 0x01], 2, &table).unwrap(),
+            [
+                NetObjectHeader::NewSharedType(1),
+                NetObjectHeader::Existing(1)
+            ]
+        );
+
+        let mut inline_header = vec![0x00, 0x00, 0x01, 0xfe, 0xfe];
+        write_unique_string(&mut inline_header, "InlineGuide").unwrap();
+        assert_eq!(
+            find_trailing_object_headers(&inline_header, 2, &table).unwrap(),
+            [
+                NetObjectHeader::Existing(1),
+                NetObjectHeader::NewType("InlineGuide".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn economy_manager_trailing_references_reject_missing_invalid_and_ambiguous_headers() {
+        let table = DataSerializerObjectTable::new("SimulationManager+Data");
+        assert!(find_trailing_object_headers(&[0xff], 2, &table).is_err());
+        assert!(find_trailing_object_headers(&[0x00, 0x00, 0x01, 0xff], 2, &table).is_err());
+        assert!(find_trailing_object_headers(&[0xff], 3, &table).is_err());
+
+        let mut large_table = table;
+        large_table
+            .object_types
+            .resize(65_536, "SimulationManager+Data".to_owned());
+        assert!(find_trailing_object_headers(&[0xff, 0x00, 0xff, 0xff], 2, &large_table).is_err());
     }
 
     #[test]

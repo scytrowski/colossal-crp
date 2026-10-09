@@ -4406,6 +4406,40 @@ mod tests {
 
     #[test]
     #[ignore = "reads the local CL Wolf Creek game map from data/maps"]
+    fn validates_wolf_creek_economy_manager_references() -> Result<(), Box<dyn std::error::Error>> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
+        let mut file = File::open(&path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("Wolf Creek has no type-52 asset"))?;
+        let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 112_004);
+
+        let references = manager.resolve_economy_manager_references(metadata.save_app_version)?;
+        let guide_type =
+            "GenericGuide, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
+        assert_eq!(
+            references,
+            [
+                Some(ResolvedObjectReference {
+                    object_id: 112,
+                    type_name: guide_type.to_owned(),
+                }),
+                Some(ResolvedObjectReference {
+                    object_id: 113,
+                    type_name: guide_type.to_owned(),
+                }),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads the local CL Wolf Creek game map from data/maps"]
     fn validates_wolf_creek_building_manager_guide_locator()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
