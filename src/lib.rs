@@ -21,6 +21,7 @@ mod info_manager_data;
 mod instance_manager_data;
 mod message_manager_data;
 mod metadata;
+mod natural_resource_manager_data;
 mod net_manager_data;
 mod path_manager_data;
 mod prop_manager_data;
@@ -79,6 +80,7 @@ pub use info_manager_data::InfoManagerData;
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use message_manager_data::{MessageDataEntry, MessageManagerData, MessageManagerDataEditor};
 pub use metadata::{DistrictStyleMetaData, MapMetaData, ModInfo, SystemMapMetaData};
+pub use natural_resource_manager_data::NaturalResourceManagerData;
 pub use net_manager_data::{
     NetFencePrefabEditor, NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor,
     NetInfoPrefabPrefix, NetLane, NetLaneEditor, NetLanePrefix, NetManagerTailEditor,

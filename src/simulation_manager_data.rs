@@ -40,6 +40,7 @@ use crate::guide_data::{
 use crate::guide_manager_data::GuideManagerReferences;
 use crate::info_manager_data::InfoManagerData;
 use crate::message_manager_data::{MessageManagerData, MessageManagerDataEditor};
+use crate::natural_resource_manager_data::NaturalResourceManagerData;
 use crate::net_manager_data::{
     NetLaneEditor, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeRecordsEditor,
     NetObjectHeader, NetSegmentFlagsEditor, NetSegmentProblemsEditor,
@@ -2221,6 +2222,23 @@ impl SimulationManagerData {
         TransferManagerData::decode(self.format_version, bytes)
     }
 
+    /// Decodes NaturalResourceManager's versioned grid and area-resource
+    /// columns between its manager tag and ImmaterialResourceManager.
+    ///
+    /// Every decoded value is exposed in serialized order, and the original
+    /// body remains available for exact unchanged writing. Legacy columns the
+    /// game reader discards are retained as well.
+    pub fn decode_natural_resource_manager_data(
+        &self,
+    ) -> Result<NaturalResourceManagerData, CrpError> {
+        let field_range = self.natural_resource_manager_field_range()?;
+        let bytes = self
+            .serialized_object_graph
+            .get(field_range)
+            .ok_or_else(|| invalid(0, "NaturalResourceManager body range exceeds manager graph"))?;
+        NaturalResourceManagerData::decode(self.format_version, bytes)
+    }
+
     /// Replaces TransferManager's amount values, reason-count distribution,
     /// and existing offer fields. The edited body may change length; the
     /// following manager bytes are retained and the new boundary is checked.
@@ -2271,6 +2289,27 @@ impl SimulationManagerData {
             return Err(invalid(
                 body_start,
                 "TransferManager body range is reversed",
+            ));
+        }
+        Ok(body_start..next_tag_start)
+    }
+
+    fn natural_resource_manager_field_range(&self) -> Result<Range<usize>, CrpError> {
+        expect_manager_type(
+            self.manager_objects.as_deref(),
+            9,
+            "NaturalResourceManager+Data",
+        )?;
+        expect_manager_type(
+            self.manager_objects.as_deref(),
+            10,
+            "ImmaterialResourceManager+Data",
+        )?;
+        let (body_start, next_tag_start) = self.manager_body_boundary(9)?;
+        if body_start > next_tag_start {
+            return Err(invalid(
+                body_start,
+                "NaturalResourceManager body range is reversed",
             ));
         }
         Ok(body_start..next_tag_start)
@@ -12797,6 +12836,52 @@ mod manager_boundary_tests {
         manager
     }
 
+    fn append_repeated_zero_encoded_byte_array(output: &mut Vec<u8>, count: usize) {
+        if count == 0 {
+            return;
+        }
+        output.extend_from_slice(&[0, 0]);
+        let mut remaining = count - 1;
+        while remaining > 0 {
+            let run = remaining.min(128);
+            output.push((0x7f + run) as u8);
+            remaining -= run;
+        }
+    }
+
+    fn natural_resource_manager_with_next(
+        next_type: &str,
+        next_tag_name: &str,
+    ) -> SimulationManagerData {
+        const CELLS: usize = 262_144;
+        let mut graph = profiler_tag("NaturalResourceManager");
+        for _ in 0..10 {
+            append_repeated_zero_encoded_byte_array(&mut graph, CELLS);
+        }
+        for _ in 0..10 {
+            write_encoded_uint_array(&mut graph, &[0; 81]);
+        }
+        graph.extend_from_slice(&[0; 8 * 4]); // Used-resource counters.
+        graph.extend_from_slice(&[0xfe, 0x03]); // Signed pollution-disposal rates.
+        graph.extend_from_slice(&[0x12, 0x34]); // Closing profiler reference.
+        graph.extend(profiler_tag(next_tag_name));
+        graph.extend_from_slice(&[0xaa, 0xbb]);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 265;
+        let mut references = vec![None; 11];
+        references[9] = Some(ManagerObjectReference {
+            object_id: 9,
+            type_name: "NaturalResourceManager+Data, Assembly-CSharp".to_owned(),
+        });
+        references[10] = Some(ManagerObjectReference {
+            object_id: 10,
+            type_name: next_type.to_owned(),
+        });
+        manager.manager_objects = Some(references);
+        manager
+    }
+
     #[test]
     fn info_manager_mask_decodes_and_replaces_at_versioned_boundary() {
         for (version, original, replacement) in [
@@ -12973,6 +13058,42 @@ mod manager_boundary_tests {
                 .replace_transfer_manager_data(&stale_editor)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn natural_resource_manager_decoder_checks_adjacent_boundary_and_preserves_body() {
+        let manager = natural_resource_manager_with_next(
+            "ImmaterialResourceManager+Data, Assembly-CSharp",
+            "ImmaterialResourceManager",
+        );
+        let natural_tag = profiler_tag("NaturalResourceManager");
+        let body_start = natural_tag.len();
+        let next_tag = profiler_tag("ImmaterialResourceManager");
+        let next_start = manager
+            .serialized_object_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        let data = manager.decode_natural_resource_manager_data().unwrap();
+        assert_eq!(data.format_version(), 265);
+        assert_eq!(data.ore().len(), 262_144);
+        assert_eq!(data.forest().len(), 262_144);
+        assert_eq!(data.area_resource_arrays().len(), 10);
+        assert_eq!(
+            data.encode_unchanged(),
+            manager.serialized_object_graph[body_start..next_start]
+        );
+
+        let wrong_type = natural_resource_manager_with_next(
+            "ElectricityManager+Data, Assembly-CSharp",
+            "ImmaterialResourceManager",
+        );
+        assert!(wrong_type.decode_natural_resource_manager_data().is_err());
+        let wrong_tag = natural_resource_manager_with_next(
+            "ImmaterialResourceManager+Data, Assembly-CSharp",
+            "ElectricityManager",
+        );
+        assert!(wrong_tag.decode_natural_resource_manager_data().is_err());
     }
 
     #[test]
