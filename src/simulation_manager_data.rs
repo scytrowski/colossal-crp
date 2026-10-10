@@ -71,7 +71,8 @@ use crate::{
     NetNodeProblemsPrefix, NetNodeRecordsPrefix, NetSegmentCoverageEditor,
     NetSegmentCoveragePrefix, NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix,
     NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsEditor,
-    NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
+    NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix, NetTreePrefabEditor,
+    NetTreePrefabPrefix,
 };
 use crate::{PathManagerData, PathManagerEditor};
 use crate::{WeatherManagerData, WeatherManagerEditor};
@@ -3947,17 +3948,126 @@ impl SimulationManagerData {
         &self,
         save_app_version: Option<u32>,
     ) -> Result<(NetTreePrefabPrefix, usize), CrpError> {
+        let (_, data, _, end) = self.decode_net_tree_prefab_with_range(save_app_version)?;
+        Ok((data, end))
+    }
+
+    fn decode_net_tree_prefab_with_range(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetSegmentRecordsPrefix, NetTreePrefabPrefix, usize, usize), CrpError> {
         let (_, info_end) = self.decode_net_info_prefab_prefix(save_app_version)?;
         let (records, _) = self.decode_net_segment_records_prefix(save_app_version)?;
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(info_end)?;
+        let body_start = reader.offset();
         let (data, body_length) = NetTreePrefabPrefix::decode_prefix(
             self.format_version,
             &records,
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        Ok((records, data, body_start, reader.offset()))
+    }
+
+    /// Decodes the optional tree-prefab table into an editor.
+    pub fn decode_net_tree_prefab_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetTreePrefabEditor, CrpError> {
+        let (_, table, _, _) = self.decode_net_tree_prefab_with_range(save_app_version)?;
+        Ok(table.into_editor())
+    }
+
+    /// Replaces tree-prefab indices and names while preserving later tables.
+    ///
+    /// The editor must match this stream's inner version, segment flags,
+    /// tree-presence bytes, and original table bytes. Unchanged names retain
+    /// their exact source encodings.
+    pub fn replace_net_tree_prefab(
+        &mut self,
+        edited: &NetTreePrefabEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager tree-prefab version does not match this stream",
+            ));
+        }
+        let (records, current, body_start, body_end) =
+            self.decode_net_tree_prefab_with_range(save_app_version)?;
+        let tree_presence: Vec<_> = records
+            .records()
+            .iter()
+            .map(|record| record.tree_present)
+            .collect();
+        if records.source_segment_flags() != edited.source_segment_flags()
+            || tree_presence != edited.source_tree_presence()
+        {
+            return Err(invalid(
+                body_start,
+                "NetManager segment flags or tree-presence bytes do not match the editor's source",
+            ));
+        }
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager tree-prefab bytes do not match the editor's source table",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager tree-prefab table range is inconsistent",
+            ));
+        }
+
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_net_tree_prefab_with_range(save_app_version)
+            .and_then(|(decoded_records, decoded, actual_start, actual_end)| {
+                let decoded_tree_presence: Vec<_> = decoded_records
+                    .records()
+                    .iter()
+                    .map(|record| record.tree_present)
+                    .collect();
+                if decoded_records.source_segment_flags() != records.source_segment_flags()
+                    || decoded_tree_presence != tree_presence
+                {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager tree table changed its source dependencies",
+                    ));
+                }
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager tree table does not match the editor",
+                    ));
+                }
+                let expected_end = body_start
+                    .checked_add(replacement.len())
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager tree-prefab end"))?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager tree-prefab table has an unexpected boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager tree table failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes optional left and right fence-prefab tables after tree prefabs.
@@ -11858,6 +11968,20 @@ mod manager_boundary_tests {
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_net_segment_flags(&editor, Some(0)).is_err());
         assert_eq!(manager.serialized_object_graph, updated_graph);
+
+        let (tree_table, tree_end) = manager.decode_net_tree_prefab_prefix(Some(0))?;
+        assert!(tree_table.indices().is_empty());
+        assert!(tree_table.names().is_empty());
+        assert_eq!(
+            &manager.serialized_object_graph[tree_end..],
+            opaque_tail.as_slice()
+        );
+        let tree_editor = tree_table.into_editor();
+        manager.replace_net_tree_prefab(&tree_editor, Some(0))?;
+        assert_eq!(
+            &manager.serialized_object_graph[tree_end..],
+            opaque_tail.as_slice()
+        );
         Ok(())
     }
 

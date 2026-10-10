@@ -88,7 +88,7 @@ pub use net_manager_data::{
     NetSegmentFlagsEditor, NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsEditor,
     NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsEditor, NetSegmentRecordsPrefix,
     NetSegmentTrafficLight, NetSegmentTrafficLightsEditor, NetSegmentTrafficLightsPrefix,
-    NetTreePrefabPrefix,
+    NetTreePrefabEditor, NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathManagerEditor, PathPosition, PathUnit};
 pub use prop_manager_data::{PropManagerDataPrefix, PropManagerEditor};
@@ -2401,16 +2401,29 @@ mod tests {
                 unavailable.records_mut()[0].event_route = 1;
                 assert!(unavailable.encode().is_err());
             }
-            let tree_bytes = [0, 0, 42, 0, 0, 0xee];
+            let tree_bytes = [0, 0, 42, 0, 2, 0xff, 0x80, 0, 1, 0xc1, 0xee];
             let (tree, tree_used) =
                 NetTreePrefabPrefix::decode_prefix(version, &prefix, &tree_bytes)?;
             if version >= 114_002 {
-                assert_eq!(tree_used, 5);
+                assert_eq!(tree_used, 10);
                 assert_eq!(tree.indices(), [42]);
-                assert!(tree.names().is_empty());
-                assert_eq!(tree.encode(), tree_bytes[..5]);
+                assert_eq!(tree.names(), [None, Some("A".to_owned())]);
+                assert_eq!(tree.encode(), tree_bytes[..tree_used]);
+                let mut editor = tree.clone().into_editor();
+                assert_eq!(editor.encode()?, tree_bytes[..tree_used]);
+                editor.indices_mut()[0] = 0x1234;
+                assert_eq!(
+                    editor.encode()?,
+                    [0, 0x12, 0x34, 0, 2, 0xff, 0x80, 0, 1, 0xc1]
+                );
+                let mut name_editor = tree.into_editor();
+                name_editor.names_mut()[1] = Some("B".to_owned());
+                assert_eq!(
+                    name_editor.encode()?,
+                    [0, 0, 42, 0, 2, 0xff, 0x80, 0, 1, 0xc2]
+                );
                 assert!(
-                    NetTreePrefabPrefix::decode_prefix(version, &prefix, &tree_bytes[..4]).is_err()
+                    NetTreePrefabPrefix::decode_prefix(version, &prefix, &tree_bytes[..9]).is_err()
                 );
             } else {
                 assert_eq!(tree_used, 0);

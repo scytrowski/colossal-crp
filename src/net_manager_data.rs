@@ -491,7 +491,28 @@ pub struct NetTreePrefabPrefix {
     format_version: u32,
     indices: Vec<u16>,
     names: Vec<Option<String>>,
+    source_segment_flags: Vec<u8>,
+    source_tree_presence: Vec<u8>,
+    serialized_indices: Vec<u8>,
+    serialized_name_count: Vec<u8>,
+    serialized_name_entries: Vec<Vec<u8>>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for NetManager's optional tree-prefab index and name table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetTreePrefabEditor {
+    format_version: u32,
+    indices: Vec<u16>,
+    names: Vec<Option<String>>,
+    original_indices: Vec<u16>,
+    original_names: Vec<Option<String>>,
+    source_segment_flags: Vec<u8>,
+    source_tree_presence: Vec<u8>,
+    serialized_indices: Vec<u8>,
+    serialized_name_count: Vec<u8>,
+    serialized_name_entries: Vec<Vec<u8>>,
+    original_prefix: Vec<u8>,
 }
 
 /// Left and right fence prefab tables after the tree-prefab table.
@@ -2171,6 +2192,10 @@ impl NetSegmentRecordsPrefix {
         &self.records
     }
 
+    pub(crate) fn source_segment_flags(&self) -> &[u8] {
+        &self.source_segment_flags
+    }
+
     /// Writes the original record bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
@@ -2622,16 +2647,22 @@ impl NetTreePrefabPrefix {
             });
         }
         let mut reader = Reader::new(bytes);
+        let mut serialized_indices = Vec::new();
+        let mut serialized_name_count = Vec::new();
+        let mut serialized_name_entries = Vec::new();
         let (indices, names) = if format_version >= SEGMENT_TREE_VERSION {
             let count = segment_records
                 .records()
                 .iter()
                 .filter(|record| record.tree_present == 1)
                 .count();
-            (
-                read_encoded_ushort_array(&mut reader, count)?,
-                read_prefab_names(&mut reader)?,
-            )
+            let indices_start = reader.offset();
+            let indices = read_encoded_ushort_array(&mut reader, count)?;
+            serialized_indices = reader.consumed_bytes()[indices_start..reader.offset()].to_vec();
+            let (names, count_bytes, name_entries) = read_prefab_names_with_raw(&mut reader)?;
+            serialized_name_count = count_bytes;
+            serialized_name_entries = name_entries;
+            (indices, names)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -2641,6 +2672,15 @@ impl NetTreePrefabPrefix {
                 format_version,
                 indices,
                 names,
+                source_segment_flags: segment_records.source_segment_flags.clone(),
+                source_tree_presence: segment_records
+                    .records()
+                    .iter()
+                    .map(|record| record.tree_present)
+                    .collect(),
+                serialized_indices,
+                serialized_name_count,
+                serialized_name_entries,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -2665,6 +2705,89 @@ impl NetTreePrefabPrefix {
     /// Writes the original encoded tree-prefab bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit its tree-prefab indices and names.
+    pub fn into_editor(self) -> NetTreePrefabEditor {
+        NetTreePrefabEditor {
+            format_version: self.format_version,
+            original_indices: self.indices.clone(),
+            original_names: self.names.clone(),
+            indices: self.indices,
+            names: self.names,
+            source_segment_flags: self.source_segment_flags,
+            source_tree_presence: self.source_tree_presence,
+            serialized_indices: self.serialized_indices,
+            serialized_name_count: self.serialized_name_count,
+            serialized_name_entries: self.serialized_name_entries,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetTreePrefabEditor {
+    /// Returns the inner DataSerializer version associated with this table.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns mutable tree-prefab indices in active-segment order.
+    pub fn indices_mut(&mut self) -> &mut [u16] {
+        &mut self.indices
+    }
+
+    /// Returns mutable names in original table order.
+    pub fn names_mut(&mut self) -> &mut [Option<String>] {
+        &mut self.names
+    }
+
+    /// Encodes edited indices and names while preserving unchanged name bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.indices.len() != self.original_indices.len()
+            || self.names.len() != self.original_names.len()
+            || self.names.len() != self.serialized_name_entries.len()
+        {
+            return Err(invalid(
+                0,
+                "edited tree-prefab counts do not match the source",
+            ));
+        }
+        if self.indices == self.original_indices && self.names == self.original_names {
+            return Ok(self.original_prefix.clone());
+        }
+
+        let mut output = Vec::with_capacity(self.original_prefix.len());
+        if self.indices != self.original_indices {
+            write_encoded_ushort_array(&mut output, &self.indices);
+        } else {
+            output.extend_from_slice(&self.serialized_indices);
+        }
+        output.extend_from_slice(&self.serialized_name_count);
+        for ((name, original_name), raw_entry) in self
+            .names
+            .iter()
+            .zip(&self.original_names)
+            .zip(&self.serialized_name_entries)
+        {
+            if name == original_name {
+                output.extend_from_slice(raw_entry);
+            } else {
+                write_nullable_unique_string(&mut output, name.as_deref())?;
+            }
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn source_tree_presence(&self) -> &[u8] {
+        &self.source_tree_presence
+    }
+
+    pub(crate) fn source_segment_flags(&self) -> &[u8] {
+        &self.source_segment_flags
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 
