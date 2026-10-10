@@ -5316,10 +5316,10 @@ impl SimulationManagerData {
         Ok((instances, graph_end))
     }
 
-    /// Decodes all known CitizenManager prefixes and tail counters at slot 7.
-    /// Active instance fields remain available as an opaque byte section. The
-    /// body boundary is checked against TransferManager at slot 8, and the
-    /// complete source body can be reproduced unchanged with `encode`.
+    /// Decodes CitizenManager prefixes, active instance fields, and tail
+    /// counters at slot 7. The body boundary is checked against
+    /// TransferManager at slot 8, and the complete source body can be
+    /// reproduced unchanged with `encode`.
     pub fn decode_citizen_manager_data(&self) -> Result<(CitizenManagerData, usize), CrpError> {
         expect_manager_type(self.manager_objects.as_deref(), 7, "CitizenManager+Data")?;
         expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
@@ -18153,7 +18153,7 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn citizen_manager_full_reader_preserves_opaque_instances_and_decodes_tail() {
+    fn citizen_manager_full_reader_decodes_instances_and_versioned_tail() {
         let mut graph = profiler_tag("CitizenManager");
         for _ in 0..(1_048_575 / 128) {
             graph.push(0xff);
@@ -18174,8 +18174,19 @@ mod manager_boundary_tests {
         graph.push((0x7f + 65_532 % 128) as u8);
         graph.extend_from_slice(&[0, 0, 1]); // one BuildingInfo index: zero
         graph.extend_from_slice(&[0, 1, 0x80, 0, 1, 0xc1]); // one name: "A"
-        let instance_fields = [0xaa, 0xbb, 0xcc]; // intentionally opaque test bytes
+        let mut instance_fields = Vec::new();
+        for value in [
+            1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ] {
+            instance_fields.extend_from_slice(&value.to_be_bytes());
+        }
+        instance_fields.extend_from_slice(&[0x12, 0x34, 0x56]); // citizen
+        instance_fields.extend_from_slice(&[0x23, 0x45, 0x67]); // path
+        instance_fields.extend_from_slice(&[0x34, 0x45, 0x56, 0x67, 0x78, 0x89]);
+        instance_fields.extend_from_slice(&[0xab, 0xcd, 0xef, 0x01]); // building indices
         graph.extend_from_slice(&instance_fields);
+        let instance_suffix = [0xf0]; // retained bytes after the modeled record
+        graph.extend_from_slice(&instance_suffix);
         graph.extend_from_slice(&(-2_i16).to_be_bytes());
         graph.extend_from_slice(&0x0102_i16.to_be_bytes());
         graph.extend_from_slice(&1000_i32.to_be_bytes());
@@ -18207,7 +18218,34 @@ mod manager_boundary_tests {
         );
         assert_eq!(decoded.instance_prefix().active_instances().len(), 1);
         assert_eq!(decoded.instance_prefix().active_instances()[0].index(), 1);
-        assert_eq!(decoded.opaque_instance_fields(), instance_fields);
+        assert_eq!(decoded.active_instances().len(), 1);
+        let instance = &decoded.active_instances()[0];
+        assert_eq!(instance.position(), [4.0, 5.0, 6.0]);
+        assert_eq!(instance.velocity(), Some([1.0, 2.0, 3.0]));
+        assert_eq!(
+            instance.target_position(),
+            crate::CitizenInstanceTargetPosition::Vector4([7.0, 8.0, 9.0, 10.0])
+        );
+        assert_eq!(instance.target_direction(), Some([11.0, 12.0]));
+        assert_eq!(instance.citizen(), 0x123456);
+        assert_eq!(instance.path(), Some(0x234567));
+        assert_eq!(instance.path_position_index(), Some(0x34));
+        assert_eq!(instance.last_path_offset(), Some(0x45));
+        assert_eq!(instance.wait_counter(), Some(0x56));
+        assert_eq!(instance.target_seed(), Some(0x67));
+        assert_eq!(instance.performer_index(), Some(0x78));
+        assert_eq!(instance.racer_index(), Some(0x89));
+        assert_eq!(instance.compatibility_value(), None);
+        assert_eq!(instance.source_building(), Some(0xabcd));
+        assert_eq!(instance.target_building(), 0xef01);
+        assert_eq!(
+            decoded.instance_record_bytes(0),
+            Some(instance_fields.as_slice())
+        );
+        let mut preserved_instance_fields = instance_fields.clone();
+        preserved_instance_fields.extend_from_slice(&instance_suffix);
+        assert_eq!(decoded.opaque_instance_fields(), preserved_instance_fields);
+        assert_eq!(decoded.unparsed_instance_suffix(), instance_suffix);
         assert_eq!(decoded.oldest_original_residents(), Some([-2, 0x0102]));
         assert_eq!(decoded.fully_educated_original_residents(), Some(1000));
         assert_eq!(decoded.end_profiler_reference(), [0x12, 0x34]);

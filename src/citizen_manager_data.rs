@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
@@ -20,6 +22,17 @@ const CITIZEN_INSTANCE_FLAGS_VERSION: u32 = 44;
 const FULL_CITIZEN_INSTANCE_FLAGS_VERSION: u32 = 204;
 const LEGACY_CITIZEN_INSTANCE_FLAG_COUNT: usize = 32_767;
 const FULL_CITIZEN_INSTANCE_FLAG_COUNT: usize = 65_535;
+const CITIZEN_INSTANCE_VELOCITY_VERSION: u32 = 46;
+const CITIZEN_INSTANCE_TARGET_POSITION_VERSION: u32 = 47;
+const CITIZEN_INSTANCE_WAIT_COUNTER_VERSION: u32 = 86;
+const CITIZEN_INSTANCE_TARGET_POSITION_VECTOR4_VERSION: u32 = 195;
+const CITIZEN_INSTANCE_TARGET_DIRECTION_VERSION: u32 = 200;
+const CITIZEN_INSTANCE_TARGET_SEED_VERSION: u32 = 201;
+const CITIZEN_INSTANCE_COLOR_VERSION: u32 = 247;
+const CITIZEN_INSTANCE_PERFORMER_VERSION: u32 = 121_028;
+const CITIZEN_INSTANCE_COMPATIBILITY_END_VERSION: u32 = 121_029;
+const CITIZEN_INSTANCE_SOURCE_BUILDING_VERSION: u32 = 180;
+const CITIZEN_INSTANCE_COLOR_FLAG: u32 = 1 << 24;
 
 /// The decoded flag and sparse-column prefix of `CitizenManager+Data`.
 ///
@@ -381,12 +394,151 @@ impl CitizenInstanceSlot {
     }
 }
 
+/// The serialized representation of an active instance's target position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CitizenInstanceTargetPosition {
+    /// Before version 47, the game uses the decoded position as its target.
+    FollowsPosition,
+    /// Versions 47–194 serialize three IEEE-754 components.
+    Vector3([f32; 3]),
+    /// Version 195 and later serialize four IEEE-754 components.
+    Vector4([f32; 4]),
+}
+
+/// One active `CitizenInstance` record decoded in manager order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CitizenInstanceRecord {
+    index: u32,
+    flags: u32,
+    prefab_index: u16,
+    velocity: Option<[f32; 3]>,
+    position: [f32; 3],
+    target_position: CitizenInstanceTargetPosition,
+    target_direction: Option<[f32; 2]>,
+    color_rgb: Option<[u8; 3]>,
+    citizen: u32,
+    path: Option<u32>,
+    path_position_index: Option<u8>,
+    last_path_offset: Option<u8>,
+    wait_counter: Option<u8>,
+    target_seed: Option<u8>,
+    performer_index: Option<u8>,
+    racer_index: Option<u8>,
+    compatibility_value: Option<u16>,
+    source_building: Option<u16>,
+    target_building: u16,
+    original_record_start: usize,
+    original_record_end: usize,
+}
+
+impl CitizenInstanceRecord {
+    /// Returns the one-based index in the fixed CitizenInstance buffer.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// Returns the serialized active-slot flags.
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    /// Returns the index into the BuildingInfo prefab table.
+    pub fn prefab_index(&self) -> u16 {
+        self.prefab_index
+    }
+
+    /// Returns velocity when the version 46 field is serialized.
+    pub fn velocity(&self) -> Option<[f32; 3]> {
+        self.velocity
+    }
+
+    /// Returns the serialized position vector.
+    pub fn position(&self) -> [f32; 3] {
+        self.position
+    }
+
+    /// Returns the versioned target-position representation.
+    pub fn target_position(&self) -> CitizenInstanceTargetPosition {
+        self.target_position
+    }
+
+    /// Returns the target direction from version 200.
+    pub fn target_direction(&self) -> Option<[f32; 2]> {
+        self.target_direction
+    }
+
+    /// Returns the conditional RGB bytes from version 247.
+    ///
+    /// The field is present only when flag bit 24 is set. The game sets alpha
+    /// to 255 when reading these three bytes.
+    pub fn color_rgb(&self) -> Option<[u8; 3]> {
+        self.color_rgb
+    }
+
+    /// Returns the 24-bit citizen reference.
+    pub fn citizen(&self) -> u32 {
+        self.citizen
+    }
+
+    /// Returns the path reference and position fields from version 46.
+    pub fn path(&self) -> Option<u32> {
+        self.path
+    }
+
+    /// Returns the path-position index from version 46.
+    pub fn path_position_index(&self) -> Option<u8> {
+        self.path_position_index
+    }
+
+    /// Returns the last path offset from version 46.
+    pub fn last_path_offset(&self) -> Option<u8> {
+        self.last_path_offset
+    }
+
+    /// Returns the wait counter from version 86.
+    pub fn wait_counter(&self) -> Option<u8> {
+        self.wait_counter
+    }
+
+    /// Returns the target seed from version 201.
+    pub fn target_seed(&self) -> Option<u8> {
+        self.target_seed
+    }
+
+    /// Returns performer and racer indices from version 121028.
+    pub fn performer_index(&self) -> Option<u8> {
+        self.performer_index
+    }
+
+    /// Returns racer index from version 121028.
+    pub fn racer_index(&self) -> Option<u8> {
+        self.racer_index
+    }
+
+    /// Returns the extra `u16` consumed only at version 121028.
+    ///
+    /// Its meaning is not established. The original bytes are retained even
+    /// though the supplied game's `Deserialize` method discards the value.
+    pub fn compatibility_value(&self) -> Option<u16> {
+        self.compatibility_value
+    }
+
+    /// Returns the source-building index from version 180.
+    pub fn source_building(&self) -> Option<u16> {
+        self.source_building
+    }
+
+    /// Returns the target-building index.
+    pub fn target_building(&self) -> u16 {
+        self.target_building
+    }
+}
+
 /// The flags and BuildingInfo prefab scope preceding active citizen instances.
 ///
 /// This prefix stops before per-instance position, path, citizen, and building
-/// fields. The exact source bytes are retained for unchanged writing. The
-/// local map corpus contains active instances, but the Rust decoder's active
-/// slot and prefab association tests use synthetic expected bytes.
+/// fields. The exact source bytes are retained for unchanged writing. Active
+/// instance records are decoded by [`CitizenManagerData`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CitizenInstanceDataPrefix {
     format_version: u32,
@@ -508,20 +660,21 @@ const CITIZEN_MANAGER_END_REFERENCE_LEN: usize = 2;
 const OLDEST_RESIDENTS_VERSION: u32 = 169;
 const FULLY_EDUCATED_RESIDENTS_VERSION: u32 = 179;
 
-/// The decoded CitizenManager prefixes, opaque instance section, and tail counters.
+/// The decoded CitizenManager prefixes, instance records, and tail counters.
 ///
 /// Citizen flags and sparse columns, version 69+ unit records, and the
-/// versioned instance flags/prefab scope are decoded. The active per-instance
-/// fields remain a raw byte section because their field ordering and conditional
-/// layouts are not yet modeled. The two-byte profiler reference and counters
-/// are retained. `encode` reproduces the complete bounded manager body exactly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// versioned instance flags/prefab scope and active records are decoded. The
+/// full instance byte section, two-byte profiler reference, and counters are
+/// retained. `encode` reproduces the complete bounded manager body exactly.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CitizenManagerData {
     format_version: u32,
     citizen_prefix: CitizenManagerDataPrefix,
     unit_prefix: CitizenUnitDataPrefix,
     instance_prefix: CitizenInstanceDataPrefix,
-    instance_fields: Vec<u8>,
+    instance_fields: Range<usize>,
+    active_instances: Vec<CitizenInstanceRecord>,
+    instance_field_suffix: Range<usize>,
     oldest_original_residents: Option<[i16; 2]>,
     fully_educated_original_residents: Option<i32>,
     end_profiler_reference: [u8; 2],
@@ -531,10 +684,10 @@ pub struct CitizenManagerData {
 impl CitizenManagerData {
     /// Decodes the known CitizenManager sections from one bounded manager body.
     ///
-    /// Supports the version 69+ unit-reference layout. The active
-    /// CitizenInstance records stay opaque, but their byte range is isolated
-    /// using the versioned counter widths and the closing two-byte profiler
-    /// reference. Truncated prefixes or tails return errors.
+    /// Supports the version 69+ unit-reference layout and decodes the
+    /// version-gated active CitizenInstance fields. Truncated prefixes,
+    /// records, or tails return errors. Any bytes after the last known record
+    /// remain available through [`Self::unparsed_instance_suffix`].
     pub fn decode(format_version: u32, bytes: &[u8]) -> Result<Self, CrpError> {
         let (citizen_prefix, citizen_len) =
             CitizenManagerDataPrefix::decode_prefix(format_version, bytes)?;
@@ -598,6 +751,36 @@ impl CitizenManagerData {
             ));
         }
 
+        let instance_fields = bytes
+            .get(instance_fields_start..counter_start)
+            .ok_or_else(|| {
+                invalid(
+                    instance_fields_start,
+                    "CitizenManager instance field range is invalid",
+                )
+            })?;
+        let mut instance_reader = Reader::new(instance_fields);
+        let mut active_instances = Vec::with_capacity(instance_prefix.active_instances().len());
+        for slot in instance_prefix.active_instances() {
+            let record_start = instance_reader.offset();
+            let mut record =
+                decode_citizen_instance_record(format_version, *slot, &mut instance_reader)?;
+            record.original_record_start = instance_fields_start.checked_add(record_start).ok_or(
+                CrpError::ArithmeticOverflow("CitizenManager instance record start"),
+            )?;
+            record.original_record_end = instance_fields_start
+                .checked_add(instance_reader.offset())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager instance record end",
+                ))?;
+            active_instances.push(record);
+        }
+        let instance_field_suffix_start = instance_fields_start
+            .checked_add(instance_reader.offset())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "CitizenManager unparsed instance suffix",
+            ))?;
+
         let mut tail_reader = Reader::new(
             bytes
                 .get(counter_start..end_reference_start)
@@ -641,7 +824,9 @@ impl CitizenManagerData {
             citizen_prefix,
             unit_prefix,
             instance_prefix,
-            instance_fields: bytes[instance_fields_start..counter_start].to_vec(),
+            instance_fields: instance_fields_start..counter_start,
+            active_instances,
+            instance_field_suffix: instance_field_suffix_start..counter_start,
             oldest_original_residents,
             fully_educated_original_residents,
             end_profiler_reference,
@@ -669,9 +854,30 @@ impl CitizenManagerData {
         &self.instance_prefix
     }
 
-    /// Returns active CitizenInstance bytes that are not yet semantically decoded.
+    /// Returns the complete source byte section for active CitizenInstance records.
+    ///
+    /// Known records are also exposed through [`Self::active_instances`]. The
+    /// original section remains available for exact preservation.
     pub fn opaque_instance_fields(&self) -> &[u8] {
-        &self.instance_fields
+        &self.original_body[self.instance_fields.clone()]
+    }
+
+    /// Returns the active CitizenInstance records in ascending slot order.
+    pub fn active_instances(&self) -> &[CitizenInstanceRecord] {
+        &self.active_instances
+    }
+
+    /// Returns the exact source bytes for an active record by its zero-based
+    /// position in [`Self::active_instances`].
+    pub fn instance_record_bytes(&self, record_index: usize) -> Option<&[u8]> {
+        let record = self.active_instances.get(record_index)?;
+        self.original_body
+            .get(record.original_record_start..record.original_record_end)
+    }
+
+    /// Returns any bytes after the decoded active records for forward-compatible preservation.
+    pub fn unparsed_instance_suffix(&self) -> &[u8] {
+        &self.original_body[self.instance_field_suffix.clone()]
     }
 
     /// Returns the two original-resident counters from version 169.
@@ -695,6 +901,128 @@ impl CitizenManagerData {
     }
 }
 
+fn decode_citizen_instance_record(
+    format_version: u32,
+    slot: CitizenInstanceSlot,
+    reader: &mut Reader<'_>,
+) -> Result<CitizenInstanceRecord, CrpError> {
+    let velocity = if format_version >= CITIZEN_INSTANCE_VELOCITY_VERSION {
+        Some(read_vector3(reader)?)
+    } else {
+        None
+    };
+    let position = read_vector3(reader)?;
+    let target_position = if format_version >= CITIZEN_INSTANCE_TARGET_POSITION_VECTOR4_VERSION {
+        CitizenInstanceTargetPosition::Vector4(read_vector4(reader)?)
+    } else if format_version >= CITIZEN_INSTANCE_TARGET_POSITION_VERSION {
+        CitizenInstanceTargetPosition::Vector3(read_vector3(reader)?)
+    } else {
+        CitizenInstanceTargetPosition::FollowsPosition
+    };
+    let target_direction = if format_version >= CITIZEN_INSTANCE_TARGET_DIRECTION_VERSION {
+        Some(read_vector2(reader)?)
+    } else {
+        None
+    };
+    let color_rgb = if format_version >= CITIZEN_INSTANCE_COLOR_VERSION
+        && slot.flags() & CITIZEN_INSTANCE_COLOR_FLAG != 0
+    {
+        Some([reader.read_u8()?, reader.read_u8()?, reader.read_u8()?])
+    } else {
+        None
+    };
+    let citizen = reader.read_u24_be()?;
+    let (path, path_position_index, last_path_offset) =
+        if format_version >= CITIZEN_INSTANCE_VELOCITY_VERSION {
+            (
+                Some(reader.read_u24_be()?),
+                Some(reader.read_u8()?),
+                Some(reader.read_u8()?),
+            )
+        } else {
+            (None, None, None)
+        };
+    let wait_counter = if format_version >= CITIZEN_INSTANCE_WAIT_COUNTER_VERSION {
+        Some(reader.read_u8()?)
+    } else {
+        None
+    };
+    let target_seed = if format_version >= CITIZEN_INSTANCE_TARGET_SEED_VERSION {
+        Some(reader.read_u8()?)
+    } else {
+        None
+    };
+    let (performer_index, racer_index, compatibility_value) = if format_version
+        >= CITIZEN_INSTANCE_PERFORMER_VERSION
+    {
+        let performer_index = reader.read_u8()?;
+        let racer_index = reader.read_u8()?;
+        let compatibility_value = if format_version < CITIZEN_INSTANCE_COMPATIBILITY_END_VERSION {
+            Some(reader.read_u16_be()?)
+        } else {
+            None
+        };
+        (
+            Some(performer_index),
+            Some(racer_index),
+            compatibility_value,
+        )
+    } else {
+        (None, None, None)
+    };
+    let source_building = if format_version >= CITIZEN_INSTANCE_SOURCE_BUILDING_VERSION {
+        Some(reader.read_u16_be()?)
+    } else {
+        None
+    };
+    let target_building = reader.read_u16_be()?;
+
+    Ok(CitizenInstanceRecord {
+        index: slot.index(),
+        flags: slot.flags(),
+        prefab_index: slot.prefab_index(),
+        velocity,
+        position,
+        target_position,
+        target_direction,
+        color_rgb,
+        citizen,
+        path,
+        path_position_index,
+        last_path_offset,
+        wait_counter,
+        target_seed,
+        performer_index,
+        racer_index,
+        compatibility_value,
+        source_building,
+        target_building,
+        original_record_start: 0,
+        original_record_end: 0,
+    })
+}
+
+fn read_vector2(reader: &mut Reader<'_>) -> Result<[f32; 2], CrpError> {
+    Ok([reader.read_f32_be()?, reader.read_f32_be()?])
+}
+
+fn read_vector3(reader: &mut Reader<'_>) -> Result<[f32; 3], CrpError> {
+    Ok([
+        reader.read_f32_be()?,
+        reader.read_f32_be()?,
+        reader.read_f32_be()?,
+    ])
+}
+
+fn read_vector4(reader: &mut Reader<'_>) -> Result<[f32; 4], CrpError> {
+    Ok([
+        reader.read_f32_be()?,
+        reader.read_f32_be()?,
+        reader.read_f32_be()?,
+        reader.read_f32_be()?,
+    ])
+}
+
 fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "CitizenManager+Data".to_owned(),
@@ -706,9 +1034,11 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CitizenInstanceDataPrefix, CitizenManagerData, CitizenManagerDataPrefix,
-        CitizenUnitDataPrefix,
+        CitizenInstanceDataPrefix, CitizenInstanceSlot, CitizenInstanceTargetPosition,
+        CitizenManagerData, CitizenManagerDataPrefix, CitizenUnitDataPrefix,
+        decode_citizen_instance_record,
     };
+    use crate::data_serializer::Reader;
 
     fn byte_array(values: &[u8]) -> Vec<u8> {
         let mut bytes = vec![(values.len() - 1) as u8];
@@ -774,6 +1104,53 @@ mod tests {
         }
         bytes.extend_from_slice(&[0x12, 0x34]);
         bytes
+    }
+
+    fn active_instance_record_bytes(format_version: u32, flags: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if format_version >= 46 {
+            append_vector(&mut bytes, &[1.0, 2.0, 3.0]); // velocity
+        }
+        append_vector(&mut bytes, &[4.0, 5.0, 6.0]); // position
+        if format_version >= 195 {
+            append_vector(&mut bytes, &[7.0, 8.0, 9.0, 10.0]);
+        } else if format_version >= 47 {
+            append_vector(&mut bytes, &[7.0, 8.0, 9.0]);
+        }
+        if format_version >= 200 {
+            append_vector(&mut bytes, &[11.0, 12.0]); // target direction
+        }
+        if format_version >= 247 && flags & (1 << 24) != 0 {
+            bytes.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        }
+        bytes.extend_from_slice(&[0x12, 0x34, 0x56]); // citizen
+        if format_version >= 46 {
+            bytes.extend_from_slice(&[0x23, 0x45, 0x67]); // path
+            bytes.extend_from_slice(&[0x34, 0x45]); // path position and offset
+        }
+        if format_version >= 86 {
+            bytes.push(0x56); // wait counter
+        }
+        if format_version >= 201 {
+            bytes.push(0x67); // target seed
+        }
+        if format_version >= 121_028 {
+            bytes.extend_from_slice(&[0x78, 0x89]); // performer and racer
+            if format_version < 121_029 {
+                bytes.extend_from_slice(&[0xab, 0xcd]); // compatibility value
+            }
+        }
+        if format_version >= 180 {
+            bytes.extend_from_slice(&[0xcd, 0xef]); // source building
+        }
+        bytes.extend_from_slice(&[0x13, 0x57]); // target building
+        bytes
+    }
+
+    fn append_vector(bytes: &mut Vec<u8>, values: &[f32]) {
+        for value in values {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
     }
 
     #[test]
@@ -1033,6 +1410,166 @@ mod tests {
             assert!(
                 CitizenManagerData::decode(179, truncated).is_err(),
                 "accepted body missing {missing} tail bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn desert_map_fixture_decodes_active_instances_and_preserves_record_bytes() {
+        let fixture = include_bytes!("../tests/fixtures/citizen-manager-v116020-desert.bin");
+        let decoded = CitizenManagerData::decode(116_020, fixture).expect("game-produced body");
+        assert_eq!(decoded.active_instances().len(), 72);
+        assert!(decoded.unparsed_instance_suffix().is_empty());
+        assert_eq!(decoded.encode(), fixture);
+
+        let first = &decoded.active_instances()[0];
+        assert_eq!(first.index(), 449);
+        assert_eq!(first.flags(), 17);
+        assert_eq!(first.prefab_index(), 53);
+        assert_eq!(
+            first.velocity(),
+            Some([
+                f32::from_bits(0xbf2a_3801),
+                f32::from_bits(0xbda1_b000),
+                f32::from_bits(0x3ff1_702c),
+            ])
+        );
+        assert_eq!(
+            first.position(),
+            [
+                f32::from_bits(0xc4d5_1612),
+                f32::from_bits(0x43a0_535e),
+                f32::from_bits(0xc50c_dfcf),
+            ]
+        );
+        assert_eq!(
+            first.target_position(),
+            CitizenInstanceTargetPosition::Vector4([
+                f32::from_bits(0xc4dd_f7c7),
+                f32::from_bits(0x43a0_4e51),
+                f32::from_bits(0xc500_46c8),
+                0.0,
+            ])
+        );
+        assert_eq!(first.target_direction(), Some([0.0, 0.0]));
+        assert_eq!(first.citizen(), 0);
+        assert_eq!(first.path(), Some(0));
+        assert_eq!(first.path_position_index(), Some(0));
+        assert_eq!(first.last_path_offset(), Some(0));
+        assert_eq!(first.wait_counter(), Some(0));
+        assert_eq!(first.target_seed(), Some(0));
+        assert_eq!(first.source_building(), Some(0));
+        assert_eq!(first.target_building(), 32_152);
+        assert_eq!(
+            decoded.instance_record_bytes(0).unwrap(),
+            [
+                0xbf, 0x2a, 0x38, 0x01, 0xbd, 0xa1, 0xb0, 0x00, 0x3f, 0xf1, 0x70, 0x2c, 0xc4, 0xd5,
+                0x16, 0x12, 0x43, 0xa0, 0x53, 0x5e, 0xc5, 0x0c, 0xdf, 0xcf, 0xc4, 0xdd, 0xf7, 0xc7,
+                0x43, 0xa0, 0x4e, 0x51, 0xc5, 0x00, 0x46, 0xc8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x7d, 0x98,
+            ]
+        );
+    }
+
+    #[test]
+    fn active_instance_fields_follow_reader_gates_and_field_order() {
+        let colored = 1 << 24;
+        for (version, flags, expected_len) in [
+            (44, 0, 17),
+            (45, 0, 17),
+            (46, 0, 34),
+            (47, 0, 46),
+            (85, 0, 46),
+            (86, 0, 47),
+            (179, 0, 47),
+            (194, 0, 49),
+            (195, 0, 53),
+            (199, 0, 53),
+            (200, 0, 61),
+            (201, 0, 62),
+            (246, 0, 62),
+            (247, 0, 62),
+            (247, colored, 65),
+            (121_027, colored, 65),
+            (121_028, colored, 69),
+            (121_029, colored, 67),
+        ] {
+            let bytes = active_instance_record_bytes(version, flags);
+            let mut reader = Reader::new(&bytes);
+            let slot = CitizenInstanceSlot {
+                index: 3,
+                flags,
+                prefab_index: 2,
+            };
+            let record = decode_citizen_instance_record(version, slot, &mut reader)
+                .unwrap_or_else(|error| panic!("version {version}: {error}"));
+            assert_eq!(reader.offset(), expected_len, "version {version}");
+            assert_eq!(reader.remaining(), 0, "version {version}");
+            assert_eq!(record.position(), [4.0, 5.0, 6.0]);
+            assert_eq!(record.citizen(), 0x123456);
+            assert_eq!(record.target_building(), 0x1357);
+            assert_eq!(
+                record.color_rgb(),
+                (flags & colored != 0).then_some([0xaa, 0xbb, 0xcc])
+            );
+            if version >= 46 {
+                assert_eq!(record.velocity(), Some([1.0, 2.0, 3.0]));
+                assert_eq!(record.path(), Some(0x234567));
+                assert_eq!(record.path_position_index(), Some(0x34));
+                assert_eq!(record.last_path_offset(), Some(0x45));
+            } else {
+                assert_eq!(record.velocity(), None);
+                assert_eq!(record.path(), None);
+            }
+            if version < 47 {
+                assert_eq!(
+                    record.target_position(),
+                    CitizenInstanceTargetPosition::FollowsPosition
+                );
+            } else if version < 195 {
+                assert_eq!(
+                    record.target_position(),
+                    CitizenInstanceTargetPosition::Vector3([7.0, 8.0, 9.0])
+                );
+            } else {
+                assert_eq!(
+                    record.target_position(),
+                    CitizenInstanceTargetPosition::Vector4([7.0, 8.0, 9.0, 10.0])
+                );
+            }
+            assert_eq!(
+                record.target_direction(),
+                (version >= 200).then_some([11.0, 12.0])
+            );
+            assert_eq!(record.wait_counter(), (version >= 86).then_some(0x56));
+            assert_eq!(record.target_seed(), (version >= 201).then_some(0x67));
+            assert_eq!(
+                record.performer_index(),
+                (version >= 121_028).then_some(0x78)
+            );
+            assert_eq!(record.racer_index(), (version >= 121_028).then_some(0x89));
+            assert_eq!(
+                record.compatibility_value(),
+                (version == 121_028).then_some(0xabcd)
+            );
+            assert_eq!(record.source_building(), (version >= 180).then_some(0xcdef));
+        }
+    }
+
+    #[test]
+    fn active_instance_records_reject_truncated_field_bytes() {
+        let flags = 1 << 24;
+        let bytes = active_instance_record_bytes(121_029, flags);
+        let slot = CitizenInstanceSlot {
+            index: 1,
+            flags,
+            prefab_index: 0,
+        };
+        for end in 0..bytes.len() {
+            assert!(
+                decode_citizen_instance_record(121_029, slot, &mut Reader::new(&bytes[..end]))
+                    .is_err()
             );
         }
     }

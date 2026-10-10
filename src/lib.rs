@@ -59,7 +59,8 @@ pub use building_manager_data::{
     BuildingTimerGeometryPrefix,
 };
 pub use citizen_manager_data::{
-    CitizenInstanceDataPrefix, CitizenInstanceSlot, CitizenManagerData, CitizenManagerDataPrefix,
+    CitizenInstanceDataPrefix, CitizenInstanceRecord, CitizenInstanceSlot,
+    CitizenInstanceTargetPosition, CitizenManagerData, CitizenManagerDataPrefix,
     CitizenUnitDataPrefix, CitizenUnitRecord,
 };
 pub use data_serializer::DataSerializerStream;
