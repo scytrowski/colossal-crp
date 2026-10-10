@@ -429,8 +429,14 @@ pub struct CitizenInstanceRecord {
     compatibility_value: Option<u16>,
     source_building: Option<u16>,
     target_building: u16,
+    color_rgb_offset: Option<usize>,
     citizen_offset: usize,
     path_fields_offset: Option<usize>,
+    wait_counter_offset: Option<usize>,
+    target_seed_offset: Option<usize>,
+    performance_indices_offset: Option<usize>,
+    source_building_offset: Option<usize>,
+    target_building_offset: usize,
     velocity_offset: Option<usize>,
     position_offset: usize,
     target_position_offset: Option<usize>,
@@ -831,6 +837,60 @@ impl CitizenManagerData {
                         ))
                 })
                 .transpose()?;
+            record.color_rgb_offset =
+                record
+                    .color_rgb_offset
+                    .map(|offset| {
+                        instance_fields_start.checked_add(offset).ok_or(
+                            CrpError::ArithmeticOverflow("CitizenManager instance RGB offset"),
+                        )
+                    })
+                    .transpose()?;
+            record.wait_counter_offset = record
+                .wait_counter_offset
+                .map(|offset| {
+                    instance_fields_start
+                        .checked_add(offset)
+                        .ok_or(CrpError::ArithmeticOverflow(
+                            "CitizenManager instance wait-counter offset",
+                        ))
+                })
+                .transpose()?;
+            record.target_seed_offset = record
+                .target_seed_offset
+                .map(|offset| {
+                    instance_fields_start
+                        .checked_add(offset)
+                        .ok_or(CrpError::ArithmeticOverflow(
+                            "CitizenManager instance target-seed offset",
+                        ))
+                })
+                .transpose()?;
+            record.performance_indices_offset = record
+                .performance_indices_offset
+                .map(|offset| {
+                    instance_fields_start
+                        .checked_add(offset)
+                        .ok_or(CrpError::ArithmeticOverflow(
+                            "CitizenManager instance performer/racer offset",
+                        ))
+                })
+                .transpose()?;
+            record.source_building_offset = record
+                .source_building_offset
+                .map(|offset| {
+                    instance_fields_start
+                        .checked_add(offset)
+                        .ok_or(CrpError::ArithmeticOverflow(
+                            "CitizenManager instance source-building offset",
+                        ))
+                })
+                .transpose()?;
+            record.target_building_offset = instance_fields_start
+                .checked_add(record.target_building_offset)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager instance target-building offset",
+                ))?;
             active_instances.push(record);
         }
         let instance_field_suffix_start = instance_fields_start
@@ -1102,6 +1162,145 @@ impl CitizenManagerData {
         Ok(())
     }
 
+    /// Replaces the conditional RGB color bytes from inner version 247.
+    ///
+    /// The field exists only when the active slot's flag bit 24 is set. This
+    /// edits the existing three bytes and does not change the slot flags.
+    pub fn set_instance_color_rgb(
+        &mut self,
+        record_index: usize,
+        color_rgb: [u8; 3],
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.color_rgb_offset.ok_or_else(|| {
+            invalid(
+                record.original_record_start,
+                "CitizenInstance RGB color is not serialized for this version and slot flags",
+            )
+        })?;
+        write_fixed_bytes(&mut self.original_body, offset, &color_rgb)?;
+        self.active_instances[record_index].color_rgb = Some(color_rgb);
+        Ok(())
+    }
+
+    /// Replaces the wait counter serialized from inner version 86.
+    pub fn set_instance_wait_counter(
+        &mut self,
+        record_index: usize,
+        wait_counter: u8,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.wait_counter_offset.ok_or_else(|| {
+            invalid(
+                record.original_record_start,
+                "CitizenInstance wait counter is not serialized before version 86",
+            )
+        })?;
+        write_fixed_bytes(&mut self.original_body, offset, &[wait_counter])?;
+        self.active_instances[record_index].wait_counter = Some(wait_counter);
+        Ok(())
+    }
+
+    /// Replaces the target seed serialized from inner version 201.
+    pub fn set_instance_target_seed(
+        &mut self,
+        record_index: usize,
+        target_seed: u8,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.target_seed_offset.ok_or_else(|| {
+            invalid(
+                record.original_record_start,
+                "CitizenInstance target seed is not serialized before version 201",
+            )
+        })?;
+        write_fixed_bytes(&mut self.original_body, offset, &[target_seed])?;
+        self.active_instances[record_index].target_seed = Some(target_seed);
+        Ok(())
+    }
+
+    /// Replaces the performer and racer indices from inner version 121028.
+    pub fn set_instance_performance_indices(
+        &mut self,
+        record_index: usize,
+        performer_index: u8,
+        racer_index: u8,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.performance_indices_offset.ok_or_else(|| {
+            invalid(
+                record.original_record_start,
+                "CitizenInstance performer/racer indices are not serialized before version 121028",
+            )
+        })?;
+        write_fixed_bytes(
+            &mut self.original_body,
+            offset,
+            &[performer_index, racer_index],
+        )?;
+        let record = &mut self.active_instances[record_index];
+        record.performer_index = Some(performer_index);
+        record.racer_index = Some(racer_index);
+        Ok(())
+    }
+
+    /// Replaces the source-building index from inner version 180.
+    pub fn set_instance_source_building(
+        &mut self,
+        record_index: usize,
+        source_building: u16,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.source_building_offset.ok_or_else(|| {
+            invalid(
+                record.original_record_start,
+                "CitizenInstance source-building index is not serialized before version 180",
+            )
+        })?;
+        write_fixed_bytes(
+            &mut self.original_body,
+            offset,
+            &source_building.to_be_bytes(),
+        )?;
+        self.active_instances[record_index].source_building = Some(source_building);
+        Ok(())
+    }
+
+    /// Replaces the always-serialized target-building index.
+    pub fn set_instance_target_building(
+        &mut self,
+        record_index: usize,
+        target_building: u16,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.target_building_offset;
+        write_fixed_bytes(
+            &mut self.original_body,
+            offset,
+            &target_building.to_be_bytes(),
+        )?;
+        self.active_instances[record_index].target_building = target_building;
+        Ok(())
+    }
+
     /// Returns any bytes after the decoded active records for forward-compatible preservation.
     pub fn unparsed_instance_suffix(&self) -> &[u8] {
         &self.original_body[self.instance_field_suffix.clone()]
@@ -1175,6 +1374,13 @@ fn decode_citizen_instance_record(
     } else {
         None
     };
+    let color_rgb_offset = if format_version >= CITIZEN_INSTANCE_COLOR_VERSION
+        && slot.flags() & CITIZEN_INSTANCE_COLOR_FLAG != 0
+    {
+        Some(reader.offset())
+    } else {
+        None
+    };
     let color_rgb = if format_version >= CITIZEN_INSTANCE_COLOR_VERSION
         && slot.flags() & CITIZEN_INSTANCE_COLOR_FLAG != 0
     {
@@ -1199,13 +1405,28 @@ fn decode_citizen_instance_record(
         } else {
             (None, None, None)
         };
+    let wait_counter_offset = if format_version >= CITIZEN_INSTANCE_WAIT_COUNTER_VERSION {
+        Some(reader.offset())
+    } else {
+        None
+    };
     let wait_counter = if format_version >= CITIZEN_INSTANCE_WAIT_COUNTER_VERSION {
         Some(reader.read_u8()?)
     } else {
         None
     };
+    let target_seed_offset = if format_version >= CITIZEN_INSTANCE_TARGET_SEED_VERSION {
+        Some(reader.offset())
+    } else {
+        None
+    };
     let target_seed = if format_version >= CITIZEN_INSTANCE_TARGET_SEED_VERSION {
         Some(reader.read_u8()?)
+    } else {
+        None
+    };
+    let performance_indices_offset = if format_version >= CITIZEN_INSTANCE_PERFORMER_VERSION {
+        Some(reader.offset())
     } else {
         None
     };
@@ -1227,11 +1448,17 @@ fn decode_citizen_instance_record(
     } else {
         (None, None, None)
     };
+    let source_building_offset = if format_version >= CITIZEN_INSTANCE_SOURCE_BUILDING_VERSION {
+        Some(reader.offset())
+    } else {
+        None
+    };
     let source_building = if format_version >= CITIZEN_INSTANCE_SOURCE_BUILDING_VERSION {
         Some(reader.read_u16_be()?)
     } else {
         None
     };
+    let target_building_offset = reader.offset();
     let target_building = reader.read_u16_be()?;
 
     Ok(CitizenInstanceRecord {
@@ -1254,8 +1481,14 @@ fn decode_citizen_instance_record(
         compatibility_value,
         source_building,
         target_building,
+        color_rgb_offset,
         citizen_offset,
         path_fields_offset,
+        wait_counter_offset,
+        target_seed_offset,
+        performance_indices_offset,
+        source_building_offset,
+        target_building_offset,
         velocity_offset,
         position_offset,
         target_position_offset,
@@ -1341,8 +1574,11 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CitizenInstanceDataPrefix, CitizenInstanceSlot, CitizenInstanceTargetPosition,
-        CitizenManagerData, CitizenManagerDataPrefix, CitizenUnitDataPrefix,
+        CITIZEN_INSTANCE_COLOR_FLAG, CITIZEN_INSTANCE_FLAGS_VERSION, CitizenInstanceDataPrefix,
+        CitizenInstanceSlot, CitizenInstanceTargetPosition, CitizenManagerData,
+        CitizenManagerDataPrefix, CitizenUnitDataPrefix, FULL_CITIZEN_INSTANCE_FLAG_COUNT,
+        FULL_CITIZEN_INSTANCE_FLAGS_VERSION, FULLY_EDUCATED_RESIDENTS_VERSION,
+        LEGACY_CITIZEN_INSTANCE_FLAG_COUNT, OLDEST_RESIDENTS_VERSION,
         decode_citizen_instance_record,
     };
     use crate::data_serializer::Reader;
@@ -1476,6 +1712,37 @@ mod tests {
         bytes.extend_from_slice(&[0; 4]); // source and target buildings
         bytes.extend_from_slice(&[0; 8]); // versioned trailing counters
         bytes.extend_from_slice(&[0x12, 0x34]); // closing profiler reference
+        bytes
+    }
+
+    fn single_active_instance_body(format_version: u32, flags: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        append_zero_uint_array(&mut bytes, 1_048_575);
+        append_zero_ushort_array(&mut bytes, 524_287);
+
+        if format_version >= CITIZEN_INSTANCE_FLAGS_VERSION {
+            let flag_count = if format_version >= FULL_CITIZEN_INSTANCE_FLAGS_VERSION {
+                FULL_CITIZEN_INSTANCE_FLAG_COUNT
+            } else {
+                LEGACY_CITIZEN_INSTANCE_FLAG_COUNT
+            };
+            bytes.push(63);
+            bytes.extend_from_slice(&flags.to_be_bytes());
+            bytes.extend(std::iter::repeat_n(0, 63 * 4));
+            append_zero_uint_array(&mut bytes, flag_count - 64);
+            bytes.extend_from_slice(&ushort_array(&[0]));
+            bytes.extend_from_slice(&[0, 0]);
+        }
+
+        bytes.extend_from_slice(&active_instance_record_bytes(format_version, flags));
+        if format_version >= OLDEST_RESIDENTS_VERSION {
+            bytes.extend_from_slice(&(-2_i16).to_be_bytes());
+            bytes.extend_from_slice(&0x0102_i16.to_be_bytes());
+        }
+        if format_version >= FULLY_EDUCATED_RESIDENTS_VERSION {
+            bytes.extend_from_slice(&(-100_i32).to_be_bytes());
+        }
+        bytes.extend_from_slice(&[0x12, 0x34]);
         bytes
     }
 
@@ -1835,6 +2102,84 @@ mod tests {
                 .is_err()
         );
         assert_eq!(edited.encode(), expected);
+    }
+
+    #[test]
+    fn edits_conditional_scalar_instance_fields_at_their_existing_offsets() {
+        let legacy_bytes = single_active_instance_body(85, 1);
+        let mut legacy = CitizenManagerData::decode(85, &legacy_bytes).expect("version-85 manager");
+        assert_eq!(legacy.active_instances()[0].wait_counter(), None);
+        assert!(legacy.set_instance_wait_counter(0, 0xa1).is_err());
+        assert!(legacy.set_instance_target_seed(0, 0xb2).is_err());
+        assert!(
+            legacy
+                .set_instance_performance_indices(0, 0xc3, 0xd4)
+                .is_err()
+        );
+        assert!(legacy.set_instance_source_building(0, 0xe5f6).is_err());
+        let target_building_offset = legacy.active_instances()[0].target_building_offset;
+        let mut expected_legacy = legacy_bytes;
+        expected_legacy[target_building_offset..target_building_offset + 2]
+            .copy_from_slice(&0xa1b2_u16.to_be_bytes());
+        legacy
+            .set_instance_target_building(0, 0xa1b2)
+            .expect("target building exists in the legacy record");
+        assert_eq!(legacy.active_instances()[0].target_building(), 0xa1b2);
+        assert_eq!(legacy.encode(), expected_legacy);
+
+        let color_flag = CITIZEN_INSTANCE_COLOR_FLAG;
+        let color_bytes = single_active_instance_body(247, color_flag);
+        let mut colored =
+            CitizenManagerData::decode(247, &color_bytes).expect("colored version-247 manager");
+        let record = &colored.active_instances()[0];
+        assert_eq!(record.color_rgb(), Some([0xaa, 0xbb, 0xcc]));
+        let color_offset = record.color_rgb_offset.expect("conditional RGB bytes");
+        let wait_offset = record.wait_counter_offset.expect("version-86 wait counter");
+        let seed_offset = record.target_seed_offset.expect("version-201 target seed");
+        let source_offset = record
+            .source_building_offset
+            .expect("version-180 source building");
+        let target_offset = record.target_building_offset;
+        let mut expected = color_bytes;
+        expected[color_offset..color_offset + 3].copy_from_slice(&[0x12, 0x34, 0x56]);
+        expected[wait_offset] = 0xa1;
+        expected[seed_offset] = 0xb2;
+        expected[source_offset..source_offset + 2].copy_from_slice(&0xc3d4_u16.to_be_bytes());
+        expected[target_offset..target_offset + 2].copy_from_slice(&0xe5f6_u16.to_be_bytes());
+        colored
+            .set_instance_color_rgb(0, [0x12, 0x34, 0x56])
+            .expect("edit conditional RGB bytes");
+        colored
+            .set_instance_wait_counter(0, 0xa1)
+            .expect("edit wait counter");
+        colored
+            .set_instance_target_seed(0, 0xb2)
+            .expect("edit target seed");
+        colored
+            .set_instance_source_building(0, 0xc3d4)
+            .expect("edit source building");
+        colored
+            .set_instance_target_building(0, 0xe5f6)
+            .expect("edit target building");
+        assert_eq!(
+            colored.active_instances()[0].color_rgb(),
+            Some([0x12, 0x34, 0x56])
+        );
+        assert_eq!(colored.active_instances()[0].wait_counter(), Some(0xa1));
+        assert_eq!(colored.active_instances()[0].target_seed(), Some(0xb2));
+        assert_eq!(
+            colored.active_instances()[0].source_building(),
+            Some(0xc3d4)
+        );
+        assert_eq!(colored.active_instances()[0].target_building(), 0xe5f6);
+        assert_eq!(colored.encode(), expected);
+
+        let uncolored_bytes = single_active_instance_body(247, 1);
+        let mut uncolored =
+            CitizenManagerData::decode(247, &uncolored_bytes).expect("uncolored manager");
+        assert_eq!(uncolored.active_instances()[0].color_rgb(), None);
+        assert!(uncolored.set_instance_color_rgb(0, [1, 2, 3]).is_err());
+        assert_eq!(uncolored.encode(), uncolored_bytes);
     }
 
     #[test]

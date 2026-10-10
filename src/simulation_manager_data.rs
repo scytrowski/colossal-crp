@@ -18386,6 +18386,8 @@ mod manager_boundary_tests {
             path_position,
             last_path_offset,
         ]);
+        expected_body[field_range.start + 56..field_range.start + 64]
+            .copy_from_slice(&[0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0xa1, 0xb2]);
         let mut edited = decoded.clone();
         edited.set_instance_velocity(0, velocity).unwrap();
         edited.set_instance_position(0, position).unwrap();
@@ -18397,6 +18399,13 @@ mod manager_boundary_tests {
         edited
             .set_instance_path_fields(0, path, path_position, last_path_offset)
             .unwrap();
+        edited.set_instance_wait_counter(0, 0xa1).unwrap();
+        edited.set_instance_target_seed(0, 0xb2).unwrap();
+        edited
+            .set_instance_performance_indices(0, 0xc3, 0xd4)
+            .unwrap();
+        edited.set_instance_source_building(0, 0xe5f6).unwrap();
+        edited.set_instance_target_building(0, 0xa1b2).unwrap();
         manager
             .replace_citizen_manager_instance_fields(&edited)
             .unwrap();
@@ -18425,6 +18434,15 @@ mod manager_boundary_tests {
             updated.active_instances()[0].last_path_offset(),
             Some(last_path_offset)
         );
+        assert_eq!(updated.active_instances()[0].wait_counter(), Some(0xa1));
+        assert_eq!(updated.active_instances()[0].target_seed(), Some(0xb2));
+        assert_eq!(updated.active_instances()[0].performer_index(), Some(0xc3));
+        assert_eq!(updated.active_instances()[0].racer_index(), Some(0xd4));
+        assert_eq!(
+            updated.active_instances()[0].source_building(),
+            Some(0xe5f6)
+        );
+        assert_eq!(updated.active_instances()[0].target_building(), 0xa1b2);
         assert_eq!(updated.unparsed_instance_suffix(), instance_suffix);
         assert_eq!(updated_end, end);
         assert!(manager.serialized_object_graph()[updated_end..].starts_with(&transfer_tag));
