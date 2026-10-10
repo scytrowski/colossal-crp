@@ -11,6 +11,7 @@ use crate::TerrainManagerData;
 use crate::TreeManagerDataPrefix;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
+use crate::WeatherManagerData;
 use crate::ZoneManagerDataPrefix;
 use crate::audio_manager_data::{AudioManagerData, AudioManagerEditor};
 use crate::data_serializer::{
@@ -2034,6 +2035,62 @@ impl SimulationManagerData {
             ));
         }
         Ok((trees, next_tag_start))
+    }
+
+    /// Decodes WeatherManager or legacy WindManager at slot 16 and checks its
+    /// boundary against VehicleManager at slot 17.
+    ///
+    /// The returned graph offset is immediately after WeatherManager's closing
+    /// profiler reference and before the VehicleManager opening tag. Original
+    /// body bytes remain available through [`WeatherManagerData::encode`].
+    pub fn decode_weather_manager_data(&self) -> Result<(WeatherManagerData, usize), CrpError> {
+        let reference = self
+            .manager_objects
+            .as_deref()
+            .and_then(|objects| objects.get(16))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| invalid(16, "missing WeatherManager or WindManager reference"))?;
+        if !reference.type_name.starts_with("WeatherManager+Data")
+            && !reference.type_name.starts_with("WindManager+Data")
+        {
+            return Err(invalid(
+                16,
+                format!(
+                    "manager slot 16 is {}, expected WeatherManager+Data or WindManager+Data",
+                    reference.type_name
+                ),
+            ));
+        }
+        expect_manager_type(self.manager_objects.as_deref(), 17, "VehicleManager+Data")?;
+
+        let graph = &self.serialized_object_graph;
+        let (body_start, next_tag_start) = self.manager_body_boundary(16)?;
+        let body = graph.get(body_start..next_tag_start).ok_or_else(|| {
+            invalid(
+                body_start,
+                "WeatherManager body range exceeds manager graph",
+            )
+        })?;
+        let (weather, body_len) = WeatherManagerData::decode_prefix(self.format_version, body)?;
+        let end_tag_start = body_start
+            .checked_add(body_len)
+            .ok_or(CrpError::ArithmeticOverflow("WeatherManager body end"))?;
+        let decoded_next_tag_start = end_tag_start
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "WeatherManager end profiler reference",
+            ))?;
+        if decoded_next_tag_start != next_tag_start
+            || graph
+                .get(end_tag_start)
+                .is_none_or(|marker| *marker >= 0xfe)
+        {
+            return Err(invalid(
+                end_tag_start,
+                "WeatherManager fields do not end before its closing profiler reference and VehicleManager tag",
+            ));
+        }
+        Ok((weather, next_tag_start))
     }
 
     /// Decodes the known DistrictManager prefix for the requested inner version.
@@ -11776,6 +11833,69 @@ mod manager_boundary_tests {
         assert_eq!(districts.district_flags(), &[0; 128]);
         assert_eq!(districts.park_flags(), &[0; 128]);
         assert_eq!(district_end, data.serialized_object_graph().len());
+    }
+
+    #[test]
+    fn weather_manager_locator_checks_closing_reference_and_vehicle_boundary() {
+        for (profiler_name, manager_type) in [
+            ("WeatherManager", "WeatherManager+Data"),
+            ("WindManager", "WindManager+Data"),
+        ] {
+            let mut graph = profiler_tag(profiler_name);
+            graph.extend([0xff; 2 * 128]);
+            for value in [1.0_f32, 2.0, 3.0] {
+                graph.extend_from_slice(&value.to_bits().to_be_bytes());
+            }
+            graph.extend_from_slice(&[0, 16]);
+            let vehicle_tag = profiler_tag("VehicleManager");
+            graph.extend_from_slice(&vehicle_tag);
+
+            let mut manager = manager_with_graph(graph);
+            manager.format_version = 231;
+            let mut manager_objects = vec![None; 18];
+            manager_objects[16] = Some(ManagerObjectReference {
+                object_id: 16,
+                type_name: format!("{manager_type}, Assembly-CSharp"),
+            });
+            manager_objects[17] = Some(ManagerObjectReference {
+                object_id: 17,
+                type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+            });
+            manager.manager_objects = Some(manager_objects);
+
+            let (weather, end) = manager.decode_weather_manager_data().unwrap();
+            assert_eq!(weather.wind_directions(), [1.0, 2.0, 3.0]);
+            assert_eq!(
+                end,
+                manager.serialized_object_graph().len() - vehicle_tag.len()
+            );
+            assert!(manager.serialized_object_graph()[end..].starts_with(&vehicle_tag));
+        }
+
+        let profiler_name = "WeatherManager";
+        let mut graph = profiler_tag(profiler_name);
+        graph.extend([0xff; 2 * 128]);
+        graph.extend_from_slice(&[0.0_f32.to_bits().to_be_bytes(); 3].concat());
+        let end_tag_start = graph.len();
+        graph.extend_from_slice(&[0xfe, 0x00]);
+        graph.extend(profiler_tag("VehicleManager"));
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 231;
+        let mut manager_objects = vec![None; 18];
+        manager_objects[16] = Some(ManagerObjectReference {
+            object_id: 16,
+            type_name: "WeatherManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+        assert!(manager.decode_weather_manager_data().is_err());
+        assert_eq!(
+            end_tag_start,
+            profiler_tag(profiler_name).len() + 2 * 128 + 12
+        );
     }
 
     #[test]
