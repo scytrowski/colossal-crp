@@ -372,7 +372,7 @@ pub struct NetSegmentEnvironmentEditor {
 /// Fixed fields stored for one segment with nonzero primary flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetSegmentRecord {
-    /// One-based segment buffer index.
+    /// Derived one-based segment buffer index; it is not serialized.
     pub index: u16,
     /// Build and modified indices, stored as big-endian `u32` values.
     pub build_index: u32,
@@ -411,7 +411,18 @@ pub struct NetSegmentRecord {
 pub struct NetSegmentRecordsPrefix {
     format_version: u32,
     records: Vec<NetSegmentRecord>,
+    source_segment_flags: Vec<u8>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for fixed records belonging to active segments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentRecordsEditor {
+    format_version: u32,
+    records: Vec<NetSegmentRecord>,
+    original_records: Vec<NetSegmentRecord>,
+    original_segment_flags: Vec<u8>,
+    original_prefix: Vec<u8>,
 }
 
 /// Counts of saved network guide and milestone prefab references.
@@ -2114,6 +2125,7 @@ impl NetSegmentRecordsPrefix {
             Self {
                 format_version,
                 records,
+                source_segment_flags: segment_flags.encode(),
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -2133,6 +2145,144 @@ impl NetSegmentRecordsPrefix {
     /// Writes the original record bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+}
+
+impl NetSegmentRecordsPrefix {
+    /// Consumes the prefix to edit records for active segments.
+    pub fn into_editor(self) -> NetSegmentRecordsEditor {
+        NetSegmentRecordsEditor {
+            format_version: self.format_version,
+            original_records: self.records.clone(),
+            records: self.records,
+            original_segment_flags: self.source_segment_flags,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetSegmentRecordsEditor {
+    /// Returns the inner DataSerializer version associated with these records.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns records in ascending active-segment buffer order.
+    pub fn records_mut(&mut self) -> &mut [NetSegmentRecord] {
+        &mut self.records
+    }
+
+    /// Encodes fixed records with the version-specific fields and byte order.
+    ///
+    /// Unchanged records retain their source bytes. Optional fields are only
+    /// writable from their respective inner-version gates; 24-bit lane and
+    /// path IDs are range-checked.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.records.len() != self.original_records.len() {
+            return Err(invalid_record(
+                0,
+                "edited segment record count does not match the source",
+            ));
+        }
+        if self.records == self.original_records {
+            return Ok(self.original_prefix.clone());
+        }
+
+        let mut output = Vec::with_capacity(self.original_prefix.len());
+        for (record, original) in self.records.iter().zip(&self.original_records) {
+            if record.index != original.index {
+                return Err(invalid_record(
+                    output.len(),
+                    "segment record index is derived from flags and cannot be changed",
+                ));
+            }
+            if self.format_version < SEGMENT_NAME_SEED_VERSION
+                && record.name_seed != original.name_seed
+            {
+                return Err(invalid_record(
+                    output.len(),
+                    "segment name seed is not serialized before inner version 312",
+                ));
+            }
+            if self.format_version < SEGMENT_PATH_OVERRIDE_VERSION
+                && record.override_path_find_direction_limit
+                    != original.override_path_find_direction_limit
+            {
+                return Err(invalid_record(
+                    output.len(),
+                    "path-direction override is not serialized before inner version 113015",
+                ));
+            }
+            if self.format_version < SEGMENT_TREE_VERSION
+                && record.tree_present != original.tree_present
+            {
+                return Err(invalid_record(
+                    output.len(),
+                    "tree-presence flag is not serialized before inner version 114002",
+                ));
+            }
+            if self.format_version < SEGMENT_FENCE_VERSION
+                && record.fence_present != original.fence_present
+            {
+                return Err(invalid_record(
+                    output.len(),
+                    "fence-presence flags are not serialized before inner version 120003",
+                ));
+            }
+            if self.format_version < SEGMENT_EVENT_ROUTE_VERSION
+                && (record.event_route != original.event_route
+                    || record.next_event_route_segment != original.next_event_route_segment)
+            {
+                return Err(invalid_record(
+                    output.len(),
+                    "event-route fields are not serialized before inner version 121005",
+                ));
+            }
+
+            output.extend_from_slice(&record.build_index.to_be_bytes());
+            output.extend_from_slice(&record.modified_index.to_be_bytes());
+            write_record_u24(&mut output, record.lanes)?;
+            write_record_u24(&mut output, record.path)?;
+            for bits in record
+                .start_direction_bits
+                .iter()
+                .chain(&record.end_direction_bits)
+            {
+                output.extend_from_slice(&bits.to_be_bytes());
+            }
+            output.extend_from_slice(&record.start_node.to_be_bytes());
+            output.extend_from_slice(&record.end_node.to_be_bytes());
+            for block in record.blocks {
+                output.extend_from_slice(&block.to_be_bytes());
+            }
+            output.extend_from_slice(&record.traffic_buffer.to_be_bytes());
+            output.push(record.traffic_density);
+            if self.format_version >= SEGMENT_NAME_SEED_VERSION {
+                output.extend_from_slice(&record.name_seed.to_be_bytes());
+            }
+            if self.format_version >= SEGMENT_PATH_OVERRIDE_VERSION {
+                output.push(record.override_path_find_direction_limit);
+            }
+            if self.format_version >= SEGMENT_TREE_VERSION {
+                output.push(record.tree_present);
+            }
+            if self.format_version >= SEGMENT_FENCE_VERSION {
+                output.extend_from_slice(&record.fence_present);
+            }
+            if self.format_version >= SEGMENT_EVENT_ROUTE_VERSION {
+                output.extend_from_slice(&record.event_route.to_be_bytes());
+                output.extend_from_slice(&record.next_event_route_segment.to_be_bytes());
+            }
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_segment_flags(&self) -> &[u8] {
+        &self.original_segment_flags
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 
@@ -2833,6 +2983,29 @@ fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, Crp
 fn read_segment_u24(reader: &mut Reader<'_>) -> Result<u32, CrpError> {
     let bytes = reader.read_bytes(3)?;
     Ok((u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]))
+}
+
+fn write_record_u24(output: &mut Vec<u8>, value: u32) -> Result<(), CrpError> {
+    if value > 0x00ff_ffff {
+        return Err(invalid_record(
+            output.len(),
+            "segment lane or path value exceeds 24-bit storage",
+        ));
+    }
+    output.extend_from_slice(&[
+        ((value >> 16) & 0xff) as u8,
+        ((value >> 8) & 0xff) as u8,
+        (value & 0xff) as u8,
+    ]);
+    Ok(())
+}
+
+fn invalid_record(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "NetManager+Data segment records".to_owned(),
+        offset,
+        reason: reason.into(),
+    }
 }
 
 fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {

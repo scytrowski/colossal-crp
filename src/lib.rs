@@ -86,8 +86,9 @@ pub use net_manager_data::{
     NetSegmentCoverage, NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironment,
     NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlag,
     NetSegmentFlagsEditor, NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsEditor,
-    NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsPrefix, NetSegmentTrafficLight,
-    NetSegmentTrafficLightsEditor, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
+    NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsEditor, NetSegmentRecordsPrefix,
+    NetSegmentTrafficLight, NetSegmentTrafficLightsEditor, NetSegmentTrafficLightsPrefix,
+    NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathManagerEditor, PathPosition, PathUnit};
 pub use prop_manager_data::{PropManagerDataPrefix, PropManagerEditor};
@@ -2331,6 +2332,7 @@ mod tests {
                 NetSegmentRecordsPrefix::decode_prefix(version, &segment_flags, &bytes)?;
             assert_eq!(used, expected_length);
             assert_eq!(prefix.encode(), bytes);
+            assert_eq!(prefix.clone().into_editor().encode()?, bytes);
             let record = &prefix.records()[0];
             assert_eq!(record.index, 1);
             assert_eq!(
@@ -2361,6 +2363,44 @@ mod tests {
                 record.next_event_route_segment,
                 if version >= 121_005 { 0xef01 } else { 0 }
             );
+            let mut edited = prefix.clone().into_editor();
+            edited.records_mut()[0].build_index = 0x1122_3344;
+            edited.records_mut()[0].lanes = 0x01_02_03;
+            let mut expected = bytes[..used].to_vec();
+            expected[..4].copy_from_slice(&0x1122_3344_u32.to_be_bytes());
+            expected[8..11].copy_from_slice(&[1, 2, 3]);
+            assert_eq!(edited.encode()?, expected);
+            edited.records_mut()[0].path = 0x0100_0000;
+            assert!(edited.encode().is_err());
+            let mut unavailable = prefix.clone().into_editor();
+            unavailable.records_mut()[0].index = 2;
+            assert!(unavailable.encode().is_err());
+
+            if version < 312 {
+                let mut unavailable = prefix.clone().into_editor();
+                unavailable.records_mut()[0].name_seed = 1;
+                assert!(unavailable.encode().is_err());
+            }
+            if version < 113_015 {
+                let mut unavailable = prefix.clone().into_editor();
+                unavailable.records_mut()[0].override_path_find_direction_limit = 1;
+                assert!(unavailable.encode().is_err());
+            }
+            if version < 114_002 {
+                let mut unavailable = prefix.clone().into_editor();
+                unavailable.records_mut()[0].tree_present = 1;
+                assert!(unavailable.encode().is_err());
+            }
+            if version < 120_003 {
+                let mut unavailable = prefix.clone().into_editor();
+                unavailable.records_mut()[0].fence_present = [1, 0];
+                assert!(unavailable.encode().is_err());
+            }
+            if version < 121_005 {
+                let mut unavailable = prefix.clone().into_editor();
+                unavailable.records_mut()[0].event_route = 1;
+                assert!(unavailable.encode().is_err());
+            }
             let tree_bytes = [0, 0, 42, 0, 0, 0xee];
             let (tree, tree_used) =
                 NetTreePrefabPrefix::decode_prefix(version, &prefix, &tree_bytes)?;

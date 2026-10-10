@@ -70,8 +70,8 @@ use crate::{
     NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
     NetNodeRecordsPrefix, NetSegmentCoverageEditor, NetSegmentCoveragePrefix,
     NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlagsPrefix,
-    NetSegmentProblemsPrefix, NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix,
-    NetTreePrefabPrefix,
+    NetSegmentProblemsPrefix, NetSegmentRecordsEditor, NetSegmentRecordsPrefix,
+    NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
 use crate::{PathManagerData, PathManagerEditor};
 use crate::{WeatherManagerData, WeatherManagerEditor};
@@ -3673,17 +3673,111 @@ impl SimulationManagerData {
         &self,
         save_app_version: Option<u32>,
     ) -> Result<(NetSegmentRecordsPrefix, usize), CrpError> {
-        let (_, environment_end) = self.decode_net_segment_environment_prefix(save_app_version)?;
-        let (segment_flags, _) = self.decode_net_segment_flags_prefix(save_app_version)?;
+        let (_, data, _, end) = self.decode_net_segment_records_with_range(save_app_version)?;
+        Ok((data, end))
+    }
+
+    fn decode_net_segment_records_with_range(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetSegmentFlagsPrefix, NetSegmentRecordsPrefix, usize, usize), CrpError> {
+        let (segment_flags, _, _, environment_end) =
+            self.decode_net_segment_environment_with_range(save_app_version)?;
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(environment_end)?;
+        let body_start = reader.offset();
         let (data, body_length) = NetSegmentRecordsPrefix::decode_prefix(
             self.format_version,
             &segment_flags,
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        Ok((segment_flags, data, body_start, reader.offset()))
+    }
+
+    /// Decodes active segment records into an editor.
+    pub fn decode_net_segment_records_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetSegmentRecordsEditor, CrpError> {
+        let (_, records, _, _) = self.decode_net_segment_records_with_range(save_app_version)?;
+        Ok(records.into_editor())
+    }
+
+    /// Replaces active segment records while preserving following NetManager bytes.
+    ///
+    /// The editor must match this stream's inner version, source segment flags,
+    /// and original record bytes. Fixed record sizes keep the following table
+    /// boundary stable for a given version.
+    pub fn replace_net_segment_records(
+        &mut self,
+        edited: &NetSegmentRecordsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager segment-record version does not match this stream",
+            ));
+        }
+        let (current_flags, current, body_start, body_end) =
+            self.decode_net_segment_records_with_range(save_app_version)?;
+        if current_flags.encode().as_slice() != edited.original_segment_flags() {
+            return Err(invalid(
+                body_start,
+                "NetManager segment flags do not match the records editor's source",
+            ));
+        }
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager segment-record bytes do not match the editor's source prefix",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager segment-record prefix range is inconsistent",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_net_segment_records_with_range(save_app_version)
+            .and_then(|(decoded_flags, decoded, actual_start, actual_end)| {
+                if decoded_flags.encode() != current_flags.encode() {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager segment records changed their source flags",
+                    ));
+                }
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager segment records do not match the editor",
+                    ));
+                }
+                let expected_end = body_start.checked_add(replacement.len()).ok_or(
+                    CrpError::ArithmeticOverflow("NetManager segment-record end"),
+                )?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager segment records have an unexpected boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager segment records failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes the two guide-table counts after individual segment records.
@@ -11352,6 +11446,18 @@ mod manager_boundary_tests {
         net_body.extend_from_slice(&[0x9d]); // Thirty zero conditions.
         net_body.extend_from_slice(&[0x9d]); // Thirty zero noise-buffer values.
         net_body.extend_from_slice(&[0x9d]); // Thirty zero noise-density values.
+        for segment in 0_u32..30 {
+            net_body.extend_from_slice(&(segment + 1).to_be_bytes());
+            net_body.extend_from_slice(&(segment + 2).to_be_bytes());
+            net_body.extend_from_slice(&[1, 2, 3, 0, 0, 4]);
+            for bits in [1_u32, 2, 3, 4, 5, 6] {
+                net_body.extend_from_slice(&bits.to_be_bytes());
+            }
+            for value in [7_u16, 8, 9, 10, 11, 12, 13] {
+                net_body.extend_from_slice(&value.to_be_bytes());
+            }
+            net_body.extend_from_slice(&[14, 0x12, 0x34]);
+        }
         let opaque_tail = [0xaa, 0xbb, 0xcc, 0xdd];
         net_body.extend_from_slice(&opaque_tail);
         manager.serialized_object_graph.extend_from_slice(&net_body);
@@ -11521,6 +11627,29 @@ mod manager_boundary_tests {
             &manager.serialized_object_graph[edited_environment_end..],
             original_segment_record_tail
         );
+        let (records, records_end) = manager.decode_net_segment_records_prefix(Some(0))?;
+        assert_eq!(records.records().len(), 30);
+        assert_eq!(records.records()[0].index, 475);
+        assert_eq!(records.records()[0].build_index, 1);
+        assert_eq!(records.records()[0].lanes, 0x010203);
+        assert_eq!(records.encode().len(), 30 * 55);
+        let original_guide_table_tail = manager.serialized_object_graph[records_end..].to_vec();
+        let mut records_editor = records.into_editor();
+        records_editor.records_mut()[0].build_index = 0x1122_3344;
+        records_editor.records_mut()[0].lanes = 0x0a_0b_0c;
+        let replacement_records_len = records_editor.encode()?.len();
+        assert_eq!(replacement_records_len, 30 * 55);
+        manager.replace_net_segment_records(&records_editor, Some(0))?;
+        let (edited_records, edited_records_end) =
+            manager.decode_net_segment_records_prefix(Some(0))?;
+        assert_eq!(edited_records.records()[0].build_index, 0x1122_3344);
+        assert_eq!(edited_records.records()[0].lanes, 0x0a_0b_0c);
+        assert_eq!(edited_records_end, records_end);
+        assert_eq!(edited_records.encode().len(), replacement_records_len);
+        assert_eq!(
+            &manager.serialized_object_graph[edited_records_end..],
+            original_guide_table_tail
+        );
 
         let graph_after_problem_edit = manager.serialized_object_graph.clone();
         assert!(
@@ -11556,6 +11685,14 @@ mod manager_boundary_tests {
             manager.serialized_object_graph,
             graph_after_environment_edit
         );
+
+        let graph_after_records_edit = manager.serialized_object_graph.clone();
+        assert!(
+            manager
+                .replace_net_segment_records(&records_editor, Some(0))
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph, graph_after_records_edit);
 
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_net_segment_flags(&editor, Some(0)).is_err());
