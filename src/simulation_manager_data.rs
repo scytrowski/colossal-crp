@@ -4231,6 +4231,7 @@ impl SimulationManagerData {
     /// The editor must match this stream's inner version and original tail
     /// bytes. Only the fixed-width wetness and name-modification fields are
     /// writable; object headers and adjusted-segment data remain byte-exact.
+    /// The same-length replacement keeps the queued-object boundary fixed.
     pub fn replace_net_manager_tail(
         &mut self,
         edited: &NetManagerTailEditor,
@@ -4262,37 +4263,21 @@ impl SimulationManagerData {
             ));
         }
 
-        let mut candidate_graph = self.serialized_object_graph.clone();
-        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
-        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
-        let validation =
-            (|| {
-                let (decoded, actual_end) =
-                    self.decode_net_manager_tail_prefix(save_app_version)?;
-                let expected_end = body_start.checked_add(replacement.len()).ok_or(
-                    CrpError::ArithmeticOverflow("NetManager tail replacement end"),
-                )?;
-                if actual_end != expected_end {
-                    return Err(invalid(
-                        actual_end,
-                        "rewritten NetManager tail has an unexpected boundary",
-                    ));
-                }
-                if decoded.encode() != replacement {
-                    return Err(invalid(
-                        body_start,
-                        "rewritten NetManager tail bytes do not match the editor",
-                    ));
-                }
-                Ok(())
-            })();
-        if let Err(error) = validation {
-            self.serialized_object_graph = original_graph;
+        let current_range = self
+            .serialized_object_graph
+            .get(body_start..body_end)
+            .ok_or_else(|| invalid(body_start, "NetManager tail range is outside the graph"))?;
+        if current_range != source_bytes {
             return Err(invalid(
                 body_start,
-                format!("rewritten NetManager tail failed validation: {error}"),
+                "NetManager tail changed while preparing the replacement",
             ));
         }
+        let target = self
+            .serialized_object_graph
+            .get_mut(body_start..body_end)
+            .ok_or_else(|| invalid(body_start, "NetManager tail range is outside the graph"))?;
+        target.copy_from_slice(&replacement);
         Ok(())
     }
 
@@ -11883,7 +11868,14 @@ mod manager_boundary_tests {
         net_body.extend_from_slice(&[0, 0, 0, 0]); // No guide or milestone references.
         write_encoded_ushort_array(&mut net_body, &vec![0; 30]); // One index per active segment.
         net_body.extend_from_slice(&[0, 1, 0x80, 0, 1, 0xc1]); // One prefab name: "A".
+        let mut tail_bytes = vec![0xff; 18]; // Null guide-state objects in fixed-field order.
+        tail_bytes.extend_from_slice(&[7, 8]); // Maximum wetness counters.
+        tail_bytes.extend_from_slice(&[1, 2, 3]); // Name-modification count.
+        tail_bytes.extend_from_slice(&[0, 0, 0]); // Empty adjusted-segment array.
+        tail_bytes.extend_from_slice(&[0, 6]); // NetManager profiler end reference.
         let opaque_tail = [0xaa, 0xbb, 0xcc, 0xdd];
+        let original_table_tail = [tail_bytes.as_slice(), opaque_tail.as_slice()].concat();
+        net_body.extend_from_slice(&tail_bytes);
         net_body.extend_from_slice(&opaque_tail);
         manager.serialized_object_graph.extend_from_slice(&net_body);
 
@@ -12081,7 +12073,7 @@ mod manager_boundary_tests {
         assert_eq!(info_table.names(), &[Some("A".to_owned())]);
         assert_eq!(
             &manager.serialized_object_graph[info_end..],
-            opaque_tail.as_slice()
+            original_table_tail.as_slice()
         );
         let original_info_len = info_table.encode().len();
         let mut info_editor = info_table.into_editor();
@@ -12099,8 +12091,44 @@ mod manager_boundary_tests {
         assert!(edited_info.encode().len() > original_info_len);
         assert_eq!(
             &manager.serialized_object_graph[edited_info_end..],
+            original_table_tail.as_slice()
+        );
+
+        let (tail, tail_end) = manager.decode_net_manager_tail_prefix(Some(0))?;
+        assert_eq!(tail.max_wetness(), (7, 8));
+        assert_eq!(tail.name_modified_count(), 0x01_02_03);
+        assert_eq!(tail.adjusted_segments(), &[]);
+        assert_eq!(
+            &manager.serialized_object_graph[tail_end..],
             opaque_tail.as_slice()
         );
+        let tail_source = tail.encode();
+        let tail_start =
+            tail_end
+                .checked_sub(tail_source.len())
+                .ok_or(crate::CrpError::ArithmeticOverflow(
+                    "test NetManager tail start",
+                ))?;
+        let graph_length_before_tail_edit = manager.serialized_object_graph.len();
+        let mut tail_editor = tail.into_editor();
+        tail_editor.set_max_wetness(0x12, 0x34)?;
+        tail_editor.set_name_modified_count(0x05_06_07)?;
+        let edited_tail_bytes = tail_editor.encode()?;
+        manager.replace_net_manager_tail(&tail_editor, Some(0))?;
+        assert_eq!(
+            manager.serialized_object_graph.len(),
+            graph_length_before_tail_edit
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[tail_start..tail_end],
+            edited_tail_bytes.as_slice()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[tail_end..],
+            opaque_tail.as_slice()
+        );
+        let mut edited_table_tail = edited_tail_bytes;
+        edited_table_tail.extend_from_slice(&opaque_tail);
 
         let graph_after_problem_edit = manager.serialized_object_graph.clone();
         assert!(
@@ -12162,13 +12190,13 @@ mod manager_boundary_tests {
         assert!(tree_table.names().is_empty());
         assert_eq!(
             &manager.serialized_object_graph[tree_end..],
-            opaque_tail.as_slice()
+            edited_table_tail.as_slice()
         );
         let tree_editor = tree_table.into_editor();
         manager.replace_net_tree_prefab(&tree_editor, Some(0))?;
         assert_eq!(
             &manager.serialized_object_graph[tree_end..],
-            opaque_tail.as_slice()
+            edited_table_tail.as_slice()
         );
 
         let (fence_tables, fence_end) = manager.decode_net_fence_prefab_prefix(Some(0))?;
@@ -12176,13 +12204,13 @@ mod manager_boundary_tests {
         assert!(fence_tables.right_indices().is_empty());
         assert_eq!(
             &manager.serialized_object_graph[fence_end..],
-            opaque_tail.as_slice()
+            edited_table_tail.as_slice()
         );
         let fence_editor = fence_tables.into_editor();
         manager.replace_net_fence_prefab(&fence_editor, Some(0))?;
         assert_eq!(
             &manager.serialized_object_graph[fence_end..],
-            opaque_tail.as_slice()
+            edited_table_tail.as_slice()
         );
         Ok(())
     }
