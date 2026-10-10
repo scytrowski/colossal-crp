@@ -29,6 +29,7 @@ mod simulation_metadata;
 mod statistics_manager_data;
 mod terrain_manager_data;
 mod texture;
+mod transfer_manager_data;
 mod tree_manager_data;
 mod unlock_manager_data;
 mod vehicle_manager_data;
@@ -113,6 +114,7 @@ pub use statistics_manager_data::{
 };
 pub use terrain_manager_data::TerrainManagerData;
 pub use texture::TextureAsset;
+pub use transfer_manager_data::{TransferManagerData, TransferManagerEditor, TransferOffer};
 pub use tree_manager_data::{
     BurningTreeRecord, TreeInstanceRecord, TreeManagerDataPrefix, TreeManagerEditor,
 };

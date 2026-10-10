@@ -49,6 +49,7 @@ use crate::statistics_manager_data::{
     StatisticArrayReferences, StatisticInt32Editor, StatisticInt64Editor, StatisticsManagerData,
     StatisticsManagerEditor,
 };
+use crate::transfer_manager_data::{TransferManagerData, TransferManagerEditor};
 use crate::unlock_manager_data::UnlockManagerReferences;
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
@@ -2203,6 +2204,76 @@ impl SimulationManagerData {
             ));
         }
         Ok(())
+    }
+
+    /// Decodes TransferManager's versioned amount, count, and offer columns.
+    ///
+    /// Supports inner versions 37 and newer. The body must end in its
+    /// two-byte profiler reference immediately before NaturalResourceManager.
+    /// Offer counts retain their serialized order; the trailing reference is
+    /// preserved but not resolved against the shared-string table.
+    pub fn decode_transfer_manager_data(&self) -> Result<TransferManagerData, CrpError> {
+        let field_range = self.transfer_manager_field_range()?;
+        let bytes = self
+            .serialized_object_graph
+            .get(field_range)
+            .ok_or_else(|| invalid(0, "TransferManager body range exceeds manager graph"))?;
+        TransferManagerData::decode(self.format_version, bytes)
+    }
+
+    /// Replaces TransferManager's amount values, reason-count distribution,
+    /// and existing offer fields. The edited body may change length; the
+    /// following manager bytes are retained and the new boundary is checked.
+    pub fn replace_transfer_manager_data(
+        &mut self,
+        edited: &TransferManagerEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited TransferManager version does not match this stream",
+            ));
+        }
+        let field_range = self.transfer_manager_field_range()?;
+        let current = self
+            .serialized_object_graph
+            .get(field_range.clone())
+            .ok_or_else(|| invalid(0, "TransferManager body range exceeds manager graph"))?;
+        if current != edited.original_bytes() {
+            return Err(invalid(
+                field_range.start,
+                "TransferManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(field_range.clone(), replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        if let Err(error) = self.decode_transfer_manager_data() {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                field_range.start,
+                format!("edited TransferManager fields failed boundary validation: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn transfer_manager_field_range(&self) -> Result<Range<usize>, CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
+        expect_manager_type(
+            self.manager_objects.as_deref(),
+            9,
+            "NaturalResourceManager+Data",
+        )?;
+        let (body_start, next_tag_start) = self.manager_body_boundary(8)?;
+        if body_start > next_tag_start {
+            return Err(invalid(
+                body_start,
+                "TransferManager body range is reversed",
+            ));
+        }
+        Ok(body_start..next_tag_start)
     }
 
     fn audio_manager_field_range(&self) -> Result<Range<usize>, CrpError> {
@@ -12686,6 +12757,46 @@ mod manager_boundary_tests {
         manager
     }
 
+    fn transfer_manager_with_noncanonical_counts() -> SimulationManagerData {
+        let mut graph = profiler_tag("TransferManager");
+        graph.extend_from_slice(&vec![0; 128 * 8]);
+        let mut counts = vec![0_u16; 128 * 16];
+        counts[0] = 1;
+        for chunk in counts.chunks(64) {
+            graph.push((chunk.len() - 1) as u8);
+            for count in chunk {
+                graph.extend_from_slice(&count.to_be_bytes());
+            }
+        }
+        graph.extend_from_slice(&[
+            0, 1, // Active offer.
+            0, 0, // Not excluded.
+            0, 6, // Priority.
+            0, 7, // Amount.
+            0, 8, // X.
+            0, 9, // Z.
+            0, 10, // Instance type.
+            0, 0, 0, 0, 1, // Instance index.
+            0x12, 0x34, // Closing profiler reference.
+        ]);
+        graph.extend(profiler_tag("NaturalResourceManager"));
+        graph.extend_from_slice(&[0xaa, 0xbb]);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 111_004;
+        let mut references = vec![None; 10];
+        references[8] = Some(ManagerObjectReference {
+            object_id: 8,
+            type_name: "TransferManager+Data, Assembly-CSharp".to_owned(),
+        });
+        references[9] = Some(ManagerObjectReference {
+            object_id: 9,
+            type_name: "NaturalResourceManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(references);
+        manager
+    }
+
     #[test]
     fn info_manager_mask_decodes_and_replaces_at_versioned_boundary() {
         for (version, original, replacement) in [
@@ -12818,6 +12929,50 @@ mod manager_boundary_tests {
         let stale_editor = stale.decode_audio_manager_data().unwrap().into_editor();
         stale.serialized_object_graph[body_start + 14] ^= 1;
         assert!(stale.replace_audio_manager_data(&stale_editor).is_err());
+    }
+
+    #[test]
+    fn transfer_manager_replacement_resizes_body_and_preserves_following_manager() {
+        let mut manager = transfer_manager_with_noncanonical_counts();
+        let natural_tag = profiler_tag("NaturalResourceManager");
+        let natural_start = manager
+            .serialized_object_graph
+            .windows(natural_tag.len())
+            .position(|window| window == natural_tag)
+            .unwrap();
+        let following_bytes = manager.serialized_object_graph[natural_start..].to_vec();
+        let original_len = manager.serialized_object_graph.len();
+
+        let mut edited = manager
+            .decode_transfer_manager_data()
+            .unwrap()
+            .into_editor();
+        assert_eq!(edited.reason_counts().len(), 128 * 16);
+        edited.reason_counts_mut()[0] = 0;
+        edited.reason_counts_mut()[1] = 1;
+        assert!(
+            edited.encode().unwrap().len() < natural_start - profiler_tag("TransferManager").len()
+        );
+        manager.replace_transfer_manager_data(&edited).unwrap();
+
+        assert!(manager.serialized_object_graph.len() < original_len);
+        assert!(manager.serialized_object_graph.ends_with(&following_bytes));
+        let decoded = manager.decode_transfer_manager_data().unwrap();
+        assert_eq!(decoded.reason_counts()[0], 0);
+        assert_eq!(decoded.reason_counts()[1], 1);
+        assert_eq!(decoded.offers().len(), 1);
+
+        let mut stale_manager = transfer_manager_with_noncanonical_counts();
+        let stale_editor = stale_manager
+            .decode_transfer_manager_data()
+            .unwrap()
+            .into_editor();
+        stale_manager.serialized_object_graph[profiler_tag("TransferManager").len()] ^= 1;
+        assert!(
+            stale_manager
+                .replace_transfer_manager_data(&stale_editor)
+                .is_err()
+        );
     }
 
     #[test]
