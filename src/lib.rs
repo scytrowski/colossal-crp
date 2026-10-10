@@ -3800,6 +3800,13 @@ mod tests {
             (111_000, &[0x12, 0x34][..], None, 0x1234, 100),
             (111_012, &[0x12, 0x34][..], Some(77), 0x1234, 77),
             (
+                121_010,
+                &[0x12, 0x34, 0x56, 0x78][..],
+                Some(77),
+                0x1234_5678,
+                77,
+            ),
+            (
                 113_001,
                 &[0x12, 0x34, 0x56, 0x78][..],
                 Some(77),
@@ -3864,7 +3871,62 @@ mod tests {
             assert!(PathManagerData::decode_prefix(116_020, &fixture[..cut]).is_err());
         }
         assert!(PathManagerData::decode_prefix(116_020, &body[..body.len() - 1]).is_err());
-        assert!(PathManagerData::decode_prefix(121_011, fixture).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn path_manager_uses_ushort_simulation_flags_from_version_121011() -> Result<(), CrpError> {
+        // Independent UShort stream: 262142 zero flags, then one 0x0100 flag.
+        let mut body = vec![0xff; 2_047];
+        body.push(0xfd);
+        body.extend_from_slice(&[0, 1, 0]);
+        let flag_bytes = body.clone();
+        body.extend_from_slice(&[
+            2, 3, // Path-finding and lane-type flags.
+            0, 0, 0, 4, // Four-byte vehicle-type mask.
+            0, // Empty path-position list.
+            0, 0, 5, // Next path-unit index.
+            0, 0, 0, 6, // Build index.
+            0x3f, 0xc0, 0, 0,  // Length = 1.5.
+            77, // Serialized speed.
+        ]);
+
+        let (decoded, used) = PathManagerData::decode_prefix(121_011, &body)?;
+        assert_eq!(used, body.len());
+        assert_eq!(decoded.simulation_flags().len(), 262_143);
+        assert_eq!(decoded.simulation_flags().last(), Some(&0x0100));
+        assert_eq!(decoded.active_units().len(), 1);
+        let unit = &decoded.active_units()[0];
+        assert_eq!(unit.index, 262_143);
+        assert_eq!(unit.simulation_flags, 0x0100);
+        assert_eq!(unit.vehicle_types, 4);
+        assert_eq!(unit.next_path_unit, 5);
+        assert_eq!(unit.build_index, 6);
+        assert_eq!(unit.length, 1.5);
+        assert_eq!(unit.speed, 77);
+        assert_eq!(decoded.encode(), body);
+
+        let mut editor = decoded.into_editor();
+        editor
+            .speeds_mut()
+            .ok_or_else(|| CrpError::InvalidAssetPayload {
+                name: "PathManager+Data test".to_owned(),
+                offset: 0,
+                reason: "version 121011 should serialize speed".to_owned(),
+            })?[0] = 88;
+        let mut expected = body;
+        *expected
+            .last_mut()
+            .ok_or_else(|| CrpError::InvalidAssetPayload {
+                name: "PathManager+Data test".to_owned(),
+                offset: 0,
+                reason: "synthetic path body should contain a speed byte".to_owned(),
+            })? = 88;
+        assert_eq!(editor.encode()?, expected);
+        assert_eq!(&expected[..flag_bytes.len()], flag_bytes);
+        assert!(
+            PathManagerData::decode_prefix(121_011, &expected[..flag_bytes.len() - 1]).is_err()
+        );
         Ok(())
     }
 

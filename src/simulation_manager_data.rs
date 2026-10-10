@@ -2786,7 +2786,7 @@ impl SimulationManagerData {
     }
 
     /// Decodes the fifth queued manager body and returns the graph offset
-    /// following its closing profiler tag. Requires inner versions 164–121010.
+    /// following its closing profiler tag. Requires inner version 164 or newer.
     pub fn decode_path_prefix(&self) -> Result<(PathManagerData, usize), CrpError> {
         let Some(Some(path)) = self
             .manager_objects

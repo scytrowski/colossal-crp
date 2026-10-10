@@ -1,6 +1,6 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::read_encoded_byte_array;
+use crate::encoded_array::{read_encoded_byte_array, read_encoded_ushort_array};
 use std::ops::Range;
 
 const PATH_UNIT_COUNT: usize = 262_144;
@@ -23,8 +23,9 @@ pub struct PathPosition {
 pub struct PathUnit {
     /// One-based index in the game's fixed path-unit buffer.
     pub index: u32,
-    /// Raw simulation flags from the encoded array.
-    pub simulation_flags: u8,
+    /// Simulation flags widened from their byte form, or raw UShort value from
+    /// inner version 121011 onward.
+    pub simulation_flags: u16,
     /// Pathfinding state flags.
     pub path_find_flags: u8,
     /// Lane type flags.
@@ -50,7 +51,7 @@ pub struct PathUnit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathManagerData {
     format_version: u32,
-    simulation_flags: Vec<u8>,
+    simulation_flags: Vec<u16>,
     active_units: Vec<PathUnit>,
     path_find_flag_ranges: Vec<Range<usize>>,
     lane_type_ranges: Vec<Range<usize>>,
@@ -79,21 +80,27 @@ pub struct PathManagerEditor {
 }
 
 impl PathManagerData {
-    /// Decodes an inner-version-164+ body below version 121011 and its length.
+    /// Decodes an inner-version-164+ body and its length.
     ///
-    /// These versions store 262143 flags through `EncodedArray.Byte`. Later
-    /// versions changed the flag array to `EncodedArray.UShort` and return an
-    /// unsupported-version error here. Truncation and invalid position counts
-    /// return errors without indexing beyond the input.
+    /// Versions 164–121010 store 262143 flags through `EncodedArray.Byte`;
+    /// versions 121011 and newer use `EncodedArray.UShort`. Truncation and
+    /// invalid position counts return errors without indexing beyond input.
     pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
-        if !(164..USHORT_FLAGS_VERSION).contains(&format_version) {
+        if format_version < 164 {
             return Err(invalid(
                 0,
                 format!("unsupported PathManager inner version {format_version}"),
             ));
         }
         let mut reader = Reader::new(bytes);
-        let simulation_flags = read_encoded_byte_array(&mut reader, PATH_UNIT_COUNT - 1)?;
+        let simulation_flags = if format_version >= USHORT_FLAGS_VERSION {
+            read_encoded_ushort_array(&mut reader, PATH_UNIT_COUNT - 1)?
+        } else {
+            read_encoded_byte_array(&mut reader, PATH_UNIT_COUNT - 1)?
+                .into_iter()
+                .map(u16::from)
+                .collect()
+        };
         let mut active_units = Vec::new();
         let mut path_find_flag_ranges = Vec::new();
         let mut lane_type_ranges = Vec::new();
@@ -186,8 +193,8 @@ impl PathManagerData {
         self.format_version
     }
 
-    /// Returns all one-based path-unit flags in buffer order.
-    pub fn simulation_flags(&self) -> &[u8] {
+    /// Returns all one-based path-unit flags widened to `u16` in buffer order.
+    pub fn simulation_flags(&self) -> &[u16] {
         &self.simulation_flags
     }
 
