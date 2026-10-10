@@ -504,6 +504,197 @@ impl CitizenInstanceDataPrefix {
     }
 }
 
+const CITIZEN_MANAGER_END_REFERENCE_LEN: usize = 2;
+const OLDEST_RESIDENTS_VERSION: u32 = 169;
+const FULLY_EDUCATED_RESIDENTS_VERSION: u32 = 179;
+
+/// The decoded CitizenManager prefixes, opaque instance section, and tail counters.
+///
+/// Citizen flags and sparse columns, version 69+ unit records, and the
+/// versioned instance flags/prefab scope are decoded. The active per-instance
+/// fields remain a raw byte section because their field ordering and conditional
+/// layouts are not yet modeled. The two-byte profiler reference and counters
+/// are retained. `encode` reproduces the complete bounded manager body exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CitizenManagerData {
+    format_version: u32,
+    citizen_prefix: CitizenManagerDataPrefix,
+    unit_prefix: CitizenUnitDataPrefix,
+    instance_prefix: CitizenInstanceDataPrefix,
+    instance_fields: Vec<u8>,
+    oldest_original_residents: Option<[i16; 2]>,
+    fully_educated_original_residents: Option<i32>,
+    end_profiler_reference: [u8; 2],
+    original_body: Vec<u8>,
+}
+
+impl CitizenManagerData {
+    /// Decodes the known CitizenManager sections from one bounded manager body.
+    ///
+    /// Supports the version 69+ unit-reference layout. The active
+    /// CitizenInstance records stay opaque, but their byte range is isolated
+    /// using the versioned counter widths and the closing two-byte profiler
+    /// reference. Truncated prefixes or tails return errors.
+    pub fn decode(format_version: u32, bytes: &[u8]) -> Result<Self, CrpError> {
+        let (citizen_prefix, citizen_len) =
+            CitizenManagerDataPrefix::decode_prefix(format_version, bytes)?;
+        let unit_bytes = bytes
+            .get(citizen_len..)
+            .ok_or_else(|| invalid(citizen_len, "CitizenManager citizen prefix exceeds body"))?;
+        let (unit_prefix, unit_len) =
+            CitizenUnitDataPrefix::decode_prefix(format_version, unit_bytes)?;
+        let instance_start =
+            citizen_len
+                .checked_add(unit_len)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager instance start",
+                ))?;
+        let instance_bytes = bytes
+            .get(instance_start..)
+            .ok_or_else(|| invalid(instance_start, "CitizenManager unit prefix exceeds body"))?;
+        let (instance_prefix, instance_prefix_len) =
+            CitizenInstanceDataPrefix::decode_prefix(format_version, instance_bytes)?;
+        let instance_fields_start =
+            instance_start
+                .checked_add(instance_prefix_len)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager instance fields start",
+                ))?;
+
+        let oldest_counter_len: usize = if format_version >= OLDEST_RESIDENTS_VERSION {
+            4
+        } else {
+            0
+        };
+        let educated_counter_len: usize = if format_version >= FULLY_EDUCATED_RESIDENTS_VERSION {
+            4
+        } else {
+            0
+        };
+        let trailing_counter_len = oldest_counter_len.checked_add(educated_counter_len).ok_or(
+            CrpError::ArithmeticOverflow("CitizenManager counter length"),
+        )?;
+        let end_reference_start = bytes
+            .len()
+            .checked_sub(CITIZEN_MANAGER_END_REFERENCE_LEN)
+            .ok_or_else(|| {
+                invalid(
+                    bytes.len(),
+                    "CitizenManager closing profiler reference is truncated",
+                )
+            })?;
+        let counter_start = end_reference_start
+            .checked_sub(trailing_counter_len)
+            .ok_or_else(|| {
+                invalid(
+                    end_reference_start,
+                    "CitizenManager trailing counters are truncated",
+                )
+            })?;
+        if instance_fields_start > counter_start {
+            return Err(invalid(
+                instance_fields_start,
+                "CitizenManager prefixes overlap the trailing counters",
+            ));
+        }
+
+        let mut tail_reader = Reader::new(
+            bytes
+                .get(counter_start..end_reference_start)
+                .ok_or_else(|| invalid(counter_start, "CitizenManager counter range is invalid"))?,
+        );
+        let oldest_original_residents = if format_version >= OLDEST_RESIDENTS_VERSION {
+            Some([tail_reader.read_i16_be()?, tail_reader.read_i16_be()?])
+        } else {
+            None
+        };
+        let fully_educated_original_residents =
+            if format_version >= FULLY_EDUCATED_RESIDENTS_VERSION {
+                Some(tail_reader.read_i32_be()?)
+            } else {
+                None
+            };
+        if tail_reader.remaining() != 0 {
+            return Err(invalid(
+                counter_start,
+                "CitizenManager counter width is inconsistent",
+            ));
+        }
+        let end_profiler_reference: [u8; 2] = bytes
+            .get(end_reference_start..)
+            .ok_or_else(|| {
+                invalid(
+                    end_reference_start,
+                    "CitizenManager profiler reference is truncated",
+                )
+            })?
+            .try_into()
+            .map_err(|_| {
+                invalid(
+                    end_reference_start,
+                    "CitizenManager profiler reference width is not two bytes",
+                )
+            })?;
+
+        Ok(Self {
+            format_version,
+            citizen_prefix,
+            unit_prefix,
+            instance_prefix,
+            instance_fields: bytes[instance_fields_start..counter_start].to_vec(),
+            oldest_original_residents,
+            fully_educated_original_residents,
+            end_profiler_reference,
+            original_body: bytes.to_vec(),
+        })
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns decoded citizen flags and sparse columns.
+    pub fn citizens(&self) -> &CitizenManagerDataPrefix {
+        &self.citizen_prefix
+    }
+
+    /// Returns decoded version 69+ citizen-unit data.
+    pub fn units(&self) -> &CitizenUnitDataPrefix {
+        &self.unit_prefix
+    }
+
+    /// Returns the decoded instance-flag and prefab scope prefix.
+    pub fn instance_prefix(&self) -> &CitizenInstanceDataPrefix {
+        &self.instance_prefix
+    }
+
+    /// Returns active CitizenInstance bytes that are not yet semantically decoded.
+    pub fn opaque_instance_fields(&self) -> &[u8] {
+        &self.instance_fields
+    }
+
+    /// Returns the two original-resident counters from version 169.
+    pub fn oldest_original_residents(&self) -> Option<[i16; 2]> {
+        self.oldest_original_residents
+    }
+
+    /// Returns the fully-educated original-resident count from version 179.
+    pub fn fully_educated_original_residents(&self) -> Option<i32> {
+        self.fully_educated_original_residents
+    }
+
+    /// Returns the original two-byte closing profiler reference.
+    pub fn end_profiler_reference(&self) -> [u8; 2] {
+        self.end_profiler_reference
+    }
+
+    /// Reproduces the complete source manager body unchanged.
+    pub fn encode(&self) -> Vec<u8> {
+        self.original_body.clone()
+    }
+}
+
 fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "CitizenManager+Data".to_owned(),
@@ -514,7 +705,10 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CitizenInstanceDataPrefix, CitizenManagerDataPrefix, CitizenUnitDataPrefix};
+    use super::{
+        CitizenInstanceDataPrefix, CitizenManagerData, CitizenManagerDataPrefix,
+        CitizenUnitDataPrefix,
+    };
 
     fn byte_array(values: &[u8]) -> Vec<u8> {
         let mut bytes = vec![(values.len() - 1) as u8];
@@ -546,6 +740,40 @@ mod tests {
         if remainder > 0 {
             bytes.push((0x7f + remainder) as u8);
         }
+    }
+
+    fn append_zero_ushort_array(bytes: &mut Vec<u8>, count: usize) {
+        for _ in 0..count / 128 {
+            bytes.push(0xff);
+        }
+        let remainder = count % 128;
+        if remainder > 0 {
+            bytes.push((0x7f + remainder) as u8);
+        }
+    }
+
+    fn empty_manager_body(format_version: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        append_zero_uint_array(&mut bytes, 1_048_575);
+        append_zero_ushort_array(&mut bytes, 524_287);
+        if format_version >= 44 {
+            let flag_count = if format_version >= 204 {
+                65_535
+            } else {
+                32_767
+            };
+            append_zero_uint_array(&mut bytes, flag_count);
+            bytes.extend_from_slice(&[0, 0]); // empty BuildingInfo prefab names
+        }
+        if format_version >= 169 {
+            bytes.extend_from_slice(&(-2_i16).to_be_bytes());
+            bytes.extend_from_slice(&0x0102_i16.to_be_bytes());
+        }
+        if format_version >= 179 {
+            bytes.extend_from_slice(&(-100_i32).to_be_bytes());
+        }
+        bytes.extend_from_slice(&[0x12, 0x34]);
+        bytes
     }
 
     #[test]
@@ -772,5 +1000,40 @@ mod tests {
             CitizenInstanceDataPrefix::decode_prefix_with_count(44, Some(3), &missing_name)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn manager_tail_counters_follow_169_and_179_gates() {
+        let oldest_residents = [-2, 0x0102];
+        for (version, expected_oldest, expected_educated) in [
+            (168, None, None),
+            (169, Some(oldest_residents), None),
+            (178, Some(oldest_residents), None),
+            (179, Some(oldest_residents), Some(-100)),
+        ] {
+            let bytes = empty_manager_body(version);
+            let decoded = CitizenManagerData::decode(version, &bytes)
+                .unwrap_or_else(|error| panic!("version {version}: {error}"));
+            assert_eq!(decoded.oldest_original_residents(), expected_oldest);
+            assert_eq!(
+                decoded.fully_educated_original_residents(),
+                expected_educated
+            );
+            assert!(decoded.opaque_instance_fields().is_empty());
+            assert_eq!(decoded.end_profiler_reference(), [0x12, 0x34]);
+            assert_eq!(decoded.encode(), bytes);
+        }
+    }
+
+    #[test]
+    fn manager_rejects_truncated_counter_and_profiler_tail() {
+        let bytes = empty_manager_body(179);
+        for missing in 1..=10 {
+            let truncated = &bytes[..bytes.len() - missing];
+            assert!(
+                CitizenManagerData::decode(179, truncated).is_err(),
+                "accepted body missing {missing} tail bytes"
+            );
+        }
     }
 }

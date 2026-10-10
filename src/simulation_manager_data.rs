@@ -22,7 +22,7 @@ use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
 use crate::audio_manager_data::{AudioManagerData, AudioManagerEditor};
 use crate::citizen_manager_data::{
-    CitizenInstanceDataPrefix, CitizenManagerDataPrefix, CitizenUnitDataPrefix,
+    CitizenInstanceDataPrefix, CitizenManagerData, CitizenManagerDataPrefix, CitizenUnitDataPrefix,
 };
 use crate::data_serializer::{
     COMPACT_STRING_FLAG, DataSerializerStream, Reader, write_nullable_unique_string, write_u24_be,
@@ -5314,6 +5314,23 @@ impl SimulationManagerData {
                 "CitizenManager instance prefix end",
             ))?;
         Ok((instances, graph_end))
+    }
+
+    /// Decodes all known CitizenManager prefixes and tail counters at slot 7.
+    /// Active instance fields remain available as an opaque byte section. The
+    /// body boundary is checked against TransferManager at slot 8, and the
+    /// complete source body can be reproduced unchanged with `encode`.
+    pub fn decode_citizen_manager_data(&self) -> Result<(CitizenManagerData, usize), CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 7, "CitizenManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
+
+        let (body_start, manager_end) = self.manager_body_boundary(7)?;
+        let body = self
+            .serialized_object_graph
+            .get(body_start..manager_end)
+            .ok_or_else(|| invalid(body_start, "CitizenManager body range is invalid"))?;
+        let data = CitizenManagerData::decode(self.format_version, body)?;
+        Ok((data, manager_end))
     }
 
     /// Decodes the known VehicleManager fields through its versioned counters.
@@ -18133,6 +18150,73 @@ mod manager_boundary_tests {
         assert_eq!(end, instance_end);
         assert_eq!(manager.serialized_object_graph()[end], 0x88);
         assert!(manager.serialized_object_graph()[end + 3..].starts_with(&transfer_tag));
+    }
+
+    #[test]
+    fn citizen_manager_full_reader_preserves_opaque_instances_and_decodes_tail() {
+        let mut graph = profiler_tag("CitizenManager");
+        for _ in 0..(1_048_575 / 128) {
+            graph.push(0xff);
+        }
+        graph.push(0xfe); // zero citizen flags
+        for _ in 0..(524_287 / 128) {
+            graph.push(0xff);
+        }
+        graph.push(0xfe); // zero citizen-unit flags
+
+        // One active instance, then zero flags through the full v204+ range.
+        graph.extend_from_slice(&[0, 0, 0, 0, 1]);
+        graph.extend_from_slice(&[0, 0, 0, 0, 0]);
+        graph.extend_from_slice(&[0, 0, 0, 0, 0]);
+        for _ in 0..(65_532 / 128) {
+            graph.push(0xff);
+        }
+        graph.push((0x7f + 65_532 % 128) as u8);
+        graph.extend_from_slice(&[0, 0, 1]); // one BuildingInfo index: zero
+        graph.extend_from_slice(&[0, 1, 0x80, 0, 1, 0xc1]); // one name: "A"
+        let instance_fields = [0xaa, 0xbb, 0xcc]; // intentionally opaque test bytes
+        graph.extend_from_slice(&instance_fields);
+        graph.extend_from_slice(&(-2_i16).to_be_bytes());
+        graph.extend_from_slice(&0x0102_i16.to_be_bytes());
+        graph.extend_from_slice(&1000_i32.to_be_bytes());
+        graph.extend_from_slice(&[0x12, 0x34]); // closing profiler reference
+        let body_end = graph.len();
+        let transfer_tag = profiler_tag("TransferManager");
+        graph.extend_from_slice(&transfer_tag);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 121_034;
+        let mut manager_objects = vec![None; 9];
+        manager_objects[7] = Some(ManagerObjectReference {
+            object_id: 7,
+            type_name: "CitizenManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[8] = Some(ManagerObjectReference {
+            object_id: 8,
+            type_name: "TransferManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let body_start = profiler_tag("CitizenManager").len();
+        let (decoded, end) = manager.decode_citizen_manager_data().unwrap();
+        assert_eq!(decoded.citizens().citizen_flags().len(), 1_048_575);
+        assert_eq!(decoded.units().unit_flags().len(), 524_287);
+        assert_eq!(
+            decoded.instance_prefix().instance_flags().unwrap().len(),
+            65_535
+        );
+        assert_eq!(decoded.instance_prefix().active_instances().len(), 1);
+        assert_eq!(decoded.instance_prefix().active_instances()[0].index(), 1);
+        assert_eq!(decoded.opaque_instance_fields(), instance_fields);
+        assert_eq!(decoded.oldest_original_residents(), Some([-2, 0x0102]));
+        assert_eq!(decoded.fully_educated_original_residents(), Some(1000));
+        assert_eq!(decoded.end_profiler_reference(), [0x12, 0x34]);
+        assert_eq!(
+            decoded.encode(),
+            manager.serialized_object_graph()[body_start..body_end]
+        );
+        assert_eq!(end, body_end);
+        assert!(manager.serialized_object_graph()[end..].starts_with(&transfer_tag));
     }
 
     #[test]
