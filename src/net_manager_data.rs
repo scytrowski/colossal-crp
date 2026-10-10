@@ -587,15 +587,18 @@ pub struct NetManagerTailPrefix {
     name_modified_count: u32,
     name_modified_count_offset: Option<usize>,
     adjusted_segments: Vec<u64>,
+    adjusted_segment_count_offset: Option<usize>,
+    adjusted_segment_array_offset: Option<usize>,
+    adjusted_segment_array_end: Option<usize>,
     profile_end_shared_string_index: Option<u16>,
     serialized_prefix: Vec<u8>,
 }
 
-/// Editor for fixed-width final NetManager counters.
+/// Editor for final NetManager counters and adjusted-segment words.
 ///
-/// It leaves object headers, adjusted-segment data, and the profiler end tag
-/// byte-exact. Since only fixed-width fields are editable, the prefix length
-/// and queued-object boundaries do not change.
+/// It leaves object headers and the profiler end tag byte-exact. Edited
+/// adjusted-segment data is rewritten with literal `EncodedArray.ULong`
+/// blocks, so its serialized length can change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetManagerTailEditor {
     format_version: u32,
@@ -604,6 +607,11 @@ pub struct NetManagerTailEditor {
     max_wetness_offset: Option<usize>,
     name_modified_count: u32,
     name_modified_count_offset: Option<usize>,
+    adjusted_segments: Vec<u64>,
+    original_adjusted_segments: Vec<u64>,
+    adjusted_segment_count_offset: Option<usize>,
+    adjusted_segment_array_offset: Option<usize>,
+    adjusted_segment_array_end: Option<usize>,
     original_prefix: Vec<u8>,
 }
 
@@ -3138,16 +3146,28 @@ impl NetManagerTailPrefix {
         } else {
             0
         };
-        let adjusted_segments = if format_version >= 321 {
+        let adjusted_segment_count_offset = if format_version >= 321 {
+            Some(reader.offset())
+        } else {
+            None
+        };
+        let adjusted_segments_count = if format_version >= 321 {
             let count = usize::try_from(read_segment_u24(&mut reader)?)
                 .map_err(|_| reader.invalid("adjusted-segment count does not fit platform"))?;
             if count > ADJUSTED_SEGMENT_WORDS {
                 return Err(reader.invalid("adjusted-segment count exceeds 576 words"));
             }
+            Some(count)
+        } else {
+            None
+        };
+        let adjusted_segment_array_offset = adjusted_segments_count.map(|_| reader.offset());
+        let adjusted_segments = if let Some(count) = adjusted_segments_count {
             read_encoded_ulong_array(&mut reader, count)?
         } else {
             Vec::new()
         };
+        let adjusted_segment_array_end = adjusted_segment_array_offset.map(|_| reader.offset());
         let profile_marker = reader.read_u8()?;
         let profile_end_shared_string_index = match profile_marker {
             0xff => return Err(reader.invalid("NetManager profiler end tag cannot be null")),
@@ -3173,6 +3193,9 @@ impl NetManagerTailPrefix {
                 name_modified_count,
                 name_modified_count_offset,
                 adjusted_segments,
+                adjusted_segment_count_offset,
+                adjusted_segment_array_offset,
+                adjusted_segment_array_end,
                 profile_end_shared_string_index,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
@@ -3224,6 +3247,11 @@ impl NetManagerTailPrefix {
             max_wetness_offset: self.max_wetness_offset,
             name_modified_count: self.name_modified_count,
             name_modified_count_offset: self.name_modified_count_offset,
+            adjusted_segments: self.adjusted_segments.clone(),
+            original_adjusted_segments: self.adjusted_segments,
+            adjusted_segment_count_offset: self.adjusted_segment_count_offset,
+            adjusted_segment_array_offset: self.adjusted_segment_array_offset,
+            adjusted_segment_array_end: self.adjusted_segment_array_end,
             original_prefix: self.serialized_prefix,
         }
     }
@@ -3266,7 +3294,19 @@ impl NetManagerTailEditor {
         Ok(())
     }
 
-    /// Encodes the edited counters while retaining every other source byte.
+    /// Returns mutable adjusted-segment words in their serialized order.
+    ///
+    /// The field is serialized from inner version 321. Encoding rejects more
+    /// than 576 words, matching the game's allocated array length.
+    pub fn adjusted_segments_mut(&mut self) -> &mut Vec<u64> {
+        &mut self.adjusted_segments
+    }
+
+    /// Encodes edits while retaining all unchanged source bytes.
+    ///
+    /// A changed adjusted-segment array uses literal `EncodedArray.ULong`
+    /// blocks and can change this prefix's length. An unchanged array retains
+    /// its original encoded representation.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut output = self.original_prefix.clone();
         if let Some(offset) = self.max_wetness_offset {
@@ -3296,6 +3336,62 @@ impl NetManagerTailEditor {
                 (self.name_modified_count >> 8) as u8,
                 self.name_modified_count as u8,
             ]);
+        }
+        if self.adjusted_segments != self.original_adjusted_segments {
+            let (Some(count_offset), Some(array_offset), Some(array_end)) = (
+                self.adjusted_segment_count_offset,
+                self.adjusted_segment_array_offset,
+                self.adjusted_segment_array_end,
+            ) else {
+                return Err(invalid(
+                    0,
+                    "adjusted-segment array is not serialized before inner version 321",
+                ));
+            };
+            if self.adjusted_segments.len() > ADJUSTED_SEGMENT_WORDS {
+                return Err(invalid(
+                    count_offset,
+                    "adjusted-segment count exceeds 576 words",
+                ));
+            }
+            let count_end = count_offset
+                .checked_add(3)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "NetManager adjusted-segment count end",
+                ))?;
+            if count_end > array_offset || array_offset > array_end {
+                return Err(invalid(
+                    count_offset,
+                    "NetManager adjusted-segment offsets are inconsistent",
+                ));
+            }
+            let suffix = output.get(array_end..).ok_or_else(|| {
+                invalid(
+                    array_end,
+                    "adjusted-segment array end is outside the source prefix",
+                )
+            })?;
+            let mut rebuilt = output
+                .get(..array_offset)
+                .ok_or_else(|| {
+                    invalid(
+                        array_offset,
+                        "adjusted-segment array start is outside the source prefix",
+                    )
+                })?
+                .to_vec();
+            let count_bytes = rebuilt.get_mut(count_offset..count_end).ok_or_else(|| {
+                invalid(
+                    count_offset,
+                    "adjusted-segment count is outside the source prefix",
+                )
+            })?;
+            let count = u32::try_from(self.adjusted_segments.len())
+                .map_err(|_| CrpError::ArithmeticOverflow("NetManager adjusted-segment count"))?;
+            count_bytes.copy_from_slice(&[(count >> 16) as u8, (count >> 8) as u8, count as u8]);
+            write_encoded_ulong_array(&mut rebuilt, &self.adjusted_segments);
+            rebuilt.extend_from_slice(suffix);
+            output = rebuilt;
         }
         Ok(output)
     }

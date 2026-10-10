@@ -2726,6 +2726,29 @@ mod tests {
             let edited = editor.encode()?;
             assert_eq!(edited, expected);
             assert_eq!(edited.len(), bytes[..used].len());
+            if version >= 321 {
+                editor.adjusted_segments_mut().pop();
+                let count_offset = header_count + 5;
+                let array_offset = count_offset + 3;
+                let original_array_end = array_offset + 17;
+                let mut resized_expected = expected[..array_offset].to_vec();
+                resized_expected[count_offset..count_offset + 3].copy_from_slice(&[0, 0, 1]);
+                resized_expected.push(0); // One EncodedArray.ULong literal.
+                resized_expected.extend_from_slice(&1_u64.to_be_bytes());
+                resized_expected.extend_from_slice(&expected[original_array_end..]);
+                let resized = editor.encode()?;
+                assert_eq!(resized, resized_expected);
+                assert_eq!(resized.len(), expected.len() - 8);
+                let (resized_tail, _) =
+                    NetManagerTailPrefix::decode_prefix(version, &counts, &resized)?;
+                assert_eq!(resized_tail.adjusted_segments(), &[1]);
+
+                editor.adjusted_segments_mut().resize(577, 0);
+                assert!(editor.encode().is_err());
+            } else {
+                editor.adjusted_segments_mut().push(1);
+                assert!(editor.encode().is_err());
+            }
         }
         let (counts, _) = NetGuideCountsPrefix::decode_prefix(164, &[0; 4])?;
         let mut mixed = vec![0xfe, 0xfe, 0x80, 0, 1, 0xc1, 0xfe, 0, 1, 0, 0, 5];

@@ -4226,12 +4226,14 @@ impl SimulationManagerData {
         Ok(tail.into_editor())
     }
 
-    /// Replaces the final NetManager counters without changing the queue layout.
+    /// Replaces final NetManager counters and adjusted-segment words.
     ///
     /// The editor must match this stream's inner version and original tail
-    /// bytes. Only the fixed-width wetness and name-modification fields are
-    /// writable; object headers and adjusted-segment data remain byte-exact.
-    /// The same-length replacement keeps the queued-object boundary fixed.
+    /// bytes. The wetness counters, name-modification count, and adjusted
+    /// segment words are writable; object headers and the profiler end tag
+    /// remain byte-exact.
+    /// Re-encoding adjusted segments can change the tail length, shifting later
+    /// queued bytes while preserving their order and contents.
     pub fn replace_net_manager_tail(
         &mut self,
         edited: &NetManagerTailEditor,
@@ -4256,13 +4258,6 @@ impl SimulationManagerData {
             ));
         }
         let replacement = edited.encode()?;
-        if replacement.len() != source_length {
-            return Err(invalid(
-                body_start,
-                "edited NetManager tail changed its serialized length",
-            ));
-        }
-
         let current_range = self
             .serialized_object_graph
             .get(body_start..body_end)
@@ -4273,11 +4268,8 @@ impl SimulationManagerData {
                 "NetManager tail changed while preparing the replacement",
             ));
         }
-        let target = self
-            .serialized_object_graph
-            .get_mut(body_start..body_end)
-            .ok_or_else(|| invalid(body_start, "NetManager tail range is outside the graph"))?;
-        target.copy_from_slice(&replacement);
+        self.serialized_object_graph
+            .splice(body_start..body_end, replacement.iter().copied());
         Ok(())
     }
 
@@ -11871,7 +11863,9 @@ mod manager_boundary_tests {
         let mut tail_bytes = vec![0xff; 18]; // Null guide-state objects in fixed-field order.
         tail_bytes.extend_from_slice(&[7, 8]); // Maximum wetness counters.
         tail_bytes.extend_from_slice(&[1, 2, 3]); // Name-modification count.
-        tail_bytes.extend_from_slice(&[0, 0, 0]); // Empty adjusted-segment array.
+        tail_bytes.extend_from_slice(&[0, 0, 2, 1]); // Two literal adjusted-segment words.
+        tail_bytes.extend_from_slice(&5_u64.to_be_bytes());
+        tail_bytes.extend_from_slice(&10_u64.to_be_bytes());
         tail_bytes.extend_from_slice(&[0, 6]); // NetManager profiler end reference.
         let opaque_tail = [0xaa, 0xbb, 0xcc, 0xdd];
         let original_table_tail = [tail_bytes.as_slice(), opaque_tail.as_slice()].concat();
@@ -12097,7 +12091,7 @@ mod manager_boundary_tests {
         let (tail, tail_end) = manager.decode_net_manager_tail_prefix(Some(0))?;
         assert_eq!(tail.max_wetness(), (7, 8));
         assert_eq!(tail.name_modified_count(), 0x01_02_03);
-        assert_eq!(tail.adjusted_segments(), &[]);
+        assert_eq!(tail.adjusted_segments(), &[5, 10]);
         assert_eq!(
             &manager.serialized_object_graph[tail_end..],
             opaque_tail.as_slice()
@@ -12113,18 +12107,25 @@ mod manager_boundary_tests {
         let mut tail_editor = tail.into_editor();
         tail_editor.set_max_wetness(0x12, 0x34)?;
         tail_editor.set_name_modified_count(0x05_06_07)?;
+        tail_editor.adjusted_segments_mut().pop();
         let edited_tail_bytes = tail_editor.encode()?;
+        let edited_tail_end = tail_start.checked_add(edited_tail_bytes.len()).ok_or(
+            crate::CrpError::ArithmeticOverflow("test edited NetManager tail end"),
+        )?;
+        let expected_graph_length = graph_length_before_tail_edit
+            .checked_sub(tail_source.len())
+            .and_then(|length| length.checked_add(edited_tail_bytes.len()))
+            .ok_or(crate::CrpError::ArithmeticOverflow(
+                "test edited NetManager graph length",
+            ))?;
         manager.replace_net_manager_tail(&tail_editor, Some(0))?;
+        assert_eq!(manager.serialized_object_graph.len(), expected_graph_length);
         assert_eq!(
-            manager.serialized_object_graph.len(),
-            graph_length_before_tail_edit
-        );
-        assert_eq!(
-            &manager.serialized_object_graph[tail_start..tail_end],
+            &manager.serialized_object_graph[tail_start..edited_tail_end],
             edited_tail_bytes.as_slice()
         );
         assert_eq!(
-            &manager.serialized_object_graph[tail_end..],
+            &manager.serialized_object_graph[edited_tail_end..],
             opaque_tail.as_slice()
         );
         let mut edited_table_tail = edited_tail_bytes;
