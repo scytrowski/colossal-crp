@@ -68,9 +68,9 @@ use crate::{
 use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
     NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
-    NetNodeRecordsPrefix, NetSegmentCoveragePrefix, NetSegmentEnvironmentPrefix,
-    NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsPrefix,
-    NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
+    NetNodeRecordsPrefix, NetSegmentCoverageEditor, NetSegmentCoveragePrefix,
+    NetSegmentEnvironmentPrefix, NetSegmentFlagsPrefix, NetSegmentProblemsPrefix,
+    NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
 use crate::{PathManagerData, PathManagerEditor};
 use crate::{WeatherManagerData, WeatherManagerEditor};
@@ -3429,17 +3429,119 @@ impl SimulationManagerData {
         &self,
         save_app_version: Option<u32>,
     ) -> Result<(NetSegmentCoveragePrefix, usize), CrpError> {
-        let (_, lights_end) = self.decode_net_segment_traffic_lights_prefix(save_app_version)?;
-        let (segment_flags, _) = self.decode_net_segment_flags_prefix(save_app_version)?;
+        let (_, data, _, end) = self.decode_net_segment_coverage_with_range(save_app_version)?;
+        Ok((data, end))
+    }
+
+    fn decode_net_segment_coverage_with_range(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<
+        (
+            NetSegmentFlagsPrefix,
+            NetSegmentCoveragePrefix,
+            usize,
+            usize,
+        ),
+        CrpError,
+    > {
+        let (segment_flags, _, _, lights_end) =
+            self.decode_net_segment_traffic_lights_with_range(save_app_version)?;
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(lights_end)?;
+        let body_start = reader.offset();
         let (data, body_length) = NetSegmentCoveragePrefix::decode_prefix(
             self.format_version,
             &segment_flags,
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        Ok((segment_flags, data, body_start, reader.offset()))
+    }
+
+    /// Decodes NetManager's active-segment coverage arrays into an editor.
+    pub fn decode_net_segment_coverage_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetSegmentCoverageEditor, CrpError> {
+        let (_, coverage, _, _) = self.decode_net_segment_coverage_with_range(save_app_version)?;
+        Ok(coverage.into_editor())
+    }
+
+    /// Replaces NetManager's active-segment fire-coverage and wetness values.
+    ///
+    /// The editor must match this stream's inner version, source segment flags,
+    /// and original coverage bytes. Changed arrays may resize the section and
+    /// shift later fields while preserving their bytes.
+    pub fn replace_net_segment_coverage(
+        &mut self,
+        edited: &NetSegmentCoverageEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager coverage version does not match this stream",
+            ));
+        }
+        let (current_flags, current, body_start, body_end) =
+            self.decode_net_segment_coverage_with_range(save_app_version)?;
+        if current_flags.encode().as_slice() != edited.original_segment_flags() {
+            return Err(invalid(
+                body_start,
+                "NetManager segment flags do not match the coverage editor's source",
+            ));
+        }
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager coverage bytes do not match the editor's source prefix",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager coverage prefix range is inconsistent",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_net_segment_coverage_with_range(save_app_version)
+            .and_then(|(decoded_flags, decoded, actual_start, actual_end)| {
+                if decoded_flags.encode() != current_flags.encode() {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager coverage changed its source flags",
+                    ));
+                }
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager coverage does not match the editor",
+                    ));
+                }
+                let expected_end = body_start
+                    .checked_add(replacement.len())
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager coverage end"))?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager coverage has an unexpected boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager coverage failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes segment condition, noise, and attractiveness after wetness.
@@ -11141,8 +11243,8 @@ mod manager_boundary_tests {
         net_body.extend_from_slice(&(-0x1234_i32).to_be_bytes());
         net_body.push(0x9b); // Repeat that value for the remaining 28 active segments.
         net_body.extend_from_slice(&[1, 34, 34, 0xb9]); // Two literals, then 58 zero-delta repeats.
-        write_encoded_byte_array(&mut net_body, &[31; 30]);
-        write_encoded_byte_array(&mut net_body, &[42; 30]);
+        net_body.extend_from_slice(&[1, 31, 31, 0x9b]); // Two literals, then 28 repeats.
+        net_body.extend_from_slice(&[1, 42, 42, 0x9b]); // Two literals, then 28 repeats.
         let opaque_tail = [0xaa, 0xbb, 0xcc, 0xdd];
         net_body.extend_from_slice(&opaque_tail);
         manager.serialized_object_graph.extend_from_slice(&net_body);
@@ -11254,7 +11356,29 @@ mod manager_boundary_tests {
         assert_eq!(coverage.coverage().len(), 30);
         assert_eq!(coverage.coverage()[0].fire_coverage, 31);
         assert_eq!(coverage.coverage()[0].wetness, 42);
+        assert_eq!(coverage.encode().len(), 8);
         assert!(edited_problems_end < edited_lights_end && edited_lights_end < coverage_end);
+        let original_environment_tail = manager.serialized_object_graph[coverage_end..].to_vec();
+        let mut coverage_editor = coverage.into_editor();
+        coverage_editor.fire_coverage_mut()[0] = 32;
+        let replacement_coverage_len = coverage_editor.encode()?.len();
+        assert!(replacement_coverage_len > 8);
+        manager.replace_net_segment_coverage(&coverage_editor, Some(0))?;
+        let (edited_coverage, edited_coverage_end) =
+            manager.decode_net_segment_coverage_prefix(Some(0))?;
+        assert_eq!(edited_coverage.coverage()[0].fire_coverage, 32);
+        assert_eq!(edited_coverage.coverage()[0].wetness, 42);
+        assert!(
+            edited_coverage.coverage()[1..]
+                .iter()
+                .all(|item| item.fire_coverage == 31 && item.wetness == 42)
+        );
+        assert!(edited_coverage_end > coverage_end);
+        assert_eq!(edited_coverage.encode().len(), replacement_coverage_len);
+        assert_eq!(
+            &manager.serialized_object_graph[edited_coverage_end..],
+            original_environment_tail
+        );
 
         let graph_after_problem_edit = manager.serialized_object_graph.clone();
         assert!(
@@ -11271,6 +11395,14 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph, graph_after_traffic_edit);
+
+        let graph_after_coverage_edit = manager.serialized_object_graph.clone();
+        assert!(
+            manager
+                .replace_net_segment_coverage(&coverage_editor, Some(0))
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph, graph_after_coverage_edit);
 
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_net_segment_flags(&editor, Some(0)).is_err());

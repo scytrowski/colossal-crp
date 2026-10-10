@@ -310,7 +310,20 @@ pub struct NetSegmentCoverage {
 pub struct NetSegmentCoveragePrefix {
     format_version: u32,
     coverage: Vec<NetSegmentCoverage>,
+    source_segment_flags: Vec<u8>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for fire coverage and wetness belonging to active segments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentCoverageEditor {
+    format_version: u32,
+    fire_coverage: Vec<u8>,
+    wetness: Vec<u8>,
+    original_fire_coverage: Vec<u8>,
+    original_wetness: Vec<u8>,
+    original_segment_flags: Vec<u8>,
+    original_prefix: Vec<u8>,
 }
 
 /// Later environmental fields for one segment with nonzero primary flags.
@@ -1642,6 +1655,7 @@ impl NetSegmentCoveragePrefix {
             Self {
                 format_version,
                 coverage,
+                source_segment_flags: segment_flags.encode(),
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -1661,6 +1675,99 @@ impl NetSegmentCoveragePrefix {
     /// Writes the original encoded arrays exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit active segments' coverage values.
+    pub fn into_editor(self) -> NetSegmentCoverageEditor {
+        let fire_coverage = self
+            .coverage
+            .iter()
+            .map(|item| item.fire_coverage)
+            .collect::<Vec<_>>();
+        let wetness = self
+            .coverage
+            .iter()
+            .map(|item| item.wetness)
+            .collect::<Vec<_>>();
+        NetSegmentCoverageEditor {
+            format_version: self.format_version,
+            original_fire_coverage: fire_coverage.clone(),
+            original_wetness: wetness.clone(),
+            fire_coverage,
+            wetness,
+            original_segment_flags: self.source_segment_flags,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetSegmentCoverageEditor {
+    /// Returns the inner DataSerializer version associated with this prefix.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns fire-coverage values in active-segment order.
+    pub fn fire_coverage_mut(&mut self) -> &mut [u8] {
+        &mut self.fire_coverage
+    }
+
+    /// Returns wetness values in active-segment order.
+    pub fn wetness_mut(&mut self) -> &mut [u8] {
+        &mut self.wetness
+    }
+
+    /// Encodes the versioned Byte arrays, preserving the source if unchanged.
+    ///
+    /// Fire coverage is serialized from inner version 185 and wetness from
+    /// version 224. Values synthesized before their field's version gate
+    /// cannot be changed.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.fire_coverage.len() != self.original_fire_coverage.len()
+            || self.wetness.len() != self.original_wetness.len()
+            || self.fire_coverage.len() != self.wetness.len()
+        {
+            return Err(invalid(
+                0,
+                "edited segment coverage counts do not match the source",
+            ));
+        }
+        if self.fire_coverage == self.original_fire_coverage
+            && self.wetness == self.original_wetness
+        {
+            return Ok(self.original_prefix.clone());
+        }
+        if self.format_version < FIRE_COVERAGE_VERSION
+            && self.fire_coverage != self.original_fire_coverage
+        {
+            return Err(invalid(
+                0,
+                "fire coverage is not serialized before inner version 185",
+            ));
+        }
+        if self.format_version < WETNESS_VERSION && self.wetness != self.original_wetness {
+            return Err(invalid(
+                0,
+                "wetness is not serialized before inner version 224",
+            ));
+        }
+
+        let mut output = Vec::new();
+        if self.format_version >= FIRE_COVERAGE_VERSION {
+            write_encoded_byte_array(&mut output, &self.fire_coverage);
+        }
+        if self.format_version >= WETNESS_VERSION {
+            write_encoded_byte_array(&mut output, &self.wetness);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_segment_flags(&self) -> &[u8] {
+        &self.original_segment_flags
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 

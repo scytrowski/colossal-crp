@@ -83,7 +83,7 @@ pub use net_manager_data::{
     NetLanePrefix, NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag,
     NetNodeFlagsPrefix, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeProblem,
     NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader,
-    NetSegmentCoverage, NetSegmentCoveragePrefix, NetSegmentEnvironment,
+    NetSegmentCoverage, NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironment,
     NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsEditor, NetSegmentFlagsPrefix,
     NetSegmentProblem, NetSegmentProblemsEditor, NetSegmentProblemsPrefix, NetSegmentRecord,
     NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsEditor,
@@ -1997,6 +1997,12 @@ mod tests {
             }]
         );
         assert!(early.encode().is_empty());
+        let mut early_editor = early.clone().into_editor();
+        early_editor.fire_coverage_mut()[0] = 1;
+        assert!(early_editor.encode().is_err());
+        let mut early_editor = early.into_editor();
+        early_editor.wetness_mut()[0] = 1;
+        assert!(early_editor.encode().is_err());
 
         let fire_flags = one_active_segment_flags(185)?;
         let fire_bytes = [0, 9];
@@ -2011,6 +2017,11 @@ mod tests {
             }]
         );
         assert_eq!(fire.encode(), fire_bytes);
+        let mut fire_editor = fire.into_editor();
+        fire_editor.fire_coverage_mut()[0] = 11;
+        assert_eq!(fire_editor.encode()?, [0, 11]);
+        fire_editor.wetness_mut()[0] = 1;
+        assert!(fire_editor.encode().is_err());
 
         let wet_flags = one_active_segment_flags(224)?;
         let wet_bytes = [0, 9, 0, 10];
@@ -2025,6 +2036,10 @@ mod tests {
             }]
         );
         assert_eq!(wet.encode(), wet_bytes);
+        let mut wet_editor = wet.into_editor();
+        wet_editor.fire_coverage_mut()[0] = 11;
+        wet_editor.wetness_mut()[0] = 12;
+        assert_eq!(wet_editor.encode()?, [0, 11, 0, 12]);
         assert!(NetSegmentCoveragePrefix::decode_prefix(224, &wet_flags, &wet_bytes[..3]).is_err());
         assert!(NetSegmentCoveragePrefix::decode_prefix(185, &wet_flags, &fire_bytes).is_err());
         Ok(())
