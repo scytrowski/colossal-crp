@@ -21,6 +21,7 @@ use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
 use crate::audio_manager_data::{AudioManagerData, AudioManagerEditor};
+use crate::citizen_manager_data::CitizenManagerDataPrefix;
 use crate::data_serializer::{
     COMPACT_STRING_FLAG, DataSerializerStream, Reader, write_nullable_unique_string, write_u24_be,
     write_unique_string, write_unique_string_with_mode,
@@ -5227,6 +5228,30 @@ impl SimulationManagerData {
             .checked_add(consumed)
             .ok_or(CrpError::ArithmeticOverflow("VehicleManager prefix end"))?;
         Ok((vehicles, graph_end))
+    }
+
+    /// Decodes CitizenManager's citizen flags and sparse citizen columns at
+    /// slot 7, stopping before the citizen-unit arrays. The returned graph
+    /// offset marks the first undecoded byte. Unit and instance data remain
+    /// intact in the original serialized graph. The next manager reference
+    /// must be TransferManager at slot 8.
+    pub fn decode_citizen_manager_prefix(
+        &self,
+    ) -> Result<(CitizenManagerDataPrefix, usize), CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 7, "CitizenManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
+
+        let (body_start, next_tag_start) = self.manager_body_boundary(7)?;
+        let body = self
+            .serialized_object_graph
+            .get(body_start..next_tag_start)
+            .ok_or_else(|| invalid(body_start, "CitizenManager body range is invalid"))?;
+        let (citizens, consumed) =
+            CitizenManagerDataPrefix::decode_prefix(self.format_version, body)?;
+        let graph_end = body_start
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow("CitizenManager prefix end"))?;
+        Ok((citizens, graph_end))
     }
 
     /// Decodes the known VehicleManager fields through its versioned counters.
@@ -17914,6 +17939,41 @@ mod manager_boundary_tests {
         let (tail, tail_end) = manager.decode_vehicle_manager_tail().unwrap();
         assert_eq!(tail.traffic_flow_totals(), None);
         assert_eq!(tail_end, data_end);
+    }
+
+    #[test]
+    fn citizen_manager_locator_stops_before_unit_arrays() {
+        let mut graph = profiler_tag("CitizenManager");
+        let body_start = graph.len();
+        graph.extend(std::iter::repeat_n(0xff, 8_191));
+        graph.push(0xfe); // 1,048,575 zero citizen flags
+        let prefix_end = graph.len();
+        graph.push(0xc0); // first byte of opaque unit data
+        graph.extend_from_slice(&[0, 0]); // closing profiler reference
+        let transfer_tag = profiler_tag("TransferManager");
+        graph.extend_from_slice(&transfer_tag);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 22;
+        let mut manager_objects = vec![None; 9];
+        manager_objects[7] = Some(ManagerObjectReference {
+            object_id: 7,
+            type_name: "CitizenManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[8] = Some(ManagerObjectReference {
+            object_id: 8,
+            type_name: "TransferManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (citizens, end) = manager.decode_citizen_manager_prefix().unwrap();
+        assert_eq!(citizens.citizen_flags().len(), 1_048_575);
+        assert!(citizens.citizen_flags().iter().all(|flags| *flags == 0));
+        assert_eq!(citizens.legacy_columns(), Some([Vec::new()].as_slice()));
+        assert_eq!(end, prefix_end);
+        assert_eq!(manager.serialized_object_graph()[end], 0xc0);
+        assert!(manager.serialized_object_graph()[end + 3..].starts_with(&transfer_tag));
+        assert_eq!(body_start, profiler_tag("CitizenManager").len());
     }
 
     #[test]

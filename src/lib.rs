@@ -9,6 +9,7 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 mod asset_io;
 mod audio_manager_data;
 mod building_manager_data;
+mod citizen_manager_data;
 mod data_serializer;
 mod disaster_manager_data;
 mod district_manager_data;
@@ -57,6 +58,7 @@ pub use building_manager_data::{
     BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
     BuildingTimerGeometryPrefix,
 };
+pub use citizen_manager_data::CitizenManagerDataPrefix;
 pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictAirportData, DistrictAirportEditor,
