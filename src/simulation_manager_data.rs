@@ -102,6 +102,179 @@ pub struct ResolvedObjectReference {
     pub type_name: String,
 }
 
+/// A TransportManager milestone's prefab index and resolved object reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportManagerMilestone {
+    prefab_index: u16,
+    reference: Option<ResolvedObjectReference>,
+}
+
+impl TransportManagerMilestone {
+    /// Returns the milestone prefab index.
+    pub fn prefab_index(&self) -> u16 {
+        self.prefab_index
+    }
+
+    /// Returns the resolved milestone object reference, if non-null.
+    pub fn reference(&self) -> Option<&ResolvedObjectReference> {
+        self.reference.as_ref()
+    }
+}
+
+/// In-place editor for existing TransportManager milestone object references.
+///
+/// Only references encoded as an existing object ID can be redirected. The
+/// replacement must point to an earlier object of the same runtime type.
+/// Null and newly allocated references retain their original form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportManagerMilestoneEditor {
+    format_version: u32,
+    save_app_version: Option<u32>,
+    milestones: Vec<TransportManagerMilestone>,
+    original_headers: Vec<NetObjectHeader>,
+    header_ranges: Vec<Range<usize>>,
+    available_object_counts: Vec<usize>,
+    object_types: Vec<String>,
+    original_body: Vec<u8>,
+}
+
+impl TransportManagerMilestoneEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns milestones in their serialized order.
+    pub fn milestones(&self) -> &[TransportManagerMilestone] {
+        &self.milestones
+    }
+
+    /// Redirects a milestone reference to an earlier object of the same type.
+    pub fn set_reference_object_id(
+        &mut self,
+        milestone_index: usize,
+        object_id: u32,
+    ) -> Result<(), CrpError> {
+        let header = self.original_headers.get(milestone_index).ok_or_else(|| {
+            invalid(
+                milestone_index,
+                "TransportManager milestone index is out of bounds",
+            )
+        })?;
+        if !matches!(header, NetObjectHeader::Existing(_)) {
+            return Err(invalid(
+                milestone_index,
+                "TransportManager milestone reference is not an existing object ID",
+            ));
+        }
+        let available_count = *self
+            .available_object_counts
+            .get(milestone_index)
+            .ok_or_else(|| invalid(milestone_index, "milestone object bounds were not captured"))?;
+        let object_index = usize::try_from(object_id)
+            .map_err(|_| CrpError::ArithmeticOverflow("TransportManager milestone object ID"))?;
+        if object_index >= available_count {
+            return Err(invalid(
+                milestone_index,
+                "TransportManager milestone target is not available at this entry",
+            ));
+        }
+        let target_type = self.object_types.get(object_index).ok_or_else(|| {
+            invalid(
+                milestone_index,
+                "TransportManager milestone target type is unresolved",
+            )
+        })?;
+        let milestone = self.milestones.get_mut(milestone_index).ok_or_else(|| {
+            invalid(
+                milestone_index,
+                "TransportManager milestone index is out of bounds",
+            )
+        })?;
+        let reference = milestone.reference.as_mut().ok_or_else(|| {
+            invalid(
+                milestone_index,
+                "TransportManager milestone reference is null",
+            )
+        })?;
+        if target_type != &reference.type_name {
+            return Err(invalid(
+                milestone_index,
+                "TransportManager milestone target has a different runtime type",
+            ));
+        }
+        reference.object_id = object_id;
+        Ok(())
+    }
+
+    /// Writes redirected references into the source body without changing its length.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let count = self.milestones.len();
+        if self.format_version < 151
+            || self.original_headers.len() != count
+            || self.header_ranges.len() != count
+            || self.available_object_counts.len() != count
+        {
+            return Err(invalid(
+                0,
+                "TransportManager milestone editor has inconsistent version or entry counts",
+            ));
+        }
+        let mut body = self.original_body.clone();
+        for (index, header) in self.original_headers.iter().enumerate() {
+            let NetObjectHeader::Existing(_) = header else {
+                continue;
+            };
+            let milestone = self.milestones.get(index).ok_or_else(|| {
+                invalid(index, "TransportManager milestone is missing from editor")
+            })?;
+            let reference = milestone.reference.as_ref().ok_or_else(|| {
+                invalid(
+                    index,
+                    "existing TransportManager milestone reference became null",
+                )
+            })?;
+            let range = self.header_ranges.get(index).ok_or_else(|| {
+                invalid(
+                    index,
+                    "TransportManager milestone header range was not captured",
+                )
+            })?;
+            if range.len() != 3 {
+                return Err(invalid(
+                    range.start,
+                    "existing TransportManager milestone header is not three bytes",
+                ));
+            }
+            let object_index = usize::try_from(reference.object_id).map_err(|_| {
+                CrpError::ArithmeticOverflow("TransportManager milestone object ID")
+            })?;
+            if object_index >= self.available_object_counts[index]
+                || self.object_types.get(object_index) != Some(&reference.type_name)
+            {
+                return Err(invalid(
+                    range.start,
+                    "TransportManager milestone target is unavailable or has a different runtime type",
+                ));
+            }
+            let bytes = [
+                (reference.object_id >> 16) as u8,
+                (reference.object_id >> 8) as u8,
+                reference.object_id as u8,
+            ];
+            body.get_mut(range.clone())
+                .ok_or_else(|| {
+                    invalid(
+                        range.start,
+                        "TransportManager milestone header range exceeds source body",
+                    )
+                })?
+                .copy_from_slice(&bytes);
+        }
+        Ok(body)
+    }
+}
+
 /// One active EconomyManager investment's serialized float history.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EconomyInvestmentValueSeries {
@@ -4536,7 +4709,8 @@ impl SimulationManagerData {
         save_app_version: Option<u32>,
     ) -> Result<QueuedObjectReferencePrefix, CrpError> {
         let mut prefix = self.zone_manager_guide_queue_prefix(save_app_version)?;
-        let fields = self.decode_transport_manager_reference_headers(&prefix.object_table)?;
+        let fields =
+            self.decode_transport_manager_reference_headers(&prefix.object_table, false)?;
         prefix.transport_manager_object_ids = register_reference_headers(
             &fields.milestone_object_headers,
             &mut prefix.object_table,
@@ -4871,6 +5045,7 @@ impl SimulationManagerData {
     fn decode_transport_manager_reference_headers(
         &self,
         object_table: &DataSerializerObjectTable,
+        capture_milestones: bool,
     ) -> Result<TransportManagerReferenceFields, CrpError> {
         let (body_range, _) = self.transport_manager_body_range()?;
         let manager_slot = self
@@ -4889,7 +5064,13 @@ impl SimulationManagerData {
             .serialized_object_graph
             .get(body_range.clone())
             .ok_or_else(|| invalid(0, "TransportManager body range exceeds manager graph"))?;
-        decode_transport_manager_reference_body(self.format_version, body, Some(object_table), None)
+        decode_transport_manager_reference_body_with_milestones(
+            self.format_version,
+            body,
+            Some(object_table),
+            None,
+            capture_milestones,
+        )
     }
 
     fn transport_manager_body_range(&self) -> Result<(Range<usize>, usize), CrpError> {
@@ -5406,6 +5587,149 @@ impl SimulationManagerData {
                     .transpose()
             })
             .collect()
+    }
+
+    /// Decodes TransportManager's milestone prefab and object references for inner
+    /// versions 164–115999. Milestone fields are gated from version 151, but this
+    /// API also requires the validated manager-queue traversal supported here.
+    ///
+    /// The result is validated against the manager queue and preserves the
+    /// source body for exact rewriting. Pass the saved application version for
+    /// inner-version-221+ guide fields in earlier managers.
+    pub fn decode_transport_manager_milestone_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<TransportManagerMilestoneEditor, CrpError> {
+        if self.format_version < 164 || self.format_version > 115_999 {
+            return Err(invalid(
+                0,
+                "TransportManager milestone editing is supported for inner versions 164–115999",
+            ));
+        }
+        let prefix = self.zone_manager_guide_queue_prefix(save_app_version)?;
+        let fields = self.decode_transport_manager_reference_headers(&prefix.object_table, true)?;
+        if fields.milestone_prefab_indices.len() != fields.milestone_object_ids.len()
+            || fields.milestone_object_ids.len() != fields.milestone_object_headers.len()
+        {
+            return Err(invalid(
+                TRANSPORT_MANAGER_SLOT,
+                "TransportManager milestone fields have inconsistent counts",
+            ));
+        }
+        let milestones = fields
+            .milestone_prefab_indices
+            .iter()
+            .zip(&fields.milestone_object_ids)
+            .map(|(prefab_index, object_id)| {
+                let reference = object_id
+                    .map(|object_id| {
+                        let object_index = usize::try_from(object_id).map_err(|_| {
+                            CrpError::ArithmeticOverflow("TransportManager milestone object ID")
+                        })?;
+                        let type_name = fields
+                            .milestone_object_types
+                            .get(object_index)
+                            .ok_or_else(|| {
+                                invalid(0, "TransportManager milestone object type is unresolved")
+                            })?;
+                        Ok::<ResolvedObjectReference, CrpError>(ResolvedObjectReference {
+                            object_id,
+                            type_name: type_name.clone(),
+                        })
+                    })
+                    .transpose()?;
+                Ok(TransportManagerMilestone {
+                    prefab_index: *prefab_index,
+                    reference,
+                })
+            })
+            .collect::<Result<Vec<_>, CrpError>>()?;
+        let (body_range, _) = self.transport_manager_body_range()?;
+        let bounded_end = body_range
+            .end
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager bounded body end",
+            ))?;
+        let original_body = self
+            .serialized_object_graph
+            .get(body_range.start..bounded_end)
+            .ok_or_else(|| invalid(body_range.start, "TransportManager bounded body is invalid"))?
+            .to_vec();
+        Ok(TransportManagerMilestoneEditor {
+            format_version: self.format_version,
+            save_app_version,
+            milestones,
+            original_headers: fields.milestone_object_headers,
+            header_ranges: fields.milestone_header_ranges,
+            available_object_counts: fields.milestone_available_object_counts,
+            object_types: fields.milestone_object_types,
+            original_body,
+        })
+    }
+
+    /// Applies existing-object redirects to TransportManager milestone references.
+    ///
+    /// The editor must come from this manager's current bytes and version.
+    /// Only existing IDs can change; each target must be available at that
+    /// point in the object stream and retain the original runtime type. The
+    /// manager graph length and all other bytes remain unchanged.
+    pub fn replace_transport_manager_milestone_references(
+        &mut self,
+        edited: &TransportManagerMilestoneEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version != self.format_version {
+            return Err(invalid(
+                0,
+                "edited TransportManager milestones use a different DataSerializer version",
+            ));
+        }
+        let (body_range, _) = self.transport_manager_body_range()?;
+        let bounded_end = body_range
+            .end
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager bounded body end",
+            ))?;
+        let current = self
+            .serialized_object_graph
+            .get(body_range.start..bounded_end)
+            .ok_or_else(|| invalid(body_range.start, "TransportManager bounded body is invalid"))?;
+        if current != edited.original_body {
+            return Err(invalid(
+                body_range.start,
+                "TransportManager bytes do not match the milestone editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != current.len() {
+            return Err(invalid(
+                body_range.start,
+                "TransportManager milestone edits must preserve the bounded body length",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph[body_range.start..bounded_end].copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_transport_manager_milestone_editor(edited.save_app_version)
+            .and_then(|decoded| {
+                if decoded.milestones != edited.milestones {
+                    return Err(invalid(
+                        body_range.start,
+                        "rewritten TransportManager milestones do not match the editor",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_range.start,
+                format!("rewritten TransportManager milestones failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes TransportManager's final vehicle-selection table from version 114001.
@@ -9005,7 +9329,23 @@ fn decode_transport_manager_reference_body(
     format_version: u32,
     bytes: &[u8],
     object_table: Option<&DataSerializerObjectTable>,
+    shared_strings: Option<&mut Vec<Option<String>>>,
+) -> Result<TransportManagerReferenceFields, CrpError> {
+    decode_transport_manager_reference_body_with_milestones(
+        format_version,
+        bytes,
+        object_table,
+        shared_strings,
+        false,
+    )
+}
+
+fn decode_transport_manager_reference_body_with_milestones(
+    format_version: u32,
+    bytes: &[u8],
+    object_table: Option<&DataSerializerObjectTable>,
     mut shared_strings: Option<&mut Vec<Option<String>>>,
+    capture_milestones: bool,
 ) -> Result<TransportManagerReferenceFields, CrpError> {
     if format_version < 164 {
         return Err(invalid(
@@ -9027,7 +9367,16 @@ fn decode_transport_manager_reference_body(
             .ok_or(CrpError::ArithmeticOverflow(
                 "TransportManager prefab index count",
             ))?;
-    skip_encoded_ushort_array(&mut reader, prefab_index_count)?;
+    let milestone_prefab_indices = if capture_milestones {
+        let all_indices = read_encoded_ushort_array(&mut reader, prefab_index_count)?;
+        all_indices
+            .get(active_line_count..)
+            .ok_or_else(|| reader.invalid("TransportManager milestone prefab range is invalid"))?
+            .to_vec()
+    } else {
+        skip_encoded_ushort_array(&mut reader, prefab_index_count)?;
+        Vec::new()
+    };
 
     let prefab_name_count = usize::from(reader.read_u16_be()?);
     for _ in 0..prefab_name_count {
@@ -9040,8 +9389,16 @@ fn decode_transport_manager_reference_body(
         )));
     }
     let mut milestone_object_headers = Vec::with_capacity(milestone_count);
+    let mut milestone_header_ranges = Vec::new();
+    if capture_milestones {
+        milestone_header_ranges.reserve(milestone_count);
+    }
     for _ in 0..milestone_count {
+        let start = reader.offset();
         milestone_object_headers.push(read_net_object_header(&mut reader)?);
+        if capture_milestones {
+            milestone_header_ranges.push(start..reader.offset());
+        }
     }
 
     let line_number_count = transport_manager_line_number_count(format_version);
@@ -9229,10 +9586,28 @@ fn decode_transport_manager_reference_body(
             "TransportManager reference fields do not end at the manager boundary",
         ));
     }
+    let mut milestone_object_ids = Vec::new();
+    let mut milestone_available_object_counts = Vec::new();
+    let mut milestone_object_types = Vec::new();
     if let Some(object_table) = object_table {
         let mut checked_table = object_table.clone();
-        for header in milestone_object_headers.iter().chain(&headers) {
+        if capture_milestones {
+            milestone_object_ids.reserve(milestone_object_headers.len());
+            milestone_available_object_counts.reserve(milestone_object_headers.len());
+        }
+        for header in &milestone_object_headers {
+            if capture_milestones {
+                milestone_available_object_counts.push(checked_table.object_types.len());
+                milestone_object_ids.push(checked_table.register(header)?);
+            } else {
+                checked_table.register(header)?;
+            }
+        }
+        for header in &headers {
             checked_table.register(header)?;
+        }
+        if capture_milestones {
+            milestone_object_types = checked_table.object_types;
         }
     }
     let shared_string_values = if selection_shared_string_counts.is_empty() {
@@ -9254,6 +9629,11 @@ fn decode_transport_manager_reference_body(
     let selection_range = (format_version >= 114_001).then_some(selection_start..reader.offset());
     Ok(TransportManagerReferenceFields {
         milestone_object_headers,
+        milestone_prefab_indices,
+        milestone_header_ranges,
+        milestone_object_ids,
+        milestone_available_object_counts,
+        milestone_object_types,
         object_headers: headers,
         line_numbers,
         line_number_range,
@@ -9272,6 +9652,11 @@ fn decode_transport_manager_reference_body(
 #[derive(Debug)]
 struct TransportManagerReferenceFields {
     milestone_object_headers: Vec<NetObjectHeader>,
+    milestone_prefab_indices: Vec<u16>,
+    milestone_header_ranges: Vec<Range<usize>>,
+    milestone_object_ids: Vec<Option<u32>>,
+    milestone_available_object_counts: Vec<usize>,
+    milestone_object_types: Vec<String>,
     object_headers: Vec<NetObjectHeader>,
     line_numbers: Option<Vec<u16>>,
     line_number_range: Option<Range<usize>>,
@@ -9612,8 +9997,9 @@ mod manager_boundary_tests {
         DataSerializerObjectTable, ECONOMY_MANAGER_CASH_VALUE_COUNT, ECONOMY_MANAGER_LOAN_COUNT,
         EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
         EconomyManagerBodyLayout, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
-        QueuedDataObject, SimulationManagerData, TransportLineVehicleSelection,
-        TransportManagerActiveLineEditor, TransportManagerSelection,
+        QueuedDataObject, ResolvedObjectReference, SimulationManagerData,
+        TransportLineVehicleSelection, TransportManagerActiveLineEditor, TransportManagerMilestone,
+        TransportManagerMilestoneEditor, TransportManagerSelection,
         TransportManagerSharedStringValue, decode_economy_manager_body_layout,
         decode_economy_manager_budget_editor, decode_economy_manager_income_expense_editor,
         decode_economy_manager_income_expense_editor_with_layout,
@@ -9624,7 +10010,8 @@ mod manager_boundary_tests {
         decode_economy_manager_loan_scalar_length, decode_economy_manager_loans_and_cash_editor,
         decode_economy_manager_loans_and_cash_editor_with_layout,
         decode_economy_manager_loans_and_cash_editor_with_prefix,
-        decode_transport_manager_reference_body, economy_manager_expense_count,
+        decode_transport_manager_reference_body,
+        decode_transport_manager_reference_body_with_milestones, economy_manager_expense_count,
         economy_manager_income_count, economy_manager_loan_expense_count,
         economy_manager_object_header_count, economy_manager_policy_expense_count,
         economy_manager_scalar_prefix_from_reference, economy_manager_service_budget_count,
@@ -11567,6 +11954,66 @@ mod manager_boundary_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn transport_manager_milestone_reference_redirect_preserves_body_layout() {
+        let (bytes, _) = active_transport_manager_reference_body(112_004, 14, 1, 7);
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        table
+            .register(&NetObjectHeader::NewType(
+                "TransportLine+Data, Assembly-CSharp".to_owned(),
+            ))
+            .unwrap();
+        table.register(&NetObjectHeader::NewSharedType(1)).unwrap();
+        let fields = decode_transport_manager_reference_body_with_milestones(
+            112_004,
+            &bytes,
+            Some(&table),
+            Some(&mut Vec::new()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(fields.milestone_prefab_indices, [8]);
+        assert_eq!(fields.milestone_object_ids, [Some(1)]);
+        assert_eq!(fields.milestone_available_object_counts, [3]);
+        assert_eq!(fields.milestone_header_ranges.len(), 1);
+        let range = fields.milestone_header_ranges[0].clone();
+        assert_eq!(&bytes[range.clone()], &[0x00, 0x00, 0x01]);
+
+        let mut editor = TransportManagerMilestoneEditor {
+            format_version: 112_004,
+            save_app_version: None,
+            milestones: vec![TransportManagerMilestone {
+                prefab_index: 8,
+                reference: Some(ResolvedObjectReference {
+                    object_id: 1,
+                    type_name: "TransportLine+Data, Assembly-CSharp".to_owned(),
+                }),
+            }],
+            original_headers: fields.milestone_object_headers,
+            header_ranges: fields.milestone_header_ranges,
+            available_object_counts: fields.milestone_available_object_counts,
+            object_types: fields.milestone_object_types,
+            original_body: bytes.clone(),
+        };
+        editor.set_reference_object_id(0, 2).unwrap();
+        assert_eq!(editor.milestones()[0].prefab_index(), 8);
+        assert_eq!(
+            editor.milestones()[0].reference(),
+            Some(&ResolvedObjectReference {
+                object_id: 2,
+                type_name: "TransportLine+Data, Assembly-CSharp".to_owned(),
+            })
+        );
+        let mut expected = bytes.clone();
+        expected[range].copy_from_slice(&[0x00, 0x00, 0x02]);
+        assert_eq!(editor.encode().unwrap(), expected);
+
+        assert!(editor.set_reference_object_id(0, 0).is_err());
+        assert!(editor.set_reference_object_id(0, 3).is_err());
+        assert!(editor.set_reference_object_id(1, 2).is_err());
+        assert_eq!(editor.encode().unwrap(), expected);
     }
 
     #[test]
