@@ -81,15 +81,16 @@ pub use metadata::{DistrictStyleMetaData, MapMetaData, ModInfo, SystemMapMetaDat
 pub use net_manager_data::{
     NetFencePrefabEditor, NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor,
     NetInfoPrefabPrefix, NetLane, NetLaneEditor, NetLanePrefix, NetManagerTailEditor,
-    NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
-    NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeProblem, NetNodeProblemsPrefix,
-    NetNodeRecord, NetNodeRecordsEditor, NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage,
-    NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironment,
-    NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlag,
-    NetSegmentFlagsEditor, NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsEditor,
-    NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsEditor, NetSegmentRecordsPrefix,
-    NetSegmentTrafficLight, NetSegmentTrafficLightsEditor, NetSegmentTrafficLightsPrefix,
-    NetTreePrefabEditor, NetTreePrefabPrefix,
+    NetManagerTailPrefix, NetNodeCounter, NetNodeCountersEditor, NetNodeCountersPrefix,
+    NetNodeFlag, NetNodeFlagsPrefix, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor,
+    NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsEditor,
+    NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage, NetSegmentCoverageEditor,
+    NetSegmentCoveragePrefix, NetSegmentEnvironment, NetSegmentEnvironmentEditor,
+    NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsEditor, NetSegmentFlagsPrefix,
+    NetSegmentProblem, NetSegmentProblemsEditor, NetSegmentProblemsPrefix, NetSegmentRecord,
+    NetSegmentRecordsEditor, NetSegmentRecordsPrefix, NetSegmentTrafficLight,
+    NetSegmentTrafficLightsEditor, NetSegmentTrafficLightsPrefix, NetTreePrefabEditor,
+    NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathManagerEditor, PathPosition, PathUnit};
 pub use prop_manager_data::{PropManagerDataPrefix, PropManagerEditor};
@@ -1363,6 +1364,27 @@ mod tests {
         assert_eq!(counters.encode(), bytes);
         assert!(NetNodeCountersPrefix::decode_prefix(115_018, &flags, &bytes[..6]).is_err());
         assert!(NetNodeCountersPrefix::decode_prefix(115_000, &flags, &bytes).is_err());
+
+        let mut early_flag_values = vec![0_u32; 16_383];
+        early_flag_values[0] = 1;
+        let mut early_flag_bytes = Vec::new();
+        crate::encoded_array::write_encoded_uint_array(&mut early_flag_bytes, &early_flag_values);
+        let (early_flags, _) = NetNodeFlagsPrefix::decode_prefix(164, &early_flag_bytes)?;
+        let (early_counters, early_used) =
+            NetNodeCountersPrefix::decode_prefix(164, &early_flags, &bytes)?;
+        assert_eq!(early_used, bytes.len());
+        assert_eq!(early_counters.counters(), counters.counters());
+
+        let mut wait_editor = counters.clone().into_editor();
+        wait_editor.counters_mut()[0].max_wait_time = 13;
+        assert_eq!(wait_editor.encode()?, [0, 13, 1, 0, 11, 0, 12]);
+        let mut value_editor = counters.clone().into_editor();
+        value_editor.counters_mut()[0].temp_counter = 20;
+        value_editor.counters_mut()[0].final_counter = 21;
+        assert_eq!(value_editor.encode()?, [0, 10, 1, 0, 20, 0, 21]);
+        let mut invalid_editor = counters.into_editor();
+        invalid_editor.counters_mut()[0].index = 2;
+        assert!(invalid_editor.encode().is_err());
         Ok(())
     }
 
@@ -1379,6 +1401,7 @@ mod tests {
             counter.max_wait_time == 0 && counter.temp_counter == 0 && counter.final_counter == 0
         }));
         assert_eq!(counters.encode(), fixture);
+        assert_eq!(counters.clone().into_editor().encode()?, fixture);
         assert!(NetNodeCountersPrefix::decode_prefix(116_020, &flags, &fixture[..49]).is_err());
         Ok(())
     }

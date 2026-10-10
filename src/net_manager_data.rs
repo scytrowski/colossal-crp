@@ -147,7 +147,26 @@ pub struct NetNodeCounter {
 pub struct NetNodeCountersPrefix {
     format_version: u32,
     counters: Vec<NetNodeCounter>,
+    source_node_flags: Vec<u8>,
+    serialized_wait_times: Vec<u8>,
+    serialized_counter_values: Vec<u8>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for wait times and temporary/final counters on active nodes.
+///
+/// The active-node order and count are fixed by the source node flags. Each
+/// changed encoded array is rewritten independently; unchanged arrays retain
+/// their original bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeCountersEditor {
+    format_version: u32,
+    counters: Vec<NetNodeCounter>,
+    original_counters: Vec<NetNodeCounter>,
+    source_node_flags: Vec<u8>,
+    original_wait_times: Vec<u8>,
+    original_counter_values: Vec<u8>,
+    original_prefix: Vec<u8>,
 }
 
 /// Fields stored for one node with nonzero primary flags.
@@ -1072,11 +1091,15 @@ impl NetNodeCountersPrefix {
             .collect::<Vec<_>>();
         let active_count = active_indices.len();
         let mut reader = Reader::new(bytes);
+        let wait_start = reader.offset();
         let max_wait_times = read_encoded_byte_array(&mut reader, active_count)?;
+        let wait_end = reader.offset();
+        let counter_start = reader.offset();
         let counter_count = active_count
             .checked_mul(2)
             .ok_or(CrpError::ArithmeticOverflow("NetManager counter count"))?;
         let counter_values = read_encoded_ushort_array(&mut reader, counter_count)?;
+        let counter_end = reader.offset();
         let mut counters = Vec::with_capacity(active_count);
         for ((index, max_wait_time), pair) in active_indices
             .into_iter()
@@ -1095,6 +1118,9 @@ impl NetNodeCountersPrefix {
             Self {
                 format_version,
                 counters,
+                source_node_flags: node_flags.encode(),
+                serialized_wait_times: bytes[wait_start..wait_end].to_vec(),
+                serialized_counter_values: bytes[counter_start..counter_end].to_vec(),
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -1114,6 +1140,104 @@ impl NetNodeCountersPrefix {
     /// Writes the original encoded counter-array bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit counters on active nodes.
+    pub fn into_editor(self) -> NetNodeCountersEditor {
+        NetNodeCountersEditor {
+            format_version: self.format_version,
+            original_counters: self.counters.clone(),
+            counters: self.counters,
+            source_node_flags: self.source_node_flags,
+            original_wait_times: self.serialized_wait_times,
+            original_counter_values: self.serialized_counter_values,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetNodeCountersEditor {
+    /// Returns the inner DataSerializer version associated with these counters.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns counters in ascending active-node buffer order.
+    pub fn counters(&self) -> &[NetNodeCounter] {
+        &self.counters
+    }
+
+    /// Returns mutable counters in ascending active-node buffer order.
+    pub fn counters_mut(&mut self) -> &mut [NetNodeCounter] {
+        &mut self.counters
+    }
+
+    /// Encodes edited counter arrays while preserving unchanged source arrays.
+    ///
+    /// The active-node count and indexes are derived from the source flags and
+    /// cannot be changed.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.counters.len() != self.original_counters.len() {
+            return Err(invalid_node_counter(
+                0,
+                "edited node-counter count does not match the source",
+            ));
+        }
+        if self.counters == self.original_counters {
+            return Ok(self.original_prefix.clone());
+        }
+
+        let mut wait_times = Vec::with_capacity(self.counters.len());
+        let counter_capacity = self
+            .counters
+            .len()
+            .checked_mul(2)
+            .ok_or(CrpError::ArithmeticOverflow("NetManager counter count"))?;
+        let mut counter_values = Vec::with_capacity(counter_capacity);
+        for (counter, original) in self.counters.iter().zip(&self.original_counters) {
+            if counter.index != original.index {
+                return Err(invalid_node_counter(
+                    wait_times.len(),
+                    "node counter index is derived from flags and cannot be changed",
+                ));
+            }
+            wait_times.push(counter.max_wait_time);
+            counter_values.push(counter.temp_counter);
+            counter_values.push(counter.final_counter);
+        }
+
+        let mut output = Vec::with_capacity(self.original_prefix.len());
+        if wait_times
+            .iter()
+            .zip(&self.original_counters)
+            .any(|(wait, original)| *wait != original.max_wait_time)
+        {
+            write_encoded_byte_array(&mut output, &wait_times);
+        } else {
+            output.extend_from_slice(&self.original_wait_times);
+        }
+        let counter_values_changed =
+            self.counters
+                .iter()
+                .zip(&self.original_counters)
+                .any(|(counter, original)| {
+                    counter.temp_counter != original.temp_counter
+                        || counter.final_counter != original.final_counter
+                });
+        if counter_values_changed {
+            write_encoded_ushort_array(&mut output, &counter_values);
+        } else {
+            output.extend_from_slice(&self.original_counter_values);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn source_node_flags(&self) -> &[u8] {
+        &self.source_node_flags
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 
@@ -3845,6 +3969,14 @@ fn invalid_record(offset: usize, reason: impl Into<String>) -> CrpError {
 fn invalid_node_record(offset: usize, reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "NetManager+Data node records".to_owned(),
+        offset,
+        reason: reason.into(),
+    }
+}
+
+fn invalid_node_counter(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "NetManager+Data node counters".to_owned(),
         offset,
         reason: reason.into(),
     }
