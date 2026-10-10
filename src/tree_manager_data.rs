@@ -1,6 +1,7 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::read_encoded_ushort_array;
+use std::ops::Range;
 
 const TREE_CAPACITY: usize = 262_144;
 const BURNING_TREES_VERSION: u32 = 266;
@@ -38,7 +39,17 @@ pub struct TreeManagerDataPrefix {
     prefab_names: Vec<Option<String>>,
     trees: Vec<TreeInstanceRecord>,
     burning_trees: Option<Vec<BurningTreeRecord>>,
+    burning_trees_range: Option<Range<usize>>,
     serialized_prefix: Vec<u8>,
+}
+
+/// In-place editor for existing TreeManager burning-tree records.
+///
+/// The record count, tree flags, prefab scopes, positions, and unknown bytes
+/// remain unchanged. Burning-tree edits are available from inner version 266.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeManagerEditor {
+    data: TreeManagerDataPrefix,
 }
 
 impl TreeManagerDataPrefix {
@@ -84,7 +95,7 @@ impl TreeManagerDataPrefix {
             })
             .collect();
 
-        let burning_trees = if format_version >= BURNING_TREES_VERSION {
+        let (burning_trees, burning_trees_range) = if format_version >= BURNING_TREES_VERSION {
             let count = usize::try_from(reader.read_u24_be()?)
                 .map_err(|_| CrpError::ArithmeticOverflow("burning tree count"))?;
             if count > TREE_CAPACITY - 1 {
@@ -93,6 +104,7 @@ impl TreeManagerDataPrefix {
                     "burning tree count exceeds the tree buffer capacity",
                 ));
             }
+            let records_start = reader.offset();
             let mut records = Vec::with_capacity(count);
             for _ in 0..count {
                 records.push(BurningTreeRecord {
@@ -101,9 +113,9 @@ impl TreeManagerDataPrefix {
                     fire_damage: reader.read_u8()?,
                 });
             }
-            Some(records)
+            (Some(records), Some(records_start..reader.offset()))
         } else {
-            None
+            (None, None)
         };
 
         let consumed = reader.offset();
@@ -114,6 +126,7 @@ impl TreeManagerDataPrefix {
                 prefab_names,
                 trees,
                 burning_trees,
+                burning_trees_range,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -145,9 +158,83 @@ impl TreeManagerDataPrefix {
         self.burning_trees.as_deref()
     }
 
+    /// Creates an editor for existing burning-tree records.
+    pub fn into_editor(self) -> TreeManagerEditor {
+        TreeManagerEditor { data: self }
+    }
+
     /// Writes the original known prefix exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+}
+
+impl TreeManagerEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.data.format_version
+    }
+
+    /// Returns mutable burning-tree records without changing their count.
+    /// Returns `None` for versions before 266.
+    pub fn burning_trees_mut(&mut self) -> Option<&mut [BurningTreeRecord]> {
+        self.data.burning_trees.as_deref_mut()
+    }
+
+    /// Writes edited records into their original fixed-width locations.
+    /// All other bytes, including encoded tree arrays, are preserved exactly.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let mut bytes = self.data.serialized_prefix.clone();
+        let (Some(records), Some(range)) = (
+            self.data.burning_trees.as_deref(),
+            self.data.burning_trees_range.as_ref(),
+        ) else {
+            return Ok(bytes);
+        };
+        let expected_len = records
+            .len()
+            .checked_mul(5)
+            .ok_or(CrpError::ArithmeticOverflow("burning tree record bytes"))?;
+        if range.len() != expected_len || range.end > bytes.len() {
+            return Err(invalid_tree_manager(
+                range.start,
+                "burning-tree record range does not match its decoded count",
+            ));
+        }
+        for (index, record) in records.iter().enumerate() {
+            if record.tree_index > 0x00ff_ffff {
+                return Err(invalid_tree_manager(
+                    range.start,
+                    "burning-tree index does not fit in 24 bits",
+                ));
+            }
+            let record_start = range
+                .start
+                .checked_add(
+                    index
+                        .checked_mul(5)
+                        .ok_or(CrpError::ArithmeticOverflow("burning tree record offset"))?,
+                )
+                .ok_or(CrpError::ArithmeticOverflow("burning tree record offset"))?;
+            let record_end = record_start
+                .checked_add(5)
+                .ok_or(CrpError::ArithmeticOverflow("burning tree record end"))?;
+            let encoded = bytes.get_mut(record_start..record_end).ok_or_else(|| {
+                invalid_tree_manager(record_start, "burning-tree record is out of bounds")
+            })?;
+            encoded[..3].copy_from_slice(&[
+                (record.tree_index >> 16) as u8,
+                (record.tree_index >> 8) as u8,
+                record.tree_index as u8,
+            ]);
+            encoded[3] = record.fire_intensity;
+            encoded[4] = record.fire_damage;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.data.serialized_prefix
     }
 }
 
@@ -244,6 +331,51 @@ mod tests {
             }]
         );
         assert_eq!(tree_manager.encode(), bytes);
+    }
+
+    #[test]
+    fn burning_tree_editor_patches_only_existing_fixed_width_records() {
+        let mut bytes = empty_prefix(266);
+        let count_offset = bytes.len() - 3;
+        bytes[count_offset..].copy_from_slice(&[0, 0, 2]);
+        write_u24_be(&mut bytes, 0x01_2345).unwrap();
+        bytes.extend_from_slice(&[7, 9]);
+        write_u24_be(&mut bytes, 0xab_cdef).unwrap();
+        bytes.extend_from_slice(&[11, 13]);
+        let record_offset = count_offset + 3;
+
+        let (tree_manager, used) = TreeManagerDataPrefix::decode_prefix(266, &bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        let mut editor = tree_manager.into_editor();
+        let records = editor.burning_trees_mut().unwrap();
+        records[0].tree_index = 0x02_3456;
+        records[0].fire_intensity = 17;
+        records[1].fire_damage = 19;
+
+        let mut expected = bytes;
+        expected[record_offset..record_offset + 5].copy_from_slice(&[0x02, 0x34, 0x56, 17, 9]);
+        expected[record_offset + 9] = 19;
+        assert_eq!(editor.encode().unwrap(), expected);
+
+        let (updated, _) = TreeManagerDataPrefix::decode_prefix(266, &expected).unwrap();
+        assert_eq!(updated.burning_trees().unwrap()[0].tree_index, 0x02_3456);
+        assert_eq!(updated.burning_trees().unwrap()[1].fire_damage, 19);
+    }
+
+    #[test]
+    fn burning_tree_editor_rejects_indexes_wider_than_twenty_four_bits() {
+        let bytes = {
+            let mut bytes = empty_prefix(266);
+            let count_offset = bytes.len() - 3;
+            bytes[count_offset..].copy_from_slice(&[0, 0, 1]);
+            write_u24_be(&mut bytes, 1).unwrap();
+            bytes.extend_from_slice(&[2, 3]);
+            bytes
+        };
+        let (tree_manager, _) = TreeManagerDataPrefix::decode_prefix(266, &bytes).unwrap();
+        let mut editor = tree_manager.into_editor();
+        editor.burning_trees_mut().unwrap()[0].tree_index = 0x0100_0000;
+        assert!(editor.encode().is_err());
     }
 
     #[test]

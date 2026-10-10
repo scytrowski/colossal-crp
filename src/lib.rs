@@ -109,7 +109,9 @@ pub use statistics_manager_data::{
 };
 pub use terrain_manager_data::TerrainManagerData;
 pub use texture::TextureAsset;
-pub use tree_manager_data::{BurningTreeRecord, TreeInstanceRecord, TreeManagerDataPrefix};
+pub use tree_manager_data::{
+    BurningTreeRecord, TreeInstanceRecord, TreeManagerDataPrefix, TreeManagerEditor,
+};
 pub use unlock_manager_data::{
     UnlockManagerMilestoneArray, UnlockManagerMilestoneKind, UnlockManagerReferences,
 };

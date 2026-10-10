@@ -9,6 +9,7 @@ use crate::PathManagerData;
 use crate::PropManagerDataPrefix;
 use crate::TerrainManagerData;
 use crate::TreeManagerDataPrefix;
+use crate::TreeManagerEditor;
 use crate::VehicleInstanceFieldsPrefix;
 use crate::VehicleLastFrameDataPrefix;
 use crate::VehicleManagerData;
@@ -3264,6 +3265,90 @@ impl SimulationManagerData {
             ));
         }
         Ok((trees, next_tag_start))
+    }
+
+    /// Decodes TreeManager into an editor for existing burning-tree records.
+    ///
+    /// Requires inner version 164 or newer and manager references at slots 15
+    /// and 16. Versions before 266 have no burning-tree table and return an
+    /// editor that preserves the source prefix unchanged.
+    pub fn decode_tree_manager_editor(&self) -> Result<TreeManagerEditor, CrpError> {
+        let (trees, _) = self.decode_tree_manager_prefix()?;
+        Ok(trees.into_editor())
+    }
+
+    /// Replaces existing TreeManager burning-tree records in place.
+    ///
+    /// The editor must come from the current manager body and inner version.
+    /// The record count, other TreeManager fields, adjacent manager boundary,
+    /// and serialized graph length are preserved.
+    pub fn replace_tree_manager_data(
+        &mut self,
+        edited: &TreeManagerEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                15,
+                "edited TreeManager version does not match this stream",
+            ));
+        }
+        let (current, next_tag_start) = self.decode_tree_manager_prefix()?;
+        if current.encode().as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                15,
+                "TreeManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != edited.original_body_bytes().len() {
+            return Err(invalid(
+                15,
+                "TreeManager edits must preserve the decoded prefix length",
+            ));
+        }
+        let tree_tag = new_profiler_tag_bytes("TreeManager")?;
+        let body_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &tree_tag,
+            "TreeManager profiler tag",
+        )?
+        .checked_add(tree_tag.len())
+        .ok_or(CrpError::ArithmeticOverflow("TreeManager body start"))?;
+        let body_end = body_start
+            .checked_add(replacement.len())
+            .ok_or(CrpError::ArithmeticOverflow("TreeManager replacement end"))?;
+        let bounded_end = body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES).ok_or(
+            CrpError::ArithmeticOverflow("TreeManager closing profiler reference end"),
+        )?;
+        if bounded_end != next_tag_start {
+            return Err(invalid(
+                body_end,
+                "TreeManager replacement no longer ends at the following manager boundary",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph
+            .get_mut(body_start..body_end)
+            .ok_or_else(|| invalid(body_start, "TreeManager replacement range is invalid"))?
+            .copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self.decode_tree_manager_prefix().and_then(|(decoded, _)| {
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten TreeManager body does not match the editor",
+                ));
+            }
+            Ok(())
+        });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten TreeManager body failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes WeatherManager or legacy WindManager at slot 16 and checks its
@@ -14690,6 +14775,61 @@ mod manager_boundary_tests {
         assert_eq!(districts.district_flags(), &[0; 128]);
         assert_eq!(districts.park_flags(), &[0; 128]);
         assert_eq!(district_end, data.serialized_object_graph().len());
+    }
+
+    #[test]
+    fn tree_manager_editor_replaces_burning_records_without_moving_weather_boundary() {
+        let mut tree_body = Vec::new();
+        write_encoded_ushort_array(&mut tree_body, &vec![0; 262_143]);
+        tree_body.extend_from_slice(&[0, 0]); // Empty prefab-name scope.
+        tree_body.extend_from_slice(&[0, 0, 2]); // Two burning-tree records.
+        tree_body.extend_from_slice(&[0, 1, 2, 3, 4]);
+        tree_body.extend_from_slice(&[0, 5, 6, 7, 8]);
+
+        let mut graph = profiler_tag("TreeManager");
+        let body_start = graph.len();
+        graph.extend_from_slice(&tree_body);
+        graph.extend_from_slice(&[0, 16]);
+        graph.extend(profiler_tag("WeatherManager"));
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 266;
+        let mut manager_objects = vec![None; 17];
+        manager_objects[15] = Some(ManagerObjectReference {
+            object_id: 15,
+            type_name: "TreeManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[16] = Some(ManagerObjectReference {
+            object_id: 16,
+            type_name: "WeatherManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let mut editor = manager.decode_tree_manager_editor().unwrap();
+        let records = editor.burning_trees_mut().unwrap();
+        records[0].tree_index = 0x01_0203;
+        records[0].fire_intensity = 9;
+        records[1].fire_damage = 10;
+        manager.replace_tree_manager_data(&editor).unwrap();
+
+        let mut expected_graph = original_graph;
+        let record_start = body_start + tree_body.len() - 10;
+        expected_graph[record_start..record_start + 5].copy_from_slice(&[1, 2, 3, 9, 4]);
+        expected_graph[record_start + 9] = 10;
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            expected_graph.len()
+        );
+        let (updated, next_start) = manager.decode_tree_manager_prefix().unwrap();
+        assert_eq!(updated.burning_trees().unwrap()[0].tree_index, 0x01_0203);
+        assert_eq!(updated.burning_trees().unwrap()[1].fire_damage, 10);
+        assert!(
+            manager.serialized_object_graph()[next_start..]
+                .starts_with(&profiler_tag("WeatherManager"))
+        );
+        assert!(manager.replace_tree_manager_data(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
     }
 
     #[test]
