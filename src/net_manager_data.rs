@@ -526,7 +526,38 @@ pub struct NetFencePrefabPrefix {
     left_names: Vec<Option<String>>,
     right_indices: Vec<u16>,
     right_names: Vec<Option<String>>,
+    source_segment_flags: Vec<u8>,
+    source_fence_presence: Vec<[u8; 2]>,
+    serialized_left_indices: Vec<u8>,
+    serialized_left_name_count: Vec<u8>,
+    serialized_left_name_entries: Vec<Vec<u8>>,
+    serialized_right_indices: Vec<u8>,
+    serialized_right_name_count: Vec<u8>,
+    serialized_right_name_entries: Vec<Vec<u8>>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for NetManager's optional left and right fence-prefab tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetFencePrefabEditor {
+    format_version: u32,
+    left_indices: Vec<u16>,
+    left_names: Vec<Option<String>>,
+    right_indices: Vec<u16>,
+    right_names: Vec<Option<String>>,
+    original_left_indices: Vec<u16>,
+    original_left_names: Vec<Option<String>>,
+    original_right_indices: Vec<u16>,
+    original_right_names: Vec<Option<String>>,
+    source_segment_flags: Vec<u8>,
+    source_fence_presence: Vec<[u8; 2]>,
+    serialized_left_indices: Vec<u8>,
+    serialized_left_name_count: Vec<u8>,
+    serialized_left_name_entries: Vec<Vec<u8>>,
+    serialized_right_indices: Vec<u8>,
+    serialized_right_name_count: Vec<u8>,
+    serialized_right_name_entries: Vec<Vec<u8>>,
+    original_prefix: Vec<u8>,
 }
 
 /// One DataSerializer object header in the NetManager tail.
@@ -2809,26 +2840,45 @@ impl NetFencePrefabPrefix {
             });
         }
         let mut reader = Reader::new(bytes);
-        let (left_indices, left_names, right_indices, right_names) =
-            if format_version >= SEGMENT_FENCE_VERSION {
-                let left_count = segment_records
-                    .records()
-                    .iter()
-                    .filter(|record| record.fence_present[0] == 1)
-                    .count();
-                let left_indices = read_encoded_ushort_array(&mut reader, left_count)?;
-                let left_names = read_prefab_names(&mut reader)?;
-                let right_count = segment_records
-                    .records()
-                    .iter()
-                    .filter(|record| record.fence_present[1] == 1)
-                    .count();
-                let right_indices = read_encoded_ushort_array(&mut reader, right_count)?;
-                let right_names = read_prefab_names(&mut reader)?;
-                (left_indices, left_names, right_indices, right_names)
-            } else {
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-            };
+        let mut serialized_left_indices = Vec::new();
+        let mut serialized_left_name_count = Vec::new();
+        let mut serialized_left_name_entries = Vec::new();
+        let mut serialized_right_indices = Vec::new();
+        let mut serialized_right_name_count = Vec::new();
+        let mut serialized_right_name_entries = Vec::new();
+        let (left_indices, left_names, right_indices, right_names) = if format_version
+            >= SEGMENT_FENCE_VERSION
+        {
+            let left_count = segment_records
+                .records()
+                .iter()
+                .filter(|record| record.fence_present[0] == 1)
+                .count();
+            let left_start = reader.offset();
+            let left_indices = read_encoded_ushort_array(&mut reader, left_count)?;
+            serialized_left_indices = reader.consumed_bytes()[left_start..reader.offset()].to_vec();
+            let (left_names, left_count_bytes, left_entries) =
+                read_prefab_names_with_raw(&mut reader)?;
+            serialized_left_name_count = left_count_bytes;
+            serialized_left_name_entries = left_entries;
+
+            let right_count = segment_records
+                .records()
+                .iter()
+                .filter(|record| record.fence_present[1] == 1)
+                .count();
+            let right_start = reader.offset();
+            let right_indices = read_encoded_ushort_array(&mut reader, right_count)?;
+            serialized_right_indices =
+                reader.consumed_bytes()[right_start..reader.offset()].to_vec();
+            let (right_names, right_count_bytes, right_entries) =
+                read_prefab_names_with_raw(&mut reader)?;
+            serialized_right_name_count = right_count_bytes;
+            serialized_right_name_entries = right_entries;
+            (left_indices, left_names, right_indices, right_names)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
         let consumed = reader.offset();
         Ok((
             Self {
@@ -2837,6 +2887,18 @@ impl NetFencePrefabPrefix {
                 left_names,
                 right_indices,
                 right_names,
+                source_segment_flags: segment_records.source_segment_flags.clone(),
+                source_fence_presence: segment_records
+                    .records()
+                    .iter()
+                    .map(|record| record.fence_present)
+                    .collect(),
+                serialized_left_indices,
+                serialized_left_name_count,
+                serialized_left_name_entries,
+                serialized_right_indices,
+                serialized_right_name_count,
+                serialized_right_name_entries,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -2871,6 +2933,132 @@ impl NetFencePrefabPrefix {
     /// Writes the original left and right table bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit the left and right fence tables.
+    pub fn into_editor(self) -> NetFencePrefabEditor {
+        NetFencePrefabEditor {
+            format_version: self.format_version,
+            original_left_indices: self.left_indices.clone(),
+            original_left_names: self.left_names.clone(),
+            original_right_indices: self.right_indices.clone(),
+            original_right_names: self.right_names.clone(),
+            left_indices: self.left_indices,
+            left_names: self.left_names,
+            right_indices: self.right_indices,
+            right_names: self.right_names,
+            source_segment_flags: self.source_segment_flags,
+            source_fence_presence: self.source_fence_presence,
+            serialized_left_indices: self.serialized_left_indices,
+            serialized_left_name_count: self.serialized_left_name_count,
+            serialized_left_name_entries: self.serialized_left_name_entries,
+            serialized_right_indices: self.serialized_right_indices,
+            serialized_right_name_count: self.serialized_right_name_count,
+            serialized_right_name_entries: self.serialized_right_name_entries,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetFencePrefabEditor {
+    /// Returns the inner DataSerializer version associated with these tables.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns mutable left-fence prefab indices in segment order.
+    pub fn left_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.left_indices
+    }
+
+    /// Returns mutable left-fence names in original table order.
+    pub fn left_names_mut(&mut self) -> &mut [Option<String>] {
+        &mut self.left_names
+    }
+
+    /// Returns mutable right-fence prefab indices in segment order.
+    pub fn right_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.right_indices
+    }
+
+    /// Returns mutable right-fence names in original table order.
+    pub fn right_names_mut(&mut self) -> &mut [Option<String>] {
+        &mut self.right_names
+    }
+
+    /// Encodes both fence tables and preserves unchanged name-entry bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.left_indices.len() != self.original_left_indices.len()
+            || self.left_names.len() != self.original_left_names.len()
+            || self.left_names.len() != self.serialized_left_name_entries.len()
+            || self.right_indices.len() != self.original_right_indices.len()
+            || self.right_names.len() != self.original_right_names.len()
+            || self.right_names.len() != self.serialized_right_name_entries.len()
+        {
+            return Err(invalid(
+                0,
+                "edited fence-prefab counts do not match the source",
+            ));
+        }
+        if self.left_indices == self.original_left_indices
+            && self.left_names == self.original_left_names
+            && self.right_indices == self.original_right_indices
+            && self.right_names == self.original_right_names
+        {
+            return Ok(self.original_prefix.clone());
+        }
+
+        let mut output = Vec::with_capacity(self.original_prefix.len());
+        if self.left_indices == self.original_left_indices {
+            output.extend_from_slice(&self.serialized_left_indices);
+        } else {
+            write_encoded_ushort_array(&mut output, &self.left_indices);
+        }
+        output.extend_from_slice(&self.serialized_left_name_count);
+        for ((name, original_name), raw_entry) in self
+            .left_names
+            .iter()
+            .zip(&self.original_left_names)
+            .zip(&self.serialized_left_name_entries)
+        {
+            if name == original_name {
+                output.extend_from_slice(raw_entry);
+            } else {
+                write_nullable_unique_string(&mut output, name.as_deref())?;
+            }
+        }
+
+        if self.right_indices == self.original_right_indices {
+            output.extend_from_slice(&self.serialized_right_indices);
+        } else {
+            write_encoded_ushort_array(&mut output, &self.right_indices);
+        }
+        output.extend_from_slice(&self.serialized_right_name_count);
+        for ((name, original_name), raw_entry) in self
+            .right_names
+            .iter()
+            .zip(&self.original_right_names)
+            .zip(&self.serialized_right_name_entries)
+        {
+            if name == original_name {
+                output.extend_from_slice(raw_entry);
+            } else {
+                write_nullable_unique_string(&mut output, name.as_deref())?;
+            }
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn source_segment_flags(&self) -> &[u8] {
+        &self.source_segment_flags
+    }
+
+    pub(crate) fn source_fence_presence(&self) -> &[[u8; 2]] {
+        &self.source_fence_presence
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 
@@ -3260,11 +3448,6 @@ fn invalid_guide(offset: usize, reason: impl Into<String>) -> CrpError {
         offset,
         reason: reason.into(),
     }
-}
-
-fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, CrpError> {
-    let (names, _, _) = read_prefab_names_with_raw(reader)?;
-    Ok(names)
 }
 
 fn read_prefab_names_with_raw(

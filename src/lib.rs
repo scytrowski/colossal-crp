@@ -79,11 +79,12 @@ pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, Inst
 pub use message_manager_data::{MessageDataEntry, MessageManagerData, MessageManagerDataEditor};
 pub use metadata::{DistrictStyleMetaData, MapMetaData, ModInfo, SystemMapMetaData};
 pub use net_manager_data::{
-    NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor, NetInfoPrefabPrefix, NetLane,
-    NetLaneEditor, NetLanePrefix, NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix,
-    NetNodeFlag, NetNodeFlagsPrefix, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor,
-    NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader,
-    NetSegmentCoverage, NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironment,
+    NetFencePrefabEditor, NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor,
+    NetInfoPrefabPrefix, NetLane, NetLaneEditor, NetLanePrefix, NetManagerTailPrefix,
+    NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
+    NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeProblem, NetNodeProblemsPrefix,
+    NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage,
+    NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironment,
     NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlag,
     NetSegmentFlagsEditor, NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsEditor,
     NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsEditor, NetSegmentRecordsPrefix,
@@ -2440,6 +2441,19 @@ mod tests {
                 assert_eq!(fence.right_indices(), [22]);
                 assert_eq!(fence.right_names(), [Some("R".to_owned())]);
                 assert_eq!(fence.encode(), fence_bytes[..15]);
+                let mut editor = fence.clone().into_editor();
+                assert_eq!(editor.encode()?, fence_bytes[..fence_used]);
+                editor.left_indices_mut()[0] = 0x1234;
+                assert_eq!(
+                    editor.encode()?,
+                    [0, 0x12, 0x34, 0, 1, 0xff, 0, 0, 22, 0, 1, 0x80, 0, 1, 0xd2]
+                );
+                let mut name_editor = fence.into_editor();
+                name_editor.right_names_mut()[0] = Some("S".to_owned());
+                assert_eq!(
+                    name_editor.encode()?,
+                    [0, 0, 21, 0, 1, 0xff, 0, 0, 22, 0, 1, 0x80, 0, 1, 0xd3]
+                );
                 assert!(
                     NetFencePrefabPrefix::decode_prefix(version, &prefix, &fence_bytes[..14])
                         .is_err()

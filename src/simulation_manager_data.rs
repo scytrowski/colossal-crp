@@ -66,9 +66,9 @@ use crate::{
     DistrictParkEditor, DistrictParkRecord,
 };
 use crate::{
-    NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor, NetInfoPrefabPrefix,
-    NetLanePrefix, NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix,
-    NetNodeProblemsPrefix, NetNodeRecordsPrefix, NetSegmentCoverageEditor,
+    NetFencePrefabEditor, NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor,
+    NetInfoPrefabPrefix, NetLanePrefix, NetManagerTailPrefix, NetNodeCountersPrefix,
+    NetNodeFlagsPrefix, NetNodeProblemsPrefix, NetNodeRecordsPrefix, NetSegmentCoverageEditor,
     NetSegmentCoveragePrefix, NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix,
     NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsEditor,
     NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix, NetTreePrefabEditor,
@@ -4076,17 +4076,126 @@ impl SimulationManagerData {
         &self,
         save_app_version: Option<u32>,
     ) -> Result<(NetFencePrefabPrefix, usize), CrpError> {
+        let (_, data, _, end) = self.decode_net_fence_prefab_with_range(save_app_version)?;
+        Ok((data, end))
+    }
+
+    fn decode_net_fence_prefab_with_range(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetSegmentRecordsPrefix, NetFencePrefabPrefix, usize, usize), CrpError> {
         let (_, tree_end) = self.decode_net_tree_prefab_prefix(save_app_version)?;
         let (records, _) = self.decode_net_segment_records_prefix(save_app_version)?;
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(tree_end)?;
+        let body_start = reader.offset();
         let (data, body_length) = NetFencePrefabPrefix::decode_prefix(
             self.format_version,
             &records,
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        Ok((records, data, body_start, reader.offset()))
+    }
+
+    /// Decodes both optional fence-prefab tables into an editor.
+    pub fn decode_net_fence_prefab_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetFencePrefabEditor, CrpError> {
+        let (_, tables, _, _) = self.decode_net_fence_prefab_with_range(save_app_version)?;
+        Ok(tables.into_editor())
+    }
+
+    /// Replaces the left and right fence tables while preserving later bytes.
+    ///
+    /// The editor must match the inner version, segment flags, fence-presence
+    /// bytes, and original table bytes. Unchanged names retain their exact
+    /// source encodings.
+    pub fn replace_net_fence_prefab(
+        &mut self,
+        edited: &NetFencePrefabEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager fence-prefab version does not match this stream",
+            ));
+        }
+        let (records, current, body_start, body_end) =
+            self.decode_net_fence_prefab_with_range(save_app_version)?;
+        let fence_presence: Vec<_> = records
+            .records()
+            .iter()
+            .map(|record| record.fence_present)
+            .collect();
+        if records.source_segment_flags() != edited.source_segment_flags()
+            || fence_presence != edited.source_fence_presence()
+        {
+            return Err(invalid(
+                body_start,
+                "NetManager segment flags or fence-presence bytes do not match the editor's source",
+            ));
+        }
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager fence-prefab bytes do not match the editor's source tables",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager fence-prefab table range is inconsistent",
+            ));
+        }
+
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_net_fence_prefab_with_range(save_app_version)
+            .and_then(|(decoded_records, decoded, actual_start, actual_end)| {
+                let decoded_fence_presence: Vec<_> = decoded_records
+                    .records()
+                    .iter()
+                    .map(|record| record.fence_present)
+                    .collect();
+                if decoded_records.source_segment_flags() != records.source_segment_flags()
+                    || decoded_fence_presence != fence_presence
+                {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager fence tables changed their source dependencies",
+                    ));
+                }
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager fence tables do not match the editor",
+                    ));
+                }
+                let expected_end = body_start
+                    .checked_add(replacement.len())
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager fence-prefab end"))?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager fence tables have an unexpected boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager fence tables failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes the final NetManager fields and profiler end tag.
@@ -11980,6 +12089,20 @@ mod manager_boundary_tests {
         manager.replace_net_tree_prefab(&tree_editor, Some(0))?;
         assert_eq!(
             &manager.serialized_object_graph[tree_end..],
+            opaque_tail.as_slice()
+        );
+
+        let (fence_tables, fence_end) = manager.decode_net_fence_prefab_prefix(Some(0))?;
+        assert!(fence_tables.left_indices().is_empty());
+        assert!(fence_tables.right_indices().is_empty());
+        assert_eq!(
+            &manager.serialized_object_graph[fence_end..],
+            opaque_tail.as_slice()
+        );
+        let fence_editor = fence_tables.into_editor();
+        manager.replace_net_fence_prefab(&fence_editor, Some(0))?;
+        assert_eq!(
+            &manager.serialized_object_graph[fence_end..],
             opaque_tail.as_slice()
         );
         Ok(())
