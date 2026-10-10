@@ -221,6 +221,8 @@ pub struct CitizenUnitRecord {
     citizens: [Option<u32>; 5],
     next_unit: Option<u32>,
     goods: u16,
+    citizen_offsets: [Option<usize>; 5],
+    next_unit_offset: Option<usize>,
 }
 
 impl CitizenUnitRecord {
@@ -253,6 +255,28 @@ impl CitizenUnitRecord {
     pub fn goods(&self) -> u16 {
         self.goods
     }
+
+    fn citizen_reference_offset(&self, citizen_slot: usize) -> Result<usize, CrpError> {
+        let offset = self
+            .citizen_offsets
+            .get(citizen_slot)
+            .ok_or_else(|| invalid(0, "CitizenUnit citizen slot is out of range"))?;
+        offset.ok_or_else(|| {
+            invalid(
+                0,
+                "CitizenUnit citizen reference is absent from its serialized mask",
+            )
+        })
+    }
+
+    fn next_unit_reference_offset(&self) -> Result<usize, CrpError> {
+        self.next_unit_offset.ok_or_else(|| {
+            invalid(
+                0,
+                "CitizenUnit next-unit reference is absent from its serialized mask",
+            )
+        })
+    }
 }
 
 /// The version 69+ active-unit records in `CitizenManager+Data`.
@@ -262,7 +286,8 @@ impl CitizenUnitRecord {
 /// The exact source bytes are retained for unchanged writing. The supplied
 /// map corpus contains no active units; nonzero records have synthetic
 /// expected-byte tests only. Pre-69 reference selection from the flag bits is
-/// not exposed by this reader.
+/// not exposed by this reader. Existing references selected by the mask can
+/// be edited without changing the mask, goods column, or record widths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CitizenUnitDataPrefix {
     format_version: u32,
@@ -308,11 +333,18 @@ impl CitizenUnitDataPrefix {
                 .map_err(|_| CrpError::ArithmeticOverflow("CitizenUnit index"))?;
             let reference_mask = reader.read_u8()?;
             let mut citizens = [None; 5];
+            let mut citizen_offsets = [None; 5];
             for (reference_index, citizen) in citizens.iter_mut().enumerate() {
                 if reference_mask & (1 << reference_index) != 0 {
+                    citizen_offsets[reference_index] = Some(reader.offset());
                     *citizen = Some(reader.read_u24_be()?);
                 }
             }
+            let next_unit_offset = if reference_mask & (1 << 5) != 0 {
+                Some(reader.offset())
+            } else {
+                None
+            };
             let next_unit = if reference_mask & (1 << 5) != 0 {
                 Some(reader.read_u24_be()?)
             } else {
@@ -325,6 +357,8 @@ impl CitizenUnitDataPrefix {
                 citizens,
                 next_unit,
                 goods: 0,
+                citizen_offsets,
+                next_unit_offset,
             });
         }
 
@@ -360,12 +394,65 @@ impl CitizenUnitDataPrefix {
         &self.active_units
     }
 
+    /// Replaces a citizen reference already present in the unit's serialized
+    /// mask. This does not change the mask or the record width.
+    ///
+    /// `unit_index` is the zero-based position in [`Self::active_units`], and
+    /// `citizen_slot` is the zero-based position among the five citizen slots.
+    /// Values above `0x00ff_ffff`, absent references, and out-of-range record
+    /// or citizen-slot indexes return errors without changing the prefix.
+    pub fn set_citizen_reference(
+        &mut self,
+        unit_index: usize,
+        citizen_slot: usize,
+        citizen: u32,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_units
+            .get(unit_index)
+            .ok_or_else(|| invalid(0, "CitizenUnit record index is out of range"))?;
+        let offset = record.citizen_reference_offset(citizen_slot)?;
+        validate_unit_reference(offset, citizen)?;
+        write_u24_field(
+            &mut self.serialized_prefix,
+            offset,
+            citizen,
+            "CitizenUnit citizen reference exceeds 24-bit storage",
+        )?;
+        self.active_units[unit_index].citizens[citizen_slot] = Some(citizen);
+        Ok(())
+    }
+
+    /// Replaces a next-unit reference already present in the serialized mask.
+    /// This does not change the mask or the record width.
+    /// `unit_index` is the zero-based position in [`Self::active_units`].
+    pub fn set_next_unit_reference(
+        &mut self,
+        unit_index: usize,
+        next_unit: u32,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_units
+            .get(unit_index)
+            .ok_or_else(|| invalid(0, "CitizenUnit record index is out of range"))?;
+        let offset = record.next_unit_reference_offset()?;
+        validate_unit_reference(offset, next_unit)?;
+        write_u24_field(
+            &mut self.serialized_prefix,
+            offset,
+            next_unit,
+            "CitizenUnit next-unit reference exceeds 24-bit storage",
+        )?;
+        self.active_units[unit_index].next_unit = Some(next_unit);
+        Ok(())
+    }
+
     /// Returns the exact source bytes consumed by this prefix decoder.
     pub fn original_prefix(&self) -> &[u8] {
         &self.serialized_prefix
     }
 
-    /// Reproduces this prefix unchanged. Unit records are not editable yet.
+    /// Reproduces the prefix, including existing-reference edits.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
@@ -677,16 +764,17 @@ const FULLY_EDUCATED_RESIDENTS_VERSION: u32 = 179;
 /// The decoded CitizenManager prefixes, instance records, and tail counters.
 ///
 /// Citizen flags and sparse columns, version 69+ unit records, and the
-/// versioned instance flags/prefab scope and active records are decoded. The
-/// full instance byte section, two-byte profiler reference, and counters are
-/// retained. `encode` reproduces the complete bounded manager body exactly
-/// until a field is explicitly edited.
+/// versioned instance flags/prefab scope and active records are decoded.
+/// Existing masked unit references and known active-instance fields can be
+/// edited in place. The full body, two-byte profiler reference, and counters
+/// are retained for rewriting.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CitizenManagerData {
     format_version: u32,
     citizen_prefix: CitizenManagerDataPrefix,
     unit_prefix: CitizenUnitDataPrefix,
     instance_prefix: CitizenInstanceDataPrefix,
+    unit_fields: Range<usize>,
     instance_fields: Range<usize>,
     active_instances: Vec<CitizenInstanceRecord>,
     instance_field_suffix: Range<usize>,
@@ -717,6 +805,7 @@ impl CitizenManagerData {
                 .ok_or(CrpError::ArithmeticOverflow(
                     "CitizenManager instance start",
                 ))?;
+        let unit_fields = citizen_len..instance_start;
         let instance_bytes = bytes
             .get(instance_start..)
             .ok_or_else(|| invalid(instance_start, "CitizenManager unit prefix exceeds body"))?;
@@ -942,6 +1031,7 @@ impl CitizenManagerData {
             citizen_prefix,
             unit_prefix,
             instance_prefix,
+            unit_fields,
             instance_fields: instance_fields_start..counter_start,
             active_instances,
             instance_field_suffix: instance_field_suffix_start..counter_start,
@@ -1013,6 +1103,67 @@ impl CitizenManagerData {
         write_f32_vector(&mut self.original_body, offset, &velocity)?;
         self.active_instances[record_index].velocity = Some(velocity);
         Ok(())
+    }
+
+    /// Replaces an existing citizen reference in an active version 69+ unit.
+    ///
+    /// `unit_index` is the zero-based position in [`CitizenUnitDataPrefix::active_units`],
+    /// and `citizen_slot` is the zero-based position among the five citizen slots.
+    /// The reference must already be selected by the serialized mask. Values
+    /// above `0x00ff_ffff` are rejected without changing the manager body.
+    pub fn set_unit_citizen_reference(
+        &mut self,
+        unit_index: usize,
+        citizen_slot: usize,
+        citizen: u32,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .unit_prefix
+            .active_units
+            .get(unit_index)
+            .ok_or_else(|| invalid(0, "CitizenUnit record index is out of range"))?;
+        let relative_offset = record.citizen_reference_offset(citizen_slot)?;
+        let offset = self.unit_fields.start.checked_add(relative_offset).ok_or(
+            CrpError::ArithmeticOverflow("CitizenManager unit citizen-reference offset"),
+        )?;
+        validate_unit_reference(offset, citizen)?;
+        self.unit_prefix
+            .set_citizen_reference(unit_index, citizen_slot, citizen)?;
+        write_u24_field(
+            &mut self.original_body,
+            offset,
+            citizen,
+            "CitizenUnit citizen reference exceeds 24-bit storage",
+        )
+    }
+
+    /// Replaces an existing next-unit reference selected by the serialized
+    /// mask. `unit_index` is the zero-based position in
+    /// [`CitizenUnitDataPrefix::active_units`]. Values above `0x00ff_ffff`
+    /// return an error without changing data.
+    pub fn set_unit_next_reference(
+        &mut self,
+        unit_index: usize,
+        next_unit: u32,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .unit_prefix
+            .active_units
+            .get(unit_index)
+            .ok_or_else(|| invalid(0, "CitizenUnit record index is out of range"))?;
+        let relative_offset = record.next_unit_reference_offset()?;
+        let offset = self.unit_fields.start.checked_add(relative_offset).ok_or(
+            CrpError::ArithmeticOverflow("CitizenManager unit next-reference offset"),
+        )?;
+        validate_unit_reference(offset, next_unit)?;
+        self.unit_prefix
+            .set_next_unit_reference(unit_index, next_unit)?;
+        write_u24_field(
+            &mut self.original_body,
+            offset,
+            next_unit,
+            "CitizenUnit next-unit reference exceeds 24-bit storage",
+        )
     }
 
     /// Replaces one active instance's serialized position without changing
@@ -1333,6 +1484,10 @@ impl CitizenManagerData {
     pub(crate) fn instance_fields_range(&self) -> Range<usize> {
         self.instance_fields.clone()
     }
+
+    pub(crate) fn unit_fields_range(&self) -> Range<usize> {
+        self.unit_fields.clone()
+    }
 }
 
 fn decode_citizen_instance_record(
@@ -1529,6 +1684,16 @@ fn write_u24_field(
     }
     let encoded = [(value >> 16) as u8, (value >> 8) as u8, value as u8];
     write_fixed_bytes(bytes, offset, &encoded)
+}
+
+fn validate_unit_reference(offset: usize, value: u32) -> Result<(), CrpError> {
+    if value > 0x00ff_ffff {
+        return Err(invalid(
+            offset,
+            "CitizenUnit reference exceeds 24-bit storage",
+        ));
+    }
+    Ok(())
 }
 
 fn write_fixed_bytes(bytes: &mut [u8], offset: usize, value: &[u8]) -> Result<(), CrpError> {
@@ -1889,6 +2054,51 @@ mod tests {
         assert_eq!(second.goods(), 0x2222);
         assert_eq!(decoded.encode(), bytes[..consumed]);
         assert_eq!(bytes[consumed..], [0xfe, 0xed]);
+
+        let mut edited = decoded.clone();
+        let mut expected = bytes[..consumed].to_vec();
+        expected[8..11].copy_from_slice(&[0xa1, 0xb2, 0xc3]);
+        expected[11..14].copy_from_slice(&[0xd4, 0xe5, 0xf6]);
+        expected[14..17].copy_from_slice(&[0x01, 0x23, 0x45]);
+        expected[17..20].copy_from_slice(&[0x67, 0x89, 0xab]);
+        expected[20..23].copy_from_slice(&[0xcd, 0xef, 0x01]);
+        expected[23..26].copy_from_slice(&[0x23, 0x45, 0x67]);
+        edited
+            .set_citizen_reference(0, 0, 0x00a1_b2c3)
+            .expect("replace existing unit citizen reference");
+        edited
+            .set_citizen_reference(0, 1, 0x00d4_e5f6)
+            .expect("replace second unit citizen reference");
+        edited
+            .set_citizen_reference(0, 2, 0x0001_2345)
+            .expect("replace third unit citizen reference");
+        edited
+            .set_citizen_reference(0, 3, 0x0067_89ab)
+            .expect("replace fourth unit citizen reference");
+        edited
+            .set_citizen_reference(0, 4, 0x00cd_ef01)
+            .expect("replace fifth unit citizen reference");
+        edited
+            .set_next_unit_reference(0, 0x0023_4567)
+            .expect("replace existing next-unit reference");
+        assert_eq!(edited.active_units()[0].citizens()[0], Some(0x00a1_b2c3));
+        assert_eq!(
+            edited.active_units()[0].citizens(),
+            &[
+                Some(0x00a1_b2c3),
+                Some(0x00d4_e5f6),
+                Some(0x0001_2345),
+                Some(0x0067_89ab),
+                Some(0x00cd_ef01),
+            ]
+        );
+        assert_eq!(edited.active_units()[0].next_unit(), Some(0x0023_4567));
+        assert!(edited.set_citizen_reference(1, 0, 9).is_err());
+        assert!(edited.set_citizen_reference(0, 5, 9).is_err());
+        assert!(edited.set_citizen_reference(0, 0, 0x0100_0000).is_err());
+        assert!(edited.set_next_unit_reference(1, 9).is_err());
+        assert!(edited.set_next_unit_reference(0, 0x0100_0000).is_err());
+        assert_eq!(edited.encode(), expected);
     }
 
     #[test]

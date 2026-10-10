@@ -5333,6 +5333,110 @@ impl SimulationManagerData {
         Ok((data, manager_end))
     }
 
+    /// Replaces the version 69+ CitizenUnit fields at slot 7 while preserving
+    /// the rest of the CitizenManager body byte-for-byte.
+    ///
+    /// The edited manager must have the same unit flags and reference masks,
+    /// source version, body length, and unchanged bytes outside the unit-field
+    /// range. Existing masked references can change without shifting the
+    /// following instance arrays or manager tags.
+    pub fn replace_citizen_manager_unit_fields(
+        &mut self,
+        edited: &CitizenManagerData,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited CitizenManager unit version does not match this stream",
+            ));
+        }
+        expect_manager_type(self.manager_objects.as_deref(), 7, "CitizenManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
+
+        let (current, manager_end) = self.decode_citizen_manager_data()?;
+        let same_unit_layout = edited.units().unit_flags() == current.units().unit_flags()
+            && edited.units().active_units().len() == current.units().active_units().len()
+            && edited
+                .units()
+                .active_units()
+                .iter()
+                .zip(current.units().active_units())
+                .all(|(edited, current)| {
+                    edited.index() == current.index()
+                        && edited.flags() == current.flags()
+                        && edited.reference_mask() == current.reference_mask()
+                });
+        if !same_unit_layout {
+            return Err(invalid(
+                0,
+                "edited CitizenManager unit layout does not match this stream",
+            ));
+        }
+        if edited.citizens() != current.citizens() {
+            return Err(invalid(
+                0,
+                "edited CitizenManager data does not match this stream outside unit fields",
+            ));
+        }
+
+        let edited_range = edited.unit_fields_range();
+        let current_range = current.unit_fields_range();
+        if edited_range != current_range {
+            return Err(invalid(
+                0,
+                "edited CitizenManager unit-field range does not match this stream",
+            ));
+        }
+        let edited_body = edited.original_body_bytes();
+        let current_body = current.original_body_bytes();
+        if edited_body.len() != current_body.len()
+            || edited_body.get(..edited_range.start) != current_body.get(..current_range.start)
+            || edited_body.get(edited_range.end..) != current_body.get(current_range.end..)
+        {
+            return Err(invalid(
+                0,
+                "edited CitizenManager data does not match this stream outside unit fields",
+            ));
+        }
+        let replacement = edited_body.get(edited_range.clone()).ok_or_else(|| {
+            invalid(
+                edited_range.start,
+                "edited CitizenManager unit-field range is invalid",
+            )
+        })?;
+        let (body_start, boundary_end) = self.manager_body_boundary(7)?;
+        if boundary_end != manager_end {
+            return Err(invalid(
+                manager_end,
+                "CitizenManager body boundary changed during unit replacement",
+            ));
+        }
+        let field_start =
+            body_start
+                .checked_add(current_range.start)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager unit fields graph start",
+                ))?;
+        let field_end =
+            body_start
+                .checked_add(current_range.end)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager unit fields graph end",
+                ))?;
+        let output = self
+            .serialized_object_graph
+            .get_mut(field_start..field_end)
+            .ok_or_else(|| invalid(field_start, "CitizenManager unit fields exceed graph"))?;
+        if output.len() != replacement.len() {
+            return Err(invalid(
+                field_start,
+                "edited CitizenManager unit fields change the serialized width",
+            ));
+        }
+        output.copy_from_slice(replacement);
+        Ok(())
+    }
+
     /// Replaces the active CitizenInstance field section at slot 7 while
     /// preserving the rest of the current CitizenManager body byte-for-byte.
     ///
@@ -18246,10 +18350,38 @@ mod manager_boundary_tests {
             graph.push(0xff);
         }
         graph.push(0xfe); // zero citizen flags
-        for _ in 0..(524_287 / 128) {
-            graph.push(0xff);
+        graph.push(63); // first 64 unit flags as literals
+        graph.extend_from_slice(&1_u16.to_be_bytes());
+        graph.extend_from_slice(&[0; 63 * 2]);
+        let mut remaining_unit_flags = 524_287 - 64;
+        while remaining_unit_flags > 0 {
+            let run = remaining_unit_flags.min(128);
+            graph.push((0x7f + run) as u8);
+            remaining_unit_flags -= run;
         }
-        graph.push(0xfe); // zero citizen-unit flags
+        let unit_record_start = graph.len();
+        graph.extend_from_slice(&[
+            0b0011_1111, // one unit with five citizen and one next-unit reference
+            0x12,
+            0x34,
+            0x56, // citizen 0
+            0x23,
+            0x45,
+            0x67, // citizen 1
+            0x34,
+            0x56,
+            0x78, // citizen 2
+            0x45,
+            0x67,
+            0x89, // citizen 3
+            0x56,
+            0x78,
+            0x9a, // citizen 4
+            0xab,
+            0xcd,
+            0xef, // next unit
+        ]);
+        write_encoded_ushort_array(&mut graph, &[0x7777]); // unit goods
 
         // One active instance, then zero flags through the full v204+ range.
         graph.extend_from_slice(&[0, 0, 0, 0, 1]);
@@ -18299,6 +18431,16 @@ mod manager_boundary_tests {
         let (decoded, end) = manager.decode_citizen_manager_data().unwrap();
         assert_eq!(decoded.citizens().citizen_flags().len(), 1_048_575);
         assert_eq!(decoded.units().unit_flags().len(), 524_287);
+        assert_eq!(decoded.units().active_units().len(), 1);
+        assert_eq!(
+            decoded.units().active_units()[0].citizens()[0],
+            Some(0x123456)
+        );
+        assert_eq!(
+            decoded.units().active_units()[0].next_unit(),
+            Some(0xabcdef)
+        );
+        assert_eq!(decoded.units().active_units()[0].goods(), 0x7777);
         assert_eq!(
             decoded.instance_prefix().instance_flags().unwrap().len(),
             65_535
@@ -18343,6 +18485,50 @@ mod manager_boundary_tests {
         assert_eq!(end, body_end);
         assert!(manager.serialized_object_graph()[end..].starts_with(&transfer_tag));
 
+        let unit_citizen = 0x00a1_b2c3;
+        let unit_next = 0x00d4_e5f6;
+        let mut expected_body = decoded.encode();
+        let unit_citizen_offset = unit_record_start - body_start + 1;
+        expected_body[unit_citizen_offset..unit_citizen_offset + 3]
+            .copy_from_slice(&[0xa1, 0xb2, 0xc3]);
+        expected_body[unit_citizen_offset + 15..unit_citizen_offset + 18]
+            .copy_from_slice(&[0xd4, 0xe5, 0xf6]);
+        let mut edited_units = decoded.clone();
+        assert!(
+            edited_units
+                .set_unit_citizen_reference(0, 0, 0x0100_0000)
+                .is_err()
+        );
+        assert!(
+            edited_units
+                .set_unit_next_reference(0, 0x0100_0000)
+                .is_err()
+        );
+        assert_eq!(edited_units.encode(), decoded.encode());
+        edited_units
+            .set_unit_citizen_reference(0, 0, unit_citizen)
+            .unwrap();
+        edited_units.set_unit_next_reference(0, unit_next).unwrap();
+        manager
+            .replace_citizen_manager_unit_fields(&edited_units)
+            .unwrap();
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start..body_end],
+            expected_body
+        );
+        let (decoded, unit_updated_end) = manager.decode_citizen_manager_data().unwrap();
+        assert_eq!(
+            decoded.units().active_units()[0].citizens()[0],
+            Some(unit_citizen)
+        );
+        assert_eq!(
+            decoded.units().active_units()[0].next_unit(),
+            Some(unit_next)
+        );
+        assert_eq!(decoded.units().active_units()[0].goods(), 0x7777);
+        assert_eq!(decoded.encode(), expected_body);
+        assert_eq!(unit_updated_end, end);
+
         let velocity = [1.25_f32, -2.5, 3.75];
         let position = [-10.0_f32, 20.5, 30.25];
         let target = [40.0_f32, -50.5, 60.25, 1.0];
@@ -18352,7 +18538,6 @@ mod manager_boundary_tests {
         let path_position = 0x66;
         let last_path_offset = 0x77;
         let field_range = decoded.instance_fields_range();
-        let mut expected_body = decoded.encode();
         for (chunk, value) in expected_body[field_range.start..field_range.start + 12]
             .chunks_exact_mut(4)
             .zip(velocity)
