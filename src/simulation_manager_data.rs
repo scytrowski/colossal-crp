@@ -21,7 +21,7 @@ use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
 use crate::audio_manager_data::{AudioManagerData, AudioManagerEditor};
-use crate::citizen_manager_data::CitizenManagerDataPrefix;
+use crate::citizen_manager_data::{CitizenManagerDataPrefix, CitizenUnitDataPrefix};
 use crate::data_serializer::{
     COMPACT_STRING_FLAG, DataSerializerStream, Reader, write_nullable_unique_string, write_u24_be,
     write_unique_string, write_unique_string_with_mode,
@@ -5252,6 +5252,40 @@ impl SimulationManagerData {
             .checked_add(consumed)
             .ok_or(CrpError::ArithmeticOverflow("CitizenManager prefix end"))?;
         Ok((citizens, graph_end))
+    }
+
+    /// Decodes CitizenManager's citizen prefix and version 69+ unit records,
+    /// stopping before the instance flags. Unit and instance data after the
+    /// returned graph offset remains unchanged in the serialized graph.
+    /// Requires CitizenManager and TransferManager at slots 7 and 8.
+    pub fn decode_citizen_manager_units(&self) -> Result<(CitizenUnitDataPrefix, usize), CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 7, "CitizenManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
+
+        let (body_start, next_tag_start) = self.manager_body_boundary(7)?;
+        let body = self
+            .serialized_object_graph
+            .get(body_start..next_tag_start)
+            .ok_or_else(|| invalid(body_start, "CitizenManager body range is invalid"))?;
+        let (_, citizen_prefix_len) =
+            CitizenManagerDataPrefix::decode_prefix(self.format_version, body)?;
+        let unit_bytes = body
+            .get(citizen_prefix_len..)
+            .ok_or_else(|| invalid(body_start, "CitizenManager citizen prefix exceeds body"))?;
+        let (units, unit_prefix_len) =
+            CitizenUnitDataPrefix::decode_prefix(self.format_version, unit_bytes)?;
+        let consumed =
+            citizen_prefix_len
+                .checked_add(unit_prefix_len)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager unit prefix length",
+                ))?;
+        let graph_end = body_start
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "CitizenManager unit prefix end",
+            ))?;
+        Ok((units, graph_end))
     }
 
     /// Decodes the known VehicleManager fields through its versioned counters.
@@ -17974,6 +18008,53 @@ mod manager_boundary_tests {
         assert_eq!(manager.serialized_object_graph()[end], 0xc0);
         assert!(manager.serialized_object_graph()[end + 3..].starts_with(&transfer_tag));
         assert_eq!(body_start, profiler_tag("CitizenManager").len());
+    }
+
+    #[test]
+    fn citizen_manager_unit_locator_stops_before_instance_flags() {
+        let mut graph = profiler_tag("CitizenManager");
+        for _ in 0..(1_048_575 / 128) {
+            graph.push(0xff);
+        }
+        graph.push(0xfe); // remaining 127 values in the citizen flag array
+        let citizen_end = graph.len();
+        for _ in 0..(524_287 / 128) {
+            graph.push(0xff);
+        }
+        graph.push(0xfe); // remaining 127 values in the unit flag array
+        let unit_end = graph.len();
+        graph.push(0x77); // first byte of opaque instance data
+        graph.extend_from_slice(&[0, 0]); // closing profiler reference
+        let transfer_tag = profiler_tag("TransferManager");
+        graph.extend_from_slice(&transfer_tag);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 121_034;
+        let mut manager_objects = vec![None; 9];
+        manager_objects[7] = Some(ManagerObjectReference {
+            object_id: 7,
+            type_name: "CitizenManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[8] = Some(ManagerObjectReference {
+            object_id: 8,
+            type_name: "TransferManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (_, citizen_prefix_end) = manager.decode_citizen_manager_prefix().unwrap();
+        assert_eq!(citizen_prefix_end, citizen_end);
+        let (units, end) = manager.decode_citizen_manager_units().unwrap();
+        assert_eq!(units.format_version(), 121_034);
+        assert_eq!(units.unit_flags().len(), 524_287);
+        assert!(units.unit_flags().iter().all(|flags| *flags == 0));
+        assert!(units.active_units().is_empty());
+        assert_eq!(
+            units.encode(),
+            manager.serialized_object_graph()[citizen_end..unit_end]
+        );
+        assert_eq!(end, unit_end);
+        assert_eq!(manager.serialized_object_graph()[end], 0x77);
+        assert!(manager.serialized_object_graph()[end + 3..].starts_with(&transfer_tag));
     }
 
     #[test]

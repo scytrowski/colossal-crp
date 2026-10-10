@@ -58,7 +58,9 @@ pub use building_manager_data::{
     BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
     BuildingTimerGeometryPrefix,
 };
-pub use citizen_manager_data::CitizenManagerDataPrefix;
+pub use citizen_manager_data::{
+    CitizenManagerDataPrefix, CitizenUnitDataPrefix, CitizenUnitRecord,
+};
 pub use data_serializer::DataSerializerStream;
 pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictAirportData, DistrictAirportEditor,
