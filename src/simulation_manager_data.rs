@@ -7,6 +7,7 @@ use crate::InstanceManagerData;
 use crate::InstanceManagerEditor;
 use crate::PathManagerData;
 use crate::PropManagerDataPrefix;
+use crate::PropManagerEditor;
 use crate::TerrainManagerData;
 use crate::TreeManagerDataPrefix;
 use crate::TreeManagerEditor;
@@ -3213,6 +3214,92 @@ impl SimulationManagerData {
             ));
         }
         Ok((props, tree_tag_start))
+    }
+
+    /// Decodes PropManager into an editor for existing active-prop columns.
+    pub fn decode_prop_manager_editor(&self) -> Result<PropManagerEditor, CrpError> {
+        let (props, _) = self.decode_prop_manager_prefix()?;
+        Ok(props.into_editor())
+    }
+
+    /// Replaces existing PropManager prefab assignments and transform columns.
+    ///
+    /// The editor must come from the current manager body and inner version.
+    /// Flags, prefab-name scopes, logo tables, and record counts stay unchanged.
+    /// Changed encoded columns can resize the graph; the TreeManager boundary
+    /// is checked again after replacement.
+    pub fn replace_prop_manager_data(
+        &mut self,
+        edited: &PropManagerEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                14,
+                "edited PropManager version does not match this stream",
+            ));
+        }
+        let (current, _) = self.decode_prop_manager_prefix()?;
+        if current.encode().as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                14,
+                "PropManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        let (body_start, next_tag_start) = self.manager_body_boundary(14)?;
+        let original_body_end = body_start
+            .checked_add(edited.original_body_bytes().len())
+            .ok_or(CrpError::ArithmeticOverflow("PropManager source body end"))?;
+        let bounded_end = original_body_end
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "PropManager closing profiler reference end",
+            ))?;
+        if bounded_end != next_tag_start {
+            return Err(invalid(
+                original_body_end,
+                "PropManager source body does not end at the TreeManager boundary",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        if body_start > original_body_end || original_body_end > candidate_graph.len() {
+            return Err(invalid(
+                body_start,
+                "PropManager replacement range is invalid",
+            ));
+        }
+        candidate_graph.splice(body_start..original_body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let expected_next_tag_start = body_start
+            .checked_add(replacement.len())
+            .and_then(|body_end| body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES))
+            .ok_or(CrpError::ArithmeticOverflow("PropManager updated boundary"));
+        let validation = expected_next_tag_start.and_then(|expected_next_tag_start| {
+            self.decode_prop_manager_prefix()
+                .and_then(|(decoded, actual_next_tag_start)| {
+                    if decoded.encode() != replacement {
+                        return Err(invalid(
+                            body_start,
+                            "rewritten PropManager body does not match the editor",
+                        ));
+                    }
+                    if actual_next_tag_start != expected_next_tag_start {
+                        return Err(invalid(
+                            actual_next_tag_start,
+                            "rewritten PropManager boundary does not match its encoded length",
+                        ));
+                    }
+                    Ok(())
+                })
+        });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten PropManager body failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes TreeManager and locates the following queued manager by type.
@@ -14787,6 +14874,55 @@ mod manager_boundary_tests {
         assert_eq!(districts.district_flags(), &[0; 128]);
         assert_eq!(districts.park_flags(), &[0; 128]);
         assert_eq!(district_end, data.serialized_object_graph().len());
+    }
+
+    #[test]
+    fn prop_manager_editor_resizes_columns_and_preserves_tree_boundary() {
+        let mut manager = synthetic_manager_data();
+        let (original_props, _) = manager.decode_prop_manager_prefix().unwrap();
+        let (_, prop_tag_start) = manager.decode_zone_manager_prefix().unwrap();
+        let prop_tag = profiler_tag("PropManager");
+        let body_start = prop_tag_start + prop_tag.len();
+        let old_body_end = body_start + original_props.encode().len();
+
+        let mut flags = vec![0_u16; 65_535];
+        flags[..3].fill(1);
+        let mut encoded_flags = Vec::new();
+        write_encoded_ushort_array(&mut encoded_flags, &flags);
+        let mut prop_body = encoded_flags;
+        write_encoded_ushort_array(&mut prop_body, &[1, 2, 3]);
+        prop_body.extend_from_slice(&[0, 0]); // Empty PropInfo name scope.
+        let x_offset = prop_body.len();
+        let mut encoded_x = Vec::new();
+        write_encoded_ushort_array(&mut encoded_x, &[10, 20, 30]);
+        prop_body.extend_from_slice(&encoded_x);
+        write_encoded_ushort_array(&mut prop_body, &[40, 50, 60]);
+        write_encoded_ushort_array(&mut prop_body, &[70, 80, 90]);
+
+        manager
+            .serialized_object_graph
+            .splice(body_start..old_body_end, prop_body.iter().copied());
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let original_graph_len = original_graph.len();
+        let mut editor = manager.decode_prop_manager_editor().unwrap();
+        editor.position_x_mut().fill(0);
+
+        let mut expected_graph = original_graph;
+        let x_start = body_start + x_offset;
+        expected_graph.splice(x_start..x_start + encoded_x.len(), [0x82]);
+        assert_eq!(expected_graph.len(), original_graph_len - 6);
+        manager.replace_prop_manager_data(&editor).unwrap();
+
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+        let (updated, tree_start) = manager.decode_prop_manager_prefix().unwrap();
+        assert_eq!(updated.position_x(), &[0, 0, 0]);
+        assert_eq!(updated.prefab_indices(), &[1, 2, 3]);
+        assert!(
+            manager.serialized_object_graph()[tree_start..]
+                .starts_with(&profiler_tag("TreeManager"))
+        );
+        assert!(manager.replace_prop_manager_data(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
     }
 
     #[test]

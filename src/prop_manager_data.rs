@@ -1,6 +1,7 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::read_encoded_ushort_array;
+use crate::encoded_array::{read_encoded_ushort_array, write_encoded_ushort_array};
+use std::ops::Range;
 
 const PROP_INSTANCE_COUNT: usize = 65_535;
 const LOGO_TABLE_VERSION: u32 = 121_026;
@@ -9,23 +10,42 @@ const LOGO_TABLE_VERSION: u32 = 121_026;
 ///
 /// The decoder supports the legacy layout below inner version 121026 and the
 /// logo-table layout from version 121026. It retains the exact known bytes for
-/// lossless rewriting; changing fields and canonical serialization are not
-/// currently exposed.
+/// lossless rewriting. The editor can change existing active-prop columns
+/// without changing flags, prefab-name scopes, or logo tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropManagerDataPrefix {
     format_version: u32,
     flags: Vec<u16>,
     prefab_indices: Vec<u16>,
+    prefab_indices_range: Range<usize>,
     prefab_names: Vec<Option<String>>,
     position_x: Vec<i16>,
+    position_x_range: Range<usize>,
     position_z: Vec<i16>,
+    position_z_range: Range<usize>,
     angles: Vec<u16>,
+    angles_range: Range<usize>,
     race_logo_indices: Vec<u16>,
     race_logo_names: Vec<Option<String>>,
     event_logo_indices: Vec<u16>,
     event_logo_names: Vec<Option<String>>,
     logo_tables_present: bool,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for existing active PropManager prefab assignments and transform columns.
+///
+/// Prop flags, prefab-name scopes, logo tables, and record counts are retained.
+/// Changed encoded columns use canonical `EncodedArray.UShort` encoding;
+/// unchanged columns and all other bytes retain their original representation.
+/// The source layout may be legacy or include the version-121026 logo tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropManagerEditor {
+    data: PropManagerDataPrefix,
+    original_prefab_indices: Vec<u16>,
+    original_position_x: Vec<i16>,
+    original_position_z: Vec<i16>,
+    original_angles: Vec<u16>,
 }
 
 impl PropManagerDataPrefix {
@@ -39,17 +59,25 @@ impl PropManagerDataPrefix {
         let mut reader = Reader::new(bytes);
         let flags = read_encoded_ushort_array(&mut reader, PROP_INSTANCE_COUNT)?;
         let active_count = flags.iter().filter(|flags| **flags != 0).count();
+        let prefab_indices_start = reader.offset();
         let prefab_indices = read_encoded_ushort_array(&mut reader, active_count)?;
+        let prefab_indices_range = prefab_indices_start..reader.offset();
         let prefab_names = read_prefab_names(&mut reader)?;
+        let position_x_start = reader.offset();
         let position_x = read_encoded_ushort_array(&mut reader, active_count)?
             .into_iter()
             .map(|value| value as i16)
             .collect();
+        let position_x_range = position_x_start..reader.offset();
+        let position_z_start = reader.offset();
         let position_z = read_encoded_ushort_array(&mut reader, active_count)?
             .into_iter()
             .map(|value| value as i16)
             .collect();
+        let position_z_range = position_z_start..reader.offset();
+        let angles_start = reader.offset();
         let angles = read_encoded_ushort_array(&mut reader, active_count)?;
+        let angles_range = angles_start..reader.offset();
 
         let logo_tables_present = format_version >= LOGO_TABLE_VERSION;
         let (race_logo_indices, race_logo_names, event_logo_indices, event_logo_names) =
@@ -81,10 +109,14 @@ impl PropManagerDataPrefix {
                 format_version,
                 flags,
                 prefab_indices,
+                prefab_indices_range,
                 prefab_names,
                 position_x,
+                position_x_range,
                 position_z,
+                position_z_range,
                 angles,
+                angles_range,
                 race_logo_indices,
                 race_logo_names,
                 event_logo_indices,
@@ -99,6 +131,17 @@ impl PropManagerDataPrefix {
     /// Returns the inner DataSerializer version.
     pub fn format_version(&self) -> u32 {
         self.format_version
+    }
+
+    /// Creates an editor for existing active-prop assignments and transforms.
+    pub fn into_editor(self) -> PropManagerEditor {
+        PropManagerEditor {
+            original_prefab_indices: self.prefab_indices.clone(),
+            original_position_x: self.position_x.clone(),
+            original_position_z: self.position_z.clone(),
+            original_angles: self.angles.clone(),
+            data: self,
+        }
     }
 
     /// Returns all 65,535 serialized flags for one-based PropInstance slots.
@@ -162,6 +205,158 @@ impl PropManagerDataPrefix {
     }
 }
 
+impl PropManagerEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.data.format_version
+    }
+
+    /// Returns mutable PropInfo assignments in active-prop order.
+    pub fn prefab_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.data.prefab_indices
+    }
+
+    /// Returns mutable signed X coordinates in active-prop order.
+    pub fn position_x_mut(&mut self) -> &mut [i16] {
+        &mut self.data.position_x
+    }
+
+    /// Returns mutable signed Z coordinates in active-prop order.
+    pub fn position_z_mut(&mut self) -> &mut [i16] {
+        &mut self.data.position_z
+    }
+
+    /// Returns mutable angle values in active-prop order.
+    pub fn angles_mut(&mut self) -> &mut [u16] {
+        &mut self.data.angles
+    }
+
+    /// Writes edited columns while retaining all unedited source bytes.
+    /// Returns an error if the source column ranges or record counts are inconsistent.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let count = self.original_prefab_indices.len();
+        if self.data.prefab_indices.len() != count
+            || self.data.position_x.len() != count
+            || self.data.position_z.len() != count
+            || self.data.angles.len() != count
+            || self.original_position_x.len() != count
+            || self.original_position_z.len() != count
+            || self.original_angles.len() != count
+        {
+            return Err(invalid_prop_manager(
+                0,
+                "active-prop column lengths do not match the source",
+            ));
+        }
+
+        let mut bytes = self.data.serialized_prefix.clone();
+        let mut replacements = Vec::new();
+        if self.data.prefab_indices != self.original_prefab_indices {
+            replacements.push(encode_ushort_column(
+                &bytes,
+                &self.data.prefab_indices_range,
+                &self.data.prefab_indices,
+                "prefab indexes",
+            )?);
+        }
+        if self.data.position_x != self.original_position_x {
+            let values = self
+                .data
+                .position_x
+                .iter()
+                .map(|value| *value as u16)
+                .collect::<Vec<_>>();
+            replacements.push(encode_ushort_column(
+                &bytes,
+                &self.data.position_x_range,
+                &values,
+                "x positions",
+            )?);
+        }
+        if self.data.position_z != self.original_position_z {
+            let values = self
+                .data
+                .position_z
+                .iter()
+                .map(|value| *value as u16)
+                .collect::<Vec<_>>();
+            replacements.push(encode_ushort_column(
+                &bytes,
+                &self.data.position_z_range,
+                &values,
+                "z positions",
+            )?);
+        }
+        if self.data.angles != self.original_angles {
+            replacements.push(encode_ushort_column(
+                &bytes,
+                &self.data.angles_range,
+                &self.data.angles,
+                "angles",
+            )?);
+        }
+
+        replacements.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        let mut previous_start = bytes.len();
+        for (range, replacement) in replacements {
+            if range.end > previous_start {
+                return Err(invalid_prop_manager(
+                    range.start,
+                    "edited PropManager field ranges overlap",
+                ));
+            }
+            validate_range(&bytes, &range, range.len(), "edited PropManager field")?;
+            bytes.splice(range.clone(), replacement);
+            previous_start = range.start;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.data.serialized_prefix
+    }
+}
+
+fn encode_ushort_column(
+    source: &[u8],
+    range: &Range<usize>,
+    values: &[u16],
+    field: &str,
+) -> Result<(Range<usize>, Vec<u8>), CrpError> {
+    if range.start > range.end || range.end > source.len() {
+        return Err(invalid_prop_manager(
+            range.start,
+            format!("{field} byte range is invalid"),
+        ));
+    }
+    let mut encoded = Vec::new();
+    write_encoded_ushort_array(&mut encoded, values);
+    Ok((range.clone(), encoded))
+}
+
+fn validate_range(
+    source: &[u8],
+    range: &Range<usize>,
+    expected_len: usize,
+    field: &str,
+) -> Result<(), CrpError> {
+    if range.start > range.end || range.end > source.len() || range.len() != expected_len {
+        return Err(invalid_prop_manager(
+            range.start,
+            format!("{field} byte range does not match its decoded values"),
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_prop_manager(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "PropManager+Data".to_owned(),
+        offset,
+        reason: reason.into(),
+    }
+}
+
 fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, CrpError> {
     let count = usize::from(reader.read_u16_be()?);
     let mut names = Vec::with_capacity(count);
@@ -174,6 +369,7 @@ fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, Crp
 #[cfg(test)]
 mod tests {
     use super::PropManagerDataPrefix;
+    use crate::encoded_array::write_encoded_ushort_array;
 
     const LEGACY_FIXTURE: &[u8] =
         include_bytes!("../tests/fixtures/prop-manager-data-v116020-desert.bin");
@@ -261,6 +457,61 @@ mod tests {
         assert_eq!(props.race_logo_indices(), &[0x44]);
         assert_eq!(props.event_logo_indices(), &[0x55]);
         assert_eq!(props.encode(), bytes);
+    }
+
+    #[test]
+    fn prop_manager_editor_reencodes_only_changed_active_columns() {
+        let mut flags = vec![0_u16; 65_535];
+        flags[..3].fill(1);
+        let mut encoded_flags = Vec::new();
+        write_encoded_ushort_array(&mut encoded_flags, &flags);
+        let mut source = encoded_flags.clone();
+        write_encoded_ushort_array(&mut source, &[10, 20, 30]);
+        source.extend_from_slice(&[0, 0]); // Empty PropInfo name scope.
+        write_encoded_ushort_array(&mut source, &[10, 20, 30]);
+        write_encoded_ushort_array(&mut source, &[0xffff, 2, 3]);
+        write_encoded_ushort_array(&mut source, &[10, 20, 30]);
+
+        let (props, _) = PropManagerDataPrefix::decode_prefix(116_020, &source).unwrap();
+        let mut editor = props.into_editor();
+        assert_eq!(editor.encode().unwrap(), source);
+        editor.prefab_indices_mut().fill(0);
+        editor.position_x_mut().fill(0);
+        editor.position_z_mut().copy_from_slice(&[5, 6, 7]);
+        editor.angles_mut().fill(0);
+
+        let mut expected = encoded_flags;
+        expected.extend_from_slice(&[0x82]); // Three zero prefab indices.
+        expected.extend_from_slice(&[0, 0]); // Unchanged empty name scope.
+        expected.extend_from_slice(&[0x82]); // Three zero x positions.
+        expected.extend_from_slice(&[2, 0, 5, 0, 6, 0, 7]); // Signed z values as UShort.
+        expected.extend_from_slice(&[0x82]); // Three zero angles.
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+
+        let (updated, used) = PropManagerDataPrefix::decode_prefix(116_020, &encoded).unwrap();
+        assert_eq!(used, encoded.len());
+        assert_eq!(updated.prefab_indices(), &[0, 0, 0]);
+        assert_eq!(updated.position_x(), &[0, 0, 0]);
+        assert_eq!(updated.position_z(), &[5, 6, 7]);
+        assert_eq!(updated.angles(), &[0, 0, 0]);
+    }
+
+    #[test]
+    fn prop_manager_editor_keeps_newer_logo_scopes_unchanged() {
+        let bytes = two_logo_prefix();
+        let (props, _) = PropManagerDataPrefix::decode_prefix(121_026, &bytes).unwrap();
+        let mut editor = props.into_editor();
+        editor.position_x_mut()[0] = 7;
+
+        let mut expected = bytes.clone();
+        expected[528..533].copy_from_slice(&[1, 0, 7, 0, 2]);
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let (updated, _) = PropManagerDataPrefix::decode_prefix(121_026, &encoded).unwrap();
+        assert_eq!(updated.position_x(), &[7, 2]);
+        assert_eq!(updated.race_logo_indices(), &[0x44]);
+        assert_eq!(updated.event_logo_indices(), &[0x55]);
     }
 
     #[test]

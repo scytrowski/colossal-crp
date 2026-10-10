@@ -89,7 +89,7 @@ pub use net_manager_data::{
     NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
-pub use prop_manager_data::PropManagerDataPrefix;
+pub use prop_manager_data::{PropManagerDataPrefix, PropManagerEditor};
 pub use simulation_manager_data::{
     EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
     EconomyInvestmentValueSeries, EconomyLoanRecord, EconomyManagerBudgetEditor,
