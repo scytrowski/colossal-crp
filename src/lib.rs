@@ -84,10 +84,10 @@ pub use net_manager_data::{
     NetNodeFlagsPrefix, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeProblem,
     NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader,
     NetSegmentCoverage, NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironment,
-    NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsEditor, NetSegmentFlagsPrefix,
-    NetSegmentProblem, NetSegmentProblemsEditor, NetSegmentProblemsPrefix, NetSegmentRecord,
-    NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsEditor,
-    NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
+    NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlag,
+    NetSegmentFlagsEditor, NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsEditor,
+    NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsPrefix, NetSegmentTrafficLight,
+    NetSegmentTrafficLightsEditor, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathManagerEditor, PathPosition, PathUnit};
 pub use prop_manager_data::{PropManagerDataPrefix, PropManagerEditor};
@@ -2163,6 +2163,7 @@ mod tests {
             assert_eq!(used, bytes.len());
             assert_eq!(prefix.environment(), fields);
             assert_eq!(prefix.encode(), bytes);
+            assert_eq!(prefix.clone().into_editor().encode()?, bytes);
             if !bytes.is_empty() {
                 assert!(
                     NetSegmentEnvironmentPrefix::decode_prefix(
@@ -2178,6 +2179,49 @@ mod tests {
                     .is_err()
             );
         }
+
+        let flags_228 = flags(228)?;
+        let (condition_228, _) = NetSegmentEnvironmentPrefix::decode_prefix(228, &flags_228, &[])?;
+        let mut editor_228 = condition_228.into_editor();
+        editor_228.condition_mut()[0] = 1;
+        assert!(editor_228.encode().is_err());
+
+        let flags_229 = flags(229)?;
+        let (condition_229, _) =
+            NetSegmentEnvironmentPrefix::decode_prefix(229, &flags_229, &[0, 7])?;
+        let mut editor_229 = condition_229.into_editor();
+        editor_229.condition_mut()[0] = 8;
+        assert_eq!(editor_229.encode()?, [0, 8]);
+        editor_229.noise_density_mut()[0] = 1;
+        assert!(editor_229.encode().is_err());
+
+        let flags_109007 = flags(109_007)?;
+        let (noise, _) = NetSegmentEnvironmentPrefix::decode_prefix(
+            109_007,
+            &flags_109007,
+            &[0, 7, 0, 0x12, 0x34, 0, 8],
+        )?;
+        let mut noise_editor = noise.into_editor();
+        noise_editor.condition_mut()[0] = 8;
+        noise_editor.noise_buffer_mut()[0] = 0x1235;
+        noise_editor.noise_density_mut()[0] = 9;
+        assert_eq!(noise_editor.encode()?, [0, 8, 0, 0x12, 0x35, 0, 9]);
+        noise_editor.attractiveness_mut()[0] = 1;
+        assert!(noise_editor.encode().is_err());
+
+        let flags_121030 = flags(121_030)?;
+        let (latest, _) = NetSegmentEnvironmentPrefix::decode_prefix(
+            121_030,
+            &flags_121030,
+            &[0, 7, 0, 0x12, 0x34, 0, 8, 0, 9],
+        )?;
+        let mut latest_editor = latest.into_editor();
+        latest_editor.condition_mut()[0] = 8;
+        latest_editor.noise_buffer_mut()[0] = 0x1235;
+        latest_editor.noise_density_mut()[0] = 10;
+        latest_editor.attractiveness_mut()[0] = 11;
+        assert_eq!(latest_editor.encode()?, [0, 8, 0, 0x12, 0x35, 0, 10, 0, 11]);
+
         let mut empty_flags_bytes = vec![0xff; 287];
         empty_flags_bytes.push(0xfe);
         empty_flags_bytes.extend(std::iter::repeat_n(0xff, 287));

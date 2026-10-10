@@ -349,7 +349,24 @@ pub struct NetSegmentEnvironment {
 pub struct NetSegmentEnvironmentPrefix {
     format_version: u32,
     environment: Vec<NetSegmentEnvironment>,
+    source_segment_flags: Vec<u8>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for condition, noise, and attractiveness values on active segments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentEnvironmentEditor {
+    format_version: u32,
+    condition: Vec<u8>,
+    noise_buffer: Vec<u16>,
+    noise_density: Vec<u8>,
+    attractiveness: Vec<u8>,
+    original_condition: Vec<u8>,
+    original_noise_buffer: Vec<u16>,
+    original_noise_density: Vec<u8>,
+    original_attractiveness: Vec<u8>,
+    original_segment_flags: Vec<u8>,
+    original_prefix: Vec<u8>,
 }
 
 /// Fixed fields stored for one segment with nonzero primary flags.
@@ -1837,6 +1854,7 @@ impl NetSegmentEnvironmentPrefix {
             Self {
                 format_version,
                 environment,
+                source_segment_flags: segment_flags.encode(),
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -1856,6 +1874,142 @@ impl NetSegmentEnvironmentPrefix {
     /// Writes the original encoded arrays exactly, preserving unknown run grouping.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit active segments' environmental values.
+    pub fn into_editor(self) -> NetSegmentEnvironmentEditor {
+        let condition = self
+            .environment
+            .iter()
+            .map(|item| item.condition)
+            .collect::<Vec<_>>();
+        let noise_buffer = self
+            .environment
+            .iter()
+            .map(|item| item.noise_buffer)
+            .collect::<Vec<_>>();
+        let noise_density = self
+            .environment
+            .iter()
+            .map(|item| item.noise_density)
+            .collect::<Vec<_>>();
+        let attractiveness = self
+            .environment
+            .iter()
+            .map(|item| item.attractiveness)
+            .collect::<Vec<_>>();
+        NetSegmentEnvironmentEditor {
+            format_version: self.format_version,
+            original_condition: condition.clone(),
+            original_noise_buffer: noise_buffer.clone(),
+            original_noise_density: noise_density.clone(),
+            original_attractiveness: attractiveness.clone(),
+            condition,
+            noise_buffer,
+            noise_density,
+            attractiveness,
+            original_segment_flags: self.source_segment_flags,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetSegmentEnvironmentEditor {
+    /// Returns the inner DataSerializer version associated with this prefix.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns condition values in active-segment order.
+    pub fn condition_mut(&mut self) -> &mut [u8] {
+        &mut self.condition
+    }
+
+    /// Returns noise-buffer values in active-segment order.
+    pub fn noise_buffer_mut(&mut self) -> &mut [u16] {
+        &mut self.noise_buffer
+    }
+
+    /// Returns noise-density values in active-segment order.
+    pub fn noise_density_mut(&mut self) -> &mut [u8] {
+        &mut self.noise_density
+    }
+
+    /// Returns attractiveness values in active-segment order.
+    pub fn attractiveness_mut(&mut self) -> &mut [u8] {
+        &mut self.attractiveness
+    }
+
+    /// Encodes arrays in their version-gated serialized order.
+    ///
+    /// Condition starts at inner version 229, the noise arrays at 109007,
+    /// and attractiveness at 121030. Fields synthesized before their gates
+    /// cannot be changed.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let count = self.original_condition.len();
+        if self.condition.len() != count
+            || self.noise_buffer.len() != count
+            || self.noise_density.len() != count
+            || self.attractiveness.len() != count
+        {
+            return Err(invalid(
+                0,
+                "edited segment environment counts do not match the source",
+            ));
+        }
+        if self.condition == self.original_condition
+            && self.noise_buffer == self.original_noise_buffer
+            && self.noise_density == self.original_noise_density
+            && self.attractiveness == self.original_attractiveness
+        {
+            return Ok(self.original_prefix.clone());
+        }
+        if self.format_version < SEGMENT_CONDITION_VERSION
+            && self.condition != self.original_condition
+        {
+            return Err(invalid(
+                0,
+                "segment condition is not serialized before inner version 229",
+            ));
+        }
+        if self.format_version < SEGMENT_NOISE_VERSION
+            && (self.noise_buffer != self.original_noise_buffer
+                || self.noise_density != self.original_noise_density)
+        {
+            return Err(invalid(
+                0,
+                "segment noise is not serialized before inner version 109007",
+            ));
+        }
+        if self.format_version < SEGMENT_ATTRACTIVENESS_VERSION
+            && self.attractiveness != self.original_attractiveness
+        {
+            return Err(invalid(
+                0,
+                "segment attractiveness is not serialized before inner version 121030",
+            ));
+        }
+
+        let mut output = Vec::new();
+        if self.format_version >= SEGMENT_CONDITION_VERSION {
+            write_encoded_byte_array(&mut output, &self.condition);
+        }
+        if self.format_version >= SEGMENT_NOISE_VERSION {
+            write_encoded_ushort_array(&mut output, &self.noise_buffer);
+            write_encoded_byte_array(&mut output, &self.noise_density);
+        }
+        if self.format_version >= SEGMENT_ATTRACTIVENESS_VERSION {
+            write_encoded_byte_array(&mut output, &self.attractiveness);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_segment_flags(&self) -> &[u8] {
+        &self.original_segment_flags
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 

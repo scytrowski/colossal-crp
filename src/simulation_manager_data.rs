@@ -69,8 +69,9 @@ use crate::{
     NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
     NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
     NetNodeRecordsPrefix, NetSegmentCoverageEditor, NetSegmentCoveragePrefix,
-    NetSegmentEnvironmentPrefix, NetSegmentFlagsPrefix, NetSegmentProblemsPrefix,
-    NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
+    NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlagsPrefix,
+    NetSegmentProblemsPrefix, NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix,
+    NetTreePrefabPrefix,
 };
 use crate::{PathManagerData, PathManagerEditor};
 use crate::{WeatherManagerData, WeatherManagerEditor};
@@ -3550,17 +3551,120 @@ impl SimulationManagerData {
         &self,
         save_app_version: Option<u32>,
     ) -> Result<(NetSegmentEnvironmentPrefix, usize), CrpError> {
-        let (_, coverage_end) = self.decode_net_segment_coverage_prefix(save_app_version)?;
-        let (segment_flags, _) = self.decode_net_segment_flags_prefix(save_app_version)?;
+        let (_, data, _, end) = self.decode_net_segment_environment_with_range(save_app_version)?;
+        Ok((data, end))
+    }
+
+    fn decode_net_segment_environment_with_range(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<
+        (
+            NetSegmentFlagsPrefix,
+            NetSegmentEnvironmentPrefix,
+            usize,
+            usize,
+        ),
+        CrpError,
+    > {
+        let (segment_flags, _, _, coverage_end) =
+            self.decode_net_segment_coverage_with_range(save_app_version)?;
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(coverage_end)?;
+        let body_start = reader.offset();
         let (data, body_length) = NetSegmentEnvironmentPrefix::decode_prefix(
             self.format_version,
             &segment_flags,
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        Ok((segment_flags, data, body_start, reader.offset()))
+    }
+
+    /// Decodes NetManager's active-segment environment arrays into an editor.
+    pub fn decode_net_segment_environment_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetSegmentEnvironmentEditor, CrpError> {
+        let (_, environment, _, _) =
+            self.decode_net_segment_environment_with_range(save_app_version)?;
+        Ok(environment.into_editor())
+    }
+
+    /// Replaces NetManager's active-segment condition, noise, and attractiveness.
+    ///
+    /// The editor must match this stream's inner version, source segment flags,
+    /// and original environment bytes. Changed arrays may resize the section
+    /// and shift individual segment records while preserving their bytes.
+    pub fn replace_net_segment_environment(
+        &mut self,
+        edited: &NetSegmentEnvironmentEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager environment version does not match this stream",
+            ));
+        }
+        let (current_flags, current, body_start, body_end) =
+            self.decode_net_segment_environment_with_range(save_app_version)?;
+        if current_flags.encode().as_slice() != edited.original_segment_flags() {
+            return Err(invalid(
+                body_start,
+                "NetManager segment flags do not match the environment editor's source",
+            ));
+        }
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager environment bytes do not match the editor's source prefix",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager environment prefix range is inconsistent",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_net_segment_environment_with_range(save_app_version)
+            .and_then(|(decoded_flags, decoded, actual_start, actual_end)| {
+                if decoded_flags.encode() != current_flags.encode() {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager environment changed its source flags",
+                    ));
+                }
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager environment does not match the editor",
+                    ));
+                }
+                let expected_end = body_start
+                    .checked_add(replacement.len())
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager environment end"))?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager environment has an unexpected boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager environment failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes individual active-segment records after the environment arrays.
@@ -11245,6 +11349,9 @@ mod manager_boundary_tests {
         net_body.extend_from_slice(&[1, 34, 34, 0xb9]); // Two literals, then 58 zero-delta repeats.
         net_body.extend_from_slice(&[1, 31, 31, 0x9b]); // Two literals, then 28 repeats.
         net_body.extend_from_slice(&[1, 42, 42, 0x9b]); // Two literals, then 28 repeats.
+        net_body.extend_from_slice(&[0x9d]); // Thirty zero conditions.
+        net_body.extend_from_slice(&[0x9d]); // Thirty zero noise-buffer values.
+        net_body.extend_from_slice(&[0x9d]); // Thirty zero noise-density values.
         let opaque_tail = [0xaa, 0xbb, 0xcc, 0xdd];
         net_body.extend_from_slice(&opaque_tail);
         manager.serialized_object_graph.extend_from_slice(&net_body);
@@ -11379,6 +11486,41 @@ mod manager_boundary_tests {
             &manager.serialized_object_graph[edited_coverage_end..],
             original_environment_tail
         );
+        let (environment, environment_end) =
+            manager.decode_net_segment_environment_prefix(Some(0))?;
+        assert_eq!(environment.environment().len(), 30);
+        assert_eq!(environment.encode(), [0x9d, 0x9d, 0x9d]);
+        assert!(environment.environment().iter().all(|item| {
+            item.condition == 0
+                && item.noise_buffer == 0
+                && item.noise_density == 0
+                && item.attractiveness == 0
+        }));
+        let original_segment_record_tail =
+            manager.serialized_object_graph[environment_end..].to_vec();
+        let mut environment_editor = environment.into_editor();
+        environment_editor.condition_mut()[0] = 7;
+        environment_editor.noise_buffer_mut()[0] = 0x1234;
+        environment_editor.noise_density_mut()[0] = 8;
+        assert!(environment_editor.encode()?.len() > 3);
+        manager.replace_net_segment_environment(&environment_editor, Some(0))?;
+        let (edited_environment, edited_environment_end) =
+            manager.decode_net_segment_environment_prefix(Some(0))?;
+        assert_eq!(edited_environment.environment()[0].condition, 7);
+        assert_eq!(edited_environment.environment()[0].noise_buffer, 0x1234);
+        assert_eq!(edited_environment.environment()[0].noise_density, 8);
+        assert_eq!(edited_environment.environment()[0].attractiveness, 0);
+        assert!(edited_environment.environment()[1..].iter().all(|item| {
+            item.condition == 0
+                && item.noise_buffer == 0
+                && item.noise_density == 0
+                && item.attractiveness == 0
+        }));
+        assert!(edited_environment_end > environment_end);
+        assert_eq!(
+            &manager.serialized_object_graph[edited_environment_end..],
+            original_segment_record_tail
+        );
 
         let graph_after_problem_edit = manager.serialized_object_graph.clone();
         assert!(
@@ -11403,6 +11545,17 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph, graph_after_coverage_edit);
+
+        let graph_after_environment_edit = manager.serialized_object_graph.clone();
+        assert!(
+            manager
+                .replace_net_segment_environment(&environment_editor, Some(0))
+                .is_err()
+        );
+        assert_eq!(
+            manager.serialized_object_graph,
+            graph_after_environment_edit
+        );
 
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_net_segment_flags(&editor, Some(0)).is_err());
