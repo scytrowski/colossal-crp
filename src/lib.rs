@@ -122,7 +122,7 @@ pub use vehicle_manager_data::{
 pub use water_simulation_data::{
     WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
 };
-pub use weather_manager_data::{WeatherLightningStrike, WeatherManagerData};
+pub use weather_manager_data::{WeatherLightningStrike, WeatherManagerData, WeatherManagerEditor};
 pub use zone_manager_data::{ZoneBlockRecord, ZoneManagerDataPrefix};
 
 const MAGIC: &[u8; 4] = b"CRAP";

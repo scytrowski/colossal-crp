@@ -18,7 +18,6 @@ use crate::VehicleManagerTailDataPrefix;
 use crate::VehicleParkedRecordsPrefix;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
-use crate::WeatherManagerData;
 use crate::ZoneManagerDataPrefix;
 use crate::audio_manager_data::{AudioManagerData, AudioManagerEditor};
 use crate::data_serializer::{
@@ -70,6 +69,7 @@ use crate::{
     NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsPrefix,
     NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
+use crate::{WeatherManagerData, WeatherManagerEditor};
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
 const BUILD_INDEX_HISTORY_LENGTH: usize = 32;
@@ -3320,6 +3320,82 @@ impl SimulationManagerData {
             ));
         }
         Ok((weather, next_tag_start))
+    }
+
+    /// Decodes WeatherManager or legacy WindManager into its scalar-field editor.
+    pub fn decode_weather_manager_editor(&self) -> Result<WeatherManagerEditor, CrpError> {
+        let (weather, _) = self.decode_weather_manager_data()?;
+        Ok(weather.into_editor())
+    }
+
+    /// Replaces existing WeatherManager scalar values and lightning records in place.
+    ///
+    /// The editor must come from this manager's current body and inner version.
+    /// Encoded wind planes, unknown bytes, record counts, closing profiler tag,
+    /// and graph length are preserved.
+    pub fn replace_weather_manager_data(
+        &mut self,
+        edited: &WeatherManagerEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                16,
+                "edited WeatherManager version does not match this stream",
+            ));
+        }
+        let (current, _) = self.decode_weather_manager_data()?;
+        if current.encode().as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                16,
+                "WeatherManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != edited.original_body_bytes().len() {
+            return Err(invalid(
+                16,
+                "WeatherManager edits must preserve the decoded body length",
+            ));
+        }
+        let (body_start, next_tag_start) = self.manager_body_boundary(16)?;
+        let body_end =
+            body_start
+                .checked_add(replacement.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "WeatherManager replacement end",
+                ))?;
+        let bounded_end = body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES).ok_or(
+            CrpError::ArithmeticOverflow("WeatherManager closing profiler reference end"),
+        )?;
+        if bounded_end != next_tag_start {
+            return Err(invalid(
+                body_end,
+                "WeatherManager replacement no longer ends at the VehicleManager boundary",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph
+            .get_mut(body_start..body_end)
+            .ok_or_else(|| invalid(body_start, "WeatherManager replacement range is invalid"))?
+            .copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self.decode_weather_manager_data().and_then(|(decoded, _)| {
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten WeatherManager body does not match the editor",
+                ));
+            }
+            Ok(())
+        });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten WeatherManager body failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes the VehicleManager flags and prefab table at slot 17.
@@ -14677,6 +14753,52 @@ mod manager_boundary_tests {
             end_tag_start,
             profiler_tag(profiler_name).len() + 2 * 128 + 12
         );
+    }
+
+    #[test]
+    fn weather_manager_editor_replaces_body_without_moving_vehicle_boundary() {
+        let mut graph = profiler_tag("WeatherManager");
+        let body_start = graph.len();
+        graph.extend([0xff; 2 * 128]);
+        for value in [1.0_f32, 2.0, 3.0] {
+            graph.extend_from_slice(&value.to_bits().to_be_bytes());
+        }
+        let body_len = graph.len() - body_start;
+        graph.extend_from_slice(&[0x00, 0x10]);
+        graph.extend(profiler_tag("VehicleManager"));
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 231;
+        let mut manager_objects = vec![None; 18];
+        manager_objects[16] = Some(ManagerObjectReference {
+            object_id: 16,
+            type_name: "WeatherManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let mut editor = manager.decode_weather_manager_editor().unwrap();
+        editor.wind_directions_mut()[1] = 9.0;
+        let mut expected = manager.serialized_object_graph().to_vec();
+        expected[body_start + 260..body_start + 264]
+            .copy_from_slice(&9.0_f32.to_bits().to_be_bytes());
+        manager.replace_weather_manager_data(&editor).unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected);
+        assert_eq!(manager.serialized_object_graph().len(), expected.len());
+        assert_eq!(
+            manager
+                .decode_weather_manager_data()
+                .unwrap()
+                .0
+                .wind_directions(),
+            [1.0, 9.0, 3.0]
+        );
+        assert!(manager.replace_weather_manager_data(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), expected);
+        assert_eq!(body_len, 256 + 12);
     }
 
     #[test]
