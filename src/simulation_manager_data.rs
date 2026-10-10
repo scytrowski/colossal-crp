@@ -10,6 +10,7 @@ use crate::PropManagerDataPrefix;
 use crate::TerrainManagerData;
 use crate::TreeManagerDataPrefix;
 use crate::VehicleManagerDataPrefix;
+use crate::VehicleManagerSparseFieldsPrefix;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::WeatherManagerData;
@@ -2117,6 +2118,28 @@ impl SimulationManagerData {
             .checked_add(consumed)
             .ok_or(CrpError::ArithmeticOverflow("VehicleManager prefix end"))?;
         Ok((vehicles, graph_end))
+    }
+
+    /// Decodes the known sparse VehicleManager columns before vehicle records.
+    ///
+    /// Returns the graph offset immediately after the version-gated gate,
+    /// race, and water-source columns. Per-vehicle records remain opaque.
+    pub fn decode_vehicle_manager_sparse_columns(
+        &self,
+    ) -> Result<(VehicleManagerSparseFieldsPrefix, usize), CrpError> {
+        let (vehicles, prefix_end) = self.decode_vehicle_manager_prefix()?;
+        let (_, manager_end) = self.manager_body_boundary(17)?;
+        let sparse_bytes = self
+            .serialized_object_graph
+            .get(prefix_end..manager_end)
+            .ok_or_else(|| invalid(prefix_end, "VehicleManager sparse-column range is invalid"))?;
+        let (columns, consumed) = vehicles.decode_sparse_columns(sparse_bytes)?;
+        let graph_end = prefix_end
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "VehicleManager sparse-column end",
+            ))?;
+        Ok((columns, graph_end))
     }
 
     /// Decodes the known DistrictManager prefix for the requested inner version.
@@ -11963,6 +11986,11 @@ mod manager_boundary_tests {
         assert!(manager.serialized_object_graph()[end..].starts_with(&[0xfe, 0]));
         assert!(manager.serialized_object_graph()[end + 2..].starts_with(&transport_tag));
         assert_eq!(body_start, profiler_tag("VehicleManager").len());
+
+        let (columns, columns_end) = manager.decode_vehicle_manager_sparse_columns().unwrap();
+        assert_eq!(columns.gate_indices(), Some([].as_slice()));
+        assert_eq!(columns.water_sources(), Some([].as_slice()));
+        assert_eq!(columns_end, end);
     }
 
     #[test]

@@ -109,7 +109,7 @@ pub use tree_manager_data::{BurningTreeRecord, TreeInstanceRecord, TreeManagerDa
 pub use unlock_manager_data::{
     UnlockManagerMilestoneArray, UnlockManagerMilestoneKind, UnlockManagerReferences,
 };
-pub use vehicle_manager_data::VehicleManagerDataPrefix;
+pub use vehicle_manager_data::{VehicleManagerDataPrefix, VehicleManagerSparseFieldsPrefix};
 pub use water_simulation_data::{
     WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
 };
@@ -5600,6 +5600,27 @@ mod tests {
                             })
                         );
                         assert!(vehicles_end < manager_data.serialized_object_graph().len());
+                        let active_vehicle_count = vehicles
+                            .vehicle_flags()
+                            .iter()
+                            .filter(|flags| **flags != 0)
+                            .count();
+                        let (vehicle_columns, vehicle_columns_end) =
+                            manager_data.decode_vehicle_manager_sparse_columns()?;
+                        assert_eq!(
+                            vehicle_columns.gate_indices().map(<[u8]>::len),
+                            (manager_data.format_version() >= 182).then_some(active_vehicle_count)
+                        );
+                        assert_eq!(
+                            vehicle_columns.race_teams().map(<[u16]>::len),
+                            (manager_data.format_version() >= 121_008)
+                                .then_some(active_vehicle_count)
+                        );
+                        assert_eq!(
+                            vehicle_columns.water_sources().map(<[u16]>::len),
+                            (manager_data.format_version() >= 273).then_some(active_vehicle_count)
+                        );
+                        assert!(vehicle_columns_end >= vehicles_end);
                         let (districts, districts_end) =
                             manager_data.decode_district_manager_flags_prefix()?;
                         assert_eq!(districts.format_version(), manager_data.format_version());
