@@ -677,6 +677,49 @@ impl TransportManagerLineRecord {
     }
 }
 
+/// Decoded TransportManager line-number and passenger tables with active lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportManagerLineData {
+    format_version: u32,
+    line_numbers: Option<Vec<u16>>,
+    active_lines: Vec<TransportManagerLineRecord>,
+    global_passengers: Option<Vec<TransportPassengerRecord>>,
+    serialized_line_numbers: Vec<u8>,
+    serialized_global_passengers: Vec<u8>,
+}
+
+impl TransportManagerLineData {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns the version-gated shared line-number table.
+    pub fn line_numbers(&self) -> Option<&[u16]> {
+        self.line_numbers.as_deref()
+    }
+
+    /// Returns active line records in flag order.
+    pub fn active_lines(&self) -> &[TransportManagerLineRecord] {
+        &self.active_lines
+    }
+
+    /// Returns version-gated global passenger records, including empty slots.
+    pub fn global_passengers(&self) -> Option<&[TransportPassengerRecord]> {
+        self.global_passengers.as_deref()
+    }
+
+    /// Returns the original shared line-number table bytes.
+    pub fn encode_line_numbers_unchanged(&self) -> Vec<u8> {
+        self.serialized_line_numbers.clone()
+    }
+
+    /// Returns the original global passenger table bytes.
+    pub fn encode_global_passengers_unchanged(&self) -> Vec<u8> {
+        self.serialized_global_passengers.clone()
+    }
+}
+
 /// Version-gated TransportManager vehicle-selection table.
 ///
 /// The original field bytes are retained for exact unchanged writing. Existing
@@ -4524,6 +4567,16 @@ impl SimulationManagerData {
     pub fn decode_transport_manager_line_records(
         &self,
     ) -> Result<Vec<TransportManagerLineRecord>, CrpError> {
+        Ok(self.decode_transport_manager_line_data()?.active_lines)
+    }
+
+    /// Decodes the TransportManager line-number, active-line, and global
+    /// passenger data.
+    ///
+    /// The bounded manager body, including its reference tail and closing
+    /// profiler tag, is checked before returning. Object headers and the
+    /// transport-selection table remain handled by their dedicated APIs.
+    pub fn decode_transport_manager_line_data(&self) -> Result<TransportManagerLineData, CrpError> {
         let (body_range, _) = self.transport_manager_body_range()?;
         let body = self
             .serialized_object_graph
@@ -4531,7 +4584,14 @@ impl SimulationManagerData {
             .ok_or_else(|| invalid(0, "TransportManager body range exceeds manager graph"))?;
         let fields =
             decode_transport_manager_reference_body(self.format_version, body, None, None)?;
-        Ok(fields.line_records)
+        Ok(TransportManagerLineData {
+            format_version: self.format_version,
+            line_numbers: fields.line_numbers,
+            active_lines: fields.line_records,
+            global_passengers: fields.global_passengers,
+            serialized_line_numbers: fields.serialized_line_numbers,
+            serialized_global_passengers: fields.serialized_global_passengers,
+        })
     }
 
     /// Resolves EconomyManager's trailing guide object references.
@@ -7775,16 +7835,7 @@ fn decode_transport_manager_line_record(
         None
     };
     let passengers = if format_version >= 122 {
-        let group_count = if format_version >= 176 { 8 } else { 7 };
-        let mut groups = Vec::with_capacity(group_count);
-        for _ in 0..group_count {
-            groups.push(TransportPassengerCounts {
-                temporary: reader.read_u24_be()?,
-                final_count: reader.read_u24_be()?,
-                average: reader.read_u24_be()?,
-            });
-        }
-        Some(TransportPassengerRecord { groups })
+        Some(decode_transport_passenger_record(format_version, reader)?)
     } else {
         None
     };
@@ -7812,6 +7863,22 @@ fn decode_transport_manager_line_record(
         legacy_vehicle_selection,
         serialized_bytes,
     })
+}
+
+fn decode_transport_passenger_record(
+    format_version: u32,
+    reader: &mut Reader<'_>,
+) -> Result<TransportPassengerRecord, CrpError> {
+    let group_count = if format_version >= 176 { 8 } else { 7 };
+    let mut groups = Vec::with_capacity(group_count);
+    for _ in 0..group_count {
+        groups.push(TransportPassengerCounts {
+            temporary: reader.read_u24_be()?,
+            final_count: reader.read_u24_be()?,
+            average: reader.read_u24_be()?,
+        });
+    }
+    Ok(TransportPassengerRecord { groups })
 }
 
 fn decode_transport_manager_reference_body(
@@ -7858,11 +7925,17 @@ fn decode_transport_manager_reference_body(
     }
 
     let line_number_count = transport_manager_line_number_count(format_version);
-    if format_version >= 153 {
+    let (line_numbers, serialized_line_numbers) = if format_version >= 153 {
+        let start = reader.offset();
+        let mut numbers = Vec::with_capacity(line_number_count);
         for _ in 0..line_number_count {
-            reader.read_u16_be()?;
+            numbers.push(reader.read_u16_be()?);
         }
-    }
+        let end = reader.offset();
+        (Some(numbers), reader.consumed_bytes()[start..end].to_vec())
+    } else {
+        (None, Vec::new())
+    };
     let passenger_group_count = if format_version >= 176 { 8_usize } else { 7 };
     let passenger_record_bytes =
         passenger_group_count
@@ -7877,15 +7950,32 @@ fn decode_transport_manager_reference_body(
             &mut reader,
         )?);
     }
-    if format_version >= 122 {
+    let (global_passengers, serialized_global_passengers) = if format_version >= 122 {
         let passenger_record_count = line_number_count;
         let passenger_bytes = passenger_record_count
             .checked_mul(passenger_record_bytes)
             .ok_or(CrpError::ArithmeticOverflow(
                 "TransportManager passenger record length",
             ))?;
-        reader.read_bytes(passenger_bytes)?;
-    }
+        if passenger_bytes > reader.remaining() {
+            return Err(reader.invalid(format!(
+                "TransportManager declares {passenger_record_count} global passenger records requiring {passenger_bytes} bytes but only {} remain",
+                reader.remaining()
+            )));
+        }
+        let start = reader.offset();
+        let mut records = Vec::with_capacity(passenger_record_count);
+        for _ in 0..passenger_record_count {
+            records.push(decode_transport_passenger_record(
+                format_version,
+                &mut reader,
+            )?);
+        }
+        let end = reader.offset();
+        (Some(records), reader.consumed_bytes()[start..end].to_vec())
+    } else {
+        (None, Vec::new())
+    };
 
     let header_count = transport_manager_object_header_count(format_version);
     let mut headers = Vec::with_capacity(header_count);
@@ -7957,7 +8047,11 @@ fn decode_transport_manager_reference_body(
     Ok(TransportManagerReferenceFields {
         milestone_object_headers,
         object_headers: headers,
+        line_numbers,
         line_records,
+        global_passengers,
+        serialized_line_numbers,
+        serialized_global_passengers,
         selection_prefix,
         #[cfg(test)]
         selection_count,
@@ -7968,7 +8062,11 @@ fn decode_transport_manager_reference_body(
 struct TransportManagerReferenceFields {
     milestone_object_headers: Vec<NetObjectHeader>,
     object_headers: Vec<NetObjectHeader>,
+    line_numbers: Option<Vec<u16>>,
     line_records: Vec<TransportManagerLineRecord>,
+    global_passengers: Option<Vec<TransportPassengerRecord>>,
+    serialized_line_numbers: Vec<u8>,
+    serialized_global_passengers: Vec<u8>,
     selection_prefix: Option<TransportManagerSelectionPrefix>,
     #[cfg(test)]
     selection_count: usize,
@@ -9549,6 +9647,21 @@ mod manager_boundary_tests {
                 panic!("version {format_version} active-line record failed: {error}")
             });
             assert_eq!(decoded.object_headers.len(), object_header_count);
+            assert_eq!(
+                decoded.line_numbers.as_deref().map(<[u16]>::len),
+                Some(line_number_count),
+                "version {format_version}"
+            );
+            assert_eq!(
+                decoded.line_numbers.as_deref(),
+                Some(vec![0; line_number_count].as_slice()),
+                "version {format_version}"
+            );
+            assert_eq!(
+                decoded.serialized_line_numbers,
+                vec![0; line_number_count * 2],
+                "version {format_version}"
+            );
             assert_eq!(decoded.line_records.len(), 1);
             let line = &decoded.line_records[0];
             assert_eq!(line.line_number(), Some(0x1234), "version {format_version}");
@@ -9608,6 +9721,19 @@ mod manager_boundary_tests {
                 bytes[line_record_start..line_record_start + line.encoded_len()],
                 "version {format_version}"
             );
+            let global_passengers = decoded.global_passengers.as_ref().unwrap();
+            assert_eq!(global_passengers.len(), line_number_count);
+            assert!(global_passengers.iter().all(|record| {
+                record.groups().len() == if format_version >= 176 { 8 } else { 7 }
+                    && record.groups().iter().all(|group| {
+                        group.temporary() == 0 && group.final_count() == 0 && group.average() == 0
+                    })
+            }));
+            assert_eq!(
+                decoded.serialized_global_passengers,
+                vec![0; line_number_count * if format_version >= 176 { 8 * 9 } else { 7 * 9 }],
+                "version {format_version}"
+            );
             if format_version >= 114_001 {
                 assert!(decoded.selection_prefix.unwrap().selections().is_empty());
             }
@@ -9617,11 +9743,61 @@ mod manager_boundary_tests {
             active_transport_manager_reference_body(320, 10, 0, 7);
         truncated_line.remove(line_start + 2); // Remove part of the stop-count field.
         assert!(decode_transport_manager_reference_body(320, &truncated_line, None, None).is_err());
+
+        let (mut truncated_line_numbers, line_start) =
+            active_transport_manager_reference_body(320, 10, 0, 7);
+        truncated_line_numbers.remove(line_start - 1);
+        assert!(
+            decode_transport_manager_reference_body(320, &truncated_line_numbers, None, None)
+                .is_err()
+        );
+
+        let (mut truncated_global_passengers, line_start) =
+            active_transport_manager_reference_body(320, 10, 0, 7);
+        let line_len =
+            decode_transport_manager_reference_body(320, &truncated_global_passengers, None, None)
+                .unwrap()
+                .line_records[0]
+                .encoded_len();
+        truncated_global_passengers.remove(line_start + line_len);
+        assert!(
+            decode_transport_manager_reference_body(320, &truncated_global_passengers, None, None)
+                .is_err()
+        );
     }
 
     #[test]
     fn transport_manager_line_record_api_checks_manager_boundary_and_preserves_bytes() {
-        let (body, line_record_start) = active_transport_manager_reference_body(320, 10, 0, 7);
+        let (mut body, line_record_start) = active_transport_manager_reference_body(320, 10, 0, 7);
+        let initial = decode_transport_manager_reference_body(320, &body, None, None).unwrap();
+        let line_record_len = initial.line_records[0].encoded_len();
+
+        let mut expected_line_numbers = Vec::new();
+        let mut expected_line_number_bytes = Vec::new();
+        let line_numbers_start = line_record_start - 10 * 2;
+        for index in 0..10_u16 {
+            let number = 0x0100 + index;
+            expected_line_numbers.push(number);
+            let bytes = number.to_be_bytes();
+            expected_line_number_bytes.extend_from_slice(&bytes);
+            let start = line_numbers_start + usize::from(index) * 2;
+            body[start..start + 2].copy_from_slice(&bytes);
+        }
+
+        let global_passengers_start = line_record_start + line_record_len;
+        let mut expected_global_passenger_bytes = Vec::new();
+        for record_index in 0..10_u32 {
+            for group_index in 0..8_u32 {
+                let base = (record_index + 1) * 0x0100 + group_index * 3;
+                for value in [base, base + 1, base + 2] {
+                    let encoded = value.to_be_bytes();
+                    let start = global_passengers_start + expected_global_passenger_bytes.len();
+                    body[start..start + 3].copy_from_slice(&encoded[1..]);
+                    expected_global_passenger_bytes.extend_from_slice(&encoded[1..]);
+                }
+            }
+        }
+
         let mut graph = profiler_tag("TransportManager");
         let body_start = graph.len();
         graph.extend_from_slice(&body);
@@ -9645,7 +9821,30 @@ mod manager_boundary_tests {
         }
         manager.manager_objects = Some(manager_objects);
 
-        let records = manager.decode_transport_manager_line_records().unwrap();
+        let line_data = manager.decode_transport_manager_line_data().unwrap();
+        assert_eq!(line_data.format_version(), 320);
+        assert_eq!(
+            line_data.line_numbers(),
+            Some(expected_line_numbers.as_slice())
+        );
+        assert_eq!(
+            line_data.encode_line_numbers_unchanged(),
+            expected_line_number_bytes
+        );
+        let global_passengers = line_data.global_passengers().unwrap();
+        assert_eq!(global_passengers.len(), 10);
+        assert_eq!(global_passengers[0].groups().len(), 8);
+        assert_eq!(global_passengers[0].groups()[0].temporary(), 0x0100);
+        assert_eq!(global_passengers[0].groups()[0].final_count(), 0x0101);
+        assert_eq!(global_passengers[0].groups()[0].average(), 0x0102);
+        assert_eq!(global_passengers[0].groups()[7].temporary(), 0x0115);
+        assert_eq!(global_passengers[9].groups()[7].average(), 0x0a17);
+        assert_eq!(
+            line_data.encode_global_passengers_unchanged(),
+            expected_global_passenger_bytes
+        );
+
+        let records = line_data.active_lines();
         assert_eq!(records.len(), 1);
         let record = &records[0];
         assert_eq!(record.line_number(), Some(0x1234));
@@ -9657,9 +9856,13 @@ mod manager_boundary_tests {
             manager.serialized_object_graph()[body_start + line_record_start
                 ..body_start + line_record_start + record.encoded_len()]
         );
+        assert_eq!(
+            manager.decode_transport_manager_line_records().unwrap(),
+            records
+        );
 
         manager.serialized_object_graph[body_start + body.len()] = 0xfe;
-        assert!(manager.decode_transport_manager_line_records().is_err());
+        assert!(manager.decode_transport_manager_line_data().is_err());
     }
 
     #[test]
