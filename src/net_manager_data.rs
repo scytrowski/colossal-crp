@@ -3,7 +3,7 @@ use crate::data_serializer::Reader;
 use crate::encoded_array::{
     read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
     read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
-    write_encoded_ushort_array,
+    write_encoded_uint_array, write_encoded_ushort_array,
 };
 
 const LANE_COUNT: usize = 262_144;
@@ -207,6 +207,20 @@ pub struct NetSegmentFlagsPrefix {
     format_version: u32,
     segment_flags: Vec<NetSegmentFlag>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for the versioned primary and secondary NetManager segment flags.
+///
+/// The zero/nonzero pattern of primary flags must remain unchanged because
+/// later segment arrays contain one record per active segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentFlagsEditor {
+    format_version: u32,
+    primary_flags: Vec<u32>,
+    secondary_flags: Option<Vec<u32>>,
+    original_primary_flags: Vec<u32>,
+    original_secondary_flags: Option<Vec<u32>>,
+    original_prefix: Vec<u8>,
 }
 
 /// Problem bits for one segment with nonzero primary flags.
@@ -1074,6 +1088,103 @@ impl NetSegmentFlagsPrefix {
     /// Writes the original encoded flag arrays exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit its serialized flag arrays.
+    pub fn into_editor(self) -> NetSegmentFlagsEditor {
+        let primary_count = if self.format_version < FULL_SEGMENT_COUNT_VERSION {
+            LEGACY_SEGMENT_COUNT - 1
+        } else {
+            SEGMENT_COUNT - 1
+        };
+        let primary_flags = self.segment_flags[..primary_count]
+            .iter()
+            .map(|segment| segment.flags)
+            .collect::<Vec<_>>();
+        let secondary_flags = (self.format_version >= TWO_SEGMENT_FLAGS_VERSION).then(|| {
+            self.segment_flags
+                .iter()
+                .map(|segment| segment.flags2)
+                .collect::<Vec<_>>()
+        });
+        NetSegmentFlagsEditor {
+            format_version: self.format_version,
+            original_primary_flags: primary_flags.clone(),
+            original_secondary_flags: secondary_flags.clone(),
+            primary_flags,
+            secondary_flags,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetSegmentFlagsEditor {
+    /// Returns the inner DataSerializer version associated with this prefix.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns primary flags for positions serialized by this version.
+    ///
+    /// Keep each entry's zero/nonzero state unchanged; `encode` rejects edits
+    /// that would change the sparse record counts in later NetManager fields.
+    pub fn primary_flags_mut(&mut self) -> &mut [u32] {
+        &mut self.primary_flags
+    }
+
+    /// Returns secondary flags from inner version 114012 onward.
+    pub fn secondary_flags_mut(&mut self) -> Option<&mut [u32]> {
+        self.secondary_flags.as_deref_mut()
+    }
+
+    /// Encodes the original flag arrays with any edits applied.
+    ///
+    /// Unchanged values preserve the original encoded bytes exactly. Changed
+    /// arrays use canonical literal blocks. Primary flags may change bits but
+    /// must retain each segment's original zero/nonzero state.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let primary_count = if self.format_version < FULL_SEGMENT_COUNT_VERSION {
+            LEGACY_SEGMENT_COUNT - 1
+        } else {
+            SEGMENT_COUNT - 1
+        };
+        let secondary_count =
+            (self.format_version >= TWO_SEGMENT_FLAGS_VERSION).then_some(SEGMENT_COUNT - 1);
+        if self.primary_flags.len() != primary_count
+            || self.secondary_flags.as_ref().map(Vec::len) != secondary_count
+        {
+            return Err(invalid(
+                0,
+                "edited segment-flag counts do not match the version",
+            ));
+        }
+        if self
+            .primary_flags
+            .iter()
+            .zip(&self.original_primary_flags)
+            .any(|(edited, original)| (edited == &0) != (original == &0))
+        {
+            return Err(invalid(
+                0,
+                "primary segment edits must preserve the active-segment pattern",
+            ));
+        }
+        if self.primary_flags == self.original_primary_flags
+            && self.secondary_flags == self.original_secondary_flags
+        {
+            return Ok(self.original_prefix.clone());
+        }
+
+        let mut output = Vec::new();
+        write_encoded_uint_array(&mut output, &self.primary_flags);
+        if let Some(secondary_flags) = &self.secondary_flags {
+            write_encoded_uint_array(&mut output, secondary_flags);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 

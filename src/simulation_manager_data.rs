@@ -42,7 +42,7 @@ use crate::info_manager_data::InfoManagerData;
 use crate::message_manager_data::{MessageManagerData, MessageManagerDataEditor};
 use crate::net_manager_data::{
     NetLaneEditor, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader,
-    read_net_object_header,
+    NetSegmentFlagsEditor, read_net_object_header,
 };
 use crate::statistics_manager_data::{
     StatisticArrayReferences, StatisticInt32Editor, StatisticInt64Editor, StatisticsManagerData,
@@ -3087,13 +3087,95 @@ impl SimulationManagerData {
         &self,
         save_app_version: Option<u32>,
     ) -> Result<(NetSegmentFlagsPrefix, usize), CrpError> {
+        let (data, _, end) = self.decode_net_segment_flags_with_range(save_app_version)?;
+        Ok((data, end))
+    }
+
+    fn decode_net_segment_flags_with_range(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetSegmentFlagsPrefix, usize, usize), CrpError> {
         let (_, records_end) = self.decode_net_node_records_prefix(save_app_version)?;
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(records_end)?;
+        let body_start = reader.offset();
         let (data, body_length) =
             NetSegmentFlagsPrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
         reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        Ok((data, body_start, reader.offset()))
+    }
+
+    /// Decodes NetManager's versioned segment-flag arrays into an editor.
+    pub fn decode_net_segment_flags_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetSegmentFlagsEditor, CrpError> {
+        let (flags, _, _) = self.decode_net_segment_flags_with_range(save_app_version)?;
+        Ok(flags.into_editor())
+    }
+
+    /// Replaces NetManager's segment-flag arrays with edited values.
+    ///
+    /// The editor must match this stream's inner version and original flag
+    /// bytes. It preserves the primary active-segment pattern so the sparse
+    /// records that follow continue to have the same number of entries.
+    pub fn replace_net_segment_flags(
+        &mut self,
+        edited: &NetSegmentFlagsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager segment-flag version does not match this stream",
+            ));
+        }
+        let (current, body_start, body_end) =
+            self.decode_net_segment_flags_with_range(save_app_version)?;
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager segment-flag bytes do not match the editor's source prefix",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager segment-flag prefix range is inconsistent",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_net_segment_flags_with_range(save_app_version)
+            .and_then(|(decoded, actual_start, actual_end)| {
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager segment flags do not match the editor",
+                    ));
+                }
+                let expected_end = body_start
+                    .checked_add(replacement.len())
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager segment-flag end"))?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager segment flags have an unexpected boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager segment flags failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes segment problems after the versioned flag arrays.
@@ -10446,7 +10528,7 @@ mod manager_boundary_tests {
     };
     use crate::encoded_array::{
         EncodedLongArrayReader, write_encoded_bool_array, write_encoded_byte_array,
-        write_encoded_uint_array, write_encoded_ushort_array,
+        write_encoded_uint_array, write_encoded_ulong_array, write_encoded_ushort_array,
     };
     use crate::net_manager_data::NetObjectHeader;
     use crate::{
@@ -10826,6 +10908,84 @@ mod manager_boundary_tests {
 
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_net_lane_prefix(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph, updated_graph);
+        Ok(())
+    }
+
+    #[test]
+    fn net_segment_flag_editor_resizes_prefix_and_preserves_sparse_fields()
+    -> Result<(), crate::CrpError> {
+        let path_fixture = include_bytes!("../tests/fixtures/path-manager-body-v116020-desert.bin");
+        let (mut manager, _) = synthetic_path_manager(path_fixture);
+
+        let mut net_body = Vec::new();
+        write_encoded_ushort_array(&mut net_body, &vec![0; 262_143]);
+        write_encoded_byte_array(&mut net_body, &[]);
+        write_encoded_byte_array(&mut net_body, &[]);
+        write_encoded_byte_array(&mut net_body, &[]);
+        write_encoded_uint_array(&mut net_body, &vec![0; 32_767]);
+        net_body.extend_from_slice(include_bytes!(
+            "../tests/fixtures/net-segment-flags-v241-co.bin"
+        ));
+        write_encoded_ulong_array(&mut net_body, &[0x1234; 30]);
+        write_encoded_byte_array(&mut net_body, &[34, 35].repeat(30));
+        write_encoded_byte_array(&mut net_body, &[31; 30]);
+        write_encoded_byte_array(&mut net_body, &[42; 30]);
+        let opaque_tail = [0xaa, 0xbb, 0xcc, 0xdd];
+        net_body.extend_from_slice(&opaque_tail);
+        manager.serialized_object_graph.extend_from_slice(&net_body);
+
+        let source_graph = manager.serialized_object_graph.clone();
+        let (source_flags, source_end) = manager.decode_net_segment_flags_prefix(Some(0))?;
+        assert_eq!(source_flags.segment_flags()[474].flags, 17);
+        assert_eq!(
+            source_flags
+                .segment_flags()
+                .iter()
+                .filter(|item| item.flags != 0)
+                .count(),
+            30
+        );
+        let original_tail = source_graph[source_end..].to_vec();
+        let original_prefix_len = source_flags.encode().len();
+        let mut editor = source_flags.into_editor();
+        editor.primary_flags_mut()[474] = 18;
+        let replacement_len = editor.encode()?.len();
+        assert!(replacement_len > original_prefix_len);
+
+        manager.replace_net_segment_flags(&editor, Some(0))?;
+        let (updated_flags, updated_end) = manager.decode_net_segment_flags_prefix(Some(0))?;
+        assert_eq!(updated_flags.segment_flags()[474].flags, 18);
+        assert_eq!(
+            updated_flags
+                .segment_flags()
+                .iter()
+                .filter(|item| item.flags != 0)
+                .count(),
+            30
+        );
+        assert!(updated_end > source_end);
+        assert_eq!(
+            &manager.serialized_object_graph[updated_end..],
+            original_tail
+        );
+        let (problems, problems_end) = manager.decode_net_segment_problems_prefix(Some(0))?;
+        assert_eq!(problems.problems().len(), 30);
+        assert_eq!(problems.problems()[0].problems1, 0x1234);
+        let (lights, lights_end) = manager.decode_net_segment_traffic_lights_prefix(Some(0))?;
+        assert_eq!(lights.states().len(), 30);
+        assert_eq!(
+            (lights.states()[0].state0, lights.states()[0].state1),
+            (34, 35)
+        );
+        let (coverage, coverage_end) = manager.decode_net_segment_coverage_prefix(Some(0))?;
+        assert_eq!(coverage.coverage().len(), 30);
+        assert_eq!(coverage.coverage()[0].fire_coverage, 31);
+        assert_eq!(coverage.coverage()[0].wetness, 42);
+        assert!(problems_end < lights_end && lights_end < coverage_end);
+
+        let updated_graph = manager.serialized_object_graph.clone();
+        assert!(manager.replace_net_segment_flags(&editor, Some(0)).is_err());
         assert_eq!(manager.serialized_object_graph, updated_graph);
         Ok(())
     }

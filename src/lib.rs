@@ -84,9 +84,9 @@ pub use net_manager_data::{
     NetNodeFlagsPrefix, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeProblem,
     NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader,
     NetSegmentCoverage, NetSegmentCoveragePrefix, NetSegmentEnvironment,
-    NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsPrefix, NetSegmentProblem,
-    NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsPrefix, NetSegmentTrafficLight,
-    NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
+    NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsEditor, NetSegmentFlagsPrefix,
+    NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsPrefix,
+    NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathManagerEditor, PathPosition, PathUnit};
 pub use prop_manager_data::{PropManagerDataPrefix, PropManagerEditor};
@@ -1550,12 +1550,29 @@ mod tests {
         );
         assert_eq!(old.segment_flags()[32_767].flags, 0);
         assert_eq!(old.encode(), old_bytes);
+        let mut legacy_editor = old.into_editor();
+        assert!(legacy_editor.secondary_flags_mut().is_none());
+        legacy_editor.primary_flags_mut()[0] = 8;
+        let legacy_edited_bytes = legacy_editor.encode()?;
+        assert_eq!(&legacy_edited_bytes[..5], &[0x3f, 0, 0, 0, 8]);
+        let (legacy_edited, _) = NetSegmentFlagsPrefix::decode_prefix(194, &legacy_edited_bytes)?;
+        assert_eq!(legacy_edited.segment_flags()[0].flags, 8);
+        assert_eq!(legacy_edited.segment_flags()[32_767].flags, 0);
 
         let middle_bytes = flags_with_first_value(36_863, 6);
         let (middle, used) = NetSegmentFlagsPrefix::decode_prefix(222, &middle_bytes)?;
         assert_eq!(used, middle_bytes.len());
         assert_eq!(middle.segment_flags()[0].flags, 6);
         assert_eq!(middle.segment_flags()[36_862].index, 36_863);
+        let mut middle_editor = middle.into_editor();
+        assert!(middle_editor.secondary_flags_mut().is_none());
+        middle_editor.primary_flags_mut()[0] = 10;
+        let middle_edited_bytes = middle_editor.encode()?;
+        assert_eq!(
+            middle_edited_bytes.len(),
+            36_863 * 4 + 36_863_usize.div_ceil(64)
+        );
+        assert_eq!(&middle_edited_bytes[..5], &[0x3f, 0, 0, 0, 10]);
 
         let mut modern_bytes = flags_with_first_value(36_863, 7);
         modern_bytes.extend_from_slice(&flags_with_first_value(36_863, 9));
@@ -1570,6 +1587,34 @@ mod tests {
             }
         );
         assert_eq!(modern.encode(), modern_bytes);
+
+        let mut editor = modern.into_editor();
+        editor.primary_flags_mut()[0] = 17;
+        editor
+            .secondary_flags_mut()
+            .expect("version includes secondary flags")[0] = 19;
+        let edited_bytes = editor.encode()?;
+        let primary_array_len = 36_863 * 4 + 36_863_usize.div_ceil(64);
+        assert_eq!(
+            edited_bytes.len(),
+            primary_array_len * 2,
+            "both full-length UInt arrays use 64-value literal blocks"
+        );
+        assert_eq!(&edited_bytes[..5], &[0x3f, 0, 0, 0, 17]);
+        assert_eq!(
+            &edited_bytes[primary_array_len..primary_array_len + 5],
+            &[0x3f, 0, 0, 0, 19]
+        );
+        let (edited, edited_used) = NetSegmentFlagsPrefix::decode_prefix(114_012, &edited_bytes)?;
+        assert_eq!(edited_used, edited_bytes.len());
+        assert_eq!(edited.segment_flags()[0].flags, 17);
+        assert_eq!(edited.segment_flags()[0].flags2, 19);
+        assert_eq!(edited.segment_flags()[1].flags, 0);
+        assert_eq!(edited.segment_flags()[1].flags2, 0);
+
+        let mut invalid_editor = edited.into_editor();
+        invalid_editor.primary_flags_mut()[0] = 0;
+        assert!(invalid_editor.encode().is_err());
         assert!(
             NetSegmentFlagsPrefix::decode_prefix(114_012, &modern_bytes[..modern_bytes.len() - 1])
                 .is_err()
