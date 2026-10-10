@@ -79,14 +79,14 @@ pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, Inst
 pub use message_manager_data::{MessageDataEntry, MessageManagerData, MessageManagerDataEditor};
 pub use metadata::{DistrictStyleMetaData, MapMetaData, ModInfo, SystemMapMetaData};
 pub use net_manager_data::{
-    NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLane, NetLanePrefix,
-    NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
-    NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeProblem, NetNodeProblemsPrefix,
-    NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage,
-    NetSegmentCoveragePrefix, NetSegmentEnvironment, NetSegmentEnvironmentPrefix, NetSegmentFlag,
-    NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentRecord,
-    NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix,
-    NetTreePrefabPrefix,
+    NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLane, NetLaneEditor,
+    NetLanePrefix, NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag,
+    NetNodeFlagsPrefix, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeProblem,
+    NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader,
+    NetSegmentCoverage, NetSegmentCoveragePrefix, NetSegmentEnvironment,
+    NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsPrefix, NetSegmentProblem,
+    NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsPrefix, NetSegmentTrafficLight,
+    NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathManagerEditor, PathPosition, PathUnit};
 pub use prop_manager_data::{PropManagerDataPrefix, PropManagerEditor};
@@ -3315,9 +3315,29 @@ mod tests {
             }]
         );
         assert_eq!(lanes.encode(), bytes);
+        let mut editor = lanes.clone().into_editor();
+        assert_eq!(editor.reserved_prev_mut(), [11]);
+        assert_eq!(editor.reserved_next_mut(), [12]);
+        assert_eq!(editor.reserved_frame_mut(), [13]);
+        assert!(
+            editor
+                .last_reserve_ids_mut()
+                .is_some_and(|values| values == [14])
+        );
+        editor.reserved_prev_mut()[0] = 21;
+        editor.reserved_next_mut()[0] = 22;
+        editor.reserved_frame_mut()[0] = 23;
+        editor.last_reserve_ids_mut().expect("version includes IDs")[0] = 0x1234;
+        let mut expected = bytes[..bytes.len() - 9].to_vec();
+        expected.extend_from_slice(&[0, 21, 0, 22, 0, 23, 0, 0x12, 0x34]);
+        assert_eq!(editor.encode()?, expected);
+
         let (legacy, used) = NetLanePrefix::decode_prefix(205, &bytes[..bytes.len() - 3])?;
         assert_eq!(used, bytes.len() - 3);
         assert_eq!(legacy.active_lanes()[0].last_reserve_id, 0);
+        let mut legacy_editor = legacy.into_editor();
+        assert!(legacy_editor.last_reserve_ids_mut().is_none());
+        assert_eq!(legacy_editor.encode()?, bytes[..bytes.len() - 3]);
         assert!(NetLanePrefix::decode_prefix(116_020, &bytes[..bytes.len() - 1]).is_err());
         assert!(NetLanePrefix::decode_prefix(116_020, &[0, 0]).is_err());
         Ok(())

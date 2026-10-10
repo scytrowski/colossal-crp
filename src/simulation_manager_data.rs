@@ -41,7 +41,8 @@ use crate::guide_manager_data::GuideManagerReferences;
 use crate::info_manager_data::InfoManagerData;
 use crate::message_manager_data::{MessageManagerData, MessageManagerDataEditor};
 use crate::net_manager_data::{
-    NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader, read_net_object_header,
+    NetLaneEditor, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader,
+    read_net_object_header,
 };
 use crate::statistics_manager_data::{
     StatisticArrayReferences, StatisticInt32Editor, StatisticInt64Editor, StatisticsManagerData,
@@ -2910,6 +2911,11 @@ impl SimulationManagerData {
     /// PathManager body. The returned offset is inside NetManager's body;
     /// later fields can be decoded by other prefix methods.
     pub fn decode_net_lane_prefix(&self) -> Result<(NetLanePrefix, usize), CrpError> {
+        let (data, _, end) = self.decode_net_lane_prefix_with_range()?;
+        Ok((data, end))
+    }
+
+    fn decode_net_lane_prefix_with_range(&self) -> Result<(NetLanePrefix, usize, usize), CrpError> {
         let Some(Some(net)) = self
             .manager_objects
             .as_ref()
@@ -2932,10 +2938,77 @@ impl SimulationManagerData {
             "PathManager".to_owned(),
         ];
         expect_profile_tag(&mut reader, &mut strings, "NetManager")?;
+        let body_start = reader.offset();
         let (data, body_length) =
             NetLanePrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
         reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        Ok((data, body_start, reader.offset()))
+    }
+
+    /// Decodes NetManager into an editor for active-lane reservation arrays.
+    pub fn decode_net_lane_editor(&self) -> Result<NetLaneEditor, CrpError> {
+        let (lanes, _, _) = self.decode_net_lane_prefix_with_range()?;
+        Ok(lanes.into_editor())
+    }
+
+    /// Replaces NetManager's active-lane reservation arrays.
+    ///
+    /// The editor must match this stream's inner version and original lane
+    /// prefix. Lane flags and next-lane links remain byte-exact. A changed
+    /// reservation array may resize the prefix, shifting following NetManager
+    /// fields without changing their bytes.
+    pub fn replace_net_lane_prefix(&mut self, edited: &NetLaneEditor) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager lane version does not match this stream",
+            ));
+        }
+        let (current, body_start, body_end) = self.decode_net_lane_prefix_with_range()?;
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager lane bytes do not match the editor's source prefix",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager lane prefix range is inconsistent",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self.decode_net_lane_prefix_with_range().and_then(
+            |(decoded, actual_start, actual_end)| {
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager lane prefix does not match the editor",
+                    ));
+                }
+                let expected_end = body_start
+                    .checked_add(replacement.len())
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager lane prefix end"))?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager lane prefix has an unexpected boundary",
+                    ));
+                }
+                Ok(())
+            },
+        );
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager lane prefix failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes NetManager's node flags after its lane section. The returned
@@ -10704,6 +10777,55 @@ mod manager_boundary_tests {
 
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_path_manager_data(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph, updated_graph);
+        Ok(())
+    }
+
+    #[test]
+    fn net_lane_editor_resizes_prefix_and_preserves_following_node_flags()
+    -> Result<(), crate::CrpError> {
+        let path_fixture = include_bytes!("../tests/fixtures/path-manager-body-v116020-desert.bin");
+        let (mut manager, _) = synthetic_path_manager(path_fixture);
+        let mut lane_flags = vec![0; 262_143];
+        lane_flags[..3].fill(1);
+        let mut lane_prefix = Vec::new();
+        write_encoded_ushort_array(&mut lane_prefix, &lane_flags);
+        lane_prefix.extend_from_slice(&[0, 0, 5, 0, 0, 6, 0, 0, 7]);
+        lane_prefix.push(0x82); // Three unchanged zero previous-reservation values.
+        write_encoded_byte_array(&mut lane_prefix, &[11, 12, 13]);
+        write_encoded_byte_array(&mut lane_prefix, &[21, 22, 23]);
+        write_encoded_ushort_array(&mut lane_prefix, &[14, 15, 16]);
+        manager
+            .serialized_object_graph
+            .extend_from_slice(&lane_prefix);
+        let node_flags_start = manager.serialized_object_graph.len();
+        write_encoded_uint_array(&mut manager.serialized_object_graph, &vec![0; 32_767]);
+        let node_flags_length = manager.serialized_object_graph.len() - node_flags_start;
+
+        let (lanes, original_end) = manager.decode_net_lane_prefix()?;
+        assert_eq!(lanes.active_lanes().len(), 3);
+        let original_prefix_length = lanes.encode().len();
+        let original_graph = manager.serialized_object_graph.clone();
+        let original_tail = original_graph[original_end..].to_vec();
+        let mut editor = lanes.into_editor();
+        editor.reserved_prev_mut()[0] = 7;
+        let replacement_length = editor.encode()?.len();
+        assert_eq!(replacement_length, original_prefix_length + 3);
+
+        manager.replace_net_lane_prefix(&editor)?;
+        assert_eq!(
+            manager.serialized_object_graph.len(),
+            original_graph.len() + 3
+        );
+        let (_, nodes_end) = manager.decode_net_node_flags_prefix()?;
+        assert_eq!(nodes_end, original_end + 3 + node_flags_length);
+        assert_eq!(
+            &manager.serialized_object_graph[original_end + 3..],
+            original_tail
+        );
+
+        let updated_graph = manager.serialized_object_graph.clone();
+        assert!(manager.replace_net_lane_prefix(&editor).is_err());
         assert_eq!(manager.serialized_object_graph, updated_graph);
         Ok(())
     }

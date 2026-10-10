@@ -2,7 +2,8 @@ use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
     read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
-    read_encoded_ulong_array, read_encoded_ushort_array,
+    read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
+    write_encoded_ushort_array,
 };
 
 const LANE_COUNT: usize = 262_144;
@@ -59,7 +60,29 @@ pub struct NetLanePrefix {
     format_version: u32,
     lane_flags: Vec<u16>,
     active_lanes: Vec<NetLane>,
+    reservation_prefix: Vec<u8>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for existing lane reservation state.
+///
+/// It keeps lane flags and next-lane links byte-exact. If a reservation value
+/// changes, the reservation arrays are re-encoded canonically and may change
+/// this prefix's byte length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetLaneEditor {
+    format_version: u32,
+    active_count: usize,
+    reservation_prefix: Vec<u8>,
+    reserved_prev: Vec<u8>,
+    reserved_next: Vec<u8>,
+    reserved_frame: Vec<u8>,
+    last_reserve_ids: Option<Vec<u16>>,
+    original_reserved_prev: Vec<u8>,
+    original_reserved_next: Vec<u8>,
+    original_reserved_frame: Vec<u8>,
+    original_last_reserve_ids: Option<Vec<u16>>,
+    original_prefix: Vec<u8>,
 }
 
 /// Serialized flags for one one-based `NetNode` buffer position.
@@ -470,6 +493,7 @@ impl NetLanePrefix {
                 last_reserve_id: 0,
             });
         }
+        let reservation_start = reader.offset();
         for field in 0..3 {
             let values = read_encoded_byte_array(&mut reader, active_count)?;
             for (lane, value) in active_lanes.iter_mut().zip(values) {
@@ -492,6 +516,7 @@ impl NetLanePrefix {
                 format_version,
                 lane_flags,
                 active_lanes,
+                reservation_prefix: bytes[..reservation_start].to_vec(),
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -516,6 +541,126 @@ impl NetLanePrefix {
     /// Writes the original prefix bytes without changing encoded-array runs.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit reservation values for active lanes.
+    pub fn into_editor(self) -> NetLaneEditor {
+        let reserved_prev = self
+            .active_lanes
+            .iter()
+            .map(|lane| lane.reserved_prev)
+            .collect::<Vec<_>>();
+        let reserved_next = self
+            .active_lanes
+            .iter()
+            .map(|lane| lane.reserved_next)
+            .collect::<Vec<_>>();
+        let reserved_frame = self
+            .active_lanes
+            .iter()
+            .map(|lane| lane.reserved_frame)
+            .collect::<Vec<_>>();
+        let last_reserve_ids = (self.format_version >= 206).then(|| {
+            self.active_lanes
+                .iter()
+                .map(|lane| lane.last_reserve_id)
+                .collect::<Vec<_>>()
+        });
+        NetLaneEditor {
+            format_version: self.format_version,
+            active_count: self.active_lanes.len(),
+            reservation_prefix: self.reservation_prefix,
+            original_reserved_prev: reserved_prev.clone(),
+            original_reserved_next: reserved_next.clone(),
+            original_reserved_frame: reserved_frame.clone(),
+            original_last_reserve_ids: last_reserve_ids.clone(),
+            reserved_prev,
+            reserved_next,
+            reserved_frame,
+            last_reserve_ids,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetLaneEditor {
+    /// Returns the inner DataSerializer version associated with this prefix.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns mutable previous-reservation values in active-lane order.
+    pub fn reserved_prev_mut(&mut self) -> &mut [u8] {
+        &mut self.reserved_prev
+    }
+
+    /// Returns mutable next-reservation values in active-lane order.
+    pub fn reserved_next_mut(&mut self) -> &mut [u8] {
+        &mut self.reserved_next
+    }
+
+    /// Returns mutable reservation-frame values in active-lane order.
+    pub fn reserved_frame_mut(&mut self) -> &mut [u8] {
+        &mut self.reserved_frame
+    }
+
+    /// Returns mutable last-reservation IDs in active-lane order from version 206.
+    ///
+    /// Returns `None` for earlier versions, which omit this array.
+    pub fn last_reserve_ids_mut(&mut self) -> Option<&mut [u16]> {
+        self.last_reserve_ids.as_deref_mut()
+    }
+
+    /// Encodes the original lane prefix with edited reservation arrays.
+    ///
+    /// If no reservation value changed, the original encoded bytes are
+    /// returned exactly. After an edit, all present reservation arrays use
+    /// canonical array controls; flags and next-lane links remain byte-exact.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        self.validate_column_lengths()?;
+        if self.reserved_prev == self.original_reserved_prev
+            && self.reserved_next == self.original_reserved_next
+            && self.reserved_frame == self.original_reserved_frame
+            && self.last_reserve_ids == self.original_last_reserve_ids
+        {
+            return Ok(self.original_prefix.clone());
+        }
+
+        let mut output = self.reservation_prefix.clone();
+        write_encoded_byte_array(&mut output, &self.reserved_prev);
+        write_encoded_byte_array(&mut output, &self.reserved_next);
+        write_encoded_byte_array(&mut output, &self.reserved_frame);
+        if let Some(last_reserve_ids) = &self.last_reserve_ids {
+            write_encoded_ushort_array(&mut output, last_reserve_ids);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
+    }
+
+    fn validate_column_lengths(&self) -> Result<(), CrpError> {
+        if self.reserved_prev.len() != self.active_count
+            || self.reserved_next.len() != self.active_count
+            || self.reserved_frame.len() != self.active_count
+            || self
+                .last_reserve_ids
+                .as_ref()
+                .is_some_and(|values| values.len() != self.active_count)
+        {
+            return Err(invalid(
+                0,
+                "edited reservation count does not match active lanes",
+            ));
+        }
+        if (self.format_version >= 206) != self.last_reserve_ids.is_some() {
+            return Err(invalid(
+                0,
+                "last-reservation IDs do not match this NetManager version",
+            ));
+        }
+        Ok(())
     }
 }
 
