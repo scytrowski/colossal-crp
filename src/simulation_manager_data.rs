@@ -635,6 +635,8 @@ pub struct TransportManagerLineRecord {
     passengers: Option<TransportPassengerRecord>,
     legacy_vehicle_selection: Option<TransportLineVehicleSelection>,
     serialized_bytes: Vec<u8>,
+    serialized_range: Range<usize>,
+    passengers_range: Option<Range<usize>>,
 }
 
 impl TransportManagerLineRecord {
@@ -698,13 +700,68 @@ impl TransportManagerLineRecord {
     pub fn encoded_len(&self) -> usize {
         self.serialized_bytes.len()
     }
+
+    fn encode_with_passenger_edits(&self) -> Result<Vec<u8>, CrpError> {
+        let mut bytes = self.serialized_bytes.clone();
+        if let Some(passengers) = &self.passengers {
+            let range = self
+                .passengers_range
+                .as_ref()
+                .ok_or_else(|| invalid(0, "active line passenger record has no source range"))?;
+            let expected_len =
+                passengers
+                    .groups()
+                    .len()
+                    .checked_mul(9)
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "TransportManager active-line passenger length",
+                    ))?;
+            if range.len() != expected_len {
+                return Err(invalid(
+                    range.start,
+                    "edited active-line passenger groups change their serialized length",
+                ));
+            }
+            let destination = bytes
+                .get_mut(range.clone())
+                .ok_or_else(|| invalid(range.start, "passenger range exceeds active line"))?;
+            let mut offset = 0_usize;
+            for group in passengers.groups() {
+                for value in [group.temporary(), group.final_count(), group.average()] {
+                    let mut encoded = Vec::with_capacity(3);
+                    write_u24_be(&mut encoded, value)?;
+                    let end = offset.checked_add(3).ok_or(CrpError::ArithmeticOverflow(
+                        "TransportManager active-line passenger field end",
+                    ))?;
+                    let error_offset =
+                        range
+                            .start
+                            .checked_add(offset)
+                            .ok_or(CrpError::ArithmeticOverflow(
+                                "TransportManager active-line passenger field offset",
+                            ))?;
+                    destination
+                        .get_mut(offset..end)
+                        .ok_or_else(|| {
+                            invalid(
+                                error_offset,
+                                "passenger field exceeds its active-line record",
+                            )
+                        })?
+                        .copy_from_slice(&encoded);
+                    offset = end;
+                }
+            }
+        }
+        Ok(bytes)
+    }
 }
 
 /// Decoded TransportManager line-number and passenger tables with active lines.
 ///
 /// Fields are exposed only where their inner DataSerializer version gates
 /// apply. Original bytes are retained for unchanged writing; semantic edits
-/// are limited to shared line numbers and global passenger counts.
+/// are limited to shared line numbers and passenger counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerLineData {
     format_version: u32,
@@ -749,7 +806,7 @@ impl TransportManagerLineData {
         self.serialized_global_passengers.clone()
     }
 
-    /// Creates an editor for the shared line numbers and global passenger table.
+    /// Creates an editor for line numbers and passenger counters.
     pub fn into_editor(self) -> TransportManagerLineDataEditor {
         TransportManagerLineDataEditor {
             format_version: self.format_version,
@@ -765,7 +822,7 @@ impl TransportManagerLineData {
     }
 }
 
-/// Editor for the fixed-width line-number and global passenger tables.
+/// Editor for fixed-width TransportManager line and passenger data.
 ///
 /// This retains the original bounded manager body and permits same-width
 /// edits only. Passenger counts must fit in the serialized 24-bit fields.
@@ -803,6 +860,18 @@ impl TransportManagerLineDataEditor {
         &self.active_lines
     }
 
+    /// Returns mutable passenger counters for an active line, if available.
+    /// The group count is fixed by the source inner DataSerializer version.
+    pub fn active_line_passengers_mut(
+        &mut self,
+        active_line_index: usize,
+    ) -> Option<&mut TransportPassengerRecord> {
+        self.active_lines
+            .get_mut(active_line_index)?
+            .passengers
+            .as_mut()
+    }
+
     /// Returns global passenger records.
     pub fn global_passengers(&self) -> Option<&[TransportPassengerRecord]> {
         self.global_passengers.as_deref()
@@ -814,12 +883,26 @@ impl TransportManagerLineDataEditor {
     }
 
     /// Writes the original bounded body with edited line-number and passenger
-    /// tables. Other manager bytes, including the closing profiler reference,
-    /// remain unchanged. Returns an error if an edit changes a table's length,
-    /// changes passenger group counts, exceeds the 24-bit passenger limit, or
-    /// would exceed the captured source ranges.
+    /// counters. Other manager bytes, including the closing profiler
+    /// reference, remain unchanged. Returns an error if an edit changes a
+    /// table's length, changes passenger group counts, exceeds the 24-bit
+    /// passenger limit, or would exceed the captured source ranges.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut body = self.original_body.clone();
+        for line in &self.active_lines {
+            let range = line.serialized_range.clone();
+            let encoded = line.encode_with_passenger_edits()?;
+            if range.len() != encoded.len() {
+                return Err(invalid(
+                    range.start,
+                    "edited active-line record changes its serialized length",
+                ));
+            }
+            body.get_mut(range.clone())
+                .ok_or_else(|| invalid(range.start, "active-line range exceeds source body"))?
+                .copy_from_slice(&encoded);
+        }
+
         if let Some(numbers) = &self.line_numbers {
             let range = self.line_number_range.as_ref().ok_or_else(|| {
                 invalid(0, "TransportManager line-number table has no source range")
@@ -4876,6 +4959,12 @@ impl SimulationManagerData {
             .and_then(|decoded| {
                 if decoded.line_numbers != edited.line_numbers
                     || decoded.global_passengers != edited.global_passengers
+                    || decoded.active_lines.len() != edited.active_lines.len()
+                    || decoded
+                        .active_lines
+                        .iter()
+                        .zip(&edited.active_lines)
+                        .any(|(decoded, edited)| decoded.passengers != edited.passengers)
                 {
                     return Err(invalid(
                         body_range.start,
@@ -8134,11 +8223,13 @@ fn decode_transport_manager_line_record(
     } else {
         None
     };
+    let passengers_start = reader.offset();
     let passengers = if format_version >= 122 {
         Some(decode_transport_passenger_record(format_version, reader)?)
     } else {
         None
     };
+    let passengers_end = reader.offset();
     let legacy_vehicle_selection = if (112_004..112_022).contains(&format_version) {
         Some(TransportLineVehicleSelection::Index(reader.read_u16_be()?))
     } else if (112_022..114_001).contains(&format_version) {
@@ -8162,6 +8253,9 @@ fn decode_transport_manager_line_record(
         passengers,
         legacy_vehicle_selection,
         serialized_bytes,
+        serialized_range: start..end,
+        passengers_range: (format_version >= 122)
+            .then_some(passengers_start - start..passengers_end - start),
     })
 }
 
@@ -10180,6 +10274,7 @@ mod manager_boundary_tests {
         let first_group = &mut editor.global_passengers_mut().unwrap()[0].groups_mut()[0];
         first_group.set_temporary(0x12_3456);
         first_group.set_average(0x23_4567);
+        editor.active_line_passengers_mut(0).unwrap().groups_mut()[1].set_final_count(0x34_5678);
 
         let mut expected_graph = original_graph.clone();
         let updated_line_number = 0x4321_u16.to_be_bytes();
@@ -10189,6 +10284,11 @@ mod manager_boundary_tests {
         let global_offset = body_start + global_passengers_start;
         expected_graph[global_offset..global_offset + 3].copy_from_slice(&[0x12, 0x34, 0x56]);
         expected_graph[global_offset + 6..global_offset + 9].copy_from_slice(&[0x23, 0x45, 0x67]);
+        // Version 320 has no ticket-price field, so passenger data starts at
+        // byte 16 of this active line.
+        let active_line_passenger_offset = body_start + line_record_start + 16 + 12;
+        expected_graph[active_line_passenger_offset..active_line_passenger_offset + 3]
+            .copy_from_slice(&[0x34, 0x56, 0x78]);
 
         manager
             .replace_transport_manager_line_data(&editor)
@@ -10208,6 +10308,10 @@ mod manager_boundary_tests {
             edited_data.global_passengers().unwrap()[0].groups()[0].average(),
             0x23_4567
         );
+        assert_eq!(
+            edited_data.active_lines()[0].passengers().unwrap().groups()[1].final_count(),
+            0x34_5678
+        );
         assert!(
             manager
                 .replace_transport_manager_line_data(&editor)
@@ -10224,6 +10328,23 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph(), before_overflow);
+
+        let mut overflowing_active_editor = manager
+            .decode_transport_manager_line_data()
+            .unwrap()
+            .into_editor();
+        overflowing_active_editor
+            .active_line_passengers_mut(0)
+            .unwrap()
+            .groups_mut()[1]
+            .set_final_count(0xff_0000);
+        let before_active_overflow = manager.serialized_object_graph().to_vec();
+        assert!(
+            manager
+                .replace_transport_manager_line_data(&overflowing_active_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), before_active_overflow);
 
         manager.serialized_object_graph[body_start + body.len()] = 0xfe;
         assert!(manager.decode_transport_manager_line_data().is_err());
