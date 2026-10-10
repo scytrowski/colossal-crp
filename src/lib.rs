@@ -3421,17 +3421,40 @@ mod tests {
             assert_eq!(decoded.active_units()[0].speed, expected_speed);
             assert_eq!(decoded.encode(), bytes);
             let mut editor = decoded.into_editor();
+            assert_eq!(editor.path_find_flags_mut(), [2]);
+            assert_eq!(editor.lane_types_mut(), [3]);
+            assert_eq!(editor.vehicle_types_mut(), [expected_vehicle]);
             assert_eq!(
                 editor.speeds_mut().map(|speeds| speeds.to_vec()),
                 speed_byte.map(|_| vec![expected_speed]),
                 "version {version}"
             );
+            editor.path_find_flags_mut()[0] = 9;
+            editor.lane_types_mut()[0] = 10;
+            let (edited_vehicle, edited_vehicle_bytes) = if version >= 113_001 {
+                (0x8765_4321, &[0x87, 0x65, 0x43, 0x21][..])
+            } else if version >= 311 {
+                (0xabcd, &[0xab, 0xcd][..])
+            } else {
+                (0x5a, &[0x5a][..])
+            };
+            editor.vehicle_types_mut()[0] = edited_vehicle;
             if let Some(speeds) = editor.speeds_mut() {
                 speeds[0] = 88;
             }
             let mut expected = bytes;
+            let active_record_start = flag_prefix.len();
+            expected[active_record_start] = 9;
+            expected[active_record_start + 1] = 10;
+            let vehicle_start = active_record_start + 2;
+            expected[vehicle_start..vehicle_start + edited_vehicle_bytes.len()]
+                .copy_from_slice(edited_vehicle_bytes);
             if speed_byte.is_some() {
                 *expected.last_mut().expect("speed byte is present") = 88;
+            } else {
+                let mut overflow_editor = editor.clone();
+                overflow_editor.vehicle_types_mut()[0] = if version < 311 { 256 } else { 65_536 };
+                assert!(overflow_editor.encode().is_err(), "version {version}");
             }
             assert_eq!(editor.encode()?, expected, "version {version}");
         }

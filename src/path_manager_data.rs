@@ -45,25 +45,34 @@ pub struct PathUnit {
 
 /// The fifth queued manager body, excluding loading-profiler tags.
 ///
-/// Its original bytes are retained for exact writing. Semantic path edits are
-/// Speed edits are available only in versions that serialize the speed byte;
-/// they preserve all other record fields and the original encoded flag array.
+/// Its original bytes are retained for exact writing. The editor can change
+/// selected fixed-width fields without rewriting the encoded flag array.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathManagerData {
     format_version: u32,
     simulation_flags: Vec<u8>,
     active_units: Vec<PathUnit>,
+    path_find_flag_ranges: Vec<Range<usize>>,
+    lane_type_ranges: Vec<Range<usize>>,
+    vehicle_type_ranges: Vec<Range<usize>>,
     speed_ranges: Option<Vec<Range<usize>>>,
     serialized_body: Vec<u8>,
 }
 
-/// In-place editor for serialized speeds of existing active path units.
+/// In-place editor for selected fields in existing active path units.
 ///
-/// It changes only the existing one-byte speed fields. Path flags, path-unit
-/// links, positions, counts, and all other original bytes remain unchanged.
+/// It changes existing path flags, vehicle-type masks, and versioned speed
+/// bytes. Path-unit links, positions, counts, and all other original bytes
+/// remain unchanged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathManagerEditor {
     format_version: u32,
+    path_find_flags: Vec<u8>,
+    lane_types: Vec<u8>,
+    vehicle_types: Vec<u32>,
+    path_find_flag_ranges: Vec<Range<usize>>,
+    lane_type_ranges: Vec<Range<usize>>,
+    vehicle_type_ranges: Vec<Range<usize>>,
     speeds: Option<Vec<u8>>,
     speed_ranges: Vec<Range<usize>>,
     original_body: Vec<u8>,
@@ -86,6 +95,9 @@ impl PathManagerData {
         let mut reader = Reader::new(bytes);
         let simulation_flags = read_encoded_byte_array(&mut reader, PATH_UNIT_COUNT - 1)?;
         let mut active_units = Vec::new();
+        let mut path_find_flag_ranges = Vec::new();
+        let mut lane_type_ranges = Vec::new();
+        let mut vehicle_type_ranges = Vec::new();
         let has_serialized_speed =
             (110_026..111_000).contains(&format_version) || format_version >= 111_012;
         let mut speed_ranges = has_serialized_speed.then(Vec::new);
@@ -95,8 +107,13 @@ impl PathManagerData {
             }
             let index = u32::try_from(offset + 1)
                 .map_err(|_| CrpError::ArithmeticOverflow("PathUnit index"))?;
+            let path_find_start = reader.offset();
             let path_find_flags = reader.read_u8()?;
+            path_find_flag_ranges.push(path_find_start..reader.offset());
+            let lane_type_start = reader.offset();
             let lane_types = reader.read_u8()?;
+            lane_type_ranges.push(lane_type_start..reader.offset());
+            let vehicle_type_start = reader.offset();
             let vehicle_types = if format_version >= 113_001 {
                 reader.read_u32_be()?
             } else if format_version >= 311 {
@@ -104,6 +121,7 @@ impl PathManagerData {
             } else {
                 u32::from(reader.read_u8()?)
             };
+            vehicle_type_ranges.push(vehicle_type_start..reader.offset());
             let position_count = usize::from(reader.read_u8()?);
             if position_count > MAX_POSITIONS {
                 return Err(
@@ -153,6 +171,9 @@ impl PathManagerData {
                 format_version,
                 simulation_flags,
                 active_units,
+                path_find_flag_ranges,
+                lane_type_ranges,
+                vehicle_type_ranges,
                 speed_ranges,
                 serialized_body: bytes[..consumed].to_vec(),
             },
@@ -180,7 +201,7 @@ impl PathManagerData {
         self.serialized_body.clone()
     }
 
-    /// Consumes the decoded body to expose its serialized speed bytes.
+    /// Consumes the decoded body to expose fixed-width fields for editing.
     ///
     /// Returns `None` when this inner version omits the speed field. For
     /// versions with the field, the slice is in active path-unit order and
@@ -188,6 +209,24 @@ impl PathManagerData {
     pub fn into_editor(self) -> PathManagerEditor {
         PathManagerEditor {
             format_version: self.format_version,
+            path_find_flags: self
+                .active_units
+                .iter()
+                .map(|unit| unit.path_find_flags)
+                .collect(),
+            lane_types: self
+                .active_units
+                .iter()
+                .map(|unit| unit.lane_types)
+                .collect(),
+            vehicle_types: self
+                .active_units
+                .iter()
+                .map(|unit| unit.vehicle_types)
+                .collect(),
+            path_find_flag_ranges: self.path_find_flag_ranges,
+            lane_type_ranges: self.lane_type_ranges,
+            vehicle_type_ranges: self.vehicle_type_ranges,
             speeds: self
                 .speed_ranges
                 .as_ref()
@@ -204,6 +243,25 @@ impl PathManagerEditor {
         self.format_version
     }
 
+    /// Returns mutable path-finding flag bytes in active path-unit order.
+    pub fn path_find_flags_mut(&mut self) -> &mut [u8] {
+        &mut self.path_find_flags
+    }
+
+    /// Returns mutable lane-type flag bytes in active path-unit order.
+    pub fn lane_types_mut(&mut self) -> &mut [u8] {
+        &mut self.lane_types
+    }
+
+    /// Returns mutable vehicle-type masks in active path-unit order.
+    ///
+    /// The on-disk width is version dependent: one byte before inner version
+    /// 311, two bytes through 113000, and four bytes from 113001. Encoding
+    /// rejects values that do not fit the width stored by the source version.
+    pub fn vehicle_types_mut(&mut self) -> &mut [u32] {
+        &mut self.vehicle_types
+    }
+
     /// Returns mutable speed bytes in active path-unit order.
     ///
     /// Returns `None` for versions that omit serialized speed. A present but
@@ -213,9 +271,37 @@ impl PathManagerEditor {
         self.speeds.as_deref_mut()
     }
 
-    /// Encodes the original body with only edited speed bytes replaced.
+    /// Encodes the original body with edited fixed-width PathUnit fields patched in place.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut output = self.original_body.clone();
+        patch_byte_column(
+            &mut output,
+            &self.path_find_flag_ranges,
+            &self.path_find_flags,
+            "path-finding flags",
+        )?;
+        patch_byte_column(
+            &mut output,
+            &self.lane_type_ranges,
+            &self.lane_types,
+            "lane types",
+        )?;
+        validate_column_len(
+            &self.vehicle_types,
+            &self.vehicle_type_ranges,
+            "vehicle types",
+        )?;
+        for (value, range) in self.vehicle_types.iter().zip(&self.vehicle_type_ranges) {
+            let encoded = value.to_be_bytes();
+            let width = range.len();
+            if !matches!(width, 1 | 2 | 4) || *value > width_max(width) {
+                return Err(invalid(
+                    range.start,
+                    format!("vehicle-type mask {value} does not fit its {width}-byte field"),
+                ));
+            }
+            patch_serialized_range(&mut output, range, &encoded[4 - width..], "vehicle types")?;
+        }
         match &self.speeds {
             Some(speeds) if speeds.len() != self.speed_ranges.len() => {
                 return Err(invalid(
@@ -225,13 +311,7 @@ impl PathManagerEditor {
             }
             Some(speeds) => {
                 for (speed, range) in speeds.iter().zip(&self.speed_ranges) {
-                    if range.len() != 1 || output.get(range.clone()).is_none() {
-                        return Err(invalid(
-                            range.start,
-                            "serialized PathUnit speed range is invalid",
-                        ));
-                    }
-                    output[range.start] = *speed;
+                    patch_serialized_range(&mut output, range, &[*speed], "PathUnit speed")?;
                 }
             }
             None if !self.speed_ranges.is_empty() => {
@@ -247,6 +327,61 @@ impl PathManagerEditor {
 
     pub(crate) fn original_body_bytes(&self) -> &[u8] {
         &self.original_body
+    }
+}
+
+fn patch_byte_column(
+    output: &mut [u8],
+    ranges: &[Range<usize>],
+    values: &[u8],
+    field: &str,
+) -> Result<(), CrpError> {
+    validate_column_len(values, ranges, field)?;
+    for (value, range) in values.iter().zip(ranges) {
+        patch_serialized_range(output, range, &[*value], field)?;
+    }
+    Ok(())
+}
+
+fn validate_column_len<T>(
+    values: &[T],
+    ranges: &[Range<usize>],
+    field: &str,
+) -> Result<(), CrpError> {
+    if values.len() != ranges.len() {
+        return Err(invalid(
+            0,
+            format!("edited {field} count does not match active path-unit records"),
+        ));
+    }
+    Ok(())
+}
+
+fn patch_serialized_range(
+    output: &mut [u8],
+    range: &Range<usize>,
+    value: &[u8],
+    field: &str,
+) -> Result<(), CrpError> {
+    if range.len() != value.len() {
+        return Err(invalid(
+            range.start,
+            format!("serialized {field} range has an unexpected width"),
+        ));
+    }
+    let destination = output
+        .get_mut(range.clone())
+        .ok_or_else(|| invalid(range.start, format!("serialized {field} range is invalid")))?;
+    destination.copy_from_slice(value);
+    Ok(())
+}
+
+fn width_max(width: usize) -> u32 {
+    match width {
+        1 => u8::MAX.into(),
+        2 => u16::MAX.into(),
+        4 => u32::MAX,
+        _ => 0,
     }
 }
 
