@@ -12,6 +12,7 @@ mod building_manager_data;
 mod data_serializer;
 mod disaster_manager_data;
 mod district_manager_data;
+mod electricity_manager_data;
 mod encoded_array;
 mod event_manager_data;
 mod game_area_data;
@@ -69,6 +70,9 @@ pub use district_manager_data::{
     DistrictPrivateDataKind, DistrictSpecializationBlock, DistrictSpecializationKind,
     DistrictStatisticsBlock, DistrictStatisticsKind, DistrictSubCultureBlock,
     DistrictSubCultureKind, DistrictTourismBlock, DistrictTourismKind,
+};
+pub use electricity_manager_data::{
+    ElectricityManagerData, ElectricityPulseGroup, ElectricityPulseUnit,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use guide_data::{
