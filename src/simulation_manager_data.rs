@@ -11,8 +11,11 @@ use crate::TerrainManagerData;
 use crate::TreeManagerDataPrefix;
 use crate::VehicleInstanceFieldsPrefix;
 use crate::VehicleLastFrameDataPrefix;
+use crate::VehicleManagerData;
 use crate::VehicleManagerDataPrefix;
 use crate::VehicleManagerSparseFieldsPrefix;
+use crate::VehicleManagerTailDataPrefix;
+use crate::VehicleParkedRecordsPrefix;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::WeatherManagerData;
@@ -2122,6 +2125,25 @@ impl SimulationManagerData {
         Ok((vehicles, graph_end))
     }
 
+    /// Decodes the known VehicleManager fields through its versioned counters.
+    ///
+    /// Requires `VehicleManager+Data` at slot 17 and `TransportManager+Data`
+    /// at slot 18. The complete manager body, including its closing profiler
+    /// reference, is retained for exact encoding. Returns the graph offset at
+    /// the start of the TransportManager tag.
+    pub fn decode_vehicle_manager_data(&self) -> Result<(VehicleManagerData, usize), CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 17, "VehicleManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 18, "TransportManager+Data")?;
+
+        let (body_start, manager_end) = self.manager_body_boundary(17)?;
+        let body = self
+            .serialized_object_graph
+            .get(body_start..manager_end)
+            .ok_or_else(|| invalid(body_start, "VehicleManager body range is invalid"))?;
+        let data = VehicleManagerData::decode_body(self.format_version, body)?;
+        Ok((data, manager_end))
+    }
+
     /// Decodes the known sparse VehicleManager columns before vehicle records.
     ///
     /// Returns the graph offset immediately after the version-gated gate,
@@ -2186,6 +2208,40 @@ impl SimulationManagerData {
                 "VehicleManager scalar-field prefix end",
             ))?;
         Ok((fields, graph_end))
+    }
+
+    /// Decodes active parked-vehicle records after the active vehicle fields.
+    ///
+    /// Returns the graph offset before versioned manager counters and the
+    /// closing profiler reference.
+    pub fn decode_vehicle_manager_parked_records_prefix(
+        &self,
+    ) -> Result<(VehicleParkedRecordsPrefix, usize), CrpError> {
+        let (fields, fields_end) = self.decode_vehicle_manager_instance_fields_prefix()?;
+        let (_, manager_end) = self.manager_body_boundary(17)?;
+        let parked_bytes = self
+            .serialized_object_graph
+            .get(fields_end..manager_end)
+            .ok_or_else(|| invalid(fields_end, "VehicleManager parked-record range is invalid"))?;
+        let (parked, consumed) = fields.decode_parked_vehicle_records(parked_bytes)?;
+        let graph_end = fields_end
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "VehicleManager parked-record prefix end",
+            ))?;
+        Ok((parked, graph_end))
+    }
+
+    /// Decodes the VehicleManager counters and checks the manager boundary.
+    ///
+    /// This method traverses the preceding known VehicleManager fields, then
+    /// verifies the two-byte closing profiler reference against TransportManager
+    /// at slot 18. Its returned graph offset is the start of that next manager.
+    pub fn decode_vehicle_manager_tail(
+        &self,
+    ) -> Result<(VehicleManagerTailDataPrefix, usize), CrpError> {
+        let (data, manager_end) = self.decode_vehicle_manager_data()?;
+        Ok((data.tail().clone(), manager_end))
     }
 
     /// Decodes the known DistrictManager prefix for the requested inner version.
@@ -12005,7 +12061,7 @@ mod manager_boundary_tests {
         graph.push(0xfe); // 32,767 zero parked-vehicle flags
         graph.extend_from_slice(&[0, 0]); // empty prefab-name table
         let prefix_end = graph.len();
-        graph.extend_from_slice(&[0xfe, 0]); // closing profiler reference
+        graph.extend_from_slice(&[0, 0]); // closing profiler reference
         let transport_tag = profiler_tag("TransportManager");
         graph.extend_from_slice(&transport_tag);
 
@@ -12029,7 +12085,7 @@ mod manager_boundary_tests {
         assert_eq!(vehicles.parked_vehicle_flags().unwrap().len(), 32_767);
         assert_eq!(vehicles.prefab_names().unwrap(), []);
         assert_eq!(end, prefix_end);
-        assert!(manager.serialized_object_graph()[end..].starts_with(&[0xfe, 0]));
+        assert!(manager.serialized_object_graph()[end..].starts_with(&[0, 0]));
         assert!(manager.serialized_object_graph()[end + 2..].starts_with(&transport_tag));
         assert_eq!(body_start, profiler_tag("VehicleManager").len());
 
@@ -12047,6 +12103,28 @@ mod manager_boundary_tests {
             .unwrap();
         assert_eq!(fields.records(), []);
         assert_eq!(fields_end, frames_end);
+
+        let (parked, parked_end) = manager
+            .decode_vehicle_manager_parked_records_prefix()
+            .unwrap();
+        assert_eq!(parked.records(), Some([].as_slice()));
+        assert_eq!(parked_end, fields_end);
+
+        let (data, data_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(data.prefix().vehicle_flags().len(), 16_383);
+        assert_eq!(data.parked_records().records(), Some([].as_slice()));
+        assert_eq!(data.tail().traffic_flow_totals(), None);
+        assert_eq!(
+            data_end,
+            manager.serialized_object_graph().len() - transport_tag.len()
+        );
+        assert_eq!(
+            data.encode(),
+            manager.serialized_object_graph()[body_start..data_end]
+        );
+        let (tail, tail_end) = manager.decode_vehicle_manager_tail().unwrap();
+        assert_eq!(tail.traffic_flow_totals(), None);
+        assert_eq!(tail_end, data_end);
     }
 
     #[test]

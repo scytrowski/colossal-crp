@@ -111,8 +111,9 @@ pub use unlock_manager_data::{
 };
 pub use vehicle_manager_data::{
     VehicleInstanceFields, VehicleInstanceFieldsPrefix, VehicleLastFrameDataPrefix,
-    VehicleLastFrameRecord, VehicleManagerDataPrefix, VehicleManagerSparseFieldsPrefix,
-    VehicleTargetPosition0,
+    VehicleLastFrameRecord, VehicleManagerData, VehicleManagerDataPrefix,
+    VehicleManagerSparseFieldsPrefix, VehicleManagerTailDataPrefix, VehicleParkedInstanceRecord,
+    VehicleParkedRecordsPrefix, VehicleTargetPosition0,
 };
 pub use water_simulation_data::{
     WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
@@ -5585,8 +5586,9 @@ mod tests {
                         assert_eq!(weather.total_heights().len(), 16_384);
                         assert!(weather_end < manager_data.serialized_object_graph().len());
                         checked_weather_manager_convenience = true;
-                        let (vehicles, vehicles_end) =
-                            manager_data.decode_vehicle_manager_prefix()?;
+                        let (vehicle_data, vehicles_end) =
+                            manager_data.decode_vehicle_manager_data()?;
+                        let vehicles = vehicle_data.prefix();
                         assert_eq!(vehicles.format_version(), manager_data.format_version());
                         assert_eq!(vehicles.vehicle_flags().len(), 16_383);
                         assert_eq!(
@@ -5604,13 +5606,18 @@ mod tests {
                             })
                         );
                         assert!(vehicles_end < manager_data.serialized_object_graph().len());
+                        let encoded_vehicle_body = vehicle_data.encode();
+                        assert_eq!(
+                            manager_data.serialized_object_graph()
+                                [vehicles_end - encoded_vehicle_body.len()..vehicles_end],
+                            encoded_vehicle_body
+                        );
                         let active_vehicle_count = vehicles
                             .vehicle_flags()
                             .iter()
                             .filter(|flags| **flags != 0)
                             .count();
-                        let (vehicle_columns, vehicle_columns_end) =
-                            manager_data.decode_vehicle_manager_sparse_columns()?;
+                        let vehicle_columns = vehicle_data.sparse_columns();
                         assert_eq!(
                             vehicle_columns.gate_indices().map(<[u8]>::len),
                             (manager_data.format_version() >= 182).then_some(active_vehicle_count)
@@ -5624,15 +5631,21 @@ mod tests {
                             vehicle_columns.water_sources().map(<[u16]>::len),
                             (manager_data.format_version() >= 273).then_some(active_vehicle_count)
                         );
-                        assert!(vehicle_columns_end >= vehicles_end);
-                        let (last_frame, last_frame_end) =
-                            manager_data.decode_vehicle_manager_last_frame_prefix()?;
+                        let last_frame = vehicle_data.last_frame_records();
                         assert_eq!(last_frame.records().len(), active_vehicle_count);
-                        assert!(last_frame_end >= vehicle_columns_end);
-                        let (vehicle_fields, vehicle_fields_end) =
-                            manager_data.decode_vehicle_manager_instance_fields_prefix()?;
+                        let vehicle_fields = vehicle_data.instance_fields();
                         assert_eq!(vehicle_fields.records().len(), active_vehicle_count);
-                        assert!(vehicle_fields_end >= last_frame_end);
+                        let parked_count = vehicles.active_parked_vehicle_count();
+                        let parked_vehicles = vehicle_data.parked_records();
+                        assert_eq!(parked_vehicles.records().map(<[_]>::len), parked_count);
+                        assert_eq!(
+                            vehicle_data.tail().traffic_flow_totals().is_some(),
+                            manager_data.format_version() >= 315
+                        );
+                        assert_eq!(
+                            vehicle_data.tail().temporary_vehicle_count().is_some(),
+                            manager_data.format_version() >= 116_013
+                        );
                         let (districts, districts_end) =
                             manager_data.decode_district_manager_flags_prefix()?;
                         assert_eq!(districts.format_version(), manager_data.format_version());

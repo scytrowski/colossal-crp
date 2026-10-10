@@ -22,6 +22,8 @@ const VEHICLE_TRAILING_VEHICLE_VERSION: u32 = 58;
 const VEHICLE_BLOCK_COUNTER_VERSION: u32 = 99;
 const VEHICLE_CARGO_PARENT_VERSION: u32 = 104;
 const VEHICLE_CUSTOM_VALUE_VERSION: u32 = 113_012;
+const VEHICLE_TRAFFIC_TOTALS_VERSION: u32 = 315;
+const VEHICLE_COUNTS_VERSION: u32 = 116_013;
 
 /// The serialized flag and prefab-table prefix of `VehicleManager+Data`.
 ///
@@ -130,6 +132,13 @@ impl VehicleManagerDataPrefix {
         self.parked_vehicle_flags.as_deref()
     }
 
+    /// Returns the number of active parked vehicles, absent before version 115.
+    pub fn active_parked_vehicle_count(&self) -> Option<usize> {
+        self.parked_vehicle_flags
+            .as_deref()
+            .map(|flags| flags.iter().filter(|flags| **flags != 0).count())
+    }
+
     /// Returns prefab indices in active-vehicle buffer order, absent before version 30.
     pub fn vehicle_prefab_indices(&self) -> Option<&[u16]> {
         self.vehicle_prefab_indices.as_deref()
@@ -197,6 +206,7 @@ impl VehicleManagerDataPrefix {
             VehicleManagerSparseFieldsPrefix {
                 format_version: self.format_version,
                 active_vehicle_count: active_count,
+                active_parked_vehicle_count: self.active_parked_vehicle_count(),
                 gate_indices,
                 race_teams,
                 race_teammates,
@@ -217,6 +227,7 @@ impl VehicleManagerDataPrefix {
 pub struct VehicleManagerSparseFieldsPrefix {
     format_version: u32,
     active_vehicle_count: usize,
+    active_parked_vehicle_count: Option<usize>,
     gate_indices: Option<Vec<u8>>,
     race_teams: Option<Vec<u16>>,
     race_teammates: Option<Vec<u8>>,
@@ -234,6 +245,11 @@ impl VehicleManagerSparseFieldsPrefix {
     /// Returns the number of active vehicle records selected by `m_flags`.
     pub fn active_vehicle_count(&self) -> usize {
         self.active_vehicle_count
+    }
+
+    /// Returns the active parked-vehicle count, absent before version 115.
+    pub fn active_parked_vehicle_count(&self) -> Option<usize> {
+        self.active_parked_vehicle_count
     }
 
     /// Returns gate indices from inner version 182.
@@ -324,6 +340,7 @@ impl VehicleManagerSparseFieldsPrefix {
         Ok((
             VehicleLastFrameDataPrefix {
                 format_version: self.format_version,
+                active_parked_vehicle_count: self.active_parked_vehicle_count,
                 records,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
@@ -392,6 +409,7 @@ impl VehicleLastFrameRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VehicleLastFrameDataPrefix {
     format_version: u32,
+    active_parked_vehicle_count: Option<usize>,
     records: Vec<VehicleLastFrameRecord>,
     serialized_prefix: Vec<u8>,
 }
@@ -488,6 +506,7 @@ impl VehicleLastFrameDataPrefix {
         Ok((
             VehicleInstanceFieldsPrefix {
                 format_version: self.format_version,
+                active_parked_vehicle_count: self.active_parked_vehicle_count,
                 records,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
@@ -585,6 +604,7 @@ impl VehicleInstanceFields {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VehicleInstanceFieldsPrefix {
     format_version: u32,
+    active_parked_vehicle_count: Option<usize>,
     records: Vec<VehicleInstanceFields>,
     serialized_prefix: Vec<u8>,
 }
@@ -603,6 +623,296 @@ impl VehicleInstanceFieldsPrefix {
     /// Writes the original scalar/reference bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Decodes serialized parked-vehicle records after the active vehicles.
+    ///
+    /// Versions before 115 have no parked-record section. From version 115,
+    /// each active parked vehicle stores a position, rotation, and 24-bit
+    /// owner-citizen reference. The returned byte count ends before manager
+    /// counters or the closing profiler reference.
+    pub fn decode_parked_vehicle_records(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(VehicleParkedRecordsPrefix, usize), CrpError> {
+        let mut reader = Reader::new(bytes);
+        let records = if let Some(count) = self.active_parked_vehicle_count {
+            let mut records = Vec::with_capacity(count);
+            for _ in 0..count {
+                records.push(VehicleParkedInstanceRecord {
+                    position: read_vector::<3>(&mut reader)?,
+                    rotation: read_vector::<4>(&mut reader)?,
+                    owner_citizen: reader.read_u24_be()?,
+                });
+            }
+            Some(records)
+        } else {
+            None
+        };
+        let consumed = reader.offset();
+        Ok((
+            VehicleParkedRecordsPrefix {
+                format_version: self.format_version,
+                records,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+}
+
+/// Position, rotation, and owner reference for one active parked vehicle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VehicleParkedInstanceRecord {
+    position: [u32; 3],
+    rotation: [u32; 4],
+    owner_citizen: u32,
+}
+
+impl VehicleParkedInstanceRecord {
+    /// Returns position component bit patterns.
+    pub fn position(&self) -> [u32; 3] {
+        self.position
+    }
+
+    /// Returns quaternion component bit patterns.
+    pub fn rotation(&self) -> [u32; 4] {
+        self.rotation
+    }
+
+    /// Returns the 24-bit owner-citizen reference.
+    pub fn owner_citizen(&self) -> u32 {
+        self.owner_citizen
+    }
+}
+
+/// Decoded parked-vehicle records after active vehicle records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleParkedRecordsPrefix {
+    format_version: u32,
+    records: Option<Vec<VehicleParkedInstanceRecord>>,
+    serialized_prefix: Vec<u8>,
+}
+
+impl VehicleParkedRecordsPrefix {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns active parked records, absent before version 115.
+    pub fn records(&self) -> Option<&[VehicleParkedInstanceRecord]> {
+        self.records.as_deref()
+    }
+
+    /// Writes the original parked-record bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+
+    /// Decodes versioned counters following the parked-record array.
+    ///
+    /// Traffic totals appear from version 315; temporary and final vehicle
+    /// counts appear from version 116013. The returned byte count ends before
+    /// the two-byte manager-closing profiler reference.
+    pub fn decode_tail(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(VehicleManagerTailDataPrefix, usize), CrpError> {
+        let mut reader = Reader::new(bytes);
+        let traffic_flow_totals = if self.format_version >= VEHICLE_TRAFFIC_TOTALS_VERSION {
+            Some([reader.read_u32_be()?, reader.read_u32_be()?])
+        } else {
+            None
+        };
+        let traffic_flow_byte = if self.format_version >= VEHICLE_TRAFFIC_TOTALS_VERSION {
+            Some(reader.read_u8()?)
+        } else {
+            None
+        };
+        let temporary_vehicle_count = if self.format_version >= VEHICLE_COUNTS_VERSION {
+            Some(reader.read_u32_be()?)
+        } else {
+            None
+        };
+        let final_vehicle_count = if self.format_version >= VEHICLE_COUNTS_VERSION {
+            Some(reader.read_u32_be()?)
+        } else {
+            None
+        };
+        let consumed = reader.offset();
+        Ok((
+            VehicleManagerTailDataPrefix {
+                format_version: self.format_version,
+                traffic_flow_totals,
+                traffic_flow_byte,
+                temporary_vehicle_count,
+                final_vehicle_count,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+}
+
+/// Versioned VehicleManager counters after parked-vehicle records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleManagerTailDataPrefix {
+    format_version: u32,
+    traffic_flow_totals: Option<[u32; 2]>,
+    traffic_flow_byte: Option<u8>,
+    temporary_vehicle_count: Option<u32>,
+    final_vehicle_count: Option<u32>,
+    serialized_prefix: Vec<u8>,
+}
+
+impl VehicleManagerTailDataPrefix {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns the two serialized traffic-flow totals from version 315.
+    pub fn traffic_flow_totals(&self) -> Option<[u32; 2]> {
+        self.traffic_flow_totals
+    }
+
+    /// Returns the trailing traffic-flow byte from version 315.
+    pub fn traffic_flow_byte(&self) -> Option<u8> {
+        self.traffic_flow_byte
+    }
+
+    /// Returns the temporary vehicle count from version 116013.
+    pub fn temporary_vehicle_count(&self) -> Option<u32> {
+        self.temporary_vehicle_count
+    }
+
+    /// Returns the final vehicle count from version 116013.
+    pub fn final_vehicle_count(&self) -> Option<u32> {
+        self.final_vehicle_count
+    }
+
+    /// Writes the original counter bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+/// Fully decoded known `VehicleManager+Data` sections through its counters.
+///
+/// The original bounded manager body, including its closing profiler
+/// reference, remains available for exact rewriting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleManagerData {
+    prefix: VehicleManagerDataPrefix,
+    sparse_columns: VehicleManagerSparseFieldsPrefix,
+    last_frame_records: VehicleLastFrameDataPrefix,
+    instance_fields: VehicleInstanceFieldsPrefix,
+    parked_records: VehicleParkedRecordsPrefix,
+    tail: VehicleManagerTailDataPrefix,
+    serialized_body: Vec<u8>,
+}
+
+impl VehicleManagerData {
+    /// Decodes the known fields in one bounded `VehicleManager+Data` body.
+    ///
+    /// The body must end with the two-byte closing profiler reference. The
+    /// returned value preserves the complete body, including that reference.
+    pub(crate) fn decode_body(format_version: u32, bytes: &[u8]) -> Result<Self, CrpError> {
+        let (prefix, mut offset) = VehicleManagerDataPrefix::decode_prefix(format_version, bytes)?;
+        let (sparse_columns, consumed) = prefix.decode_sparse_columns(remaining(bytes, offset)?)?;
+        offset = checked_end(offset, consumed, "VehicleManager sparse columns")?;
+
+        let (last_frame_records, consumed) =
+            sparse_columns.decode_last_frame_records(remaining(bytes, offset)?)?;
+        offset = checked_end(offset, consumed, "VehicleManager last-frame records")?;
+
+        let (instance_fields, consumed) =
+            last_frame_records.decode_scalar_fields(remaining(bytes, offset)?)?;
+        offset = checked_end(offset, consumed, "VehicleManager instance fields")?;
+
+        let (parked_records, consumed) =
+            instance_fields.decode_parked_vehicle_records(remaining(bytes, offset)?)?;
+        offset = checked_end(offset, consumed, "VehicleManager parked records")?;
+
+        let (tail, consumed) = parked_records.decode_tail(remaining(bytes, offset)?)?;
+        offset = checked_end(offset, consumed, "VehicleManager counters")?;
+
+        let closing_reference_end = checked_end(offset, 2, "VehicleManager closing reference")?;
+        if closing_reference_end != bytes.len()
+            || bytes.get(offset).is_none_or(|marker| *marker >= 0xfe)
+        {
+            return Err(invalid(
+                offset,
+                "VehicleManager counters do not end before its two-byte closing profiler reference",
+            ));
+        }
+
+        Ok(Self {
+            prefix,
+            sparse_columns,
+            last_frame_records,
+            instance_fields,
+            parked_records,
+            tail,
+            serialized_body: bytes.to_vec(),
+        })
+    }
+
+    /// Returns the initial flags and prefab collection.
+    pub fn prefix(&self) -> &VehicleManagerDataPrefix {
+        &self.prefix
+    }
+
+    /// Returns the version-gated sparse active-vehicle columns.
+    pub fn sparse_columns(&self) -> &VehicleManagerSparseFieldsPrefix {
+        &self.sparse_columns
+    }
+
+    /// Returns active-vehicle last-frame vectors and target positions.
+    pub fn last_frame_records(&self) -> &VehicleLastFrameDataPrefix {
+        &self.last_frame_records
+    }
+
+    /// Returns remaining active-vehicle scalar and reference fields.
+    pub fn instance_fields(&self) -> &VehicleInstanceFieldsPrefix {
+        &self.instance_fields
+    }
+
+    /// Returns active parked-vehicle records when present.
+    pub fn parked_records(&self) -> &VehicleParkedRecordsPrefix {
+        &self.parked_records
+    }
+
+    /// Returns the version-gated manager counters.
+    pub fn tail(&self) -> &VehicleManagerTailDataPrefix {
+        &self.tail
+    }
+
+    /// Writes the original bounded manager body exactly, including its closing
+    /// profiler reference.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_body.clone()
+    }
+}
+
+fn remaining(bytes: &[u8], offset: usize) -> Result<&[u8], CrpError> {
+    bytes
+        .get(offset..)
+        .ok_or_else(|| invalid(offset, "VehicleManager field offset is out of bounds"))
+}
+
+fn checked_end(offset: usize, consumed: usize, context: &'static str) -> Result<usize, CrpError> {
+    offset
+        .checked_add(consumed)
+        .ok_or(CrpError::ArithmeticOverflow(context))
+}
+
+fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "VehicleManager+Data".to_owned(),
+        offset,
+        reason: reason.into(),
     }
 }
 
@@ -626,8 +936,9 @@ fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, Crp
 #[cfg(test)]
 mod tests {
     use super::{
-        VehicleLastFrameDataPrefix, VehicleLastFrameRecord, VehicleManagerDataPrefix,
-        VehicleManagerSparseFieldsPrefix, VehicleTargetPosition0,
+        VehicleInstanceFieldsPrefix, VehicleLastFrameDataPrefix, VehicleLastFrameRecord,
+        VehicleManagerData, VehicleManagerDataPrefix, VehicleManagerSparseFieldsPrefix,
+        VehicleParkedRecordsPrefix, VehicleTargetPosition0,
     };
 
     fn append_zero_uint_array(bytes: &mut Vec<u8>, count: usize) {
@@ -690,6 +1001,7 @@ mod tests {
         VehicleManagerSparseFieldsPrefix {
             format_version,
             active_vehicle_count,
+            active_parked_vehicle_count: None,
             gate_indices: None,
             race_teams: None,
             race_teammates: None,
@@ -713,7 +1025,28 @@ mod tests {
         };
         VehicleLastFrameDataPrefix {
             format_version,
+            active_parked_vehicle_count: None,
             records: std::iter::repeat_n(empty_record, record_count).collect(),
+            serialized_prefix: Vec::new(),
+        }
+    }
+
+    fn instance_fields_prefix(
+        format_version: u32,
+        active_parked_vehicle_count: Option<usize>,
+    ) -> VehicleInstanceFieldsPrefix {
+        VehicleInstanceFieldsPrefix {
+            format_version,
+            active_parked_vehicle_count,
+            records: Vec::new(),
+            serialized_prefix: Vec::new(),
+        }
+    }
+
+    fn parked_records_prefix(format_version: u32) -> VehicleParkedRecordsPrefix {
+        VehicleParkedRecordsPrefix {
+            format_version,
+            records: Some(Vec::new()),
             serialized_prefix: Vec::new(),
         }
     }
@@ -746,6 +1079,13 @@ mod tests {
         if version >= 113_012 {
             bytes.extend_from_slice(&[0x17, 0x18]); // custom value
         }
+        bytes
+    }
+
+    fn parked_record(position: [u32; 3], rotation: [u32; 4], owner: u32) -> Vec<u8> {
+        let mut bytes = words_as_bytes(&position);
+        bytes.extend_from_slice(&words_as_bytes(&rotation));
+        bytes.extend_from_slice(&owner.to_be_bytes()[1..]);
         bytes
     }
 
@@ -820,6 +1160,7 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(decoded.active_parked_vehicle_count(), Some(1));
         assert_eq!(decoded.vehicle_prefab_indices(), Some([1].as_slice()));
         assert_eq!(
             decoded.parked_vehicle_prefab_indices(),
@@ -1072,5 +1413,151 @@ mod tests {
         assert_eq!(decoded.records(), []);
         assert_eq!(consumed, 0);
         assert_eq!(decoded.encode(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn parked_vehicle_records_follow_active_parked_flags_and_preserve_bits() {
+        let mut prefix = prefix_with_active_slots(205, 0);
+        let mut parked_flags = vec![0; 32_767];
+        parked_flags[2] = 1;
+        parked_flags[19] = 4;
+        prefix.parked_vehicle_flags = Some(parked_flags);
+        let (columns, _) = prefix
+            .decode_sparse_columns(&[])
+            .expect("empty sparse columns with no active vehicles");
+        assert_eq!(columns.active_parked_vehicle_count(), Some(2));
+        let (frames, _) = columns
+            .decode_last_frame_records(&[])
+            .expect("there are no active vehicle records");
+        let (fields, _) = frames
+            .decode_scalar_fields(&[])
+            .expect("there are no active scalar records");
+
+        let first = parked_record(
+            [0x3f80_0000, 0xc020_0000, 0x42a0_0000],
+            [0, 0, 0, 0x3f80_0000],
+            0x12_3456,
+        );
+        let second = parked_record(
+            [0x4120_0000, 0x41a0_0000, 0x41f0_0000],
+            [0x3f00_0000, 0, 0, 0x3f80_0000],
+            0xab_cdef,
+        );
+        let mut bytes = first;
+        bytes.extend_from_slice(&second);
+        let (decoded, consumed) = fields
+            .decode_parked_vehicle_records(&bytes)
+            .expect("two parked records are complete");
+        assert_eq!(decoded.records().unwrap().len(), 2);
+        assert_eq!(consumed, 62);
+        assert_eq!(
+            decoded.records().unwrap()[0].position(),
+            [0x3f80_0000, 0xc020_0000, 0x42a0_0000]
+        );
+        assert_eq!(
+            decoded.records().unwrap()[0].rotation(),
+            [0, 0, 0, 0x3f80_0000]
+        );
+        assert_eq!(decoded.records().unwrap()[0].owner_citizen(), 0x12_3456);
+        assert_eq!(decoded.records().unwrap()[1].owner_citizen(), 0xab_cdef);
+        assert_eq!(decoded.encode(), bytes);
+    }
+
+    #[test]
+    fn parked_vehicle_records_respect_version_gate_and_truncation() {
+        let old = instance_fields_prefix(114, None);
+        let (decoded, consumed) = old
+            .decode_parked_vehicle_records(&[0xaa])
+            .expect("old versions have no parked record bytes");
+        assert_eq!(decoded.records(), None);
+        assert_eq!(consumed, 0);
+
+        let empty = instance_fields_prefix(115, Some(0));
+        let (decoded, consumed) = empty
+            .decode_parked_vehicle_records(&[])
+            .expect("version 115 has an empty active parked set");
+        assert_eq!(decoded.records(), Some([].as_slice()));
+        assert_eq!(consumed, 0);
+
+        let one = instance_fields_prefix(115, Some(1));
+        assert!(one.decode_parked_vehicle_records(&[0; 30]).is_err());
+    }
+
+    #[test]
+    fn vehicle_manager_tail_counters_follow_version_gates() {
+        for (version, expected_byte_count, has_flow, has_vehicle_counts) in [
+            (314, 0, false, false),
+            (315, 9, true, false),
+            (116_012, 9, true, false),
+            (116_013, 17, true, true),
+        ] {
+            let parked = parked_records_prefix(version);
+            let bytes = [
+                0, 0, 0, 1, // first traffic total
+                0, 0, 0, 2, // second traffic total
+                3, // final traffic byte
+                0, 0, 0, 4, // temporary vehicle count
+                0, 0, 0, 5, // final vehicle count
+            ];
+            let (decoded, consumed) = parked
+                .decode_tail(&bytes)
+                .expect("versioned manager tail is complete");
+            assert_eq!(consumed, expected_byte_count, "version {version}");
+            assert_eq!(decoded.traffic_flow_totals().is_some(), has_flow);
+            assert_eq!(decoded.traffic_flow_byte().is_some(), has_flow);
+            assert_eq!(
+                decoded.temporary_vehicle_count().is_some(),
+                has_vehicle_counts
+            );
+            assert_eq!(decoded.final_vehicle_count().is_some(), has_vehicle_counts);
+            if has_flow {
+                assert_eq!(decoded.traffic_flow_totals(), Some([1, 2]));
+                assert_eq!(decoded.traffic_flow_byte(), Some(3));
+            }
+            if has_vehicle_counts {
+                assert_eq!(decoded.temporary_vehicle_count(), Some(4));
+                assert_eq!(decoded.final_vehicle_count(), Some(5));
+            }
+            assert_eq!(decoded.encode(), bytes[..expected_byte_count]);
+        }
+
+        assert!(parked_records_prefix(315).decode_tail(&[0; 8]).is_err());
+        assert!(
+            parked_records_prefix(116_013)
+                .decode_tail(&[0; 16])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn full_vehicle_manager_body_decodes_latest_counters_and_preserves_bytes() {
+        let mut bytes = empty_prefix(116_013);
+        bytes.extend_from_slice(&[
+            0, 0, 0, 1, // first traffic total
+            0, 0, 0, 2, // second traffic total
+            3, // final traffic byte
+            0, 0, 0, 4, // temporary vehicle count
+            0, 0, 0, 5, // final vehicle count
+            0, 0, // closing profiler reference
+        ]);
+
+        let decoded = VehicleManagerData::decode_body(116_013, &bytes)
+            .expect("complete latest-version VehicleManager body");
+        assert_eq!(decoded.prefix().active_parked_vehicle_count(), Some(0));
+        assert_eq!(decoded.sparse_columns().active_vehicle_count(), 0);
+        assert_eq!(decoded.last_frame_records().records(), []);
+        assert_eq!(decoded.instance_fields().records(), []);
+        assert_eq!(decoded.parked_records().records(), Some([].as_slice()));
+        assert_eq!(decoded.tail().traffic_flow_totals(), Some([1, 2]));
+        assert_eq!(decoded.tail().traffic_flow_byte(), Some(3));
+        assert_eq!(decoded.tail().temporary_vehicle_count(), Some(4));
+        assert_eq!(decoded.tail().final_vehicle_count(), Some(5));
+        assert_eq!(decoded.encode(), bytes);
+
+        let mut malformed = bytes.clone();
+        let closing_marker_offset = malformed.len() - 2;
+        malformed[closing_marker_offset] = 0xfe;
+        assert!(VehicleManagerData::decode_body(116_013, &malformed).is_err());
+        assert!(VehicleManagerData::decode_body(116_013, &bytes[..bytes.len() - 1]).is_err());
     }
 }
