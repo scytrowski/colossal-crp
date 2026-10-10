@@ -4,7 +4,7 @@
 //! 4 through 10. It verifies each asset's stored MD5 and returns raw payloads.
 
 use std::fmt;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 mod asset_io;
 mod audio_manager_data;
@@ -113,6 +113,7 @@ pub use water_simulation_data::{
 pub use zone_manager_data::{ZoneBlockRecord, ZoneManagerDataPrefix};
 
 const MAGIC: &[u8; 4] = b"CRAP";
+const ASSET_TYPE_PACKAGE: i32 = 53;
 const MIN_SUPPORTED_VERSION: u16 = 4;
 const MAX_SUPPORTED_VERSION: u16 = 10;
 const MAX_STRING_BYTES: u32 = 16 * 1024 * 1024;
@@ -153,6 +154,27 @@ pub struct Asset {
     pub relative_offset: u64,
     /// Payload bytes read from the package.
     pub data: Vec<u8>,
+}
+
+impl Asset {
+    /// Reads this type-53 asset payload as a nested package.
+    ///
+    /// The nested reader is bounded to this asset's payload bytes, so child
+    /// offsets cannot read into following assets in the parent package. The
+    /// nested package must use an outer format version supported by
+    /// [`Package::read_from`] (currently versions 4 through 10). No
+    /// game-produced nested package has been validated against this method.
+    pub fn read_nested_package(&self) -> Result<Package, CrpError> {
+        if self.asset_type != ASSET_TYPE_PACKAGE {
+            return Err(CrpError::AssetTypeMismatch {
+                name: self.name.clone(),
+                expected: ASSET_TYPE_PACKAGE,
+                actual: self.asset_type,
+            });
+        }
+
+        Package::read_from(&mut Cursor::new(self.data.as_slice()))
+    }
 }
 
 /// Errors returned while reading a `.crp` package's outer container.
@@ -3661,6 +3683,66 @@ mod tests {
         assert!(matches!(
             Package::read_assets_of_type_from(&mut selected_corrupt_cursor, 712),
             Err(CrpError::ChecksumMismatch { name, .. }) if name == "future asset"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_package_reader_is_bounded_to_the_asset_payload() -> Result<(), CrpError> {
+        let mut child_bytes = Vec::new();
+        sample_package().write_compact_to(&mut child_bytes)?;
+        let expected_child = Package::read_from(&mut Cursor::new(child_bytes.as_slice()))?;
+
+        let mut parent = sample_package();
+        parent.assets = vec![Asset {
+            name: "nested package".to_owned(),
+            checksum: String::new(),
+            asset_type: ASSET_TYPE_PACKAGE,
+            relative_offset: 0,
+            data: child_bytes.clone(),
+        }];
+        let mut parent_bytes = Vec::new();
+        parent.write_compact_to(&mut parent_bytes)?;
+        let decoded_parent = Package::read_from(&mut Cursor::new(parent_bytes))?;
+        assert_eq!(
+            decoded_parent.assets[0].read_nested_package()?,
+            expected_child
+        );
+
+        let mut wrong_type = sample_package();
+        assert!(matches!(
+            wrong_type.assets.remove(0).read_nested_package(),
+            Err(CrpError::AssetTypeMismatch {
+                expected: ASSET_TYPE_PACKAGE,
+                actual: 3,
+                ..
+            })
+        ));
+
+        child_bytes.pop();
+        let mut truncated_parent = sample_package();
+        truncated_parent.assets = vec![
+            Asset {
+                name: "truncated nested package".to_owned(),
+                checksum: String::new(),
+                asset_type: ASSET_TYPE_PACKAGE,
+                relative_offset: 0,
+                data: child_bytes,
+            },
+            Asset {
+                name: "following parent payload".to_owned(),
+                checksum: String::new(),
+                asset_type: 3,
+                relative_offset: 0,
+                data: b"outside the nested asset".to_vec(),
+            },
+        ];
+        let mut truncated_parent_bytes = Vec::new();
+        truncated_parent.write_compact_to(&mut truncated_parent_bytes)?;
+        let decoded_parent = Package::read_from(&mut Cursor::new(truncated_parent_bytes))?;
+        assert!(matches!(
+            decoded_parent.assets[0].read_nested_package(),
+            Err(CrpError::AssetOutOfBounds { name, .. }) if name == "future asset"
         ));
         Ok(())
     }
