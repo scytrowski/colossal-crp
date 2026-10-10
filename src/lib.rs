@@ -31,6 +31,7 @@ mod terrain_manager_data;
 mod texture;
 mod tree_manager_data;
 mod unlock_manager_data;
+mod vehicle_manager_data;
 mod water_simulation_data;
 mod weather_manager_data;
 mod zone_manager_data;
@@ -108,6 +109,7 @@ pub use tree_manager_data::{BurningTreeRecord, TreeInstanceRecord, TreeManagerDa
 pub use unlock_manager_data::{
     UnlockManagerMilestoneArray, UnlockManagerMilestoneKind, UnlockManagerReferences,
 };
+pub use vehicle_manager_data::VehicleManagerDataPrefix;
 pub use water_simulation_data::{
     WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
 };
@@ -5579,6 +5581,25 @@ mod tests {
                         assert_eq!(weather.total_heights().len(), 16_384);
                         assert!(weather_end < manager_data.serialized_object_graph().len());
                         checked_weather_manager_convenience = true;
+                        let (vehicles, vehicles_end) =
+                            manager_data.decode_vehicle_manager_prefix()?;
+                        assert_eq!(vehicles.format_version(), manager_data.format_version());
+                        assert_eq!(vehicles.vehicle_flags().len(), 16_383);
+                        assert_eq!(
+                            vehicles.vehicle_flags2().is_some(),
+                            manager_data.format_version() >= 274
+                        );
+                        assert_eq!(
+                            vehicles.vehicle_prefab_indices().map(<[u16]>::len),
+                            (manager_data.format_version() >= 30).then(|| {
+                                vehicles
+                                    .vehicle_flags()
+                                    .iter()
+                                    .filter(|flags| **flags != 0)
+                                    .count()
+                            })
+                        );
+                        assert!(vehicles_end < manager_data.serialized_object_graph().len());
                         let (districts, districts_end) =
                             manager_data.decode_district_manager_flags_prefix()?;
                         assert_eq!(districts.format_version(), manager_data.format_version());

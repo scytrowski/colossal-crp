@@ -229,41 +229,58 @@ pub(crate) fn read_encoded_uint_array(
     reader: &mut Reader<'_>,
     count: usize,
 ) -> Result<Vec<u32>, CrpError> {
-    let mut values = Vec::with_capacity(count);
-    let mut previous_value = 0_u32;
-    let mut previous_delta = 0_i32;
-    let mut full_count = 0_usize;
-    let mut close_count = 0_usize;
-    let mut same_count = 0_usize;
+    EncodedUIntArrayReader::default().read_array(reader, count)
+}
 
-    while values.len() < count {
-        if same_count > 0 {
-            previous_value = previous_value.wrapping_add(previous_delta as u32);
-            same_count -= 1;
-        } else if close_count > 0 {
-            let adjustment = i32::from(reader.read_i16_be()?);
-            previous_delta = previous_delta.wrapping_add(adjustment);
-            previous_value = previous_value.wrapping_add(previous_delta as u32);
-            close_count -= 1;
-        } else if full_count > 0 {
-            let value = reader.read_u32_be()?;
-            previous_delta = value.wrapping_sub(previous_value) as i32;
-            previous_value = value;
-            full_count -= 1;
-        } else {
-            let control = reader.read_u8()?;
-            if control >= 0x80 {
-                same_count = usize::from(control - 0x7f);
-            } else if control >= 0x40 {
-                close_count = usize::from(control - 0x3f);
+/// Reads consecutive unsigned `EncodedArray.UInt` fields in one shared scope.
+///
+/// `BeginRead` resets the delta state once; callers keep this reader while
+/// decoding multiple arrays before `EndRead`.
+#[derive(Debug, Default)]
+pub(crate) struct EncodedUIntArrayReader {
+    previous_value: u32,
+    previous_delta: i32,
+    full_count: usize,
+    close_count: usize,
+    same_count: usize,
+}
+
+impl EncodedUIntArrayReader {
+    pub(crate) fn read_array(
+        &mut self,
+        reader: &mut Reader<'_>,
+        count: usize,
+    ) -> Result<Vec<u32>, CrpError> {
+        let mut values = Vec::with_capacity(count);
+        while values.len() < count {
+            if self.same_count > 0 {
+                self.previous_value = self.previous_value.wrapping_add(self.previous_delta as u32);
+                self.same_count -= 1;
+            } else if self.close_count > 0 {
+                let adjustment = i32::from(reader.read_i16_be()?);
+                self.previous_delta = self.previous_delta.wrapping_add(adjustment);
+                self.previous_value = self.previous_value.wrapping_add(self.previous_delta as u32);
+                self.close_count -= 1;
+            } else if self.full_count > 0 {
+                let value = reader.read_u32_be()?;
+                self.previous_delta = value.wrapping_sub(self.previous_value) as i32;
+                self.previous_value = value;
+                self.full_count -= 1;
             } else {
-                full_count = usize::from(control) + 1;
+                let control = reader.read_u8()?;
+                if control >= 0x80 {
+                    self.same_count = usize::from(control - 0x7f);
+                } else if control >= 0x40 {
+                    self.close_count = usize::from(control - 0x3f);
+                } else {
+                    self.full_count = usize::from(control) + 1;
+                }
+                continue;
             }
-            continue;
+            values.push(self.previous_value);
         }
-        values.push(previous_value);
+        Ok(values)
     }
-    Ok(values)
 }
 
 /// `EncodedArray.Int` has the UInt control layout and modulo-32-bit deltas.
@@ -428,10 +445,11 @@ fn repeated_delta_run(values: &[u16], start: usize, previous: u16, delta: i16) -
 #[cfg(test)]
 mod tests {
     use super::{
-        EncodedLongArrayReader, read_encoded_bool_array, read_encoded_byte_array,
-        read_encoded_float_array, read_encoded_long_array, read_encoded_uint_array,
-        read_encoded_ulong_array, read_encoded_ushort_array, skip_encoded_ushort_array,
-        write_encoded_bool_array, write_encoded_float_array, write_encoded_long_array,
+        EncodedLongArrayReader, EncodedUIntArrayReader, read_encoded_bool_array,
+        read_encoded_byte_array, read_encoded_float_array, read_encoded_long_array,
+        read_encoded_uint_array, read_encoded_ulong_array, read_encoded_ushort_array,
+        skip_encoded_ushort_array, write_encoded_bool_array, write_encoded_float_array,
+        write_encoded_long_array,
     };
     use crate::data_serializer::Reader;
 
@@ -481,6 +499,21 @@ mod tests {
             [5, 10, 15, 18]
         );
         assert_eq!(reader.offset(), bytes.len());
+    }
+
+    #[test]
+    fn uint_reader_carries_delta_state_between_fields_in_one_scope() {
+        let bytes = [0, 0, 0, 0, 1, 0x80];
+        let mut reader = Reader::new(&bytes);
+        let mut scope = EncodedUIntArrayReader::default();
+        assert_eq!(scope.read_array(&mut reader, 1).unwrap(), [1]);
+        assert_eq!(scope.read_array(&mut reader, 1).unwrap(), [2]);
+
+        let mut separate_scope = Reader::new(&[0x80]);
+        assert_eq!(
+            read_encoded_uint_array(&mut separate_scope, 1).unwrap(),
+            [0]
+        );
     }
 
     #[test]

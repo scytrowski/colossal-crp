@@ -9,6 +9,7 @@ use crate::PathManagerData;
 use crate::PropManagerDataPrefix;
 use crate::TerrainManagerData;
 use crate::TreeManagerDataPrefix;
+use crate::VehicleManagerDataPrefix;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::WeatherManagerData;
@@ -2091,6 +2092,31 @@ impl SimulationManagerData {
             ));
         }
         Ok((weather, next_tag_start))
+    }
+
+    /// Decodes the VehicleManager flags and prefab table at slot 17.
+    ///
+    /// Returns the graph offset after the known prefix and before its active
+    /// vehicle sparse columns. Active vehicle records and later manager fields
+    /// remain opaque. The next manager reference must be TransportManager at
+    /// slot 18.
+    pub fn decode_vehicle_manager_prefix(
+        &self,
+    ) -> Result<(VehicleManagerDataPrefix, usize), CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 17, "VehicleManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 18, "TransportManager+Data")?;
+
+        let graph = &self.serialized_object_graph;
+        let (body_start, next_tag_start) = self.manager_body_boundary(17)?;
+        let body = graph
+            .get(body_start..next_tag_start)
+            .ok_or_else(|| invalid(body_start, "VehicleManager body range is invalid"))?;
+        let (vehicles, consumed) =
+            VehicleManagerDataPrefix::decode_prefix(self.format_version, body)?;
+        let graph_end = body_start
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow("VehicleManager prefix end"))?;
+        Ok((vehicles, graph_end))
     }
 
     /// Decodes the known DistrictManager prefix for the requested inner version.
@@ -11896,6 +11922,47 @@ mod manager_boundary_tests {
             end_tag_start,
             profiler_tag(profiler_name).len() + 2 * 128 + 12
         );
+    }
+
+    #[test]
+    fn vehicle_manager_locator_returns_prefix_before_sparse_columns() {
+        let mut graph = profiler_tag("VehicleManager");
+        let body_start = graph.len();
+        for _ in 0..2 {
+            graph.extend(std::iter::repeat_n(0xff, 127));
+            graph.push(0xfe); // 16,383 zero vehicle flags
+        }
+        graph.extend(std::iter::repeat_n(0xff, 255));
+        graph.push(0xfe); // 32,767 zero parked-vehicle flags
+        graph.extend_from_slice(&[0, 0]); // empty prefab-name table
+        let prefix_end = graph.len();
+        graph.extend_from_slice(&[0xfe, 0]); // closing profiler reference
+        let transport_tag = profiler_tag("TransportManager");
+        graph.extend_from_slice(&transport_tag);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 274;
+        let mut manager_objects = vec![None; 19];
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[18] = Some(ManagerObjectReference {
+            object_id: 18,
+            type_name: "TransportManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (vehicles, end) = manager.decode_vehicle_manager_prefix().unwrap();
+        assert_eq!(vehicles.format_version(), 274);
+        assert_eq!(vehicles.vehicle_flags().len(), 16_383);
+        assert_eq!(vehicles.vehicle_flags2().unwrap().len(), 16_383);
+        assert_eq!(vehicles.parked_vehicle_flags().unwrap().len(), 32_767);
+        assert_eq!(vehicles.prefab_names().unwrap(), []);
+        assert_eq!(end, prefix_end);
+        assert!(manager.serialized_object_graph()[end..].starts_with(&[0xfe, 0]));
+        assert!(manager.serialized_object_graph()[end + 2..].starts_with(&transport_tag));
+        assert_eq!(body_start, profiler_tag("VehicleManager").len());
     }
 
     #[test]
