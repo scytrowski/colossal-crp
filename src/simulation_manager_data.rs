@@ -21,7 +21,9 @@ use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
 use crate::audio_manager_data::{AudioManagerData, AudioManagerEditor};
-use crate::citizen_manager_data::{CitizenManagerDataPrefix, CitizenUnitDataPrefix};
+use crate::citizen_manager_data::{
+    CitizenInstanceDataPrefix, CitizenManagerDataPrefix, CitizenUnitDataPrefix,
+};
 use crate::data_serializer::{
     COMPACT_STRING_FLAG, DataSerializerStream, Reader, write_nullable_unique_string, write_u24_be,
     write_unique_string, write_unique_string_with_mode,
@@ -5286,6 +5288,32 @@ impl SimulationManagerData {
                 "CitizenManager unit prefix end",
             ))?;
         Ok((units, graph_end))
+    }
+
+    /// Decodes CitizenManager's citizen and unit prefixes plus the instance
+    /// flags and BuildingInfo prefab table. Stops before per-instance fields
+    /// and returns their graph offset. Requires manager references at slots 7
+    /// and 8; the instance flag width follows inner versions 44 and 204.
+    pub fn decode_citizen_manager_instances(
+        &self,
+    ) -> Result<(CitizenInstanceDataPrefix, usize), CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 7, "CitizenManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
+
+        let (_, unit_end) = self.decode_citizen_manager_units()?;
+        let (_, next_tag_start) = self.manager_body_boundary(7)?;
+        let bytes = self
+            .serialized_object_graph
+            .get(unit_end..next_tag_start)
+            .ok_or_else(|| invalid(unit_end, "CitizenManager instance prefix range is invalid"))?;
+        let (instances, consumed) =
+            CitizenInstanceDataPrefix::decode_prefix(self.format_version, bytes)?;
+        let graph_end = unit_end
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "CitizenManager instance prefix end",
+            ))?;
+        Ok((instances, graph_end))
     }
 
     /// Decodes the known VehicleManager fields through its versioned counters.
@@ -18054,6 +18082,56 @@ mod manager_boundary_tests {
         );
         assert_eq!(end, unit_end);
         assert_eq!(manager.serialized_object_graph()[end], 0x77);
+        assert!(manager.serialized_object_graph()[end + 3..].starts_with(&transfer_tag));
+    }
+
+    #[test]
+    fn citizen_manager_instance_locator_obeys_legacy_flag_range_and_prefab_boundary() {
+        let mut graph = profiler_tag("CitizenManager");
+        for _ in 0..(1_048_575 / 128) {
+            graph.push(0xff);
+        }
+        graph.push(0xfe); // zero citizen flags
+        for _ in 0..(524_287 / 128) {
+            graph.push(0xff);
+        }
+        graph.push(0xfe); // zero citizen-unit flags
+        let unit_end = graph.len();
+        for _ in 0..(32_767 / 128) {
+            graph.push(0xff);
+        }
+        graph.push(0xfe); // 32,767 zero instance flags at version 203
+        graph.extend_from_slice(&[0, 0]); // empty BuildingInfo name table
+        let instance_end = graph.len();
+        graph.push(0x88); // first active instance field
+        graph.extend_from_slice(&[0, 0]); // closing profiler reference
+        let transfer_tag = profiler_tag("TransferManager");
+        graph.extend_from_slice(&transfer_tag);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 203;
+        let mut manager_objects = vec![None; 9];
+        manager_objects[7] = Some(ManagerObjectReference {
+            object_id: 7,
+            type_name: "CitizenManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[8] = Some(ManagerObjectReference {
+            object_id: 8,
+            type_name: "TransferManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (instances, end) = manager.decode_citizen_manager_instances().unwrap();
+        assert_eq!(instances.format_version(), 203);
+        assert_eq!(instances.instance_flags().unwrap().len(), 32_767);
+        assert!(instances.active_instances().is_empty());
+        assert_eq!(instances.prefab_names(), Some([].as_slice()));
+        assert_eq!(
+            instances.encode(),
+            manager.serialized_object_graph()[unit_end..instance_end]
+        );
+        assert_eq!(end, instance_end);
+        assert_eq!(manager.serialized_object_graph()[end], 0x88);
         assert!(manager.serialized_object_graph()[end + 3..].starts_with(&transfer_tag));
     }
 

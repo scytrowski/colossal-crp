@@ -1,7 +1,8 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
-    EncodedUIntArrayReader, read_encoded_byte_array, read_encoded_ushort_array,
+    EncodedUIntArrayReader, read_encoded_byte_array, read_encoded_uint_array,
+    read_encoded_ushort_array,
 };
 
 const CITIZEN_FLAG_COUNT: usize = 1_048_575;
@@ -15,6 +16,10 @@ const CITIZEN_JOB_TITLE_VERSION: u32 = 112_007;
 const CITIZEN_TOURIST_TYPE_VERSION: u32 = 117_002;
 const CITIZEN_UNIT_FLAG_COUNT: usize = 524_287;
 const CITIZEN_UNIT_MASK_VERSION: u32 = 69;
+const CITIZEN_INSTANCE_FLAGS_VERSION: u32 = 44;
+const FULL_CITIZEN_INSTANCE_FLAGS_VERSION: u32 = 204;
+const LEGACY_CITIZEN_INSTANCE_FLAG_COUNT: usize = 32_767;
+const FULL_CITIZEN_INSTANCE_FLAG_COUNT: usize = 65_535;
 
 /// The decoded flag and sparse-column prefix of `CitizenManager+Data`.
 ///
@@ -351,6 +356,154 @@ impl CitizenUnitDataPrefix {
     }
 }
 
+/// One active CitizenManager instance and its BuildingInfo prefab-table index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CitizenInstanceSlot {
+    index: u32,
+    flags: u32,
+    prefab_index: u16,
+}
+
+impl CitizenInstanceSlot {
+    /// Returns the one-based index in the citizen-instance buffer.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// Returns the serialized instance flags.
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    /// Returns the index into [`CitizenInstanceDataPrefix::prefab_names`].
+    pub fn prefab_index(&self) -> u16 {
+        self.prefab_index
+    }
+}
+
+/// The flags and BuildingInfo prefab scope preceding active citizen instances.
+///
+/// This prefix stops before per-instance position, path, citizen, and building
+/// fields. The exact source bytes are retained for unchanged writing. The
+/// local map corpus contains active instances, but the Rust decoder's active
+/// slot and prefab association tests use synthetic expected bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CitizenInstanceDataPrefix {
+    format_version: u32,
+    instance_flags: Option<Vec<u32>>,
+    active_instances: Vec<CitizenInstanceSlot>,
+    prefab_names: Option<Vec<Option<String>>>,
+    serialized_prefix: Vec<u8>,
+}
+
+impl CitizenInstanceDataPrefix {
+    /// Decodes the versioned instance-flag array and BuildingInfo prefab table,
+    /// returning the consumed byte count before active instance fields.
+    ///
+    /// Before inner version 44 these fields are absent. Versions 44–203 read
+    /// 32,767 flags; version 204 and later read 65,535. Truncated arrays,
+    /// indices, or names return errors.
+    pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
+        let flag_count = if format_version < CITIZEN_INSTANCE_FLAGS_VERSION {
+            None
+        } else if format_version < FULL_CITIZEN_INSTANCE_FLAGS_VERSION {
+            Some(LEGACY_CITIZEN_INSTANCE_FLAG_COUNT)
+        } else {
+            Some(FULL_CITIZEN_INSTANCE_FLAG_COUNT)
+        };
+        Self::decode_prefix_with_count(format_version, flag_count, bytes)
+    }
+
+    fn decode_prefix_with_count(
+        format_version: u32,
+        flag_count: Option<usize>,
+        bytes: &[u8],
+    ) -> Result<(Self, usize), CrpError> {
+        let mut reader = Reader::new(bytes);
+        let Some(flag_count) = flag_count else {
+            return Ok((
+                Self {
+                    format_version,
+                    instance_flags: None,
+                    active_instances: Vec::new(),
+                    prefab_names: None,
+                    serialized_prefix: Vec::new(),
+                },
+                0,
+            ));
+        };
+
+        let instance_flags = read_encoded_uint_array(&mut reader, flag_count)?;
+        let active_count = instance_flags.iter().filter(|flags| **flags != 0).count();
+        let prefab_indices = read_encoded_ushort_array(&mut reader, active_count)?;
+        let name_count = usize::from(reader.read_u16_be()?);
+        let mut prefab_names = Vec::with_capacity(name_count);
+        for _ in 0..name_count {
+            prefab_names.push(reader.read_unique_string()?);
+        }
+
+        let mut active_instances = Vec::with_capacity(active_count);
+        let mut prefab_indices = prefab_indices.into_iter();
+        for (offset, flags) in instance_flags.iter().copied().enumerate() {
+            if flags == 0 {
+                continue;
+            }
+            let index = u32::try_from(offset + 1)
+                .map_err(|_| CrpError::ArithmeticOverflow("CitizenInstance index"))?;
+            let prefab_index = prefab_indices.next().ok_or_else(|| {
+                invalid(reader.offset(), "CitizenInstance prefab index is missing")
+            })?;
+            active_instances.push(CitizenInstanceSlot {
+                index,
+                flags,
+                prefab_index,
+            });
+        }
+
+        let consumed = reader.offset();
+        Ok((
+            Self {
+                format_version,
+                instance_flags: Some(instance_flags),
+                active_instances,
+                prefab_names: Some(prefab_names),
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns the version-sized flag array, absent before version 44.
+    pub fn instance_flags(&self) -> Option<&[u32]> {
+        self.instance_flags.as_deref()
+    }
+
+    /// Returns active slots in ascending buffer-index order.
+    pub fn active_instances(&self) -> &[CitizenInstanceSlot] {
+        &self.active_instances
+    }
+
+    /// Returns the BuildingInfo prefab names, preserving null entries.
+    pub fn prefab_names(&self) -> Option<&[Option<String>]> {
+        self.prefab_names.as_deref()
+    }
+
+    /// Returns the exact source bytes consumed by this prefix decoder.
+    pub fn original_prefix(&self) -> &[u8] {
+        &self.serialized_prefix
+    }
+
+    /// Reproduces this prefix unchanged. Active instance fields are not edited.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
 fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "CitizenManager+Data".to_owned(),
@@ -361,7 +514,7 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CitizenManagerDataPrefix, CitizenUnitDataPrefix};
+    use super::{CitizenInstanceDataPrefix, CitizenManagerDataPrefix, CitizenUnitDataPrefix};
 
     fn byte_array(values: &[u8]) -> Vec<u8> {
         let mut bytes = vec![(values.len() - 1) as u8];
@@ -383,6 +536,16 @@ mod tests {
             bytes.extend_from_slice(&value.to_be_bytes());
         }
         bytes
+    }
+
+    fn append_zero_uint_array(bytes: &mut Vec<u8>, count: usize) {
+        for _ in 0..count / 128 {
+            bytes.push(0xff);
+        }
+        let remainder = count % 128;
+        if remainder > 0 {
+            bytes.push((0x7f + remainder) as u8);
+        }
     }
 
     #[test]
@@ -541,5 +704,73 @@ mod tests {
             .expect("empty CitizenUnit prefix");
         assert!(decoded.active_units().is_empty());
         assert_eq!(consumed, empty.len());
+    }
+
+    #[test]
+    fn instance_flag_and_prefab_scope_obey_version_gates() {
+        let before =
+            CitizenInstanceDataPrefix::decode_prefix(43, &[0xaa]).expect("pre-44 instance layout");
+        assert_eq!(before.0.instance_flags(), None);
+        assert_eq!(before.0.prefab_names(), None);
+        assert_eq!(before.1, 0);
+
+        for (version, expected_count) in [(203, 32_767), (204, 65_535)] {
+            let mut bytes = Vec::new();
+            append_zero_uint_array(&mut bytes, expected_count);
+            bytes.extend_from_slice(&[0, 0]); // no BuildingInfo prefab names
+            let (decoded, consumed) = CitizenInstanceDataPrefix::decode_prefix(version, &bytes)
+                .expect("empty instance and prefab tables");
+            assert_eq!(decoded.instance_flags().unwrap().len(), expected_count);
+            assert!(decoded.active_instances().is_empty());
+            assert_eq!(decoded.prefab_names(), Some([].as_slice()));
+            assert_eq!(decoded.encode(), bytes);
+            assert_eq!(consumed, bytes.len());
+        }
+    }
+
+    #[test]
+    fn active_instance_prefab_indices_follow_flag_order() {
+        let mut bytes = uint_array(&[0x41, 0, 0x07]);
+        bytes.extend_from_slice(&ushort_array(&[1, 0]));
+        bytes.extend_from_slice(&[0, 2, 0xff, 0x80, 0, 1, 0xc1]);
+        bytes.extend_from_slice(&[0xaa, 0xbb]);
+
+        let (decoded, consumed) =
+            CitizenInstanceDataPrefix::decode_prefix_with_count(44, Some(3), &bytes)
+                .expect("active instance prefab table");
+        assert_eq!(decoded.instance_flags(), Some([0x41, 0, 0x07].as_slice()));
+        assert_eq!(decoded.active_instances().len(), 2);
+        assert_eq!(decoded.active_instances()[0].index(), 1);
+        assert_eq!(decoded.active_instances()[0].flags(), 0x41);
+        assert_eq!(decoded.active_instances()[0].prefab_index(), 1);
+        assert_eq!(decoded.active_instances()[1].index(), 3);
+        assert_eq!(decoded.active_instances()[1].flags(), 0x07);
+        assert_eq!(decoded.active_instances()[1].prefab_index(), 0);
+        assert_eq!(
+            decoded.prefab_names(),
+            Some([None, Some("A".to_owned())].as_slice())
+        );
+        assert_eq!(decoded.encode(), bytes[..consumed]);
+        assert_eq!(bytes[consumed..], [0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn instance_prefix_rejects_truncated_flags_indices_and_names() {
+        assert!(CitizenInstanceDataPrefix::decode_prefix_with_count(44, Some(3), &[0, 0]).is_err());
+
+        let active_flags = uint_array(&[1, 0, 0]);
+        let mut missing_index = active_flags.clone();
+        missing_index.extend_from_slice(&[0, 0]); // name table only; active index is missing
+        assert!(
+            CitizenInstanceDataPrefix::decode_prefix_with_count(44, Some(3), &missing_index)
+                .is_err()
+        );
+
+        let mut missing_name = active_flags;
+        missing_name.extend_from_slice(&[0, 0, 1, 0, 1]); // index 1 and one name advertised
+        assert!(
+            CitizenInstanceDataPrefix::decode_prefix_with_count(44, Some(3), &missing_name)
+                .is_err()
+        );
     }
 }
