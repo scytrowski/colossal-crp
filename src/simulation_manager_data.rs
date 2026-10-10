@@ -3267,21 +3267,21 @@ impl SimulationManagerData {
         Ok((trees, next_tag_start))
     }
 
-    /// Decodes TreeManager into an editor for existing burning-tree records.
+    /// Decodes TreeManager into an editor for active trees and burning records.
     ///
     /// Requires inner version 164 or newer and manager references at slots 15
     /// and 16. Versions before 266 have no burning-tree table and return an
-    /// editor that preserves the source prefix unchanged.
+    /// editor without a burning-tree table; active tree fields remain editable.
     pub fn decode_tree_manager_editor(&self) -> Result<TreeManagerEditor, CrpError> {
         let (trees, _) = self.decode_tree_manager_prefix()?;
         Ok(trees.into_editor())
     }
 
-    /// Replaces existing TreeManager burning-tree records in place.
+    /// Replaces existing TreeManager tree values in the serialized graph.
     ///
     /// The editor must come from the current manager body and inner version.
-    /// The record count, other TreeManager fields, adjacent manager boundary,
-    /// and serialized graph length are preserved.
+    /// Tree slots and record counts remain fixed, and the following manager
+    /// boundary is revalidated. Re-encoded array columns can change graph length.
     pub fn replace_tree_manager_data(
         &mut self,
         edited: &TreeManagerEditor,
@@ -3300,12 +3300,6 @@ impl SimulationManagerData {
             ));
         }
         let replacement = edited.encode()?;
-        if replacement.len() != edited.original_body_bytes().len() {
-            return Err(invalid(
-                15,
-                "TreeManager edits must preserve the decoded prefix length",
-            ));
-        }
         let tree_tag = new_profiler_tag_bytes("TreeManager")?;
         let body_start = find_unique_bytes(
             &self.serialized_object_graph,
@@ -3314,32 +3308,50 @@ impl SimulationManagerData {
         )?
         .checked_add(tree_tag.len())
         .ok_or(CrpError::ArithmeticOverflow("TreeManager body start"))?;
-        let body_end = body_start
-            .checked_add(replacement.len())
-            .ok_or(CrpError::ArithmeticOverflow("TreeManager replacement end"))?;
-        let bounded_end = body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES).ok_or(
-            CrpError::ArithmeticOverflow("TreeManager closing profiler reference end"),
-        )?;
+        let original_body_end = body_start
+            .checked_add(edited.original_body_bytes().len())
+            .ok_or(CrpError::ArithmeticOverflow("TreeManager source body end"))?;
+        let bounded_end = original_body_end
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TreeManager closing profiler reference end",
+            ))?;
         if bounded_end != next_tag_start {
             return Err(invalid(
-                body_end,
-                "TreeManager replacement no longer ends at the following manager boundary",
+                original_body_end,
+                "TreeManager source body does not end at the following manager boundary",
             ));
         }
         let mut candidate_graph = self.serialized_object_graph.clone();
-        candidate_graph
-            .get_mut(body_start..body_end)
-            .ok_or_else(|| invalid(body_start, "TreeManager replacement range is invalid"))?
-            .copy_from_slice(&replacement);
+        if body_start > original_body_end || original_body_end > candidate_graph.len() {
+            return Err(invalid(
+                body_start,
+                "TreeManager replacement range is invalid",
+            ));
+        }
+        candidate_graph.splice(body_start..original_body_end, replacement.iter().copied());
         let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
-        let validation = self.decode_tree_manager_prefix().and_then(|(decoded, _)| {
-            if decoded.encode() != replacement {
-                return Err(invalid(
-                    body_start,
-                    "rewritten TreeManager body does not match the editor",
-                ));
-            }
-            Ok(())
+        let expected_next_tag_start = body_start
+            .checked_add(replacement.len())
+            .and_then(|body_end| body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES))
+            .ok_or(CrpError::ArithmeticOverflow("TreeManager updated boundary"));
+        let validation = expected_next_tag_start.and_then(|expected_next_tag_start| {
+            self.decode_tree_manager_prefix()
+                .and_then(|(decoded, actual_next_tag_start)| {
+                    if decoded.encode() != replacement {
+                        return Err(invalid(
+                            body_start,
+                            "rewritten TreeManager body does not match the editor",
+                        ));
+                    }
+                    if actual_next_tag_start != expected_next_tag_start {
+                        return Err(invalid(
+                            actual_next_tag_start,
+                            "rewritten TreeManager boundary does not match its encoded length",
+                        ));
+                    }
+                    Ok(())
+                })
         });
         if let Err(error) = validation {
             self.serialized_object_graph = original_graph;
@@ -14830,6 +14842,96 @@ mod manager_boundary_tests {
         );
         assert!(manager.replace_tree_manager_data(&editor).is_err());
         assert_eq!(manager.serialized_object_graph(), expected_graph);
+    }
+
+    #[test]
+    fn tree_manager_editor_resizes_changed_encoded_columns_at_manager_boundary() {
+        let mut flags = vec![0_u16; 262_143];
+        flags[..3].fill(1);
+        let mut encoded_flags = Vec::new();
+        write_encoded_ushort_array(&mut encoded_flags, &flags);
+        let mut encoded_prefabs = Vec::new();
+        write_encoded_ushort_array(&mut encoded_prefabs, &[1, 2, 3]);
+        let mut encoded_x = Vec::new();
+        write_encoded_ushort_array(&mut encoded_x, &[10, 20, 30]);
+
+        let mut tree_body = encoded_flags;
+        tree_body.extend_from_slice(&encoded_prefabs);
+        tree_body.extend_from_slice(&[0, 0]); // Empty prefab-name scope.
+        let x_offset = tree_body.len();
+        tree_body.extend_from_slice(&encoded_x);
+        write_encoded_ushort_array(&mut tree_body, &[40, 50, 60]);
+
+        let mut graph = profiler_tag("TreeManager");
+        let body_start = graph.len();
+        graph.extend_from_slice(&tree_body);
+        graph.extend_from_slice(&[0, 16]);
+        graph.extend(profiler_tag("WeatherManager"));
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 194;
+        let mut manager_objects = vec![None; 17];
+        manager_objects[15] = Some(ManagerObjectReference {
+            object_id: 15,
+            type_name: "TreeManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[16] = Some(ManagerObjectReference {
+            object_id: 16,
+            type_name: "WeatherManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let original_graph_len = original_graph.len();
+        let mut editor = manager.decode_tree_manager_editor().unwrap();
+        for tree in editor.trees_mut() {
+            tree.position_x = 0;
+        }
+        let mut expected_graph = original_graph;
+        let x_start = body_start + x_offset;
+        expected_graph.splice(x_start..x_start + encoded_x.len(), [0x82]);
+        assert_eq!(encoded_x.len(), 7);
+        assert_eq!(expected_graph.len(), original_graph_len - 6);
+        manager.replace_tree_manager_data(&editor).unwrap();
+
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            expected_graph.len()
+        );
+        let (updated, weather_start) = manager.decode_tree_manager_prefix().unwrap();
+        assert!(updated.trees().iter().all(|tree| tree.position_x == 0));
+        assert!(
+            manager.serialized_object_graph()[weather_start..]
+                .starts_with(&profiler_tag("WeatherManager"))
+        );
+        assert!(manager.replace_tree_manager_data(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+
+        let mut expansion_editor = manager.decode_tree_manager_editor().unwrap();
+        for (tree, position) in expansion_editor.trees_mut().iter_mut().zip([10, 20, 30]) {
+            tree.position_x = position;
+        }
+        let expanded_column = [2, 0, 10, 0, 20, 0, 30];
+        let mut expanded_graph = manager.serialized_object_graph().to_vec();
+        expanded_graph.splice(x_start..x_start + 1, expanded_column);
+        manager
+            .replace_tree_manager_data(&expansion_editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expanded_graph);
+        assert_eq!(expanded_graph.len(), original_graph_len);
+        let (expanded, weather_start) = manager.decode_tree_manager_prefix().unwrap();
+        assert_eq!(
+            expanded
+                .trees()
+                .iter()
+                .map(|tree| tree.position_x)
+                .collect::<Vec<_>>(),
+            [10, 20, 30]
+        );
+        assert!(
+            manager.serialized_object_graph()[weather_start..]
+                .starts_with(&profiler_tag("WeatherManager"))
+        );
     }
 
     #[test]

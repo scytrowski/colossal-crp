@@ -1,6 +1,6 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::read_encoded_ushort_array;
+use crate::encoded_array::{read_encoded_ushort_array, write_encoded_ushort_array};
 use std::ops::Range;
 
 const TREE_CAPACITY: usize = 262_144;
@@ -38,18 +38,23 @@ pub struct TreeManagerDataPrefix {
     flags: Vec<u16>,
     prefab_names: Vec<Option<String>>,
     trees: Vec<TreeInstanceRecord>,
+    prefab_indices_range: Range<usize>,
+    position_x_range: Range<usize>,
+    position_z_range: Range<usize>,
     burning_trees: Option<Vec<BurningTreeRecord>>,
     burning_trees_range: Option<Range<usize>>,
     serialized_prefix: Vec<u8>,
 }
 
-/// In-place editor for existing TreeManager burning-tree records.
+/// Editor for existing active trees and burning-tree records.
 ///
-/// The record count, tree flags, prefab scopes, positions, and unknown bytes
-/// remain unchanged. Burning-tree edits are available from inner version 266.
+/// Tree slots and record counts remain unchanged. Changed `EncodedArray.UShort`
+/// columns use the canonical encoding; unchanged columns and all other bytes
+/// retain their source representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeManagerEditor {
     data: TreeManagerDataPrefix,
+    original_trees: Vec<TreeInstanceRecord>,
 }
 
 impl TreeManagerDataPrefix {
@@ -79,10 +84,16 @@ impl TreeManagerDataPrefix {
             .enumerate()
             .filter_map(|(index, flag)| (*flag != 0).then_some(index))
             .collect();
+        let prefab_indices_start = reader.offset();
         let prefab_indices = read_encoded_ushort_array(&mut reader, active_indices.len())?;
+        let prefab_indices_range = prefab_indices_start..reader.offset();
         let prefab_names = read_prefab_names(&mut reader)?;
+        let position_x_start = reader.offset();
         let position_x = read_encoded_ushort_array(&mut reader, active_indices.len())?;
+        let position_x_range = position_x_start..reader.offset();
+        let position_z_start = reader.offset();
         let position_z = read_encoded_ushort_array(&mut reader, active_indices.len())?;
+        let position_z_range = position_z_start..reader.offset();
 
         let trees = active_indices
             .into_iter()
@@ -125,6 +136,9 @@ impl TreeManagerDataPrefix {
                 flags,
                 prefab_names,
                 trees,
+                prefab_indices_range,
+                position_x_range,
+                position_z_range,
                 burning_trees,
                 burning_trees_range,
                 serialized_prefix: bytes[..consumed].to_vec(),
@@ -158,9 +172,13 @@ impl TreeManagerDataPrefix {
         self.burning_trees.as_deref()
     }
 
-    /// Creates an editor for existing burning-tree records.
+    /// Creates an editor for existing active trees and burning-tree records.
     pub fn into_editor(self) -> TreeManagerEditor {
-        TreeManagerEditor { data: self }
+        let original_trees = self.trees.clone();
+        TreeManagerEditor {
+            data: self,
+            original_trees,
+        }
     }
 
     /// Writes the original known prefix exactly.
@@ -175,60 +193,147 @@ impl TreeManagerEditor {
         self.data.format_version
     }
 
+    /// Returns mutable active tree records without changing their count or slots.
+    pub fn trees_mut(&mut self) -> &mut [TreeInstanceRecord] {
+        &mut self.data.trees
+    }
+
     /// Returns mutable burning-tree records without changing their count.
     /// Returns `None` for versions before 266.
     pub fn burning_trees_mut(&mut self) -> Option<&mut [BurningTreeRecord]> {
         self.data.burning_trees.as_deref_mut()
     }
 
-    /// Writes edited records into their original fixed-width locations.
-    /// All other bytes, including encoded tree arrays, are preserved exactly.
+    /// Writes edited fields while retaining unchanged source bytes.
+    ///
+    /// Changing prefab indexes or positions re-encodes only the affected
+    /// `EncodedArray.UShort` column. That column may change length. Burning-tree
+    /// records remain fixed-width, and tree slots and record counts cannot change.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.data.serialized_prefix.clone();
-        let (Some(records), Some(range)) = (
-            self.data.burning_trees.as_deref(),
-            self.data.burning_trees_range.as_ref(),
-        ) else {
-            return Ok(bytes);
-        };
-        let expected_len = records
-            .len()
-            .checked_mul(5)
-            .ok_or(CrpError::ArithmeticOverflow("burning tree record bytes"))?;
-        if range.len() != expected_len || range.end > bytes.len() {
+        if self.data.trees.len() != self.original_trees.len() {
             return Err(invalid_tree_manager(
-                range.start,
-                "burning-tree record range does not match its decoded count",
+                0,
+                "active tree record count does not match the source",
             ));
         }
-        for (index, record) in records.iter().enumerate() {
-            if record.tree_index > 0x00ff_ffff {
+
+        if self
+            .data
+            .trees
+            .iter()
+            .zip(&self.original_trees)
+            .any(|(tree, original)| tree.index != original.index)
+        {
+            return Err(invalid_tree_manager(
+                0,
+                "active tree buffer indexes cannot be changed",
+            ));
+        }
+
+        let mut replacements = Vec::new();
+        let current_prefab_indices = self
+            .data
+            .trees
+            .iter()
+            .map(|tree| tree.prefab_index)
+            .collect::<Vec<_>>();
+        let original_prefab_indices = self
+            .original_trees
+            .iter()
+            .map(|tree| tree.prefab_index)
+            .collect::<Vec<_>>();
+        if current_prefab_indices != original_prefab_indices {
+            replacements.push(encode_ushort_column(
+                &bytes,
+                &self.data.prefab_indices_range,
+                &current_prefab_indices,
+                "tree prefab indexes",
+            )?);
+        }
+
+        let current_position_x = self
+            .data
+            .trees
+            .iter()
+            .map(|tree| tree.position_x as u16)
+            .collect::<Vec<_>>();
+        let original_position_x = self
+            .original_trees
+            .iter()
+            .map(|tree| tree.position_x as u16)
+            .collect::<Vec<_>>();
+        if current_position_x != original_position_x {
+            replacements.push(encode_ushort_column(
+                &bytes,
+                &self.data.position_x_range,
+                &current_position_x,
+                "tree x positions",
+            )?);
+        }
+
+        let current_position_z = self
+            .data
+            .trees
+            .iter()
+            .map(|tree| tree.position_z as u16)
+            .collect::<Vec<_>>();
+        let original_position_z = self
+            .original_trees
+            .iter()
+            .map(|tree| tree.position_z as u16)
+            .collect::<Vec<_>>();
+        if current_position_z != original_position_z {
+            replacements.push(encode_ushort_column(
+                &bytes,
+                &self.data.position_z_range,
+                &current_position_z,
+                "tree z positions",
+            )?);
+        }
+
+        if let (Some(records), Some(range)) = (
+            self.data.burning_trees.as_deref(),
+            self.data.burning_trees_range.as_ref(),
+        ) {
+            let expected_len = records
+                .len()
+                .checked_mul(5)
+                .ok_or(CrpError::ArithmeticOverflow("burning tree record bytes"))?;
+            validate_range(&bytes, range, expected_len, "burning-tree records")?;
+            let mut encoded_records = Vec::with_capacity(expected_len);
+            for record in records {
+                if record.tree_index > 0x00ff_ffff {
+                    return Err(invalid_tree_manager(
+                        range.start,
+                        "burning-tree index does not fit in 24 bits",
+                    ));
+                }
+                encoded_records.extend_from_slice(&[
+                    (record.tree_index >> 16) as u8,
+                    (record.tree_index >> 8) as u8,
+                    record.tree_index as u8,
+                    record.fire_intensity,
+                    record.fire_damage,
+                ]);
+            }
+            if bytes.get(range.clone()) != Some(encoded_records.as_slice()) {
+                replacements.push((range.clone(), encoded_records));
+            }
+        }
+
+        replacements.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        let mut previous_start = bytes.len();
+        for (range, replacement) in replacements {
+            if range.end > previous_start {
                 return Err(invalid_tree_manager(
                     range.start,
-                    "burning-tree index does not fit in 24 bits",
+                    "edited TreeManager field ranges overlap",
                 ));
             }
-            let record_start = range
-                .start
-                .checked_add(
-                    index
-                        .checked_mul(5)
-                        .ok_or(CrpError::ArithmeticOverflow("burning tree record offset"))?,
-                )
-                .ok_or(CrpError::ArithmeticOverflow("burning tree record offset"))?;
-            let record_end = record_start
-                .checked_add(5)
-                .ok_or(CrpError::ArithmeticOverflow("burning tree record end"))?;
-            let encoded = bytes.get_mut(record_start..record_end).ok_or_else(|| {
-                invalid_tree_manager(record_start, "burning-tree record is out of bounds")
-            })?;
-            encoded[..3].copy_from_slice(&[
-                (record.tree_index >> 16) as u8,
-                (record.tree_index >> 8) as u8,
-                record.tree_index as u8,
-            ]);
-            encoded[3] = record.fire_intensity;
-            encoded[4] = record.fire_damage;
+            validate_range(&bytes, &range, range.len(), "edited TreeManager field")?;
+            bytes.splice(range.clone(), replacement);
+            previous_start = range.start;
         }
         Ok(bytes)
     }
@@ -236,6 +341,38 @@ impl TreeManagerEditor {
     pub(crate) fn original_body_bytes(&self) -> &[u8] {
         &self.data.serialized_prefix
     }
+}
+
+fn encode_ushort_column(
+    source: &[u8],
+    range: &Range<usize>,
+    values: &[u16],
+    field: &str,
+) -> Result<(Range<usize>, Vec<u8>), CrpError> {
+    if range.start > range.end || range.end > source.len() {
+        return Err(invalid_tree_manager(
+            range.start,
+            format!("{field} byte range is invalid"),
+        ));
+    }
+    let mut encoded = Vec::new();
+    write_encoded_ushort_array(&mut encoded, values);
+    Ok((range.clone(), encoded))
+}
+
+fn validate_range(
+    source: &[u8],
+    range: &Range<usize>,
+    expected_len: usize,
+    field: &str,
+) -> Result<(), CrpError> {
+    if range.start > range.end || range.end > source.len() || range.len() != expected_len {
+        return Err(invalid_tree_manager(
+            range.start,
+            format!("{field} byte range does not match its decoded values"),
+        ));
+    }
+    Ok(())
 }
 
 fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, CrpError> {
@@ -375,6 +512,65 @@ mod tests {
         let (tree_manager, _) = TreeManagerDataPrefix::decode_prefix(266, &bytes).unwrap();
         let mut editor = tree_manager.into_editor();
         editor.burning_trees_mut().unwrap()[0].tree_index = 0x0100_0000;
+        assert!(editor.encode().is_err());
+    }
+
+    #[test]
+    fn active_tree_editor_reencodes_only_changed_columns() {
+        let mut flags = vec![0_u16; 262_143];
+        flags[..3].fill(1);
+        let mut source = Vec::new();
+        write_encoded_ushort_array(&mut source, &flags);
+        write_encoded_ushort_array(&mut source, &[10, 20, 30]);
+        source.extend_from_slice(&[0, 0]); // Empty prefab-name scope.
+        write_encoded_ushort_array(&mut source, &[10, 20, 30]);
+        write_encoded_ushort_array(&mut source, &[0xfffe, 7, 12]);
+        let source_z = source[source.len() - 7..].to_vec();
+
+        let (tree_manager, _) = TreeManagerDataPrefix::decode_prefix(194, &source).unwrap();
+        let mut editor = tree_manager.into_editor();
+        assert_eq!(editor.encode().unwrap(), source);
+        for tree in editor.trees_mut() {
+            tree.prefab_index = 0;
+            tree.position_x = 0;
+        }
+
+        let mut expected = Vec::new();
+        write_encoded_ushort_array(&mut expected, &flags);
+        expected.push(0x82); // Canonical encoding of three zero prefab indexes.
+        expected.extend_from_slice(&[0, 0]);
+        expected.push(0x82); // Canonical encoding of three zero x positions.
+        expected.extend_from_slice(&source_z);
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+        assert!(encoded.len() < source.len());
+
+        let (updated, used) = TreeManagerDataPrefix::decode_prefix(194, &encoded).unwrap();
+        assert_eq!(used, encoded.len());
+        assert!(
+            updated
+                .trees()
+                .iter()
+                .all(|tree| tree.prefab_index == 0 && tree.position_x == 0)
+        );
+        assert_eq!(updated.trees()[0].position_z, -2);
+        assert_eq!(updated.trees()[2].position_z, 12);
+    }
+
+    #[test]
+    fn active_tree_editor_rejects_changes_to_flag_selected_slots() {
+        let mut flags = vec![0_u16; 262_143];
+        flags[0] = 1;
+        let mut source = Vec::new();
+        write_encoded_ushort_array(&mut source, &flags);
+        write_encoded_ushort_array(&mut source, &[1]);
+        source.extend_from_slice(&[0, 0]);
+        write_encoded_ushort_array(&mut source, &[2]);
+        write_encoded_ushort_array(&mut source, &[3]);
+
+        let (tree_manager, _) = TreeManagerDataPrefix::decode_prefix(194, &source).unwrap();
+        let mut editor = tree_manager.into_editor();
+        editor.trees_mut()[0].index = 2;
         assert!(editor.encode().is_err());
     }
 
