@@ -18347,6 +18347,10 @@ mod manager_boundary_tests {
         let position = [-10.0_f32, 20.5, 30.25];
         let target = [40.0_f32, -50.5, 60.25, 1.0];
         let direction = [0.5_f32, -0.75];
+        let citizen = 0x00a1_b2c3;
+        let path = 0x00c3_d4e5;
+        let path_position = 0x66;
+        let last_path_offset = 0x77;
         let field_range = decoded.instance_fields_range();
         let mut expected_body = decoded.encode();
         for (chunk, value) in expected_body[field_range.start..field_range.start + 12]
@@ -18373,6 +18377,15 @@ mod manager_boundary_tests {
         {
             chunk.copy_from_slice(&value.to_bits().to_be_bytes());
         }
+        expected_body[field_range.start + 48..field_range.start + 51]
+            .copy_from_slice(&[0xa1, 0xb2, 0xc3]);
+        expected_body[field_range.start + 51..field_range.start + 56].copy_from_slice(&[
+            0xc3,
+            0xd4,
+            0xe5,
+            path_position,
+            last_path_offset,
+        ]);
         let mut edited = decoded.clone();
         edited.set_instance_velocity(0, velocity).unwrap();
         edited.set_instance_position(0, position).unwrap();
@@ -18380,6 +18393,10 @@ mod manager_boundary_tests {
             .set_instance_target_position(0, crate::CitizenInstanceTargetPosition::Vector4(target))
             .unwrap();
         edited.set_instance_target_direction(0, direction).unwrap();
+        edited.set_instance_citizen_reference(0, citizen).unwrap();
+        edited
+            .set_instance_path_fields(0, path, path_position, last_path_offset)
+            .unwrap();
         manager
             .replace_citizen_manager_instance_fields(&edited)
             .unwrap();
@@ -18398,7 +18415,16 @@ mod manager_boundary_tests {
             updated.active_instances()[0].target_direction(),
             Some(direction)
         );
-        assert_eq!(updated.active_instances()[0].citizen(), 0x123456);
+        assert_eq!(updated.active_instances()[0].citizen(), citizen);
+        assert_eq!(updated.active_instances()[0].path(), Some(path));
+        assert_eq!(
+            updated.active_instances()[0].path_position_index(),
+            Some(path_position)
+        );
+        assert_eq!(
+            updated.active_instances()[0].last_path_offset(),
+            Some(last_path_offset)
+        );
         assert_eq!(updated.unparsed_instance_suffix(), instance_suffix);
         assert_eq!(updated_end, end);
         assert!(manager.serialized_object_graph()[updated_end..].starts_with(&transfer_tag));

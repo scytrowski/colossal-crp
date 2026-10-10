@@ -429,6 +429,8 @@ pub struct CitizenInstanceRecord {
     compatibility_value: Option<u16>,
     source_building: Option<u16>,
     target_building: u16,
+    citizen_offset: usize,
+    path_fields_offset: Option<usize>,
     velocity_offset: Option<usize>,
     position_offset: usize,
     target_position_offset: Option<usize>,
@@ -794,6 +796,21 @@ impl CitizenManagerData {
                         )
                     })
                     .transpose()?;
+            record.citizen_offset = instance_fields_start
+                .checked_add(record.citizen_offset)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager instance citizen-reference offset",
+                ))?;
+            record.path_fields_offset = record
+                .path_fields_offset
+                .map(|offset| {
+                    instance_fields_start
+                        .checked_add(offset)
+                        .ok_or(CrpError::ArithmeticOverflow(
+                            "CitizenManager instance path fields offset",
+                        ))
+                })
+                .transpose()?;
             record.target_position_offset = record
                 .target_position_offset
                 .map(|offset| {
@@ -1021,6 +1038,70 @@ impl CitizenManagerData {
         Ok(())
     }
 
+    /// Replaces one active instance's 24-bit citizen reference.
+    ///
+    /// Values above `0x00ff_ffff` are rejected without changing the data.
+    pub fn set_instance_citizen_reference(
+        &mut self,
+        record_index: usize,
+        citizen: u32,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        write_u24_field(
+            &mut self.original_body,
+            record.citizen_offset,
+            citizen,
+            "CitizenInstance citizen reference exceeds 24-bit storage",
+        )?;
+        self.active_instances[record_index].citizen = citizen;
+        Ok(())
+    }
+
+    /// Replaces the path reference and its two serialized cursor bytes.
+    ///
+    /// These fields exist from inner version 46. Path values above
+    /// `0x00ff_ffff` are rejected without changing the data.
+    pub fn set_instance_path_fields(
+        &mut self,
+        record_index: usize,
+        path: u32,
+        path_position_index: u8,
+        last_path_offset: u8,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.path_fields_offset.ok_or_else(|| {
+            invalid(
+                record.original_record_start,
+                "CitizenInstance path fields are not serialized before version 46",
+            )
+        })?;
+        if path > 0x00ff_ffff {
+            return Err(invalid(
+                offset,
+                "CitizenInstance path reference exceeds 24-bit storage",
+            ));
+        }
+        let patch = [
+            (path >> 16) as u8,
+            (path >> 8) as u8,
+            path as u8,
+            path_position_index,
+            last_path_offset,
+        ];
+        write_fixed_bytes(&mut self.original_body, offset, &patch)?;
+        let record = &mut self.active_instances[record_index];
+        record.path = Some(path);
+        record.path_position_index = Some(path_position_index);
+        record.last_path_offset = Some(last_path_offset);
+        Ok(())
+    }
+
     /// Returns any bytes after the decoded active records for forward-compatible preservation.
     pub fn unparsed_instance_suffix(&self) -> &[u8] {
         &self.original_body[self.instance_field_suffix.clone()]
@@ -1101,7 +1182,13 @@ fn decode_citizen_instance_record(
     } else {
         None
     };
+    let citizen_offset = reader.offset();
     let citizen = reader.read_u24_be()?;
+    let path_fields_offset = if format_version >= CITIZEN_INSTANCE_VELOCITY_VERSION {
+        Some(reader.offset())
+    } else {
+        None
+    };
     let (path, path_position_index, last_path_offset) =
         if format_version >= CITIZEN_INSTANCE_VELOCITY_VERSION {
             (
@@ -1167,6 +1254,8 @@ fn decode_citizen_instance_record(
         compatibility_value,
         source_building,
         target_building,
+        citizen_offset,
+        path_fields_offset,
         velocity_offset,
         position_offset,
         target_position_offset,
@@ -1193,6 +1282,30 @@ fn write_f32_vector<const N: usize>(
     for (chunk, value) in output.chunks_exact_mut(4).zip(values) {
         chunk.copy_from_slice(&value.to_bits().to_be_bytes());
     }
+    Ok(())
+}
+
+fn write_u24_field(
+    bytes: &mut [u8],
+    offset: usize,
+    value: u32,
+    overflow_reason: &str,
+) -> Result<(), CrpError> {
+    if value > 0x00ff_ffff {
+        return Err(invalid(offset, overflow_reason));
+    }
+    let encoded = [(value >> 16) as u8, (value >> 8) as u8, value as u8];
+    write_fixed_bytes(bytes, offset, &encoded)
+}
+
+fn write_fixed_bytes(bytes: &mut [u8], offset: usize, value: &[u8]) -> Result<(), CrpError> {
+    let end = offset
+        .checked_add(value.len())
+        .ok_or(CrpError::ArithmeticOverflow("CitizenInstance field end"))?;
+    let output = bytes
+        .get_mut(offset..end)
+        .ok_or_else(|| invalid(offset, "CitizenInstance field exceeds manager body"))?;
+    output.copy_from_slice(value);
     Ok(())
 }
 
@@ -1634,10 +1747,16 @@ mod tests {
         let position = [-10.5_f32, 20.25, 30.0];
         let velocity = [0.25_f32, -1.5, 3.75];
         let target = CitizenInstanceTargetPosition::Vector3([40.5_f32, -50.25, 60.0]);
+        let citizen = 0x00ab_cd01;
+        let path = 0x0012_3456;
+        let path_position = 0x78;
+        let last_path_offset = 0x9a;
         let record = &decoded.active_instances()[0];
         let velocity_offset = record.velocity_offset.expect("serialized velocity");
         let position_offset = record.position_offset;
         let target_offset = record.target_position_offset.expect("serialized target");
+        let citizen_offset = record.citizen_offset;
+        let path_offset = record.path_fields_offset.expect("serialized path fields");
         let mut expected = bytes.clone();
         for (chunk, value) in expected[velocity_offset..velocity_offset + 12]
             .chunks_exact_mut(4)
@@ -1659,6 +1778,14 @@ mod tests {
                 chunk.copy_from_slice(&value.to_bits().to_be_bytes());
             }
         }
+        expected[citizen_offset..citizen_offset + 3].copy_from_slice(&[0xab, 0xcd, 0x01]);
+        expected[path_offset..path_offset + 5].copy_from_slice(&[
+            0x12,
+            0x34,
+            0x56,
+            path_position,
+            last_path_offset,
+        ]);
 
         let mut edited = decoded;
         edited
@@ -1670,12 +1797,38 @@ mod tests {
         edited
             .set_instance_target_position(0, target)
             .expect("edit version-194 target");
+        edited
+            .set_instance_citizen_reference(0, citizen)
+            .expect("edit citizen reference");
+        edited
+            .set_instance_path_fields(0, path, path_position, last_path_offset)
+            .expect("edit path fields");
         assert_eq!(edited.active_instances()[0].velocity(), Some(velocity));
         assert_eq!(edited.active_instances()[0].position(), position);
         assert_eq!(edited.active_instances()[0].target_position(), target);
+        assert_eq!(edited.active_instances()[0].citizen(), citizen);
+        assert_eq!(edited.active_instances()[0].path(), Some(path));
+        assert_eq!(
+            edited.active_instances()[0].path_position_index(),
+            Some(path_position)
+        );
+        assert_eq!(
+            edited.active_instances()[0].last_path_offset(),
+            Some(last_path_offset)
+        );
         assert_eq!(edited.encode(), expected);
         assert!(edited.set_instance_target_direction(0, [0.0; 2]).is_err());
         assert!(edited.set_instance_position(1, [0.0; 3]).is_err());
+        assert!(
+            edited
+                .set_instance_citizen_reference(0, 0x0100_0000)
+                .is_err()
+        );
+        assert!(
+            edited
+                .set_instance_path_fields(0, 0x0100_0000, 1, 2)
+                .is_err()
+        );
         assert!(
             edited
                 .set_instance_target_position(0, CitizenInstanceTargetPosition::Vector4([0.0; 4]))
@@ -1756,6 +1909,10 @@ mod tests {
         let changed_target = [12.5_f32, -34.25, 56.0, 1.0];
         let changed_velocity = [1.5_f32, -2.25, 3.75];
         let changed_direction = [0.5_f32, -0.75];
+        let changed_citizen = 0x00ab_cdef;
+        let changed_path = 0x0012_3456;
+        let changed_path_position = 0x34;
+        let changed_last_path_offset = 0x56;
         let record = &decoded.active_instances()[0];
         let velocity_offset = record.velocity_offset.expect("serialized velocity");
         let target_offset = record.target_position_offset.expect("serialized Vector4");
@@ -1781,6 +1938,16 @@ mod tests {
         {
             chunk.copy_from_slice(&value.to_bits().to_be_bytes());
         }
+        expected[record.citizen_offset..record.citizen_offset + 3]
+            .copy_from_slice(&[0xab, 0xcd, 0xef]);
+        let path_offset = record.path_fields_offset.expect("serialized path fields");
+        expected[path_offset..path_offset + 5].copy_from_slice(&[
+            0x12,
+            0x34,
+            0x56,
+            changed_path_position,
+            changed_last_path_offset,
+        ]);
         let mut edited = decoded;
         edited
             .set_instance_velocity(0, changed_velocity)
@@ -1791,6 +1958,17 @@ mod tests {
         edited
             .set_instance_target_direction(0, changed_direction)
             .expect("edit game-produced target direction");
+        edited
+            .set_instance_citizen_reference(0, changed_citizen)
+            .expect("edit game-produced citizen reference");
+        edited
+            .set_instance_path_fields(
+                0,
+                changed_path,
+                changed_path_position,
+                changed_last_path_offset,
+            )
+            .expect("edit game-produced path fields");
         assert_eq!(edited.encode(), expected);
     }
 
