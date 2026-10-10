@@ -309,6 +309,45 @@ impl Package {
         reader: &mut R,
         implementation_data_offset: u64,
     ) -> Result<Self, CrpError> {
+        Self::read_with_data_offset_and_asset_type(reader, implementation_data_offset, None)
+    }
+
+    /// Reads and verifies only assets with the requested asset type.
+    ///
+    /// The package header and every index record are parsed, and every payload
+    /// range is checked against the file size. Payload bytes and checksums are
+    /// read and verified only for matching assets. Use [`Package::read_from`]
+    /// when the entire package must be validated or rewritten.
+    pub fn read_assets_of_type_from<R: Read + Seek>(
+        reader: &mut R,
+        asset_type: i32,
+    ) -> Result<Vec<Asset>, CrpError> {
+        Self::read_assets_of_type_from_with_data_offset(reader, asset_type, 0)
+    }
+
+    /// Reads and verifies matching assets using an implementation-specific
+    /// payload data offset.
+    ///
+    /// All index records and payload ranges are validated, but payload bytes
+    /// and checksums are read only for assets whose type matches `asset_type`.
+    pub fn read_assets_of_type_from_with_data_offset<R: Read + Seek>(
+        reader: &mut R,
+        asset_type: i32,
+        implementation_data_offset: u64,
+    ) -> Result<Vec<Asset>, CrpError> {
+        Ok(Self::read_with_data_offset_and_asset_type(
+            reader,
+            implementation_data_offset,
+            Some(asset_type),
+        )?
+        .assets)
+    }
+
+    fn read_with_data_offset_and_asset_type<R: Read + Seek>(
+        reader: &mut R,
+        implementation_data_offset: u64,
+        selected_asset_type: Option<i32>,
+    ) -> Result<Self, CrpError> {
         let file_size = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
 
@@ -396,7 +435,11 @@ impl Package {
             });
         }
 
-        let mut assets = Vec::with_capacity(asset_count);
+        let selected_asset_count = records
+            .iter()
+            .filter(|record| selected_asset_type.is_none_or(|asset_type| record.2 == asset_type))
+            .count();
+        let mut assets = Vec::with_capacity(selected_asset_count);
         for (asset_name, checksum, asset_type, relative_offset, size) in records {
             let payload_offset = data_start_offset
                 .checked_add(implementation_data_offset)
@@ -412,6 +455,10 @@ impl Package {
                     size,
                     file_size,
                 });
+            }
+
+            if selected_asset_type.is_some_and(|selected_type| selected_type != asset_type) {
+                continue;
             }
 
             let payload_size = usize::try_from(size)
@@ -787,6 +834,29 @@ mod tests {
     use std::fs::{self, File};
     use std::io::Cursor;
     use std::path::PathBuf;
+
+    struct RejectReadAtOffset {
+        cursor: Cursor<Vec<u8>>,
+        rejected_offset: u64,
+    }
+
+    impl Read for RejectReadAtOffset {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.cursor.position() == self.rejected_offset {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "test rejected a read from an unmatched payload",
+                ));
+            }
+            self.cursor.read(buffer)
+        }
+    }
+
+    impl Seek for RejectReadAtOffset {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.cursor.seek(position)
+        }
+    }
 
     fn sample_package() -> Package {
         Package {
@@ -3507,10 +3577,90 @@ mod tests {
             .map_err(|_| CrpError::ArithmeticOverflow("test cursor position"))?;
         encoded[size_offset..size_offset + 8].copy_from_slice(&i64::MAX.to_le_bytes());
 
-        let mut cursor = Cursor::new(encoded);
+        let mut cursor = Cursor::new(encoded.as_slice());
         assert!(matches!(
             Package::read_from(&mut cursor),
             Err(CrpError::AssetOutOfBounds { .. })
+        ));
+
+        let mut cursor = Cursor::new(encoded);
+        assert!(matches!(
+            Package::read_assets_of_type_from(&mut cursor, 712),
+            Err(CrpError::AssetOutOfBounds { name, .. }) if name == "preview"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_reader_returns_matching_assets_in_index_order() -> Result<(), CrpError> {
+        let mut package = sample_package();
+        package.assets[1].asset_type = 3;
+        package.assets.push(Asset {
+            name: "later matching asset".to_owned(),
+            checksum: String::new(),
+            asset_type: 3,
+            relative_offset: 0,
+            data: b"third payload".to_vec(),
+        });
+        package.assets.push(Asset {
+            name: "unmatched asset".to_owned(),
+            checksum: String::new(),
+            asset_type: 712,
+            relative_offset: 0,
+            data: b"fourth payload".to_vec(),
+        });
+        let mut encoded = Vec::new();
+        package.write_compact_to(&mut encoded)?;
+
+        let mut cursor = Cursor::new(encoded);
+        let assets = Package::read_assets_of_type_from(&mut cursor, 3)?;
+
+        assert_eq!(assets.len(), 3);
+        assert_eq!(assets[0].name, "preview");
+        assert_eq!(assets[0].data, b"first payload");
+        assert_eq!(assets[1].name, "future asset");
+        assert_eq!(assets[1].data, [0, 1, 2, 255]);
+        assert_eq!(assets[2].name, "later matching asset");
+        assert_eq!(assets[2].data, b"third payload");
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_reader_skips_unmatched_payload_checksums() -> Result<(), CrpError> {
+        let mut encoded = Vec::new();
+        sample_package().write_compact_to(&mut encoded)?;
+
+        let mut valid_cursor = Cursor::new(encoded.as_slice());
+        let decoded = Package::read_from(&mut valid_cursor)?;
+        let unmatched_offset =
+            usize::try_from(decoded.data_start_offset + decoded.assets[0].relative_offset)
+                .map_err(|_| CrpError::ArithmeticOverflow("test payload offset"))?;
+        let selected_offset =
+            usize::try_from(decoded.data_start_offset + decoded.assets[1].relative_offset)
+                .map_err(|_| CrpError::ArithmeticOverflow("test payload offset"))?;
+
+        encoded[unmatched_offset] ^= 0xff;
+        let mut full_cursor = Cursor::new(encoded.as_slice());
+        assert!(matches!(
+            Package::read_from(&mut full_cursor),
+            Err(CrpError::ChecksumMismatch { name, .. }) if name == "preview"
+        ));
+
+        let mut filtered_cursor = RejectReadAtOffset {
+            cursor: Cursor::new(encoded.clone()),
+            rejected_offset: u64::try_from(unmatched_offset)
+                .map_err(|_| CrpError::ArithmeticOverflow("test payload offset"))?,
+        };
+        let assets = Package::read_assets_of_type_from(&mut filtered_cursor, 712)?;
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].name, "future asset");
+        assert_eq!(assets[0].data, [0, 1, 2, 255]);
+
+        encoded[selected_offset] ^= 0xff;
+        let mut selected_corrupt_cursor = Cursor::new(encoded);
+        assert!(matches!(
+            Package::read_assets_of_type_from(&mut selected_corrupt_cursor, 712),
+            Err(CrpError::ChecksumMismatch { name, .. }) if name == "future asset"
         ));
         Ok(())
     }
