@@ -96,9 +96,10 @@ pub use simulation_manager_data::{
     EconomyManagerIncomeExpenseEditor, EconomyManagerInvestmentsEditor,
     EconomyManagerLoansAndCashEditor, GuideBodyLocation, ManagerObjectReference,
     ResolvedObjectReference, SerializableDataEntry, SimulationManagerData,
-    TransportLineVehicleSelection, TransportManagerLineData, TransportManagerLineDataEditor,
-    TransportManagerLineRecord, TransportManagerSelection, TransportManagerSelectionPrefix,
-    TransportManagerSharedStringValue, TransportPassengerCounts, TransportPassengerRecord,
+    TransportLineVehicleSelection, TransportManagerActiveLineEditor, TransportManagerLineData,
+    TransportManagerLineDataEditor, TransportManagerLineRecord, TransportManagerSelection,
+    TransportManagerSelectionPrefix, TransportManagerSharedStringValue, TransportPassengerCounts,
+    TransportPassengerRecord,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use statistics_manager_data::{

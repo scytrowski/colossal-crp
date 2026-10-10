@@ -703,11 +703,75 @@ impl TransportManagerLineRecord {
 
     fn encode_with_passenger_edits(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.serialized_bytes.clone();
+        let mut field_offset = 0_usize;
+        if let Some(line_number) = self.line_number {
+            overwrite_active_line_field(
+                &mut bytes,
+                &mut field_offset,
+                &line_number.to_be_bytes(),
+                "line number",
+            )?;
+        }
+        overwrite_active_line_field(
+            &mut bytes,
+            &mut field_offset,
+            &self.stop_count.to_be_bytes(),
+            "stop count",
+        )?;
+        if let Some(color) = self.color {
+            overwrite_active_line_field(&mut bytes, &mut field_offset, &color, "line color")?;
+        }
+        if let Some(building) = self.building {
+            overwrite_active_line_field(
+                &mut bytes,
+                &mut field_offset,
+                &building.to_be_bytes(),
+                "building reference",
+            )?;
+        }
+        if let Some(budget) = self.budget {
+            overwrite_active_line_field(
+                &mut bytes,
+                &mut field_offset,
+                &budget.to_be_bytes(),
+                "budget",
+            )?;
+        }
+        if let Some(total_length_bits) = self.total_length_bits {
+            overwrite_active_line_field(
+                &mut bytes,
+                &mut field_offset,
+                &total_length_bits.to_be_bytes(),
+                "total length",
+            )?;
+        }
+        if let Some(average_interval) = self.average_interval {
+            overwrite_active_line_field(
+                &mut bytes,
+                &mut field_offset,
+                &[average_interval],
+                "average interval",
+            )?;
+        }
+        if let Some(ticket_price) = self.ticket_price {
+            overwrite_active_line_field(
+                &mut bytes,
+                &mut field_offset,
+                &ticket_price.to_be_bytes(),
+                "ticket price",
+            )?;
+        }
         if let Some(passengers) = &self.passengers {
             let range = self
                 .passengers_range
                 .as_ref()
                 .ok_or_else(|| invalid(0, "active line passenger record has no source range"))?;
+            if range.start != field_offset {
+                return Err(invalid(
+                    range.start,
+                    "active-line passenger range does not follow its fixed-width fields",
+                ));
+            }
             let expected_len =
                 passengers
                     .groups()
@@ -757,11 +821,87 @@ impl TransportManagerLineRecord {
     }
 }
 
+fn overwrite_active_line_field(
+    bytes: &mut [u8],
+    offset: &mut usize,
+    encoded: &[u8],
+    field_name: &str,
+) -> Result<(), CrpError> {
+    let end = offset
+        .checked_add(encoded.len())
+        .ok_or(CrpError::ArithmeticOverflow(
+            "TransportManager active-line field end",
+        ))?;
+    let destination = bytes
+        .get_mut(*offset..end)
+        .ok_or_else(|| invalid(*offset, format!("{field_name} exceeds active-line record")))?;
+    destination.copy_from_slice(encoded);
+    *offset = end;
+    Ok(())
+}
+
+/// Mutable view of one active TransportManager line.
+///
+/// Only fields present in the source version can be edited. The original
+/// record and any unmodeled legacy selection bytes remain attached to the
+/// source editor for rewriting.
+pub struct TransportManagerActiveLineEditor<'a> {
+    record: &'a mut TransportManagerLineRecord,
+}
+
+impl TransportManagerActiveLineEditor<'_> {
+    /// Returns the version-gated line number for editing.
+    pub fn line_number_mut(&mut self) -> Option<&mut u16> {
+        self.record.line_number.as_mut()
+    }
+
+    /// Returns the serialized stop count for editing.
+    pub fn stop_count_mut(&mut self) -> &mut u16 {
+        &mut self.record.stop_count
+    }
+
+    /// Returns the version-gated RGB color for editing.
+    pub fn color_mut(&mut self) -> Option<&mut [u8; 3]> {
+        self.record.color.as_mut()
+    }
+
+    /// Returns the version-gated building reference for editing.
+    pub fn building_mut(&mut self) -> Option<&mut u16> {
+        self.record.building.as_mut()
+    }
+
+    /// Returns the version-gated budget for editing.
+    pub fn budget_mut(&mut self) -> Option<&mut u16> {
+        self.record.budget.as_mut()
+    }
+
+    /// Returns the total-length float bits from version 314 for editing.
+    pub fn total_length_bits_mut(&mut self) -> Option<&mut u32> {
+        self.record.total_length_bits.as_mut()
+    }
+
+    /// Returns the average interval from version 320 for editing.
+    pub fn average_interval_mut(&mut self) -> Option<&mut u8> {
+        self.record.average_interval.as_mut()
+    }
+
+    /// Returns the ticket price from version 110023 for editing.
+    pub fn ticket_price_mut(&mut self) -> Option<&mut u16> {
+        self.record.ticket_price.as_mut()
+    }
+
+    /// Returns version-gated passenger counters for editing.
+    pub fn passengers_mut(&mut self) -> Option<&mut TransportPassengerRecord> {
+        self.record.passengers.as_mut()
+    }
+}
+
 /// Decoded TransportManager line-number and passenger tables with active lines.
 ///
 /// Fields are exposed only where their inner DataSerializer version gates
 /// apply. Original bytes are retained for unchanged writing; semantic edits
-/// are limited to shared line numbers and passenger counters.
+/// support version-gated active-line fields, shared line numbers, and passenger
+/// counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerLineData {
     format_version: u32,
@@ -806,7 +946,7 @@ impl TransportManagerLineData {
         self.serialized_global_passengers.clone()
     }
 
-    /// Creates an editor for line numbers and passenger counters.
+    /// Creates an editor for active-line fields, line numbers, and passengers.
     pub fn into_editor(self) -> TransportManagerLineDataEditor {
         TransportManagerLineDataEditor {
             format_version: self.format_version,
@@ -858,6 +998,16 @@ impl TransportManagerLineDataEditor {
     /// Returns the active line records retained from the source body.
     pub fn active_lines(&self) -> &[TransportManagerLineRecord] {
         &self.active_lines
+    }
+
+    /// Returns a mutable view of one active line, if the index exists.
+    pub fn active_line_mut(
+        &mut self,
+        active_line_index: usize,
+    ) -> Option<TransportManagerActiveLineEditor<'_>> {
+        Some(TransportManagerActiveLineEditor {
+            record: self.active_lines.get_mut(active_line_index)?,
+        })
     }
 
     /// Returns mutable passenger counters for an active line, if available.
@@ -4960,11 +5110,21 @@ impl SimulationManagerData {
                 if decoded.line_numbers != edited.line_numbers
                     || decoded.global_passengers != edited.global_passengers
                     || decoded.active_lines.len() != edited.active_lines.len()
-                    || decoded
-                        .active_lines
-                        .iter()
-                        .zip(&edited.active_lines)
-                        .any(|(decoded, edited)| decoded.passengers != edited.passengers)
+                    || decoded.active_lines.iter().zip(&edited.active_lines).any(
+                        |(decoded, edited)| {
+                            decoded.line_number != edited.line_number
+                                || decoded.stop_count != edited.stop_count
+                                || decoded.color != edited.color
+                                || decoded.building != edited.building
+                                || decoded.budget != edited.budget
+                                || decoded.total_length_bits != edited.total_length_bits
+                                || decoded.average_interval != edited.average_interval
+                                || decoded.ticket_price != edited.ticket_price
+                                || decoded.passengers != edited.passengers
+                                || decoded.legacy_vehicle_selection
+                                    != edited.legacy_vehicle_selection
+                        },
+                    )
                 {
                     return Err(invalid(
                         body_range.start,
@@ -8806,9 +8966,9 @@ mod manager_boundary_tests {
         EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
         EconomyManagerBodyLayout, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
         QueuedDataObject, SimulationManagerData, TransportLineVehicleSelection,
-        TransportManagerSelection, TransportManagerSharedStringValue,
-        decode_economy_manager_body_layout, decode_economy_manager_budget_editor,
-        decode_economy_manager_income_expense_editor,
+        TransportManagerActiveLineEditor, TransportManagerSelection,
+        TransportManagerSharedStringValue, decode_economy_manager_body_layout,
+        decode_economy_manager_budget_editor, decode_economy_manager_income_expense_editor,
         decode_economy_manager_income_expense_editor_with_layout,
         decode_economy_manager_investment_editor,
         decode_economy_manager_investment_flags_from_body,
@@ -10044,7 +10204,7 @@ mod manager_boundary_tests {
                 object_header_count,
             );
             let mut shared_strings = Vec::new();
-            let decoded = decode_transport_manager_reference_body(
+            let mut decoded = decode_transport_manager_reference_body(
                 format_version,
                 &bytes,
                 None,
@@ -10128,6 +10288,29 @@ mod manager_boundary_tests {
                 bytes[line_record_start..line_record_start + line.encoded_len()],
                 "version {format_version}"
             );
+            if format_version == 110_023 {
+                let line = &mut decoded.line_records[0];
+                let mut expected = line.encode_unchanged();
+                expected[16..18].copy_from_slice(&0x6789_u16.to_be_bytes());
+                let encoded = {
+                    let mut line_editor = TransportManagerActiveLineEditor { record: line };
+                    assert_eq!(*line_editor.ticket_price_mut().unwrap(), 0x4567);
+                    *line_editor.ticket_price_mut().unwrap() = 0x6789;
+                    line_editor.record.encode_with_passenger_edits().unwrap()
+                };
+                assert_eq!(encoded, expected);
+            }
+            if matches!(format_version, 112_004 | 112_022) {
+                let line = &mut decoded.line_records[0];
+                let mut expected = line.encode_unchanged();
+                expected[2..4].copy_from_slice(&10_u16.to_be_bytes());
+                let encoded = {
+                    let mut line_editor = TransportManagerActiveLineEditor { record: line };
+                    *line_editor.stop_count_mut() = 10;
+                    line_editor.record.encode_with_passenger_edits().unwrap()
+                };
+                assert_eq!(encoded, expected, "version {format_version}");
+            }
             let global_passengers = decoded.global_passengers.as_ref().unwrap();
             assert_eq!(global_passengers.len(), line_number_count);
             assert!(global_passengers.iter().all(|record| {
@@ -10274,13 +10457,38 @@ mod manager_boundary_tests {
         let first_group = &mut editor.global_passengers_mut().unwrap()[0].groups_mut()[0];
         first_group.set_temporary(0x12_3456);
         first_group.set_average(0x23_4567);
-        editor.active_line_passengers_mut(0).unwrap().groups_mut()[1].set_final_count(0x34_5678);
+        {
+            let mut active_line = editor.active_line_mut(0).unwrap();
+            *active_line.line_number_mut().unwrap() = 0x2468;
+            *active_line.stop_count_mut() = 10;
+            *active_line.color_mut().unwrap() = [0xaa, 0xbb, 0xcc];
+            *active_line.building_mut().unwrap() = 0x1357;
+            *active_line.budget_mut().unwrap() = 0x2468;
+            *active_line.total_length_bits_mut().unwrap() = 2.25_f32.to_bits();
+            *active_line.average_interval_mut().unwrap() = 0x67;
+            assert!(active_line.ticket_price_mut().is_none());
+            active_line.passengers_mut().unwrap().groups_mut()[1].set_final_count(0x34_5678);
+        }
 
         let mut expected_graph = original_graph.clone();
         let updated_line_number = 0x4321_u16.to_be_bytes();
         let line_number_offset = body_start + line_numbers_start;
         expected_graph[line_number_offset..line_number_offset + 2]
             .copy_from_slice(&updated_line_number);
+        let active_line_offset = body_start + line_record_start;
+        expected_graph[active_line_offset..active_line_offset + 2]
+            .copy_from_slice(&0x2468_u16.to_be_bytes());
+        expected_graph[active_line_offset + 2..active_line_offset + 4]
+            .copy_from_slice(&10_u16.to_be_bytes());
+        expected_graph[active_line_offset + 4..active_line_offset + 7]
+            .copy_from_slice(&[0xaa, 0xbb, 0xcc]);
+        expected_graph[active_line_offset + 7..active_line_offset + 9]
+            .copy_from_slice(&0x1357_u16.to_be_bytes());
+        expected_graph[active_line_offset + 9..active_line_offset + 11]
+            .copy_from_slice(&0x2468_u16.to_be_bytes());
+        expected_graph[active_line_offset + 11..active_line_offset + 15]
+            .copy_from_slice(&2.25_f32.to_bits().to_be_bytes());
+        expected_graph[active_line_offset + 15] = 0x67;
         let global_offset = body_start + global_passengers_start;
         expected_graph[global_offset..global_offset + 3].copy_from_slice(&[0x12, 0x34, 0x56]);
         expected_graph[global_offset + 6..global_offset + 9].copy_from_slice(&[0x23, 0x45, 0x67]);
@@ -10300,6 +10508,19 @@ mod manager_boundary_tests {
         );
         let edited_data = manager.decode_transport_manager_line_data().unwrap();
         assert_eq!(edited_data.line_numbers().unwrap()[0], 0x4321);
+        assert_eq!(edited_data.active_lines()[0].line_number(), Some(0x2468));
+        assert_eq!(edited_data.active_lines()[0].stop_count(), 10);
+        assert_eq!(
+            edited_data.active_lines()[0].color(),
+            Some([0xaa, 0xbb, 0xcc])
+        );
+        assert_eq!(edited_data.active_lines()[0].building(), Some(0x1357));
+        assert_eq!(edited_data.active_lines()[0].budget(), Some(0x2468));
+        assert_eq!(
+            edited_data.active_lines()[0].total_length_bits(),
+            Some(2.25_f32.to_bits())
+        );
+        assert_eq!(edited_data.active_lines()[0].average_interval(), Some(0x67));
         assert_eq!(
             edited_data.global_passengers().unwrap()[0].groups()[0].temporary(),
             0x12_3456
