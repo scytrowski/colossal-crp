@@ -583,10 +583,28 @@ pub struct NetManagerTailPrefix {
     object_headers: Vec<NetObjectHeader>,
     last_max_wetness: u8,
     current_max_wetness: u8,
+    max_wetness_offset: Option<usize>,
     name_modified_count: u32,
+    name_modified_count_offset: Option<usize>,
     adjusted_segments: Vec<u64>,
     profile_end_shared_string_index: Option<u16>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for fixed-width final NetManager counters.
+///
+/// It leaves object headers, adjusted-segment data, and the profiler end tag
+/// byte-exact. Since only fixed-width fields are editable, the prefix length
+/// and queued-object boundaries do not change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetManagerTailEditor {
+    format_version: u32,
+    last_max_wetness: u8,
+    current_max_wetness: u8,
+    max_wetness_offset: Option<usize>,
+    name_modified_count: u32,
+    name_modified_count_offset: Option<usize>,
+    original_prefix: Vec<u8>,
 }
 
 /// One queued `NetNodeInstanceGuide` body decoded according to its version gates.
@@ -3099,10 +3117,21 @@ impl NetManagerTailPrefix {
         for _ in 0..header_count {
             object_headers.push(read_net_object_header(&mut reader)?);
         }
-        let (last_max_wetness, current_max_wetness) = if format_version >= 237 {
+        let max_wetness_offset = if format_version >= 237 {
+            let offset = reader.offset();
+            Some(offset)
+        } else {
+            None
+        };
+        let (last_max_wetness, current_max_wetness) = if max_wetness_offset.is_some() {
             (reader.read_u8()?, reader.read_u8()?)
         } else {
             (0, 0)
+        };
+        let name_modified_count_offset = if format_version >= 319 {
+            Some(reader.offset())
+        } else {
+            None
         };
         let name_modified_count = if format_version >= 319 {
             read_segment_u24(&mut reader)?
@@ -3140,7 +3169,9 @@ impl NetManagerTailPrefix {
                 object_headers,
                 last_max_wetness,
                 current_max_wetness,
+                max_wetness_offset,
                 name_modified_count,
+                name_modified_count_offset,
                 adjusted_segments,
                 profile_end_shared_string_index,
                 serialized_prefix: bytes[..consumed].to_vec(),
@@ -3182,6 +3213,95 @@ impl NetManagerTailPrefix {
     /// Writes the original object headers, scalars, and profiler tag exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the tail prefix to edit its fixed-width counters.
+    pub fn into_editor(self) -> NetManagerTailEditor {
+        NetManagerTailEditor {
+            format_version: self.format_version,
+            last_max_wetness: self.last_max_wetness,
+            current_max_wetness: self.current_max_wetness,
+            max_wetness_offset: self.max_wetness_offset,
+            name_modified_count: self.name_modified_count,
+            name_modified_count_offset: self.name_modified_count_offset,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetManagerTailEditor {
+    /// Returns the inner DataSerializer version associated with this editor.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Sets the final wetness counters, serialized from inner version 237.
+    pub fn set_max_wetness(&mut self, last: u8, current: u8) -> Result<(), CrpError> {
+        if self.max_wetness_offset.is_none() {
+            return Err(invalid(
+                0,
+                "NetManager wetness counters are not serialized before inner version 237",
+            ));
+        }
+        self.last_max_wetness = last;
+        self.current_max_wetness = current;
+        Ok(())
+    }
+
+    /// Sets the 24-bit name-modification count, serialized from inner version 319.
+    pub fn set_name_modified_count(&mut self, count: u32) -> Result<(), CrpError> {
+        let Some(offset) = self.name_modified_count_offset else {
+            return Err(invalid(
+                0,
+                "NetManager name-modification count is not serialized before inner version 319",
+            ));
+        };
+        if count > 0x00ff_ffff {
+            return Err(invalid(
+                offset,
+                "NetManager name-modification count exceeds its 24-bit field",
+            ));
+        }
+        self.name_modified_count = count;
+        Ok(())
+    }
+
+    /// Encodes the edited counters while retaining every other source byte.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let mut output = self.original_prefix.clone();
+        if let Some(offset) = self.max_wetness_offset {
+            let end = offset
+                .checked_add(2)
+                .ok_or(CrpError::ArithmeticOverflow("NetManager wetness field end"))?;
+            let field = output.get_mut(offset..end).ok_or_else(|| {
+                invalid(
+                    offset,
+                    "NetManager wetness field is outside the source prefix",
+                )
+            })?;
+            field.copy_from_slice(&[self.last_max_wetness, self.current_max_wetness]);
+        }
+        if let Some(offset) = self.name_modified_count_offset {
+            let end = offset.checked_add(3).ok_or(CrpError::ArithmeticOverflow(
+                "NetManager name-modification field end",
+            ))?;
+            let field = output.get_mut(offset..end).ok_or_else(|| {
+                invalid(
+                    offset,
+                    "NetManager name-modification field is outside the source prefix",
+                )
+            })?;
+            field.copy_from_slice(&[
+                (self.name_modified_count >> 16) as u8,
+                (self.name_modified_count >> 8) as u8,
+                self.name_modified_count as u8,
+            ]);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 

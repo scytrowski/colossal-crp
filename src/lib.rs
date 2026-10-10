@@ -80,8 +80,8 @@ pub use message_manager_data::{MessageDataEntry, MessageManagerData, MessageMana
 pub use metadata::{DistrictStyleMetaData, MapMetaData, ModInfo, SystemMapMetaData};
 pub use net_manager_data::{
     NetFencePrefabEditor, NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor,
-    NetInfoPrefabPrefix, NetLane, NetLaneEditor, NetLanePrefix, NetManagerTailPrefix,
-    NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
+    NetInfoPrefabPrefix, NetLane, NetLaneEditor, NetLanePrefix, NetManagerTailEditor,
+    NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
     NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeProblem, NetNodeProblemsPrefix,
     NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage,
     NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironment,
@@ -2707,6 +2707,25 @@ mod tests {
             assert!(
                 NetManagerTailPrefix::decode_prefix(version, &counts, &bytes[..used - 1]).is_err()
             );
+
+            let mut editor = tail.into_editor();
+            let mut expected = bytes[..used].to_vec();
+            if version >= 237 {
+                editor.set_max_wetness(0x12, 0x34)?;
+                expected[header_count..header_count + 2].copy_from_slice(&[0x12, 0x34]);
+            } else {
+                assert!(editor.set_max_wetness(0x12, 0x34).is_err());
+            }
+            if version >= 319 {
+                editor.set_name_modified_count(0x05_06_07)?;
+                expected[header_count + 2..header_count + 5].copy_from_slice(&[0x05, 0x06, 0x07]);
+                assert!(editor.set_name_modified_count(0x01_00_00_00).is_err());
+            } else {
+                assert!(editor.set_name_modified_count(1).is_err());
+            }
+            let edited = editor.encode()?;
+            assert_eq!(edited, expected);
+            assert_eq!(edited.len(), bytes[..used].len());
         }
         let (counts, _) = NetGuideCountsPrefix::decode_prefix(164, &[0; 4])?;
         let mut mixed = vec![0xfe, 0xfe, 0x80, 0, 1, 0xc1, 0xfe, 0, 1, 0, 0, 5];
@@ -2742,8 +2761,41 @@ mod tests {
             )
         );
         assert_eq!(tail.object_headers()[1], NetObjectHeader::NewSharedType(31));
+        let mut header_reader = crate::data_serializer::Reader::new(bytes);
+        for _ in 0..18 {
+            crate::net_manager_data::read_net_object_header(&mut header_reader)?;
+        }
+        let counters_offset = header_reader.offset();
+        assert_eq!(
+            tail.max_wetness(),
+            (bytes[counters_offset], bytes[counters_offset + 1])
+        );
+        let name_count_offset = counters_offset + 2;
+        assert_eq!(
+            tail.name_modified_count(),
+            u32::from_be_bytes([
+                0,
+                bytes[name_count_offset],
+                bytes[name_count_offset + 1],
+                bytes[name_count_offset + 2],
+            ])
+        );
         assert_eq!(tail.profile_end_shared_string_index(), Some(6));
         assert_eq!(tail.encode(), &bytes[..used]);
+        let mut editor = tail.into_editor();
+        editor.set_max_wetness(0x12, 0x34)?;
+        editor.set_name_modified_count(0x05_06_07)?;
+        let mut expected = bytes[..used].to_vec();
+        expected[counters_offset..counters_offset + 2].copy_from_slice(&[0x12, 0x34]);
+        expected[name_count_offset..name_count_offset + 3].copy_from_slice(&[0x05, 0x06, 0x07]);
+        let edited = editor.encode()?;
+        assert_eq!(edited, expected);
+        assert_eq!(edited.len(), bytes[..used].len());
+        let (decoded, decoded_length) =
+            NetManagerTailPrefix::decode_prefix(116_020, &counts, &edited)?;
+        assert_eq!(decoded_length, edited.len());
+        assert_eq!(decoded.max_wetness(), (0x12, 0x34));
+        assert_eq!(decoded.name_modified_count(), 0x05_06_07);
         let mut next = crate::data_serializer::Reader::new(&bytes[used..]);
         assert_eq!(next.read_u8()?, 0xfe);
         assert_eq!(

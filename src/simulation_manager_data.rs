@@ -67,12 +67,12 @@ use crate::{
 };
 use crate::{
     NetFencePrefabEditor, NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor,
-    NetInfoPrefabPrefix, NetLanePrefix, NetManagerTailPrefix, NetNodeCountersPrefix,
-    NetNodeFlagsPrefix, NetNodeProblemsPrefix, NetNodeRecordsPrefix, NetSegmentCoverageEditor,
-    NetSegmentCoveragePrefix, NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix,
-    NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsEditor,
-    NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix, NetTreePrefabEditor,
-    NetTreePrefabPrefix,
+    NetInfoPrefabPrefix, NetLanePrefix, NetManagerTailEditor, NetManagerTailPrefix,
+    NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix, NetNodeRecordsPrefix,
+    NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironmentEditor,
+    NetSegmentEnvironmentPrefix, NetSegmentFlagsPrefix, NetSegmentProblemsPrefix,
+    NetSegmentRecordsEditor, NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix,
+    NetTreePrefabEditor, NetTreePrefabPrefix,
 };
 use crate::{PathManagerData, PathManagerEditor};
 use crate::{WeatherManagerData, WeatherManagerEditor};
@@ -4215,6 +4215,85 @@ impl SimulationManagerData {
         )?;
         reader.read_bytes(body_length)?;
         Ok((data, reader.offset()))
+    }
+
+    /// Decodes the final NetManager counters into a fixed-width editor.
+    pub fn decode_net_manager_tail_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetManagerTailEditor, CrpError> {
+        let (tail, _) = self.decode_net_manager_tail_prefix(save_app_version)?;
+        Ok(tail.into_editor())
+    }
+
+    /// Replaces the final NetManager counters without changing the queue layout.
+    ///
+    /// The editor must match this stream's inner version and original tail
+    /// bytes. Only the fixed-width wetness and name-modification fields are
+    /// writable; object headers and adjusted-segment data remain byte-exact.
+    pub fn replace_net_manager_tail(
+        &mut self,
+        edited: &NetManagerTailEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager tail version does not match this stream",
+            ));
+        }
+        let (current, body_end) = self.decode_net_manager_tail_prefix(save_app_version)?;
+        let source_bytes = current.encode();
+        let source_length = source_bytes.len();
+        let body_start = body_end
+            .checked_sub(source_length)
+            .ok_or(CrpError::ArithmeticOverflow("NetManager tail source start"))?;
+        if source_bytes.as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager tail bytes do not match the editor's source",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != source_length {
+            return Err(invalid(
+                body_start,
+                "edited NetManager tail changed its serialized length",
+            ));
+        }
+
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation =
+            (|| {
+                let (decoded, actual_end) =
+                    self.decode_net_manager_tail_prefix(save_app_version)?;
+                let expected_end = body_start.checked_add(replacement.len()).ok_or(
+                    CrpError::ArithmeticOverflow("NetManager tail replacement end"),
+                )?;
+                if actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager tail has an unexpected boundary",
+                    ));
+                }
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager tail bytes do not match the editor",
+                    ));
+                }
+                Ok(())
+            })();
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager tail failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes ZoneManager after locating its profiler tag in the queued graph.
