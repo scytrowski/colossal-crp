@@ -66,12 +66,12 @@ use crate::{
     DistrictParkEditor, DistrictParkRecord,
 };
 use crate::{
-    NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLanePrefix,
-    NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
-    NetNodeRecordsPrefix, NetSegmentCoverageEditor, NetSegmentCoveragePrefix,
-    NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlagsPrefix,
-    NetSegmentProblemsPrefix, NetSegmentRecordsEditor, NetSegmentRecordsPrefix,
-    NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
+    NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor, NetInfoPrefabPrefix,
+    NetLanePrefix, NetManagerTailPrefix, NetNodeCountersPrefix, NetNodeFlagsPrefix,
+    NetNodeProblemsPrefix, NetNodeRecordsPrefix, NetSegmentCoverageEditor,
+    NetSegmentCoveragePrefix, NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix,
+    NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsEditor,
+    NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
 use crate::{PathManagerData, PathManagerEditor};
 use crate::{WeatherManagerData, WeatherManagerEditor};
@@ -3801,11 +3801,30 @@ impl SimulationManagerData {
         &self,
         save_app_version: Option<u32>,
     ) -> Result<(NetInfoPrefabPrefix, usize), CrpError> {
+        let (_, _, _, data, _, end) = self.decode_net_info_prefab_with_range(save_app_version)?;
+        Ok((data, end))
+    }
+
+    fn decode_net_info_prefab_with_range(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<
+        (
+            NetNodeFlagsPrefix,
+            NetSegmentFlagsPrefix,
+            NetGuideCountsPrefix,
+            NetInfoPrefabPrefix,
+            usize,
+            usize,
+        ),
+        CrpError,
+    > {
         let (guide_counts, counts_end) = self.decode_net_guide_counts_prefix(save_app_version)?;
         let (node_flags, _) = self.decode_net_node_flags_prefix()?;
         let (segment_flags, _) = self.decode_net_segment_flags_prefix(save_app_version)?;
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(counts_end)?;
+        let body_start = reader.offset();
         let (data, body_length) = NetInfoPrefabPrefix::decode_prefix(
             self.format_version,
             &node_flags,
@@ -3814,7 +3833,112 @@ impl SimulationManagerData {
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        Ok((
+            node_flags,
+            segment_flags,
+            guide_counts,
+            data,
+            body_start,
+            reader.offset(),
+        ))
+    }
+
+    /// Decodes the primary network-info prefab table into an editor.
+    pub fn decode_net_info_prefab_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetInfoPrefabEditor, CrpError> {
+        let (_, _, _, table, _, _) = self.decode_net_info_prefab_with_range(save_app_version)?;
+        Ok(table.into_editor())
+    }
+
+    /// Replaces network-info indices and names while preserving later tables.
+    ///
+    /// The editor must match this stream's inner version, node/segment flags,
+    /// guide counts, and source table bytes. Unchanged name encodings remain
+    /// byte-exact when another index or name is edited.
+    pub fn replace_net_info_prefab(
+        &mut self,
+        edited: &NetInfoPrefabEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager network-info version does not match this stream",
+            ));
+        }
+        let (node_flags, segment_flags, guide_counts, current, body_start, body_end) =
+            self.decode_net_info_prefab_with_range(save_app_version)?;
+        if node_flags.encode().as_slice() != edited.source_node_flags()
+            || segment_flags.encode().as_slice() != edited.source_segment_flags()
+            || guide_counts.encode().as_slice() != edited.source_guide_counts()
+        {
+            return Err(invalid(
+                body_start,
+                "NetManager flags or guide counts do not match the network-info editor's source",
+            ));
+        }
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager network-info bytes do not match the editor's source table",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager network-info table range is inconsistent",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_net_info_prefab_with_range(save_app_version)
+            .and_then(|(
+                decoded_nodes,
+                decoded_segments,
+                decoded_counts,
+                decoded,
+                actual_start,
+                actual_end,
+            )| {
+                if decoded_nodes.encode() != node_flags.encode()
+                    || decoded_segments.encode() != segment_flags.encode()
+                    || decoded_counts.encode() != guide_counts.encode()
+                {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager network-info table changed its source dependencies",
+                    ));
+                }
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager network-info table does not match the editor",
+                    ));
+                }
+                let expected_end = body_start
+                    .checked_add(replacement.len())
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager network-info end"))?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager network-info table has an unexpected boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager network-info table failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes the tree-prefab index and name table after network-info prefabs.
@@ -11458,6 +11582,9 @@ mod manager_boundary_tests {
             }
             net_body.extend_from_slice(&[14, 0x12, 0x34]);
         }
+        net_body.extend_from_slice(&[0, 0, 0, 0]); // No guide or milestone references.
+        write_encoded_ushort_array(&mut net_body, &vec![0; 30]); // One index per active segment.
+        net_body.extend_from_slice(&[0, 1, 0x80, 0, 1, 0xc1]); // One prefab name: "A".
         let opaque_tail = [0xaa, 0xbb, 0xcc, 0xdd];
         net_body.extend_from_slice(&opaque_tail);
         manager.serialized_object_graph.extend_from_slice(&net_body);
@@ -11651,6 +11778,32 @@ mod manager_boundary_tests {
             original_guide_table_tail
         );
 
+        let (info_table, info_end) = manager.decode_net_info_prefab_prefix(Some(0))?;
+        assert_eq!(info_table.segment_info_indices(), &[0; 30]);
+        assert_eq!(info_table.names(), &[Some("A".to_owned())]);
+        assert_eq!(
+            &manager.serialized_object_graph[info_end..],
+            opaque_tail.as_slice()
+        );
+        let original_info_len = info_table.encode().len();
+        let mut info_editor = info_table.into_editor();
+        info_editor.segment_info_indices_mut()[0] = 42;
+        assert_eq!(info_editor.names_mut()[0].as_deref(), Some("A"));
+        manager.replace_net_info_prefab(&info_editor, Some(0))?;
+        let (edited_info, edited_info_end) = manager.decode_net_info_prefab_prefix(Some(0))?;
+        assert_eq!(edited_info.segment_info_indices()[0], 42);
+        assert!(
+            edited_info.segment_info_indices()[1..]
+                .iter()
+                .all(|index| *index == 0)
+        );
+        assert_eq!(edited_info.names(), &[Some("A".to_owned())]);
+        assert!(edited_info.encode().len() > original_info_len);
+        assert_eq!(
+            &manager.serialized_object_graph[edited_info_end..],
+            opaque_tail.as_slice()
+        );
+
         let graph_after_problem_edit = manager.serialized_object_graph.clone();
         assert!(
             manager
@@ -11693,6 +11846,14 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph, graph_after_records_edit);
+
+        let graph_after_info_edit = manager.serialized_object_graph.clone();
+        assert!(
+            manager
+                .replace_net_info_prefab(&info_editor, Some(0))
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph, graph_after_info_edit);
 
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_net_segment_flags(&editor, Some(0)).is_err());

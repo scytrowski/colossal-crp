@@ -1,5 +1,5 @@
 use crate::CrpError;
-use crate::data_serializer::Reader;
+use crate::data_serializer::{Reader, write_nullable_unique_string};
 use crate::encoded_array::{
     read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
     read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
@@ -450,7 +450,36 @@ pub struct NetInfoPrefabPrefix {
     guide_indices: Vec<u16>,
     milestone_indices: Vec<u16>,
     names: Vec<Option<String>>,
+    source_node_flags: Vec<u8>,
+    source_segment_flags: Vec<u8>,
+    source_guide_counts: Vec<u8>,
+    serialized_indices: Vec<u8>,
+    serialized_name_count: Vec<u8>,
+    serialized_name_entries: Vec<Vec<u8>>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for NetManager's primary network-info prefab index and name table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetInfoPrefabEditor {
+    format_version: u32,
+    node_info_indices: Vec<u16>,
+    segment_info_indices: Vec<u16>,
+    guide_indices: Vec<u16>,
+    milestone_indices: Vec<u16>,
+    names: Vec<Option<String>>,
+    original_node_info_indices: Vec<u16>,
+    original_segment_info_indices: Vec<u16>,
+    original_guide_indices: Vec<u16>,
+    original_milestone_indices: Vec<u16>,
+    original_names: Vec<Option<String>>,
+    source_node_flags: Vec<u8>,
+    source_segment_flags: Vec<u8>,
+    source_guide_counts: Vec<u8>,
+    serialized_indices: Vec<u8>,
+    serialized_name_count: Vec<u8>,
+    serialized_name_entries: Vec<Vec<u8>>,
+    original_prefix: Vec<u8>,
 }
 
 /// Optional tree-prefab indices and names after the network-info table.
@@ -2378,13 +2407,16 @@ impl NetInfoPrefabPrefix {
                 "NetManager info prefab index count",
             ))?;
         let mut reader = Reader::new(bytes);
+        let indices_start = reader.offset();
         let indices = read_encoded_ushort_array(&mut reader, total_count)?;
+        let serialized_indices = reader.consumed_bytes()[indices_start..reader.offset()].to_vec();
         let mut index_iter = indices.into_iter();
         let node_info_indices = index_iter.by_ref().take(node_count).collect();
         let segment_info_indices = index_iter.by_ref().take(segment_count).collect();
         let guide_indices = index_iter.by_ref().take(guide_count).collect();
         let milestone_indices = index_iter.take(milestone_count).collect();
-        let names = read_prefab_names(&mut reader)?;
+        let (names, serialized_name_count, serialized_name_entries) =
+            read_prefab_names_with_raw(&mut reader)?;
         let consumed = reader.offset();
         Ok((
             Self {
@@ -2394,6 +2426,12 @@ impl NetInfoPrefabPrefix {
                 guide_indices,
                 milestone_indices,
                 names,
+                source_node_flags: node_flags.encode(),
+                source_segment_flags: segment_flags.encode(),
+                source_guide_counts: guide_counts.encode(),
+                serialized_indices,
+                serialized_name_count,
+                serialized_name_entries,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -2433,6 +2471,136 @@ impl NetInfoPrefabPrefix {
     /// Writes the original encoded index and name-table bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit its prefab indices and names.
+    pub fn into_editor(self) -> NetInfoPrefabEditor {
+        NetInfoPrefabEditor {
+            format_version: self.format_version,
+            original_node_info_indices: self.node_info_indices.clone(),
+            original_segment_info_indices: self.segment_info_indices.clone(),
+            original_guide_indices: self.guide_indices.clone(),
+            original_milestone_indices: self.milestone_indices.clone(),
+            original_names: self.names.clone(),
+            node_info_indices: self.node_info_indices,
+            segment_info_indices: self.segment_info_indices,
+            guide_indices: self.guide_indices,
+            milestone_indices: self.milestone_indices,
+            names: self.names,
+            source_node_flags: self.source_node_flags,
+            source_segment_flags: self.source_segment_flags,
+            source_guide_counts: self.source_guide_counts,
+            serialized_indices: self.serialized_indices,
+            serialized_name_count: self.serialized_name_count,
+            serialized_name_entries: self.serialized_name_entries,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetInfoPrefabEditor {
+    /// Returns the inner DataSerializer version associated with this table.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns mutable network-info indices for active nodes.
+    pub fn node_info_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.node_info_indices
+    }
+
+    /// Returns mutable network-info indices for active segments.
+    pub fn segment_info_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.segment_info_indices
+    }
+
+    /// Returns mutable network-info indices for guide objects.
+    pub fn guide_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.guide_indices
+    }
+
+    /// Returns mutable network-info indices for milestone objects.
+    pub fn milestone_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.milestone_indices
+    }
+
+    /// Returns mutable names in original table order.
+    pub fn names_mut(&mut self) -> &mut [Option<String>] {
+        &mut self.names
+    }
+
+    /// Encodes edited indices while retaining unchanged name-entry bytes.
+    ///
+    /// The index array is rewritten canonically only if an index changes.
+    /// Changed names use the crate's unique-string writer; unchanged names
+    /// retain their exact source bytes, including compact/full encoding.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.node_info_indices.len() != self.original_node_info_indices.len()
+            || self.segment_info_indices.len() != self.original_segment_info_indices.len()
+            || self.guide_indices.len() != self.original_guide_indices.len()
+            || self.milestone_indices.len() != self.original_milestone_indices.len()
+            || self.names.len() != self.original_names.len()
+            || self.names.len() != self.serialized_name_entries.len()
+        {
+            return Err(invalid(
+                0,
+                "edited network-info prefab counts do not match the source",
+            ));
+        }
+        if self.node_info_indices == self.original_node_info_indices
+            && self.segment_info_indices == self.original_segment_info_indices
+            && self.guide_indices == self.original_guide_indices
+            && self.milestone_indices == self.original_milestone_indices
+            && self.names == self.original_names
+        {
+            return Ok(self.original_prefix.clone());
+        }
+
+        let indices_changed = self.node_info_indices != self.original_node_info_indices
+            || self.segment_info_indices != self.original_segment_info_indices
+            || self.guide_indices != self.original_guide_indices
+            || self.milestone_indices != self.original_milestone_indices;
+        let mut output = Vec::with_capacity(self.original_prefix.len());
+        if indices_changed {
+            let mut indices = Vec::new();
+            indices.extend_from_slice(&self.node_info_indices);
+            indices.extend_from_slice(&self.segment_info_indices);
+            indices.extend_from_slice(&self.guide_indices);
+            indices.extend_from_slice(&self.milestone_indices);
+            write_encoded_ushort_array(&mut output, &indices);
+        } else {
+            output.extend_from_slice(&self.serialized_indices);
+        }
+        output.extend_from_slice(&self.serialized_name_count);
+        for ((name, original_name), raw_entry) in self
+            .names
+            .iter()
+            .zip(&self.original_names)
+            .zip(&self.serialized_name_entries)
+        {
+            if name == original_name {
+                output.extend_from_slice(raw_entry);
+            } else {
+                write_nullable_unique_string(&mut output, name.as_deref())?;
+            }
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn source_node_flags(&self) -> &[u8] {
+        &self.source_node_flags
+    }
+
+    pub(crate) fn source_segment_flags(&self) -> &[u8] {
+        &self.source_segment_flags
+    }
+
+    pub(crate) fn source_guide_counts(&self) -> &[u8] {
+        &self.source_guide_counts
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 
@@ -2972,12 +3140,24 @@ fn invalid_guide(offset: usize, reason: impl Into<String>) -> CrpError {
 }
 
 fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, CrpError> {
-    let name_count = usize::from(reader.read_u16_be()?);
-    let mut names = Vec::with_capacity(name_count);
-    for _ in 0..name_count {
-        names.push(reader.read_unique_string()?);
-    }
+    let (names, _, _) = read_prefab_names_with_raw(reader)?;
     Ok(names)
+}
+
+fn read_prefab_names_with_raw(
+    reader: &mut Reader<'_>,
+) -> Result<(Vec<Option<String>>, Vec<u8>, Vec<Vec<u8>>), CrpError> {
+    let count_start = reader.offset();
+    let name_count = usize::from(reader.read_u16_be()?);
+    let serialized_count = reader.consumed_bytes()[count_start..reader.offset()].to_vec();
+    let mut names = Vec::with_capacity(name_count);
+    let mut serialized_entries = Vec::with_capacity(name_count);
+    for _ in 0..name_count {
+        let entry_start = reader.offset();
+        names.push(reader.read_unique_string()?);
+        serialized_entries.push(reader.consumed_bytes()[entry_start..reader.offset()].to_vec());
+    }
+    Ok((names, serialized_count, serialized_entries))
 }
 
 fn read_segment_u24(reader: &mut Reader<'_>) -> Result<u32, CrpError> {

@@ -79,10 +79,10 @@ pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, Inst
 pub use message_manager_data::{MessageDataEntry, MessageManagerData, MessageManagerDataEditor};
 pub use metadata::{DistrictStyleMetaData, MapMetaData, ModInfo, SystemMapMetaData};
 pub use net_manager_data::{
-    NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabPrefix, NetLane, NetLaneEditor,
-    NetLanePrefix, NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag,
-    NetNodeFlagsPrefix, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeProblem,
-    NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader,
+    NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor, NetInfoPrefabPrefix, NetLane,
+    NetLaneEditor, NetLanePrefix, NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix,
+    NetNodeFlag, NetNodeFlagsPrefix, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor,
+    NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader,
     NetSegmentCoverage, NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironment,
     NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlag,
     NetSegmentFlagsEditor, NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsEditor,
@@ -2542,6 +2542,20 @@ mod tests {
         assert_eq!(table.milestone_indices(), [5]);
         assert_eq!(table.names(), [None, Some("A".to_owned())]);
         assert_eq!(table.encode(), bytes[..used]);
+
+        let mut editor = table.clone().into_editor();
+        assert_eq!(editor.encode()?, bytes[..used]);
+        editor.segment_info_indices_mut()[0] = 0x1234;
+        let mut expected = vec![3, 0, 2, 0x12, 0x34, 0, 4, 0, 5];
+        expected.extend_from_slice(&[0, 2, 0xff, 0x80, 0, 1, 0xc1]);
+        assert_eq!(editor.encode()?, expected);
+
+        let mut name_editor = table.into_editor();
+        name_editor.names_mut()[1] = Some("B".to_owned());
+        let mut expected = bytes[..9].to_vec();
+        expected.extend_from_slice(&[0, 2, 0xff, 0x80, 0, 1, 0xc2]);
+        assert_eq!(name_editor.encode()?, expected);
+
         assert!(
             NetInfoPrefabPrefix::decode_prefix(version, &nodes, &segments, &counts, &bytes[..15])
                 .is_err()
