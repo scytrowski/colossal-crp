@@ -5333,6 +5333,93 @@ impl SimulationManagerData {
         Ok((data, manager_end))
     }
 
+    /// Replaces the active CitizenInstance field section at slot 7 while
+    /// preserving the rest of the current CitizenManager body byte-for-byte.
+    ///
+    /// The edited data must use this stream's inner version, have the same
+    /// active slot layout, and originate from a body with matching prefixes
+    /// and trailing counters. The replacement has the same length as the
+    /// current field section, so later manager offsets remain unchanged.
+    pub fn replace_citizen_manager_instance_fields(
+        &mut self,
+        edited: &CitizenManagerData,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited CitizenManager instance version does not match this stream",
+            ));
+        }
+        expect_manager_type(self.manager_objects.as_deref(), 7, "CitizenManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
+
+        let (current, manager_end) = self.decode_citizen_manager_data()?;
+        if edited.instance_prefix().active_instances()
+            != current.instance_prefix().active_instances()
+        {
+            return Err(invalid(
+                0,
+                "edited CitizenManager active-slot layout does not match this stream",
+            ));
+        }
+        let edited_range = edited.instance_fields_range();
+        let current_range = current.instance_fields_range();
+        if edited_range != current_range {
+            return Err(invalid(
+                0,
+                "edited CitizenManager instance field range does not match this stream",
+            ));
+        }
+        let edited_body = edited.original_body_bytes();
+        let current_body = current.original_body_bytes();
+        if edited_body.len() != current_body.len()
+            || edited_body.get(..edited_range.start) != current_body.get(..current_range.start)
+            || edited_body.get(edited_range.end..) != current_body.get(current_range.end..)
+        {
+            return Err(invalid(
+                0,
+                "edited CitizenManager data does not match this stream outside instance fields",
+            ));
+        }
+        let replacement = edited_body.get(edited_range.clone()).ok_or_else(|| {
+            invalid(
+                edited_range.start,
+                "edited CitizenManager field range is invalid",
+            )
+        })?;
+        let (body_start, boundary_end) = self.manager_body_boundary(7)?;
+        if boundary_end != manager_end {
+            return Err(invalid(
+                manager_end,
+                "CitizenManager body boundary changed during replacement",
+            ));
+        }
+        let field_start =
+            body_start
+                .checked_add(current_range.start)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager instance fields graph start",
+                ))?;
+        let field_end =
+            body_start
+                .checked_add(current_range.end)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager instance fields graph end",
+                ))?;
+        let output = self
+            .serialized_object_graph
+            .get_mut(field_start..field_end)
+            .ok_or_else(|| invalid(field_start, "CitizenManager instance fields exceed graph"))?;
+        if output.len() != replacement.len() {
+            return Err(invalid(
+                field_start,
+                "edited CitizenManager instance fields change the serialized width",
+            ));
+        }
+        output.copy_from_slice(replacement);
+        Ok(())
+    }
+
     /// Decodes the known VehicleManager fields through its versioned counters.
     ///
     /// Requires `VehicleManager+Data` at slot 17 and `TransportManager+Data`
@@ -18255,6 +18342,55 @@ mod manager_boundary_tests {
         );
         assert_eq!(end, body_end);
         assert!(manager.serialized_object_graph()[end..].starts_with(&transfer_tag));
+
+        let position = [-10.0_f32, 20.5, 30.25];
+        let target = [40.0_f32, -50.5, 60.25, 1.0];
+        let field_range = decoded.instance_fields_range();
+        let mut expected_body = decoded.encode();
+        for (chunk, value) in expected_body[field_range.start + 12..field_range.start + 24]
+            .chunks_exact_mut(4)
+            .zip(position)
+        {
+            chunk.copy_from_slice(&value.to_bits().to_be_bytes());
+        }
+        for (chunk, value) in expected_body[field_range.start + 24..field_range.start + 40]
+            .chunks_exact_mut(4)
+            .zip(target)
+        {
+            chunk.copy_from_slice(&value.to_bits().to_be_bytes());
+        }
+        let mut edited = decoded.clone();
+        edited.set_instance_position(0, position).unwrap();
+        edited
+            .set_instance_target_position(0, crate::CitizenInstanceTargetPosition::Vector4(target))
+            .unwrap();
+        manager
+            .replace_citizen_manager_instance_fields(&edited)
+            .unwrap();
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start..body_end],
+            expected_body
+        );
+        let (updated, updated_end) = manager.decode_citizen_manager_data().unwrap();
+        assert_eq!(updated.active_instances()[0].position(), position);
+        assert_eq!(
+            updated.active_instances()[0].target_position(),
+            crate::CitizenInstanceTargetPosition::Vector4(target)
+        );
+        assert_eq!(updated.active_instances()[0].citizen(), 0x123456);
+        assert_eq!(updated.unparsed_instance_suffix(), instance_suffix);
+        assert_eq!(updated_end, end);
+        assert!(manager.serialized_object_graph()[updated_end..].starts_with(&transfer_tag));
+
+        let mut wrong_version = manager.clone();
+        wrong_version.format_version -= 1;
+        let stable_graph = wrong_version.serialized_object_graph.clone();
+        assert!(
+            wrong_version
+                .replace_citizen_manager_instance_fields(&edited)
+                .is_err()
+        );
+        assert_eq!(wrong_version.serialized_object_graph, stable_graph);
     }
 
     #[test]

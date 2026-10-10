@@ -26,6 +26,8 @@ const CITIZEN_INSTANCE_VELOCITY_VERSION: u32 = 46;
 const CITIZEN_INSTANCE_TARGET_POSITION_VERSION: u32 = 47;
 const CITIZEN_INSTANCE_WAIT_COUNTER_VERSION: u32 = 86;
 const CITIZEN_INSTANCE_TARGET_POSITION_VECTOR4_VERSION: u32 = 195;
+const CITIZEN_INSTANCE_TARGET_POSITION_VECTOR3_END_VERSION: u32 =
+    CITIZEN_INSTANCE_TARGET_POSITION_VECTOR4_VERSION - 1;
 const CITIZEN_INSTANCE_TARGET_DIRECTION_VERSION: u32 = 200;
 const CITIZEN_INSTANCE_TARGET_SEED_VERSION: u32 = 201;
 const CITIZEN_INSTANCE_COLOR_VERSION: u32 = 247;
@@ -427,6 +429,8 @@ pub struct CitizenInstanceRecord {
     compatibility_value: Option<u16>,
     source_building: Option<u16>,
     target_building: u16,
+    position_offset: usize,
+    target_position_offset: Option<usize>,
     original_record_start: usize,
     original_record_end: usize,
 }
@@ -665,7 +669,8 @@ const FULLY_EDUCATED_RESIDENTS_VERSION: u32 = 179;
 /// Citizen flags and sparse columns, version 69+ unit records, and the
 /// versioned instance flags/prefab scope and active records are decoded. The
 /// full instance byte section, two-byte profiler reference, and counters are
-/// retained. `encode` reproduces the complete bounded manager body exactly.
+/// retained. `encode` reproduces the complete bounded manager body exactly
+/// until a field is explicitly edited.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CitizenManagerData {
     format_version: u32,
@@ -773,6 +778,21 @@ impl CitizenManagerData {
                 .ok_or(CrpError::ArithmeticOverflow(
                     "CitizenManager instance record end",
                 ))?;
+            record.position_offset = instance_fields_start
+                .checked_add(record.position_offset)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager instance position offset",
+                ))?;
+            record.target_position_offset = record
+                .target_position_offset
+                .map(|offset| {
+                    instance_fields_start
+                        .checked_add(offset)
+                        .ok_or(CrpError::ArithmeticOverflow(
+                            "CitizenManager instance target-position offset",
+                        ))
+                })
+                .transpose()?;
             active_instances.push(record);
         }
         let instance_field_suffix_start = instance_fields_start
@@ -854,10 +874,10 @@ impl CitizenManagerData {
         &self.instance_prefix
     }
 
-    /// Returns the complete source byte section for active CitizenInstance records.
+    /// Returns the complete serialized byte section for active records.
     ///
     /// Known records are also exposed through [`Self::active_instances`]. The
-    /// original section remains available for exact preservation.
+    /// section includes any edits made through this type's setters.
     pub fn opaque_instance_fields(&self) -> &[u8] {
         &self.original_body[self.instance_fields.clone()]
     }
@@ -867,12 +887,75 @@ impl CitizenManagerData {
         &self.active_instances
     }
 
-    /// Returns the exact source bytes for an active record by its zero-based
-    /// position in [`Self::active_instances`].
+    /// Returns the serialized bytes for an active record by its zero-based
+    /// position in [`Self::active_instances`], including edits made through
+    /// this type's setters.
     pub fn instance_record_bytes(&self, record_index: usize) -> Option<&[u8]> {
         let record = self.active_instances.get(record_index)?;
         self.original_body
             .get(record.original_record_start..record.original_record_end)
+    }
+
+    /// Replaces one active instance's serialized position without changing
+    /// the record width or any neighboring bytes.
+    pub fn set_instance_position(
+        &mut self,
+        record_index: usize,
+        position: [f32; 3],
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.position_offset;
+        write_f32_vector(&mut self.original_body, offset, &position)?;
+        self.active_instances[record_index].position = position;
+        Ok(())
+    }
+
+    /// Replaces one active instance's serialized target position.
+    ///
+    /// Versions 47–194 require [`CitizenInstanceTargetPosition::Vector3`];
+    /// version 195 and later require `Vector4`. Before version 47 the target
+    /// follows the position and has no separate serialized field.
+    pub fn set_instance_target_position(
+        &mut self,
+        record_index: usize,
+        target_position: CitizenInstanceTargetPosition,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.target_position_offset.ok_or_else(|| {
+            invalid(
+                record.original_record_start,
+                "CitizenInstance target position is not serialized before version 47",
+            )
+        })?;
+        match (self.format_version, target_position) {
+            (
+                CITIZEN_INSTANCE_TARGET_POSITION_VERSION
+                    ..=CITIZEN_INSTANCE_TARGET_POSITION_VECTOR3_END_VERSION,
+                CitizenInstanceTargetPosition::Vector3(values),
+            ) => {
+                write_f32_vector(&mut self.original_body, offset, &values)?;
+            }
+            (
+                CITIZEN_INSTANCE_TARGET_POSITION_VECTOR4_VERSION..,
+                CitizenInstanceTargetPosition::Vector4(values),
+            ) => {
+                write_f32_vector(&mut self.original_body, offset, &values)?;
+            }
+            _ => {
+                return Err(invalid(
+                    record.original_record_start,
+                    "CitizenInstance target-position width does not match the inner version",
+                ));
+            }
+        }
+        self.active_instances[record_index].target_position = target_position;
+        Ok(())
     }
 
     /// Returns any bytes after the decoded active records for forward-compatible preservation.
@@ -895,9 +978,17 @@ impl CitizenManagerData {
         self.end_profiler_reference
     }
 
-    /// Reproduces the complete source manager body unchanged.
+    /// Reproduces the retained manager body, including any explicit field edits.
     pub fn encode(&self) -> Vec<u8> {
         self.original_body.clone()
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original_body
+    }
+
+    pub(crate) fn instance_fields_range(&self) -> Range<usize> {
+        self.instance_fields.clone()
     }
 }
 
@@ -911,7 +1002,13 @@ fn decode_citizen_instance_record(
     } else {
         None
     };
+    let position_offset = reader.offset();
     let position = read_vector3(reader)?;
+    let target_position_offset = if format_version >= CITIZEN_INSTANCE_TARGET_POSITION_VERSION {
+        Some(reader.offset())
+    } else {
+        None
+    };
     let target_position = if format_version >= CITIZEN_INSTANCE_TARGET_POSITION_VECTOR4_VERSION {
         CitizenInstanceTargetPosition::Vector4(read_vector4(reader)?)
     } else if format_version >= CITIZEN_INSTANCE_TARGET_POSITION_VERSION {
@@ -997,9 +1094,31 @@ fn decode_citizen_instance_record(
         compatibility_value,
         source_building,
         target_building,
+        position_offset,
+        target_position_offset,
         original_record_start: 0,
         original_record_end: 0,
     })
+}
+
+fn write_f32_vector<const N: usize>(
+    bytes: &mut [u8],
+    offset: usize,
+    values: &[f32; N],
+) -> Result<(), CrpError> {
+    let width = N
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or(CrpError::ArithmeticOverflow("CitizenInstance vector width"))?;
+    let end = offset
+        .checked_add(width)
+        .ok_or(CrpError::ArithmeticOverflow("CitizenInstance vector end"))?;
+    let output = bytes
+        .get_mut(offset..end)
+        .ok_or_else(|| invalid(offset, "CitizenInstance vector exceeds manager body"))?;
+    for (chunk, value) in output.chunks_exact_mut(4).zip(values) {
+        chunk.copy_from_slice(&value.to_bits().to_be_bytes());
+    }
+    Ok(())
 }
 
 fn read_vector2(reader: &mut Reader<'_>) -> Result<[f32; 2], CrpError> {
@@ -1144,6 +1263,31 @@ mod tests {
             bytes.extend_from_slice(&[0xcd, 0xef]); // source building
         }
         bytes.extend_from_slice(&[0x13, 0x57]); // target building
+        bytes
+    }
+
+    fn single_active_instance_body_194() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        append_zero_uint_array(&mut bytes, 1_048_575);
+        append_zero_ushort_array(&mut bytes, 524_287);
+
+        // Encode one active slot followed by zero flags in the legacy range.
+        bytes.push(63);
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend(std::iter::repeat_n(0, 63 * 4));
+        append_zero_uint_array(&mut bytes, 32_767 - 64);
+        bytes.extend_from_slice(&ushort_array(&[0])); // prefab index
+        bytes.extend_from_slice(&[0, 0]); // empty prefab-name table
+
+        append_vector(&mut bytes, &[1.0, 2.0, 3.0]); // velocity
+        append_vector(&mut bytes, &[4.0, 5.0, 6.0]); // position
+        append_vector(&mut bytes, &[7.0, 8.0, 9.0]); // version-194 target position
+        bytes.extend_from_slice(&[0, 0, 0]); // citizen reference
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0]); // path and offsets
+        bytes.push(0); // wait counter
+        bytes.extend_from_slice(&[0; 4]); // source and target buildings
+        bytes.extend_from_slice(&[0; 8]); // versioned trailing counters
+        bytes.extend_from_slice(&[0x12, 0x34]); // closing profiler reference
         bytes
     }
 
@@ -1403,6 +1547,56 @@ mod tests {
     }
 
     #[test]
+    fn edits_instance_position_and_versioned_target_without_touching_other_bytes() {
+        let bytes = single_active_instance_body_194();
+        let decoded = CitizenManagerData::decode(194, &bytes).expect("version-194 manager");
+        assert_eq!(decoded.active_instances().len(), 1);
+        assert_eq!(
+            decoded.active_instances()[0].target_position(),
+            CitizenInstanceTargetPosition::Vector3([7.0, 8.0, 9.0])
+        );
+
+        let position = [-10.5_f32, 20.25, 30.0];
+        let target = CitizenInstanceTargetPosition::Vector3([40.5_f32, -50.25, 60.0]);
+        let record = &decoded.active_instances()[0];
+        let position_offset = record.position_offset;
+        let target_offset = record.target_position_offset.expect("serialized target");
+        let mut expected = bytes.clone();
+        for (chunk, value) in expected[position_offset..position_offset + 12]
+            .chunks_exact_mut(4)
+            .zip(position)
+        {
+            chunk.copy_from_slice(&value.to_bits().to_be_bytes());
+        }
+        if let CitizenInstanceTargetPosition::Vector3(values) = target {
+            for (chunk, value) in expected[target_offset..target_offset + 12]
+                .chunks_exact_mut(4)
+                .zip(values)
+            {
+                chunk.copy_from_slice(&value.to_bits().to_be_bytes());
+            }
+        }
+
+        let mut edited = decoded;
+        edited
+            .set_instance_position(0, position)
+            .expect("edit position");
+        edited
+            .set_instance_target_position(0, target)
+            .expect("edit version-194 target");
+        assert_eq!(edited.active_instances()[0].position(), position);
+        assert_eq!(edited.active_instances()[0].target_position(), target);
+        assert_eq!(edited.encode(), expected);
+        assert!(edited.set_instance_position(1, [0.0; 3]).is_err());
+        assert!(
+            edited
+                .set_instance_target_position(0, CitizenInstanceTargetPosition::Vector4([0.0; 4]))
+                .is_err()
+        );
+        assert_eq!(edited.encode(), expected);
+    }
+
+    #[test]
     fn manager_rejects_truncated_counter_and_profiler_tail() {
         let bytes = empty_manager_body(179);
         for missing in 1..=10 {
@@ -1470,6 +1664,22 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, 0x7d, 0x98,
             ]
         );
+
+        let changed_target = [12.5_f32, -34.25, 56.0, 1.0];
+        let record = &decoded.active_instances()[0];
+        let target_offset = record.target_position_offset.expect("serialized Vector4");
+        let mut expected = fixture.to_vec();
+        for (chunk, value) in expected[target_offset..target_offset + 16]
+            .chunks_exact_mut(4)
+            .zip(changed_target)
+        {
+            chunk.copy_from_slice(&value.to_bits().to_be_bytes());
+        }
+        let mut edited = decoded;
+        edited
+            .set_instance_target_position(0, CitizenInstanceTargetPosition::Vector4(changed_target))
+            .expect("edit game-produced target position");
+        assert_eq!(edited.encode(), expected);
     }
 
     #[test]
