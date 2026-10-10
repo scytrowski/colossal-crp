@@ -429,8 +429,10 @@ pub struct CitizenInstanceRecord {
     compatibility_value: Option<u16>,
     source_building: Option<u16>,
     target_building: u16,
+    velocity_offset: Option<usize>,
     position_offset: usize,
     target_position_offset: Option<usize>,
+    target_direction_offset: Option<usize>,
     original_record_start: usize,
     original_record_end: usize,
 }
@@ -783,6 +785,15 @@ impl CitizenManagerData {
                 .ok_or(CrpError::ArithmeticOverflow(
                     "CitizenManager instance position offset",
                 ))?;
+            record.velocity_offset =
+                record
+                    .velocity_offset
+                    .map(|offset| {
+                        instance_fields_start.checked_add(offset).ok_or(
+                            CrpError::ArithmeticOverflow("CitizenManager instance velocity offset"),
+                        )
+                    })
+                    .transpose()?;
             record.target_position_offset = record
                 .target_position_offset
                 .map(|offset| {
@@ -790,6 +801,16 @@ impl CitizenManagerData {
                         .checked_add(offset)
                         .ok_or(CrpError::ArithmeticOverflow(
                             "CitizenManager instance target-position offset",
+                        ))
+                })
+                .transpose()?;
+            record.target_direction_offset = record
+                .target_direction_offset
+                .map(|offset| {
+                    instance_fields_start
+                        .checked_add(offset)
+                        .ok_or(CrpError::ArithmeticOverflow(
+                            "CitizenManager instance target-direction offset",
                         ))
                 })
                 .transpose()?;
@@ -896,6 +917,27 @@ impl CitizenManagerData {
             .get(record.original_record_start..record.original_record_end)
     }
 
+    /// Replaces one active instance's velocity from inner version 46 onward.
+    pub fn set_instance_velocity(
+        &mut self,
+        record_index: usize,
+        velocity: [f32; 3],
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.velocity_offset.ok_or_else(|| {
+            invalid(
+                record.original_record_start,
+                "CitizenInstance velocity is not serialized before version 46",
+            )
+        })?;
+        write_f32_vector(&mut self.original_body, offset, &velocity)?;
+        self.active_instances[record_index].velocity = Some(velocity);
+        Ok(())
+    }
+
     /// Replaces one active instance's serialized position without changing
     /// the record width or any neighboring bytes.
     pub fn set_instance_position(
@@ -958,6 +1000,27 @@ impl CitizenManagerData {
         Ok(())
     }
 
+    /// Replaces one active instance's target direction from inner version 200.
+    pub fn set_instance_target_direction(
+        &mut self,
+        record_index: usize,
+        target_direction: [f32; 2],
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.target_direction_offset.ok_or_else(|| {
+            invalid(
+                record.original_record_start,
+                "CitizenInstance target direction is not serialized before version 200",
+            )
+        })?;
+        write_f32_vector(&mut self.original_body, offset, &target_direction)?;
+        self.active_instances[record_index].target_direction = Some(target_direction);
+        Ok(())
+    }
+
     /// Returns any bytes after the decoded active records for forward-compatible preservation.
     pub fn unparsed_instance_suffix(&self) -> &[u8] {
         &self.original_body[self.instance_field_suffix.clone()]
@@ -997,6 +1060,11 @@ fn decode_citizen_instance_record(
     slot: CitizenInstanceSlot,
     reader: &mut Reader<'_>,
 ) -> Result<CitizenInstanceRecord, CrpError> {
+    let velocity_offset = if format_version >= CITIZEN_INSTANCE_VELOCITY_VERSION {
+        Some(reader.offset())
+    } else {
+        None
+    };
     let velocity = if format_version >= CITIZEN_INSTANCE_VELOCITY_VERSION {
         Some(read_vector3(reader)?)
     } else {
@@ -1015,6 +1083,11 @@ fn decode_citizen_instance_record(
         CitizenInstanceTargetPosition::Vector3(read_vector3(reader)?)
     } else {
         CitizenInstanceTargetPosition::FollowsPosition
+    };
+    let target_direction_offset = if format_version >= CITIZEN_INSTANCE_TARGET_DIRECTION_VERSION {
+        Some(reader.offset())
+    } else {
+        None
     };
     let target_direction = if format_version >= CITIZEN_INSTANCE_TARGET_DIRECTION_VERSION {
         Some(read_vector2(reader)?)
@@ -1094,8 +1167,10 @@ fn decode_citizen_instance_record(
         compatibility_value,
         source_building,
         target_building,
+        velocity_offset,
         position_offset,
         target_position_offset,
+        target_direction_offset,
         original_record_start: 0,
         original_record_end: 0,
     })
@@ -1557,11 +1632,19 @@ mod tests {
         );
 
         let position = [-10.5_f32, 20.25, 30.0];
+        let velocity = [0.25_f32, -1.5, 3.75];
         let target = CitizenInstanceTargetPosition::Vector3([40.5_f32, -50.25, 60.0]);
         let record = &decoded.active_instances()[0];
+        let velocity_offset = record.velocity_offset.expect("serialized velocity");
         let position_offset = record.position_offset;
         let target_offset = record.target_position_offset.expect("serialized target");
         let mut expected = bytes.clone();
+        for (chunk, value) in expected[velocity_offset..velocity_offset + 12]
+            .chunks_exact_mut(4)
+            .zip(velocity)
+        {
+            chunk.copy_from_slice(&value.to_bits().to_be_bytes());
+        }
         for (chunk, value) in expected[position_offset..position_offset + 12]
             .chunks_exact_mut(4)
             .zip(position)
@@ -1579,14 +1662,19 @@ mod tests {
 
         let mut edited = decoded;
         edited
+            .set_instance_velocity(0, velocity)
+            .expect("edit velocity");
+        edited
             .set_instance_position(0, position)
             .expect("edit position");
         edited
             .set_instance_target_position(0, target)
             .expect("edit version-194 target");
+        assert_eq!(edited.active_instances()[0].velocity(), Some(velocity));
         assert_eq!(edited.active_instances()[0].position(), position);
         assert_eq!(edited.active_instances()[0].target_position(), target);
         assert_eq!(edited.encode(), expected);
+        assert!(edited.set_instance_target_direction(0, [0.0; 2]).is_err());
         assert!(edited.set_instance_position(1, [0.0; 3]).is_err());
         assert!(
             edited
@@ -1666,19 +1754,43 @@ mod tests {
         );
 
         let changed_target = [12.5_f32, -34.25, 56.0, 1.0];
+        let changed_velocity = [1.5_f32, -2.25, 3.75];
+        let changed_direction = [0.5_f32, -0.75];
         let record = &decoded.active_instances()[0];
+        let velocity_offset = record.velocity_offset.expect("serialized velocity");
         let target_offset = record.target_position_offset.expect("serialized Vector4");
+        let direction_offset = record
+            .target_direction_offset
+            .expect("serialized target direction");
         let mut expected = fixture.to_vec();
+        for (chunk, value) in expected[velocity_offset..velocity_offset + 12]
+            .chunks_exact_mut(4)
+            .zip(changed_velocity)
+        {
+            chunk.copy_from_slice(&value.to_bits().to_be_bytes());
+        }
         for (chunk, value) in expected[target_offset..target_offset + 16]
             .chunks_exact_mut(4)
             .zip(changed_target)
         {
             chunk.copy_from_slice(&value.to_bits().to_be_bytes());
         }
+        for (chunk, value) in expected[direction_offset..direction_offset + 8]
+            .chunks_exact_mut(4)
+            .zip(changed_direction)
+        {
+            chunk.copy_from_slice(&value.to_bits().to_be_bytes());
+        }
         let mut edited = decoded;
+        edited
+            .set_instance_velocity(0, changed_velocity)
+            .expect("edit game-produced velocity");
         edited
             .set_instance_target_position(0, CitizenInstanceTargetPosition::Vector4(changed_target))
             .expect("edit game-produced target position");
+        edited
+            .set_instance_target_direction(0, changed_direction)
+            .expect("edit game-produced target direction");
         assert_eq!(edited.encode(), expected);
     }
 

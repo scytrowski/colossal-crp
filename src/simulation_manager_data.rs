@@ -18343,10 +18343,18 @@ mod manager_boundary_tests {
         assert_eq!(end, body_end);
         assert!(manager.serialized_object_graph()[end..].starts_with(&transfer_tag));
 
+        let velocity = [1.25_f32, -2.5, 3.75];
         let position = [-10.0_f32, 20.5, 30.25];
         let target = [40.0_f32, -50.5, 60.25, 1.0];
+        let direction = [0.5_f32, -0.75];
         let field_range = decoded.instance_fields_range();
         let mut expected_body = decoded.encode();
+        for (chunk, value) in expected_body[field_range.start..field_range.start + 12]
+            .chunks_exact_mut(4)
+            .zip(velocity)
+        {
+            chunk.copy_from_slice(&value.to_bits().to_be_bytes());
+        }
         for (chunk, value) in expected_body[field_range.start + 12..field_range.start + 24]
             .chunks_exact_mut(4)
             .zip(position)
@@ -18359,11 +18367,19 @@ mod manager_boundary_tests {
         {
             chunk.copy_from_slice(&value.to_bits().to_be_bytes());
         }
+        for (chunk, value) in expected_body[field_range.start + 40..field_range.start + 48]
+            .chunks_exact_mut(4)
+            .zip(direction)
+        {
+            chunk.copy_from_slice(&value.to_bits().to_be_bytes());
+        }
         let mut edited = decoded.clone();
+        edited.set_instance_velocity(0, velocity).unwrap();
         edited.set_instance_position(0, position).unwrap();
         edited
             .set_instance_target_position(0, crate::CitizenInstanceTargetPosition::Vector4(target))
             .unwrap();
+        edited.set_instance_target_direction(0, direction).unwrap();
         manager
             .replace_citizen_manager_instance_fields(&edited)
             .unwrap();
@@ -18372,10 +18388,15 @@ mod manager_boundary_tests {
             expected_body
         );
         let (updated, updated_end) = manager.decode_citizen_manager_data().unwrap();
+        assert_eq!(updated.active_instances()[0].velocity(), Some(velocity));
         assert_eq!(updated.active_instances()[0].position(), position);
         assert_eq!(
             updated.active_instances()[0].target_position(),
             crate::CitizenInstanceTargetPosition::Vector4(target)
+        );
+        assert_eq!(
+            updated.active_instances()[0].target_direction(),
+            Some(direction)
         );
         assert_eq!(updated.active_instances()[0].citizen(), 0x123456);
         assert_eq!(updated.unparsed_instance_suffix(), instance_suffix);
