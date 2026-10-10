@@ -9,6 +9,8 @@ use crate::PathManagerData;
 use crate::PropManagerDataPrefix;
 use crate::TerrainManagerData;
 use crate::TreeManagerDataPrefix;
+use crate::VehicleInstanceFieldsPrefix;
+use crate::VehicleLastFrameDataPrefix;
 use crate::VehicleManagerDataPrefix;
 use crate::VehicleManagerSparseFieldsPrefix;
 use crate::WaterSimulationData;
@@ -2140,6 +2142,50 @@ impl SimulationManagerData {
                 "VehicleManager sparse-column end",
             ))?;
         Ok((columns, graph_end))
+    }
+
+    /// Decodes active VehicleManager last-frame vectors and target positions.
+    ///
+    /// Returns the graph offset after these records and before the remaining
+    /// per-vehicle scalar and reference fields.
+    pub fn decode_vehicle_manager_last_frame_prefix(
+        &self,
+    ) -> Result<(VehicleLastFrameDataPrefix, usize), CrpError> {
+        let (columns, columns_end) = self.decode_vehicle_manager_sparse_columns()?;
+        let (_, manager_end) = self.manager_body_boundary(17)?;
+        let record_bytes = self
+            .serialized_object_graph
+            .get(columns_end..manager_end)
+            .ok_or_else(|| invalid(columns_end, "VehicleManager record range is invalid"))?;
+        let (frames, consumed) = columns.decode_last_frame_records(record_bytes)?;
+        let graph_end = columns_end
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "VehicleManager last-frame prefix end",
+            ))?;
+        Ok((frames, graph_end))
+    }
+
+    /// Decodes the remaining active-vehicle fields through the custom value.
+    ///
+    /// Returns the graph offset before parked-vehicle records and manager
+    /// counters. Those later sections remain opaque.
+    pub fn decode_vehicle_manager_instance_fields_prefix(
+        &self,
+    ) -> Result<(VehicleInstanceFieldsPrefix, usize), CrpError> {
+        let (frames, frames_end) = self.decode_vehicle_manager_last_frame_prefix()?;
+        let (_, manager_end) = self.manager_body_boundary(17)?;
+        let record_bytes = self
+            .serialized_object_graph
+            .get(frames_end..manager_end)
+            .ok_or_else(|| invalid(frames_end, "VehicleManager scalar-field range is invalid"))?;
+        let (fields, consumed) = frames.decode_scalar_fields(record_bytes)?;
+        let graph_end = frames_end
+            .checked_add(consumed)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "VehicleManager scalar-field prefix end",
+            ))?;
+        Ok((fields, graph_end))
     }
 
     /// Decodes the known DistrictManager prefix for the requested inner version.
@@ -11991,6 +12037,16 @@ mod manager_boundary_tests {
         assert_eq!(columns.gate_indices(), Some([].as_slice()));
         assert_eq!(columns.water_sources(), Some([].as_slice()));
         assert_eq!(columns_end, end);
+
+        let (frames, frames_end) = manager.decode_vehicle_manager_last_frame_prefix().unwrap();
+        assert_eq!(frames.records(), []);
+        assert_eq!(frames_end, columns_end);
+
+        let (fields, fields_end) = manager
+            .decode_vehicle_manager_instance_fields_prefix()
+            .unwrap();
+        assert_eq!(fields.records(), []);
+        assert_eq!(fields_end, frames_end);
     }
 
     #[test]

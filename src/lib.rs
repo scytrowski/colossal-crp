@@ -109,7 +109,11 @@ pub use tree_manager_data::{BurningTreeRecord, TreeInstanceRecord, TreeManagerDa
 pub use unlock_manager_data::{
     UnlockManagerMilestoneArray, UnlockManagerMilestoneKind, UnlockManagerReferences,
 };
-pub use vehicle_manager_data::{VehicleManagerDataPrefix, VehicleManagerSparseFieldsPrefix};
+pub use vehicle_manager_data::{
+    VehicleInstanceFields, VehicleInstanceFieldsPrefix, VehicleLastFrameDataPrefix,
+    VehicleLastFrameRecord, VehicleManagerDataPrefix, VehicleManagerSparseFieldsPrefix,
+    VehicleTargetPosition0,
+};
 pub use water_simulation_data::{
     WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
 };
@@ -5621,6 +5625,14 @@ mod tests {
                             (manager_data.format_version() >= 273).then_some(active_vehicle_count)
                         );
                         assert!(vehicle_columns_end >= vehicles_end);
+                        let (last_frame, last_frame_end) =
+                            manager_data.decode_vehicle_manager_last_frame_prefix()?;
+                        assert_eq!(last_frame.records().len(), active_vehicle_count);
+                        assert!(last_frame_end >= vehicle_columns_end);
+                        let (vehicle_fields, vehicle_fields_end) =
+                            manager_data.decode_vehicle_manager_instance_fields_prefix()?;
+                        assert_eq!(vehicle_fields.records().len(), active_vehicle_count);
+                        assert!(vehicle_fields_end >= last_frame_end);
                         let (districts, districts_end) =
                             manager_data.decode_district_manager_flags_prefix()?;
                         assert_eq!(districts.format_version(), manager_data.format_version());

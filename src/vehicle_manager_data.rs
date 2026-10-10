@@ -15,6 +15,13 @@ const VEHICLE_GATE_INDEX_VERSION: u32 = 182;
 const VEHICLE_RACE_TEAM_VERSION: u32 = 121_008;
 const VEHICLE_RACE_COLUMNS_VERSION: u32 = 121_012;
 const VEHICLE_WATER_SOURCE_VERSION: u32 = 273;
+const VEHICLE_CITIZEN_UNIT_VERSION: u32 = 32;
+const VEHICLE_PATH_VERSION: u32 = 47;
+const VEHICLE_TRANSPORT_LINE_VERSION: u32 = 52;
+const VEHICLE_TRAILING_VEHICLE_VERSION: u32 = 58;
+const VEHICLE_BLOCK_COUNTER_VERSION: u32 = 99;
+const VEHICLE_CARGO_PARENT_VERSION: u32 = 104;
+const VEHICLE_CUSTOM_VALUE_VERSION: u32 = 113_012;
 
 /// The serialized flag and prefab-table prefix of `VehicleManager+Data`.
 ///
@@ -189,6 +196,7 @@ impl VehicleManagerDataPrefix {
         Ok((
             VehicleManagerSparseFieldsPrefix {
                 format_version: self.format_version,
+                active_vehicle_count: active_count,
                 gate_indices,
                 race_teams,
                 race_teammates,
@@ -203,11 +211,12 @@ impl VehicleManagerDataPrefix {
 
 /// Known sparse active-vehicle columns between the prefab table and vehicle records.
 ///
-/// The original consumed bytes are retained. This type does not interpret or
-/// rewrite the per-vehicle records that follow these columns.
+/// The original column bytes are retained. A separate method decodes the
+/// versioned last-frame vectors; later scalar and reference fields stay opaque.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VehicleManagerSparseFieldsPrefix {
     format_version: u32,
+    active_vehicle_count: usize,
     gate_indices: Option<Vec<u8>>,
     race_teams: Option<Vec<u16>>,
     race_teammates: Option<Vec<u8>>,
@@ -220,6 +229,11 @@ impl VehicleManagerSparseFieldsPrefix {
     /// Returns the inner DataSerializer version.
     pub fn format_version(&self) -> u32 {
         self.format_version
+    }
+
+    /// Returns the number of active vehicle records selected by `m_flags`.
+    pub fn active_vehicle_count(&self) -> usize {
+        self.active_vehicle_count
     }
 
     /// Returns gate indices from inner version 182.
@@ -251,6 +265,353 @@ impl VehicleManagerSparseFieldsPrefix {
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
+
+    /// Decodes the last-frame vectors and target positions for each active vehicle.
+    ///
+    /// Returns the consumed byte count before the remaining per-vehicle scalar
+    /// and reference fields. The decoded vectors retain their IEEE-754 bit
+    /// patterns, and the original bytes are preserved for exact rewriting.
+    pub fn decode_last_frame_records(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(VehicleLastFrameDataPrefix, usize), CrpError> {
+        let mut reader = Reader::new(bytes);
+        let mut records = Vec::with_capacity(self.active_vehicle_count);
+        for _ in 0..self.active_vehicle_count {
+            let velocity = if self.format_version >= 47 {
+                Some(read_vector::<3>(&mut reader)?)
+            } else {
+                None
+            };
+            let position = read_vector::<3>(&mut reader)?;
+            let rotation = if self.format_version >= 78 {
+                Some(read_vector::<4>(&mut reader)?)
+            } else {
+                None
+            };
+            let angle_velocity = if self.format_version >= 129 {
+                Some(read_vector::<3>(&mut reader)?)
+            } else {
+                None
+            };
+            let target_position0 = if self.format_version >= 68 {
+                VehicleTargetPosition0::Vector4(read_vector::<4>(&mut reader)?)
+            } else if self.format_version >= 47 {
+                VehicleTargetPosition0::Vector3(read_vector::<3>(&mut reader)?)
+            } else {
+                VehicleTargetPosition0::DerivedFromPosition
+            };
+            let target_positions1_to_3 = if self.format_version >= 90 {
+                Some([
+                    read_vector::<4>(&mut reader)?,
+                    read_vector::<4>(&mut reader)?,
+                    read_vector::<4>(&mut reader)?,
+                ])
+            } else {
+                None
+            };
+            records.push(VehicleLastFrameRecord {
+                velocity,
+                position,
+                rotation,
+                angle_velocity,
+                target_position0,
+                target_positions1_to_3,
+            });
+        }
+
+        let consumed = reader.offset();
+        Ok((
+            VehicleLastFrameDataPrefix {
+                format_version: self.format_version,
+                records,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+}
+
+/// The serialized representation of `m_targetPos0` for one vehicle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VehicleTargetPosition0 {
+    /// Before version 47, the game derives this value from the vehicle position.
+    DerivedFromPosition,
+    /// Versions 47–67 store three float components.
+    Vector3([u32; 3]),
+    /// Version 68 and newer store four float components.
+    Vector4([u32; 4]),
+}
+
+/// Last-frame vectors and target positions for one active vehicle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleLastFrameRecord {
+    velocity: Option<[u32; 3]>,
+    position: [u32; 3],
+    rotation: Option<[u32; 4]>,
+    angle_velocity: Option<[u32; 3]>,
+    target_position0: VehicleTargetPosition0,
+    target_positions1_to_3: Option<[[u32; 4]; 3]>,
+}
+
+impl VehicleLastFrameRecord {
+    /// Returns velocity component bit patterns from version 47.
+    pub fn velocity(&self) -> Option<[u32; 3]> {
+        self.velocity
+    }
+
+    /// Returns the position component bit patterns.
+    pub fn position(&self) -> [u32; 3] {
+        self.position
+    }
+
+    /// Returns rotation component bit patterns from version 78.
+    pub fn rotation(&self) -> Option<[u32; 4]> {
+        self.rotation
+    }
+
+    /// Returns angle-velocity component bit patterns from version 129.
+    pub fn angle_velocity(&self) -> Option<[u32; 3]> {
+        self.angle_velocity
+    }
+
+    /// Returns the versioned first target position.
+    pub fn target_position0(&self) -> VehicleTargetPosition0 {
+        self.target_position0
+    }
+
+    /// Returns serialized target positions 1–3 from version 90.
+    ///
+    /// Before version 90, the game copies target position 0 into these slots.
+    pub fn target_positions1_to_3(&self) -> Option<[[u32; 4]; 3]> {
+        self.target_positions1_to_3
+    }
+}
+
+/// Decoded last-frame records at the start of active vehicle data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleLastFrameDataPrefix {
+    format_version: u32,
+    records: Vec<VehicleLastFrameRecord>,
+    serialized_prefix: Vec<u8>,
+}
+
+impl VehicleLastFrameDataPrefix {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns one last-frame record per active vehicle, in flag order.
+    pub fn records(&self) -> &[VehicleLastFrameRecord] {
+        &self.records
+    }
+
+    /// Writes the original last-frame bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+
+    /// Decodes the remaining scalar and reference fields of each active vehicle.
+    ///
+    /// Returns the consumed byte count before parked-vehicle records or later
+    /// manager counters. Version-gated fields absent from old saves are exposed
+    /// as `None`; truncated records return an error.
+    pub fn decode_scalar_fields(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(VehicleInstanceFieldsPrefix, usize), CrpError> {
+        let mut reader = Reader::new(bytes);
+        let mut records = Vec::with_capacity(self.records.len());
+        for _ in &self.records {
+            let source_building = reader.read_u16_be()?;
+            let target_building = reader.read_u16_be()?;
+            let transport_line = if self.format_version >= VEHICLE_TRANSPORT_LINE_VERSION {
+                Some(reader.read_u16_be()?)
+            } else {
+                None
+            };
+            let transfer_size = reader.read_u16_be()?;
+            let transfer_type = reader.read_u8()?;
+            let wait_counter = reader.read_u8()?;
+            let block_counter = if self.format_version >= VEHICLE_BLOCK_COUNTER_VERSION {
+                Some(reader.read_u8()?)
+            } else {
+                None
+            };
+            let citizen_unit = if self.format_version >= VEHICLE_CITIZEN_UNIT_VERSION {
+                Some(reader.read_u24_be()?)
+            } else {
+                None
+            };
+            let (path_unit, path_position) = if self.format_version >= VEHICLE_PATH_VERSION {
+                (
+                    Some(reader.read_u16_be()?),
+                    Some([reader.read_u8()?, reader.read_u8()?]),
+                )
+            } else {
+                (None, None)
+            };
+            let trailing_vehicle = if self.format_version >= VEHICLE_TRAILING_VEHICLE_VERSION {
+                Some(reader.read_u16_be()?)
+            } else {
+                None
+            };
+            let cargo_parent = if self.format_version >= VEHICLE_CARGO_PARENT_VERSION {
+                Some(reader.read_u16_be()?)
+            } else {
+                None
+            };
+            let custom_value = if self.format_version >= VEHICLE_CUSTOM_VALUE_VERSION {
+                Some(reader.read_u16_be()?)
+            } else {
+                None
+            };
+            records.push(VehicleInstanceFields {
+                source_building,
+                target_building,
+                transport_line,
+                transfer_size,
+                transfer_type,
+                wait_counter,
+                block_counter,
+                citizen_unit,
+                path_unit,
+                path_position,
+                trailing_vehicle,
+                cargo_parent,
+                custom_value,
+            });
+        }
+
+        let consumed = reader.offset();
+        Ok((
+            VehicleInstanceFieldsPrefix {
+                format_version: self.format_version,
+                records,
+                serialized_prefix: bytes[..consumed].to_vec(),
+            },
+            consumed,
+        ))
+    }
+}
+
+/// Remaining scalar and reference values from one active vehicle record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleInstanceFields {
+    source_building: u16,
+    target_building: u16,
+    transport_line: Option<u16>,
+    transfer_size: u16,
+    transfer_type: u8,
+    wait_counter: u8,
+    block_counter: Option<u8>,
+    citizen_unit: Option<u32>,
+    path_unit: Option<u16>,
+    path_position: Option<[u8; 2]>,
+    trailing_vehicle: Option<u16>,
+    cargo_parent: Option<u16>,
+    custom_value: Option<u16>,
+}
+
+impl VehicleInstanceFields {
+    /// Returns the source-building index.
+    pub fn source_building(&self) -> u16 {
+        self.source_building
+    }
+
+    /// Returns the target-building index.
+    pub fn target_building(&self) -> u16 {
+        self.target_building
+    }
+
+    /// Returns the transport-line index from version 52.
+    pub fn transport_line(&self) -> Option<u16> {
+        self.transport_line
+    }
+
+    /// Returns the transfer size.
+    pub fn transfer_size(&self) -> u16 {
+        self.transfer_size
+    }
+
+    /// Returns the transfer type byte.
+    pub fn transfer_type(&self) -> u8 {
+        self.transfer_type
+    }
+
+    /// Returns the wait counter byte.
+    pub fn wait_counter(&self) -> u8 {
+        self.wait_counter
+    }
+
+    /// Returns the block counter from version 99.
+    pub fn block_counter(&self) -> Option<u8> {
+        self.block_counter
+    }
+
+    /// Returns the 24-bit citizen-unit reference from version 32.
+    pub fn citizen_unit(&self) -> Option<u32> {
+        self.citizen_unit
+    }
+
+    /// Returns the path-unit reference from version 47.
+    pub fn path_unit(&self) -> Option<u16> {
+        self.path_unit
+    }
+
+    /// Returns the two path-position bytes from version 47.
+    pub fn path_position(&self) -> Option<[u8; 2]> {
+        self.path_position
+    }
+
+    /// Returns the trailing-vehicle index from version 58.
+    pub fn trailing_vehicle(&self) -> Option<u16> {
+        self.trailing_vehicle
+    }
+
+    /// Returns the cargo-parent index from version 104.
+    pub fn cargo_parent(&self) -> Option<u16> {
+        self.cargo_parent
+    }
+
+    /// Returns the custom value from version 113012.
+    pub fn custom_value(&self) -> Option<u16> {
+        self.custom_value
+    }
+}
+
+/// Decoded remaining fields for the active VehicleManager records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleInstanceFieldsPrefix {
+    format_version: u32,
+    records: Vec<VehicleInstanceFields>,
+    serialized_prefix: Vec<u8>,
+}
+
+impl VehicleInstanceFieldsPrefix {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns one field record per active vehicle, in flag order.
+    pub fn records(&self) -> &[VehicleInstanceFields] {
+        &self.records
+    }
+
+    /// Writes the original scalar/reference bytes exactly.
+    pub fn encode(&self) -> Vec<u8> {
+        self.serialized_prefix.clone()
+    }
+}
+
+fn read_vector<const N: usize>(reader: &mut Reader<'_>) -> Result<[u32; N], CrpError> {
+    let mut values = [0_u32; N];
+    for value in &mut values {
+        *value = reader.read_u32_be()?;
+    }
+    Ok(values)
 }
 
 fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, CrpError> {
@@ -264,7 +625,10 @@ fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, Crp
 
 #[cfg(test)]
 mod tests {
-    use super::VehicleManagerDataPrefix;
+    use super::{
+        VehicleLastFrameDataPrefix, VehicleLastFrameRecord, VehicleManagerDataPrefix,
+        VehicleManagerSparseFieldsPrefix, VehicleTargetPosition0,
+    };
 
     fn append_zero_uint_array(bytes: &mut Vec<u8>, count: usize) {
         for _ in 0..count / 128 {
@@ -317,6 +681,72 @@ mod tests {
             prefab_names: None,
             serialized_prefix: Vec::new(),
         }
+    }
+
+    fn sparse_fields_with_count(
+        format_version: u32,
+        active_vehicle_count: usize,
+    ) -> VehicleManagerSparseFieldsPrefix {
+        VehicleManagerSparseFieldsPrefix {
+            format_version,
+            active_vehicle_count,
+            gate_indices: None,
+            race_teams: None,
+            race_teammates: None,
+            racer_indices: None,
+            water_sources: None,
+            serialized_prefix: Vec::new(),
+        }
+    }
+
+    fn last_frame_prefix_with_count(
+        format_version: u32,
+        record_count: usize,
+    ) -> VehicleLastFrameDataPrefix {
+        let empty_record = VehicleLastFrameRecord {
+            velocity: None,
+            position: [0; 3],
+            rotation: None,
+            angle_velocity: None,
+            target_position0: VehicleTargetPosition0::DerivedFromPosition,
+            target_positions1_to_3: None,
+        };
+        VehicleLastFrameDataPrefix {
+            format_version,
+            records: std::iter::repeat_n(empty_record, record_count).collect(),
+            serialized_prefix: Vec::new(),
+        }
+    }
+
+    fn words_as_bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_be_bytes()).collect()
+    }
+
+    fn scalar_record_for_version(version: u32) -> Vec<u8> {
+        let mut bytes = vec![0x01, 0x02, 0x03, 0x04]; // source and target buildings
+        if version >= 52 {
+            bytes.extend_from_slice(&[0x05, 0x06]); // transport line
+        }
+        bytes.extend_from_slice(&[0x07, 0x08, 0x09, 0x0a]); // transfer size, type, wait
+        if version >= 99 {
+            bytes.push(0x0b); // block counter
+        }
+        if version >= 32 {
+            bytes.extend_from_slice(&[0x0c, 0x0d, 0x0e]); // citizen unit
+        }
+        if version >= 47 {
+            bytes.extend_from_slice(&[0x0f, 0x10, 0x11, 0x12]); // path unit and positions
+        }
+        if version >= 58 {
+            bytes.extend_from_slice(&[0x13, 0x14]); // trailing vehicle
+        }
+        if version >= 104 {
+            bytes.extend_from_slice(&[0x15, 0x16]); // cargo parent
+        }
+        if version >= 113_012 {
+            bytes.extend_from_slice(&[0x17, 0x18]); // custom value
+        }
+        bytes
     }
 
     #[test]
@@ -487,5 +917,160 @@ mod tests {
                 .decode_sparse_columns(&truncated_race_teammate)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn last_frame_records_follow_version_gates_and_preserve_float_bits() {
+        for (version, word_count, has_velocity, has_rotation, has_angle, targets_1_to_3) in [
+            (46, 3, false, false, false, false),
+            (47, 9, true, false, false, false),
+            (67, 9, true, false, false, false),
+            (68, 10, true, false, false, false),
+            (77, 10, true, false, false, false),
+            (78, 14, true, true, false, false),
+            (89, 14, true, true, false, false),
+            (90, 26, true, true, false, true),
+            (128, 26, true, true, false, true),
+            (129, 29, true, true, true, true),
+        ] {
+            let fields = sparse_fields_with_count(version, 1);
+            let expected_words: Vec<u32> = (1..=word_count as u32).collect();
+            let bytes = words_as_bytes(&expected_words);
+            let (decoded, consumed) = fields
+                .decode_last_frame_records(&bytes)
+                .expect("versioned last-frame record is complete");
+            assert_eq!(consumed, bytes.len(), "version {version}");
+            assert_eq!(decoded.encode(), bytes, "version {version}");
+            assert_eq!(decoded.records().len(), 1, "version {version}");
+            let record = &decoded.records()[0];
+            assert_eq!(
+                record.velocity().is_some(),
+                has_velocity,
+                "version {version}"
+            );
+            assert_eq!(
+                record.rotation().is_some(),
+                has_rotation,
+                "version {version}"
+            );
+            assert_eq!(
+                record.angle_velocity().is_some(),
+                has_angle,
+                "version {version}"
+            );
+            assert_eq!(
+                record.target_positions1_to_3().is_some(),
+                targets_1_to_3,
+                "version {version}"
+            );
+            match (version, record.target_position0()) {
+                (..=46, VehicleTargetPosition0::DerivedFromPosition) => {}
+                (47..=67, VehicleTargetPosition0::Vector3(_)) => {}
+                (68.., VehicleTargetPosition0::Vector4(_)) => {}
+                _ => panic!("target position 0 does not match version {version}"),
+            }
+        }
+
+        let fields = sparse_fields_with_count(129, 2);
+        let words: Vec<u32> = (1..=58).collect();
+        let bytes = words_as_bytes(&words);
+        let (decoded, consumed) = fields
+            .decode_last_frame_records(&bytes)
+            .expect("two current last-frame records are complete");
+        assert_eq!(consumed, 2 * 29 * 4);
+        assert_eq!(decoded.records().len(), 2);
+        assert_eq!(decoded.records()[0].velocity(), Some([1, 2, 3]));
+        assert_eq!(decoded.records()[0].position(), [4, 5, 6]);
+        assert_eq!(decoded.records()[0].rotation(), Some([7, 8, 9, 10]));
+        assert_eq!(decoded.records()[0].angle_velocity(), Some([11, 12, 13]));
+        assert_eq!(
+            decoded.records()[0].target_position0(),
+            VehicleTargetPosition0::Vector4([14, 15, 16, 17])
+        );
+        assert_eq!(
+            decoded.records()[0].target_positions1_to_3(),
+            Some([[18, 19, 20, 21], [22, 23, 24, 25], [26, 27, 28, 29]])
+        );
+        assert_eq!(decoded.records()[1].velocity(), Some([30, 31, 32]));
+        assert_eq!(decoded.records()[1].position(), [33, 34, 35]);
+        assert_eq!(decoded.encode(), bytes);
+    }
+
+    #[test]
+    fn last_frame_records_reject_truncation_and_allow_no_active_vehicles() {
+        let fields = sparse_fields_with_count(129, 1);
+        assert!(fields.decode_last_frame_records(&[0; 115]).is_err());
+
+        let empty = sparse_fields_with_count(129, 0);
+        let (decoded, consumed) = empty.decode_last_frame_records(&[0xaa, 0xbb]).unwrap();
+        assert_eq!(decoded.records(), []);
+        assert_eq!(consumed, 0);
+        assert!(decoded.encode().is_empty());
+    }
+
+    #[test]
+    fn vehicle_scalar_fields_follow_version_gates_and_big_endian_order() {
+        for (version, byte_count) in [
+            (31, 8),
+            (32, 11),
+            (47, 15),
+            (52, 17),
+            (58, 19),
+            (99, 20),
+            (104, 22),
+            (113_012, 24),
+        ] {
+            let frames = last_frame_prefix_with_count(version, 1);
+            let bytes = scalar_record_for_version(version);
+            assert_eq!(bytes.len(), byte_count, "fixture size at version {version}");
+            let (decoded, consumed) = frames
+                .decode_scalar_fields(&bytes[..byte_count])
+                .expect("versioned scalar fields are complete");
+            assert_eq!(consumed, byte_count, "version {version}");
+            assert_eq!(decoded.encode(), bytes[..byte_count], "version {version}");
+            assert_eq!(decoded.records().len(), 1, "version {version}");
+            let record = &decoded.records()[0];
+            assert_eq!(record.source_building(), 0x0102);
+            assert_eq!(record.target_building(), 0x0304);
+            assert_eq!(record.transport_line().is_some(), version >= 52);
+            assert_eq!(record.transfer_size(), 0x0708);
+            assert_eq!(record.transfer_type(), 0x09);
+            assert_eq!(record.wait_counter(), 0x0a);
+            assert_eq!(record.block_counter().is_some(), version >= 99);
+            assert_eq!(record.citizen_unit().is_some(), version >= 32);
+            assert_eq!(record.path_unit().is_some(), version >= 47);
+            assert_eq!(record.trailing_vehicle().is_some(), version >= 58);
+            assert_eq!(record.cargo_parent().is_some(), version >= 104);
+            assert_eq!(record.custom_value().is_some(), version >= 113_012);
+        }
+
+        let frames = last_frame_prefix_with_count(113_012, 2);
+        let mut bytes = scalar_record_for_version(113_012);
+        let mut second_record = scalar_record_for_version(113_012);
+        second_record[..2].copy_from_slice(&[0x21, 0x22]);
+        bytes.extend_from_slice(&second_record);
+        let (decoded, consumed) = frames
+            .decode_scalar_fields(&bytes)
+            .expect("two current scalar records are complete");
+        assert_eq!(consumed, 48);
+        assert_eq!(decoded.records().len(), 2);
+        assert_eq!(decoded.records()[0].citizen_unit(), Some(0x0c0d0e));
+        assert_eq!(decoded.records()[0].path_position(), Some([0x11, 0x12]));
+        assert_eq!(decoded.records()[0].custom_value(), Some(0x1718));
+        assert_eq!(decoded.records()[1].source_building(), 0x2122);
+        assert_eq!(decoded.encode(), bytes);
+    }
+
+    #[test]
+    fn vehicle_scalar_fields_reject_truncation_and_handle_empty_records() {
+        let one_current = last_frame_prefix_with_count(113_012, 1);
+        let record = scalar_record_for_version(113_012);
+        assert!(one_current.decode_scalar_fields(&record[..23]).is_err());
+
+        let empty = last_frame_prefix_with_count(113_012, 0);
+        let (decoded, consumed) = empty.decode_scalar_fields(&[0xaa, 0xbb]).unwrap();
+        assert_eq!(decoded.records(), []);
+        assert_eq!(consumed, 0);
+        assert_eq!(decoded.encode(), Vec::<u8>::new());
     }
 }
