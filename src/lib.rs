@@ -36,6 +36,7 @@ mod transfer_manager_data;
 mod tree_manager_data;
 mod unlock_manager_data;
 mod vehicle_manager_data;
+mod water_manager_data;
 mod water_simulation_data;
 mod weather_manager_data;
 mod zone_manager_data;
@@ -135,6 +136,7 @@ pub use vehicle_manager_data::{
     VehicleManagerSparseFieldsPrefix, VehicleManagerTailDataPrefix, VehicleParkedInstanceRecord,
     VehicleParkedRecordsPrefix, VehicleTargetPosition0,
 };
+pub use water_manager_data::{WaterManagerData, WaterPulseGroup, WaterPulseUnit};
 pub use water_simulation_data::{
     WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
 };

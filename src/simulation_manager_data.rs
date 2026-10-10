@@ -54,6 +54,7 @@ use crate::statistics_manager_data::{
 };
 use crate::transfer_manager_data::{TransferManagerData, TransferManagerEditor};
 use crate::unlock_manager_data::UnlockManagerReferences;
+use crate::water_manager_data::WaterManagerData;
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
     BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlagsPrefix,
@@ -2276,6 +2277,19 @@ impl SimulationManagerData {
         ElectricityManagerData::decode(self.format_version, bytes)
     }
 
+    /// Decodes WaterManager's versioned water, sewage, and heating grids,
+    /// pulse records, node arrays, and unresolved guide headers before
+    /// ZoneManager. The complete bounded body remains available for exact
+    /// unchanged writing.
+    pub fn decode_water_manager_data(&self) -> Result<WaterManagerData, CrpError> {
+        let field_range = self.water_manager_field_range()?;
+        let bytes = self
+            .serialized_object_graph
+            .get(field_range)
+            .ok_or_else(|| invalid(0, "WaterManager body range exceeds manager graph"))?;
+        WaterManagerData::decode(self.format_version, bytes)
+    }
+
     /// Replaces TransferManager's amount values, reason-count distribution,
     /// and existing offer fields. The edited body may change length; the
     /// following manager bytes are retained and the new boundary is checked.
@@ -2386,6 +2400,16 @@ impl SimulationManagerData {
                 body_start,
                 "ElectricityManager body range is reversed",
             ));
+        }
+        Ok(body_start..next_tag_start)
+    }
+
+    fn water_manager_field_range(&self) -> Result<Range<usize>, CrpError> {
+        expect_manager_type(self.manager_objects.as_deref(), 12, "WaterManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 13, "ZoneManager+Data")?;
+        let (body_start, next_tag_start) = self.manager_body_boundary(12)?;
+        if body_start > next_tag_start {
+            return Err(invalid(body_start, "WaterManager body range is reversed"));
         }
         Ok(body_start..next_tag_start)
     }
@@ -13026,6 +13050,40 @@ mod manager_boundary_tests {
         manager
     }
 
+    fn water_manager_with_next(next_type: &str, next_tag_name: &str) -> SimulationManagerData {
+        const FORMAT_VERSION: u32 = 265;
+        let mut graph = profiler_tag("WaterManager");
+        append_zero_encoded_long_array(&mut graph, 65_536); // Water conductivity.
+        append_zero_encoded_long_array(&mut graph, 65_536); // Heating conductivity.
+        append_zero_encoded_long_array(&mut graph, 65_536); // Closest water segment.
+        append_zero_encoded_long_array(&mut graph, 65_536); // Closest heating segment.
+        graph.extend_from_slice(&[0; 12]); // Three empty pulse group/unit pairs.
+        for _ in 0..9 {
+            append_zero_encoded_long_array(&mut graph, 32_768);
+        }
+        append_zero_encoded_long_array(&mut graph, 32_768); // Node pollution.
+        graph.extend_from_slice(&[0; 8]); // Processed and conductive-cell counters.
+        graph.push(1); // canContinue.
+        graph.extend_from_slice(&[0xff, 0xff]); // Two null guide references.
+        graph.extend_from_slice(&[0x12, 0x34]); // Closing profiler reference.
+        graph.extend(profiler_tag(next_tag_name));
+        graph.extend_from_slice(&[0xaa, 0xbb]);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = FORMAT_VERSION;
+        let mut references = vec![None; 14];
+        references[12] = Some(ManagerObjectReference {
+            object_id: 12,
+            type_name: "WaterManager+Data, Assembly-CSharp".to_owned(),
+        });
+        references[13] = Some(ManagerObjectReference {
+            object_id: 13,
+            type_name: next_type.to_owned(),
+        });
+        manager.manager_objects = Some(references);
+        manager
+    }
+
     #[test]
     fn info_manager_mask_decodes_and_replaces_at_versioned_boundary() {
         for (version, original, replacement) in [
@@ -13312,6 +13370,38 @@ mod manager_boundary_tests {
         let wrong_tag =
             electricity_manager_with_next("WaterManager+Data, Assembly-CSharp", "ZoneManager");
         assert!(wrong_tag.decode_electricity_manager_data().is_err());
+    }
+
+    #[test]
+    fn water_manager_decoder_checks_adjacent_boundary_and_preserves_body() {
+        let manager = water_manager_with_next("ZoneManager+Data, Assembly-CSharp", "ZoneManager");
+        let tag = profiler_tag("WaterManager");
+        let body_start = tag.len();
+        let next_tag = profiler_tag("ZoneManager");
+        let next_start = manager
+            .serialized_object_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        let data = manager.decode_water_manager_data().unwrap();
+        assert_eq!(data.format_version(), 265);
+        assert_eq!(data.conductivity().len(), 65_536);
+        assert!(data.conductive_cells().is_empty());
+        assert_eq!(data.heating_cells().len(), 0);
+        assert_eq!(data.heating_pulse_groups().unwrap().len(), 0);
+        assert_eq!(data.water_node_pressure().len(), 32_768);
+        assert_eq!(data.guide_references().len(), 2);
+        assert_eq!(
+            data.encode_unchanged(),
+            manager.serialized_object_graph[body_start..next_start]
+        );
+
+        let wrong_type =
+            water_manager_with_next("DistrictManager+Data, Assembly-CSharp", "ZoneManager");
+        assert!(wrong_type.decode_water_manager_data().is_err());
+        let wrong_tag =
+            water_manager_with_next("ZoneManager+Data, Assembly-CSharp", "DistrictManager");
+        assert!(wrong_tag.decode_water_manager_data().is_err());
     }
 
     #[test]
