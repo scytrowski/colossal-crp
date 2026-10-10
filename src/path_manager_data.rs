@@ -1,6 +1,7 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::read_encoded_byte_array;
+use std::ops::Range;
 
 const PATH_UNIT_COUNT: usize = 262_144;
 const MAX_POSITIONS: usize = 12;
@@ -45,13 +46,27 @@ pub struct PathUnit {
 /// The fifth queued manager body, excluding loading-profiler tags.
 ///
 /// Its original bytes are retained for exact writing. Semantic path edits are
-/// not exposed because they require consistent references in other managers.
+/// Speed edits are available only in versions that serialize the speed byte;
+/// they preserve all other record fields and the original encoded flag array.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathManagerData {
     format_version: u32,
     simulation_flags: Vec<u8>,
     active_units: Vec<PathUnit>,
+    speed_ranges: Option<Vec<Range<usize>>>,
     serialized_body: Vec<u8>,
+}
+
+/// In-place editor for serialized speeds of existing active path units.
+///
+/// It changes only the existing one-byte speed fields. Path flags, path-unit
+/// links, positions, counts, and all other original bytes remain unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathManagerEditor {
+    format_version: u32,
+    speeds: Option<Vec<u8>>,
+    speed_ranges: Vec<Range<usize>>,
+    original_body: Vec<u8>,
 }
 
 impl PathManagerData {
@@ -71,6 +86,9 @@ impl PathManagerData {
         let mut reader = Reader::new(bytes);
         let simulation_flags = read_encoded_byte_array(&mut reader, PATH_UNIT_COUNT - 1)?;
         let mut active_units = Vec::new();
+        let has_serialized_speed =
+            (110_026..111_000).contains(&format_version) || format_version >= 111_012;
+        let mut speed_ranges = has_serialized_speed.then(Vec::new);
         for (offset, &flags) in simulation_flags.iter().enumerate() {
             if flags == 0 {
                 continue;
@@ -98,9 +116,13 @@ impl PathManagerData {
                 | u32::from(next_bytes[2]);
             let build_index = reader.read_u32_be()?;
             let length = reader.read_f32_be()?;
-            let speed = if (110_026..111_000).contains(&format_version) || format_version >= 111_012
-            {
-                reader.read_u8()?
+            let speed = if has_serialized_speed {
+                let start = reader.offset();
+                let speed = reader.read_u8()?;
+                if let Some(ranges) = &mut speed_ranges {
+                    ranges.push(start..reader.offset());
+                }
+                speed
             } else {
                 100
             };
@@ -131,6 +153,7 @@ impl PathManagerData {
                 format_version,
                 simulation_flags,
                 active_units,
+                speed_ranges,
                 serialized_body: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -155,6 +178,75 @@ impl PathManagerData {
     /// Writes the original body byte for byte, including encoded-array runs.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_body.clone()
+    }
+
+    /// Consumes the decoded body to expose its serialized speed bytes.
+    ///
+    /// Returns `None` when this inner version omits the speed field. For
+    /// versions with the field, the slice is in active path-unit order and
+    /// can be edited without changing body length or any other path data.
+    pub fn into_editor(self) -> PathManagerEditor {
+        PathManagerEditor {
+            format_version: self.format_version,
+            speeds: self
+                .speed_ranges
+                .as_ref()
+                .map(|_| self.active_units.iter().map(|unit| unit.speed).collect()),
+            speed_ranges: self.speed_ranges.unwrap_or_default(),
+            original_body: self.serialized_body,
+        }
+    }
+}
+
+impl PathManagerEditor {
+    /// Returns the inner DataSerializer version associated with this body.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns mutable speed bytes in active path-unit order.
+    ///
+    /// Returns `None` for versions that omit serialized speed. A present but
+    /// empty slice means the version stores speed and this body has no active
+    /// path units.
+    pub fn speeds_mut(&mut self) -> Option<&mut [u8]> {
+        self.speeds.as_deref_mut()
+    }
+
+    /// Encodes the original body with only edited speed bytes replaced.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let mut output = self.original_body.clone();
+        match &self.speeds {
+            Some(speeds) if speeds.len() != self.speed_ranges.len() => {
+                return Err(invalid(
+                    0,
+                    "edited speed count does not match active path-unit records",
+                ));
+            }
+            Some(speeds) => {
+                for (speed, range) in speeds.iter().zip(&self.speed_ranges) {
+                    if range.len() != 1 || output.get(range.clone()).is_none() {
+                        return Err(invalid(
+                            range.start,
+                            "serialized PathUnit speed range is invalid",
+                        ));
+                    }
+                    output[range.start] = *speed;
+                }
+            }
+            None if !self.speed_ranges.is_empty() => {
+                return Err(invalid(
+                    0,
+                    "speed ranges exist for a version without serialized speed",
+                ));
+            }
+            None => {}
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original_body
     }
 }
 

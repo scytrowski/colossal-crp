@@ -5,7 +5,6 @@ use crate::CrpError;
 use crate::GameAreaManagerData;
 use crate::InstanceManagerData;
 use crate::InstanceManagerEditor;
-use crate::PathManagerData;
 use crate::PropManagerDataPrefix;
 use crate::PropManagerEditor;
 use crate::TerrainManagerData;
@@ -71,6 +70,7 @@ use crate::{
     NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsPrefix,
     NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
+use crate::{PathManagerData, PathManagerEditor};
 use crate::{WeatherManagerData, WeatherManagerEditor};
 
 const ROOT_TYPE: &str = "SimulationManager+Data, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null";
@@ -2820,6 +2820,90 @@ impl SimulationManagerData {
             expect_profile_tag(&mut reader, &mut strings, "NetManager")?;
         }
         Ok((data, end))
+    }
+
+    /// Decodes PathManager into an editor for existing serialized speed bytes.
+    ///
+    /// The editor exposes no speed slice for versions that omit the field.
+    pub fn decode_path_manager_editor(&self) -> Result<PathManagerEditor, CrpError> {
+        let (path, _) = self.decode_path_prefix()?;
+        Ok(path.into_editor())
+    }
+
+    /// Replaces only existing PathManager speed bytes in the bounded manager body.
+    ///
+    /// The editor must match this stream's inner version and original PathManager
+    /// body. The body length, flags, path-unit links, and following NetManager
+    /// boundary are checked before and after the fixed-width replacement.
+    pub fn replace_path_manager_data(
+        &mut self,
+        edited: &PathManagerEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                4,
+                "edited PathManager version does not match this stream",
+            ));
+        }
+        let (current, _) = self.decode_path_prefix()?;
+        if current.encode().as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                4,
+                "PathManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != edited.original_body_bytes().len() {
+            return Err(invalid(
+                4,
+                "PathManager speed edits must preserve the body length",
+            ));
+        }
+        let (body_start, next_tag_start) = self.manager_body_boundary(4)?;
+        let body_end = body_start
+            .checked_add(replacement.len())
+            .ok_or(CrpError::ArithmeticOverflow("PathManager replacement end"))?;
+        let bounded_end = body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES).ok_or(
+            CrpError::ArithmeticOverflow("PathManager closing profiler reference end"),
+        )?;
+        if bounded_end != next_tag_start {
+            return Err(invalid(
+                body_end,
+                "PathManager body does not end at the NetManager boundary",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph
+            .get_mut(body_start..body_end)
+            .ok_or_else(|| invalid(body_start, "PathManager replacement range is invalid"))?
+            .copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self.decode_path_prefix().and_then(|(decoded, actual_end)| {
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten PathManager body does not match the editor",
+                ));
+            }
+            let expected_end = body_end
+                .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+                .ok_or(CrpError::ArithmeticOverflow("PathManager updated boundary"))?;
+            if actual_end != expected_end {
+                return Err(invalid(
+                    actual_end,
+                    "rewritten PathManager boundary does not match its encoded length",
+                ));
+            }
+            Ok(())
+        });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten PathManager body failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes NetManager's lane flags and active next-lane links after the
@@ -10288,8 +10372,8 @@ mod manager_boundary_tests {
         DistrictParkIndustryTradeData,
     };
     use crate::encoded_array::{
-        EncodedLongArrayReader, write_encoded_bool_array, write_encoded_uint_array,
-        write_encoded_ushort_array,
+        EncodedLongArrayReader, write_encoded_bool_array, write_encoded_byte_array,
+        write_encoded_uint_array, write_encoded_ushort_array,
     };
     use crate::net_manager_data::NetObjectHeader;
     use crate::{
@@ -10526,6 +10610,102 @@ mod manager_boundary_tests {
         let mut bytes = vec![0xfe];
         write_unique_string(&mut bytes, name).expect("short test tag is encodable");
         bytes
+    }
+
+    fn synthetic_path_manager(path_body: &[u8]) -> (SimulationManagerData, usize) {
+        let mut graph = profiler_tag("GameAreaManager");
+        graph.extend_from_slice(&[0, 0]);
+        write_encoded_byte_array(&mut graph, &[0; 25]);
+        graph.push(0xff);
+        graph.extend_from_slice(&[0; 16]); // Buildable-area bounds from version 199.
+        graph.extend_from_slice(&[0, 1]);
+
+        graph.extend(profiler_tag("TerrainManager"));
+        write_encoded_ushort_array(&mut graph, &vec![0; 1_168_561]);
+        graph.extend_from_slice(&[0; 4]); // Dirt buffer from version 243.
+        graph.extend_from_slice(&[0xff; 3]); // Null references from version 244.
+        graph.extend_from_slice(&[0, 2]);
+
+        graph.extend(profiler_tag("WaterSimulation"));
+        write_encoded_ushort_array(&mut graph, &vec![0; 1081 * 1081]);
+        graph.extend_from_slice(&[0, 0]); // No sources.
+        graph.extend_from_slice(&[0, 0]); // No waves from inner version 259.
+        graph.extend_from_slice(&[0; 10]); // Sea level, rates, and frame index.
+        graph.extend_from_slice(&[0, 3]);
+
+        graph.extend(profiler_tag("InstanceManager"));
+        graph.extend_from_slice(&[0; 8]); // Empty names and groups from version 258.
+        graph.extend_from_slice(&[0, 4]);
+
+        graph.extend(profiler_tag("PathManager"));
+        let path_body_start = graph.len();
+        graph.extend_from_slice(path_body);
+        graph.extend_from_slice(&[0, 5]);
+        graph.extend(profiler_tag("NetManager"));
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 112_004;
+        manager.manager_objects = Some(
+            [
+                "GameAreaManager+Data",
+                "TerrainManager+Data",
+                "WaterSimulation+Data",
+                "InstanceManager+Data",
+                "PathManager+Data",
+                "NetManager+Data",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                Some(ManagerObjectReference {
+                    object_id: index as u32 + 1,
+                    type_name: format!("{name}, Assembly-CSharp"),
+                })
+            })
+            .collect(),
+        );
+        (manager, path_body_start)
+    }
+
+    #[test]
+    fn path_manager_editor_replaces_only_speed_and_rejects_stale_source()
+    -> Result<(), crate::CrpError> {
+        let mut flags = vec![0; 262_143];
+        flags[0] = 1;
+        let mut path_body = Vec::new();
+        write_encoded_byte_array(&mut path_body, &flags);
+        path_body.extend_from_slice(&[
+            2, 3, 0, 4, 0, // Flags, vehicle type, and zero positions.
+            0, 0, 5, // Next path-unit ID.
+            0, 0, 0, 6, // Build index.
+            0x3f, 0xc0, 0, 0,  // Length 1.5.
+            77, // Serialized speed.
+        ]);
+        let path_body_len = path_body.len();
+        let (mut manager, path_body_start) = synthetic_path_manager(&path_body);
+        let original_graph = manager.serialized_object_graph.clone();
+        let mut editor = manager.decode_path_manager_editor()?;
+        assert!(editor.speeds_mut().is_some_and(|speeds| speeds == [77]));
+        editor.speeds_mut().expect("version stores speed")[0] = 42;
+
+        manager.replace_path_manager_data(&editor)?;
+        assert_eq!(manager.serialized_object_graph.len(), original_graph.len());
+        let changed_offsets = original_graph
+            .iter()
+            .zip(&manager.serialized_object_graph)
+            .enumerate()
+            .filter_map(|(offset, (before, after))| (before != after).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(changed_offsets, [path_body_start + path_body_len - 1]);
+        assert_eq!(
+            manager.serialized_object_graph[path_body_start + path_body_len - 1],
+            42
+        );
+
+        let updated_graph = manager.serialized_object_graph.clone();
+        assert!(manager.replace_path_manager_data(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph, updated_graph);
+        Ok(())
     }
 
     fn info_manager_with_next(

@@ -88,7 +88,7 @@ pub use net_manager_data::{
     NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix,
     NetTreePrefabPrefix,
 };
-pub use path_manager_data::{PathManagerData, PathPosition, PathUnit};
+pub use path_manager_data::{PathManagerData, PathManagerEditor, PathPosition, PathUnit};
 pub use prop_manager_data::{PropManagerDataPrefix, PropManagerEditor};
 pub use simulation_manager_data::{
     EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
@@ -3360,6 +3360,12 @@ mod tests {
         assert!(path.simulation_flags().iter().all(|flag| *flag == 0));
         assert!(path.active_units().is_empty());
         assert_eq!(path.encode(), fixture);
+        let mut empty_editor = path.clone().into_editor();
+        assert!(
+            empty_editor
+                .speeds_mut()
+                .is_some_and(|speeds| speeds.is_empty())
+        );
 
         let mut body = vec![2, 1, 0, 0];
         body.extend(std::iter::repeat_n(0xff, 2047));
@@ -3414,6 +3420,20 @@ mod tests {
             assert_eq!(decoded.active_units()[0].vehicle_types, expected_vehicle);
             assert_eq!(decoded.active_units()[0].speed, expected_speed);
             assert_eq!(decoded.encode(), bytes);
+            let mut editor = decoded.into_editor();
+            assert_eq!(
+                editor.speeds_mut().map(|speeds| speeds.to_vec()),
+                speed_byte.map(|_| vec![expected_speed]),
+                "version {version}"
+            );
+            if let Some(speeds) = editor.speeds_mut() {
+                speeds[0] = 88;
+            }
+            let mut expected = bytes;
+            if speed_byte.is_some() {
+                *expected.last_mut().expect("speed byte is present") = 88;
+            }
+            assert_eq!(editor.encode()?, expected, "version {version}");
         }
         let mut too_many_positions = body.clone();
         too_many_positions[2058] = 13;
