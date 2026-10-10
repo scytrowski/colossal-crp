@@ -3,7 +3,8 @@ use crate::data_serializer::Reader;
 use crate::encoded_array::{
     read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
     read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
-    write_encoded_uint_array, write_encoded_ulong_array, write_encoded_ushort_array,
+    write_encoded_int_array, write_encoded_uint_array, write_encoded_ulong_array,
+    write_encoded_ushort_array,
 };
 
 const LANE_COUNT: usize = 262_144;
@@ -275,7 +276,20 @@ pub struct NetSegmentTrafficLight {
 pub struct NetSegmentTrafficLightsPrefix {
     format_version: u32,
     states: Vec<NetSegmentTrafficLight>,
+    source_segment_flags: Vec<u8>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for paired traffic-light values belonging to active segments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentTrafficLightsEditor {
+    format_version: u32,
+    state0: Vec<i32>,
+    state1: Vec<i32>,
+    original_state0: Vec<i32>,
+    original_state1: Vec<i32>,
+    original_segment_flags: Vec<u8>,
+    original_prefix: Vec<u8>,
 }
 
 /// Environmental byte fields for one segment with nonzero primary flags.
@@ -1444,6 +1458,7 @@ impl NetSegmentTrafficLightsPrefix {
             Self {
                 format_version,
                 states,
+                source_segment_flags: segment_flags.encode(),
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -1463,6 +1478,116 @@ impl NetSegmentTrafficLightsPrefix {
     /// Writes the original encoded state array exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit active segments' paired state values.
+    pub fn into_editor(self) -> NetSegmentTrafficLightsEditor {
+        let state0 = self
+            .states
+            .iter()
+            .map(|state| state.state0)
+            .collect::<Vec<_>>();
+        let state1 = self
+            .states
+            .iter()
+            .map(|state| state.state1)
+            .collect::<Vec<_>>();
+        NetSegmentTrafficLightsEditor {
+            format_version: self.format_version,
+            original_state0: state0.clone(),
+            original_state1: state1.clone(),
+            state0,
+            state1,
+            original_segment_flags: self.source_segment_flags,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetSegmentTrafficLightsEditor {
+    /// Returns the inner DataSerializer version associated with this prefix.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns first traffic-light values in active-segment order.
+    pub fn state0_mut(&mut self) -> &mut [i32] {
+        &mut self.state0
+    }
+
+    /// Returns second traffic-light values in active-segment order.
+    pub fn state1_mut(&mut self) -> &mut [i32] {
+        &mut self.state1
+    }
+
+    /// Encodes paired state values using the version-specific array type.
+    ///
+    /// Unchanged values preserve their original bytes. Versions before 115017
+    /// store bytes and reject edited values outside 0–255; later versions use
+    /// signed 32-bit values.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.state0.len() != self.original_state0.len()
+            || self.state1.len() != self.original_state1.len()
+            || self.state0.len() != self.state1.len()
+        {
+            return Err(invalid(
+                0,
+                "edited traffic-light state counts do not match the source",
+            ));
+        }
+        if self.state0 == self.original_state0 && self.state1 == self.original_state1 {
+            return Ok(self.original_prefix.clone());
+        }
+
+        if self.format_version >= INT_TRAFFIC_LIGHT_VERSION {
+            let value_count =
+                self.state0
+                    .len()
+                    .checked_mul(2)
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "NetManager traffic-light state count",
+                    ))?;
+            let mut interleaved = Vec::with_capacity(value_count);
+            for (&state0, &state1) in self.state0.iter().zip(&self.state1) {
+                interleaved.push(state0);
+                interleaved.push(state1);
+            }
+            let mut output = Vec::new();
+            write_encoded_int_array(&mut output, &interleaved);
+            return Ok(output);
+        }
+
+        let value_count = self
+            .state0
+            .len()
+            .checked_mul(2)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "NetManager traffic-light state count",
+            ))?;
+        let mut interleaved = Vec::with_capacity(value_count);
+        for (&state0, &state1) in self.state0.iter().zip(&self.state1) {
+            interleaved.push(
+                u8::try_from(state0).map_err(|_| {
+                    invalid(0, "byte traffic-light state must be in the range 0–255")
+                })?,
+            );
+            interleaved.push(
+                u8::try_from(state1).map_err(|_| {
+                    invalid(0, "byte traffic-light state must be in the range 0–255")
+                })?,
+            );
+        }
+        let mut output = Vec::new();
+        write_encoded_byte_array(&mut output, &interleaved);
+        Ok(output)
+    }
+
+    pub(crate) fn original_segment_flags(&self) -> &[u8] {
+        &self.original_segment_flags
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 

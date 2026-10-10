@@ -42,7 +42,8 @@ use crate::info_manager_data::InfoManagerData;
 use crate::message_manager_data::{MessageManagerData, MessageManagerDataEditor};
 use crate::net_manager_data::{
     NetLaneEditor, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader,
-    NetSegmentFlagsEditor, NetSegmentProblemsEditor, read_net_object_header,
+    NetSegmentFlagsEditor, NetSegmentProblemsEditor, NetSegmentTrafficLightsEditor,
+    read_net_object_header,
 };
 use crate::statistics_manager_data::{
     StatisticArrayReferences, StatisticInt32Editor, StatisticInt64Editor, StatisticsManagerData,
@@ -3305,17 +3306,121 @@ impl SimulationManagerData {
         &self,
         save_app_version: Option<u32>,
     ) -> Result<(NetSegmentTrafficLightsPrefix, usize), CrpError> {
-        let (_, problems_end) = self.decode_net_segment_problems_prefix(save_app_version)?;
-        let (segment_flags, _) = self.decode_net_segment_flags_prefix(save_app_version)?;
+        let (_, data, _, end) =
+            self.decode_net_segment_traffic_lights_with_range(save_app_version)?;
+        Ok((data, end))
+    }
+
+    fn decode_net_segment_traffic_lights_with_range(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<
+        (
+            NetSegmentFlagsPrefix,
+            NetSegmentTrafficLightsPrefix,
+            usize,
+            usize,
+        ),
+        CrpError,
+    > {
+        let (segment_flags, _, _, problems_end) =
+            self.decode_net_segment_problems_with_range(save_app_version)?;
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(problems_end)?;
+        let body_start = reader.offset();
         let (data, body_length) = NetSegmentTrafficLightsPrefix::decode_prefix(
             self.format_version,
             &segment_flags,
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        Ok((segment_flags, data, body_start, reader.offset()))
+    }
+
+    /// Decodes NetManager's active-segment traffic-light arrays into an editor.
+    pub fn decode_net_segment_traffic_lights_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetSegmentTrafficLightsEditor, CrpError> {
+        let (_, lights, _, _) =
+            self.decode_net_segment_traffic_lights_with_range(save_app_version)?;
+        Ok(lights.into_editor())
+    }
+
+    /// Replaces NetManager's active-segment traffic-light values.
+    ///
+    /// The editor must match this stream's inner version, source segment flags,
+    /// and original state bytes. Changed values may resize the section and
+    /// shift coverage and later fields while preserving their bytes.
+    pub fn replace_net_segment_traffic_lights(
+        &mut self,
+        edited: &NetSegmentTrafficLightsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager traffic-light version does not match this stream",
+            ));
+        }
+        let (current_flags, current, body_start, body_end) =
+            self.decode_net_segment_traffic_lights_with_range(save_app_version)?;
+        if current_flags.encode().as_slice() != edited.original_segment_flags() {
+            return Err(invalid(
+                body_start,
+                "NetManager segment flags do not match the traffic-light editor's source",
+            ));
+        }
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager traffic-light bytes do not match the editor's source prefix",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager traffic-light prefix range is inconsistent",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_net_segment_traffic_lights_with_range(save_app_version)
+            .and_then(|(decoded_flags, decoded, actual_start, actual_end)| {
+                if decoded_flags.encode() != current_flags.encode() {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager traffic-light states changed their source flags",
+                    ));
+                }
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager traffic-light states do not match the editor",
+                    ));
+                }
+                let expected_end = body_start
+                    .checked_add(replacement.len())
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager traffic-light end"))?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager traffic-light states have an unexpected boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager traffic-light states failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes sparse segment fire coverage and wetness after traffic lights.
@@ -11035,7 +11140,7 @@ mod manager_boundary_tests {
         net_body.push(0x40); // One close delta resets the delta to zero.
         net_body.extend_from_slice(&(-0x1234_i32).to_be_bytes());
         net_body.push(0x9b); // Repeat that value for the remaining 28 active segments.
-        write_encoded_byte_array(&mut net_body, &[34, 35].repeat(30));
+        net_body.extend_from_slice(&[1, 34, 34, 0xb9]); // Two literals, then 58 zero-delta repeats.
         write_encoded_byte_array(&mut net_body, &[31; 30]);
         write_encoded_byte_array(&mut net_body, &[42; 30]);
         let opaque_tail = [0xaa, 0xbb, 0xcc, 0xdd];
@@ -11109,13 +11214,47 @@ mod manager_boundary_tests {
         assert_eq!(lights.states().len(), 30);
         assert_eq!(
             (lights.states()[0].state0, lights.states()[0].state1),
-            (34, 35)
+            (34, 34)
+        );
+        assert_eq!(
+            lights
+                .states()
+                .iter()
+                .filter(|state| state.state0 != 34 || state.state1 != 34)
+                .count(),
+            0
+        );
+        assert_eq!(lights.encode().len(), 4);
+        let original_coverage_tail = manager.serialized_object_graph[lights_end..].to_vec();
+        let mut traffic_editor = lights.into_editor();
+        traffic_editor.state0_mut()[0] = 35;
+        let replacement_traffic_len = traffic_editor.encode()?.len();
+        assert!(replacement_traffic_len > 4);
+        manager.replace_net_segment_traffic_lights(&traffic_editor, Some(0))?;
+        let (edited_lights, edited_lights_end) =
+            manager.decode_net_segment_traffic_lights_prefix(Some(0))?;
+        assert_eq!(
+            (
+                edited_lights.states()[0].state0,
+                edited_lights.states()[0].state1
+            ),
+            (35, 34)
+        );
+        assert!(
+            edited_lights.states()[1..]
+                .iter()
+                .all(|state| state.state0 == 34 && state.state1 == 34)
+        );
+        assert!(edited_lights_end > lights_end);
+        assert_eq!(
+            &manager.serialized_object_graph[edited_lights_end..],
+            original_coverage_tail
         );
         let (coverage, coverage_end) = manager.decode_net_segment_coverage_prefix(Some(0))?;
         assert_eq!(coverage.coverage().len(), 30);
         assert_eq!(coverage.coverage()[0].fire_coverage, 31);
         assert_eq!(coverage.coverage()[0].wetness, 42);
-        assert!(edited_problems_end < lights_end && lights_end < coverage_end);
+        assert!(edited_problems_end < edited_lights_end && edited_lights_end < coverage_end);
 
         let graph_after_problem_edit = manager.serialized_object_graph.clone();
         assert!(
@@ -11124,6 +11263,14 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph, graph_after_problem_edit);
+
+        let graph_after_traffic_edit = manager.serialized_object_graph.clone();
+        assert!(
+            manager
+                .replace_net_segment_traffic_lights(&traffic_editor, Some(0))
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph, graph_after_traffic_edit);
 
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_net_segment_flags(&editor, Some(0)).is_err());

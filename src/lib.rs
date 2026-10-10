@@ -86,8 +86,8 @@ pub use net_manager_data::{
     NetSegmentCoverage, NetSegmentCoveragePrefix, NetSegmentEnvironment,
     NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsEditor, NetSegmentFlagsPrefix,
     NetSegmentProblem, NetSegmentProblemsEditor, NetSegmentProblemsPrefix, NetSegmentRecord,
-    NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix,
-    NetTreePrefabPrefix,
+    NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsEditor,
+    NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathManagerEditor, PathPosition, PathUnit};
 pub use prop_manager_data::{PropManagerDataPrefix, PropManagerEditor};
@@ -1866,6 +1866,12 @@ mod tests {
             }]
         );
         assert_eq!(old.encode(), old_bytes);
+        let mut old_editor = old.into_editor();
+        old_editor.state0_mut()[0] = 4;
+        let edited_old_bytes = old_editor.encode()?;
+        assert_eq!(edited_old_bytes, [1, 4, 250]);
+        old_editor.state0_mut()[0] = 256;
+        assert!(old_editor.encode().is_err());
         assert!(
             NetSegmentTrafficLightsPrefix::decode_prefix(115_016, &old_flags, &old_bytes[..2])
                 .is_err()
@@ -1887,6 +1893,18 @@ mod tests {
             }]
         );
         assert_eq!(new.encode(), new_bytes);
+        let mut new_editor = new.into_editor();
+        new_editor.state0_mut()[0] = -2;
+        new_editor.state1_mut()[0] = 0x0102_0304;
+        let edited_new_bytes = new_editor.encode()?;
+        let mut expected_new_bytes = vec![1];
+        expected_new_bytes.extend_from_slice(&(-2_i32).to_be_bytes());
+        expected_new_bytes.extend_from_slice(&0x0102_0304_i32.to_be_bytes());
+        assert_eq!(edited_new_bytes, expected_new_bytes);
+        let (edited_new, _) =
+            NetSegmentTrafficLightsPrefix::decode_prefix(115_017, &new_flags, &edited_new_bytes)?;
+        assert_eq!(edited_new.states()[0].state0, -2);
+        assert_eq!(edited_new.states()[0].state1, 0x0102_0304);
         assert!(
             NetSegmentTrafficLightsPrefix::decode_prefix(
                 115_017,
