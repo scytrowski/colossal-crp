@@ -2,7 +2,7 @@ use crate::CrpError;
 
 const NULL_MARKER: u8 = 0xff;
 const NEW_OBJECT_MARKER: u8 = 0xfe;
-const COMPACT_STRING_FLAG: u32 = 0x80_0000;
+pub(crate) const COMPACT_STRING_FLAG: u32 = 0x80_0000;
 const MAX_STRING_CHARS: usize = 16 * 1024 * 1024;
 
 /// Framing information for one isolated DataSerializer stream.
@@ -266,7 +266,22 @@ impl<'a> Reader<'a> {
 
 pub(crate) fn write_unique_string(output: &mut Vec<u8>, value: &str) -> Result<(), CrpError> {
     let compact = value.chars().all(|character| u32::from(character) < 256);
+    write_unique_string_with_mode(output, value, compact)
+}
+
+pub(crate) fn write_unique_string_with_mode(
+    output: &mut Vec<u8>,
+    value: &str,
+    compact: bool,
+) -> Result<(), CrpError> {
     let units = if compact {
+        if value.chars().any(|character| u32::from(character) >= 256) {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "DataSerializer stream".to_owned(),
+                offset: output.len(),
+                reason: "string cannot be represented with the source compact encoding".to_owned(),
+            });
+        }
         value
             .chars()
             .map(|character| u32::from(character))
