@@ -83,7 +83,7 @@ pub use net_manager_data::{
     NetInfoPrefabPrefix, NetLane, NetLaneEditor, NetLanePrefix, NetManagerTailEditor,
     NetManagerTailPrefix, NetNodeCounter, NetNodeCountersPrefix, NetNodeFlag, NetNodeFlagsPrefix,
     NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeProblem, NetNodeProblemsPrefix,
-    NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage,
+    NetNodeRecord, NetNodeRecordsEditor, NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage,
     NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironment,
     NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlag,
     NetSegmentFlagsEditor, NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsEditor,
@@ -1469,6 +1469,52 @@ mod tests {
             (0x01_02_03, 66, 77, 88, 99, 0)
         );
         assert_eq!(legacy.encode(), bytes);
+
+        let mut legacy_editor = legacy.into_editor();
+        let edited_record = &mut legacy_editor.records_mut()[0];
+        edited_record.position_bits[0] = 4.5_f32.to_bits();
+        edited_record.segments = vec![11, 22, 0x3344];
+        edited_record.build_index = 0x0102_0304;
+        edited_record.building = 0x1122;
+        edited_record.next_building_node = 0x5566;
+        edited_record.lane = 0x0a_0b_0c;
+        edited_record.lane_offset = 0xa1;
+        edited_record.elevation = 0xb2;
+        edited_record.height_offset = 0xc3;
+        edited_record.connect_count = 0xd4;
+        let edited_bytes = legacy_editor.encode()?;
+        let mut expected_bytes = Vec::new();
+        for bits in [4.5_f32.to_bits(), (-2.5_f32).to_bits(), 3.0_f32.to_bits()] {
+            expected_bytes.extend_from_slice(&bits.to_be_bytes());
+        }
+        expected_bytes.push(3);
+        expected_bytes.extend_from_slice(&11_u16.to_be_bytes());
+        expected_bytes.extend_from_slice(&22_u16.to_be_bytes());
+        expected_bytes.extend_from_slice(&0x3344_u16.to_be_bytes());
+        expected_bytes.extend_from_slice(&0x0102_0304_u32.to_be_bytes());
+        expected_bytes.extend_from_slice(&0x1122_u16.to_be_bytes());
+        expected_bytes.extend_from_slice(&0x5566_u16.to_be_bytes());
+        expected_bytes.extend_from_slice(&[0x0a, 0x0b, 0x0c, 0xa1, 0xb2, 0xc3, 0xd4]);
+        assert_eq!(edited_bytes, expected_bytes);
+        assert_eq!(edited_bytes.len(), bytes.len() + 2);
+        let (edited, consumed) =
+            NetNodeRecordsPrefix::decode_prefix(121_006, &legacy_flags, &edited_bytes)?;
+        assert_eq!(consumed, edited_bytes.len());
+        assert_eq!(edited.records(), legacy_editor.records());
+
+        let mut too_many_segments = legacy_editor.clone();
+        too_many_segments.records_mut()[0].segments.resize(9, 1);
+        assert!(too_many_segments.encode().is_err());
+        let mut oversized_lane = legacy_editor.clone();
+        oversized_lane.records_mut()[0].lane = 0x0100_0000;
+        assert!(oversized_lane.encode().is_err());
+        let mut changed_index = legacy_editor.clone();
+        changed_index.records_mut()[0].index = 2;
+        assert!(changed_index.encode().is_err());
+        let mut unavailable_event_route = legacy_editor;
+        unavailable_event_route.records_mut()[0].event_route = 1;
+        assert!(unavailable_event_route.encode().is_err());
+
         assert!(NetNodeRecordsPrefix::decode_prefix(121_006, &legacy_flags, &bytes[..12]).is_err());
         let mut too_many = bytes.clone();
         too_many[12] = 9;
@@ -1480,6 +1526,12 @@ mod tests {
         assert_eq!(used, bytes.len());
         assert_eq!(modern.records()[0].event_route, 123);
         assert_eq!(modern.encode(), bytes);
+        let mut modern_editor = modern.into_editor();
+        modern_editor.records_mut()[0].event_route = 0xabcd;
+        let mut expected_modern = bytes.clone();
+        let event_route_start = expected_modern.len() - 2;
+        expected_modern[event_route_start..].copy_from_slice(&0xabcd_u16.to_be_bytes());
+        assert_eq!(modern_editor.encode()?, expected_modern);
         assert!(
             NetNodeRecordsPrefix::decode_prefix(121_007, &modern_flags, &bytes[..bytes.len() - 1])
                 .is_err()
@@ -1522,6 +1574,7 @@ mod tests {
             2_077
         );
         assert_eq!(records.encode(), fixture);
+        assert_eq!(records.into_editor().encode()?, fixture);
         assert!(NetNodeRecordsPrefix::decode_prefix(116_020, &flags, &fixture[..66_619]).is_err());
         Ok(())
     }

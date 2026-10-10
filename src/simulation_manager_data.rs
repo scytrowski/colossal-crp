@@ -41,9 +41,9 @@ use crate::guide_manager_data::GuideManagerReferences;
 use crate::info_manager_data::InfoManagerData;
 use crate::message_manager_data::{MessageManagerData, MessageManagerDataEditor};
 use crate::net_manager_data::{
-    NetLaneEditor, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader,
-    NetSegmentFlagsEditor, NetSegmentProblemsEditor, NetSegmentTrafficLightsEditor,
-    read_net_object_header,
+    NetLaneEditor, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetNodeRecordsEditor,
+    NetObjectHeader, NetSegmentFlagsEditor, NetSegmentProblemsEditor,
+    NetSegmentTrafficLightsEditor, read_net_object_header,
 };
 use crate::statistics_manager_data::{
     StatisticArrayReferences, StatisticInt32Editor, StatisticInt64Editor, StatisticsManagerData,
@@ -3082,6 +3082,128 @@ impl SimulationManagerData {
         )?;
         reader.read_bytes(body_length)?;
         Ok((data, reader.offset()))
+    }
+
+    fn decode_net_node_records_with_range(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetNodeFlagsPrefix, NetNodeRecordsPrefix, usize, usize), CrpError> {
+        let (node_flags, _) = self.decode_net_node_flags_prefix()?;
+        let (records, body_end) = self.decode_net_node_records_prefix(save_app_version)?;
+        let body_start = body_end
+            .checked_sub(records.encode().len())
+            .ok_or(CrpError::ArithmeticOverflow("NetManager node-record start"))?;
+        Ok((node_flags, records, body_start, body_end))
+    }
+
+    /// Decodes active node records into an editor.
+    pub fn decode_net_node_records_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetNodeRecordsEditor, CrpError> {
+        let (_, records, _, _) = self.decode_net_node_records_with_range(save_app_version)?;
+        Ok(records.into_editor())
+    }
+
+    /// Replaces active node records while preserving following NetManager bytes.
+    ///
+    /// The editor must match this stream's inner version, source node flags,
+    /// and original record bytes. Segment-list edits may resize the records;
+    /// this method checks that the following segment-flag table still decodes
+    /// at the new boundary and retains its original encoded bytes.
+    pub fn replace_net_node_records(
+        &mut self,
+        edited: &NetNodeRecordsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager node-record version does not match this stream",
+            ));
+        }
+        let (current_flags, current, body_start, body_end) =
+            self.decode_net_node_records_with_range(save_app_version)?;
+        if current_flags.encode().as_slice() != edited.source_node_flags() {
+            return Err(invalid(
+                body_start,
+                "NetManager node flags do not match the records editor's source",
+            ));
+        }
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager node-record bytes do not match the editor's source prefix",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager node-record prefix range is inconsistent",
+            ));
+        }
+        let (following_flags, following_start, following_end) =
+            self.decode_net_segment_flags_with_range(save_app_version)?;
+        if following_start != body_end
+            || following_start.checked_add(following_flags.encode().len()) != Some(following_end)
+        {
+            return Err(invalid(
+                body_end,
+                "NetManager node records do not end at the segment-flag table",
+            ));
+        }
+        let following_flag_bytes = following_flags.encode();
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_net_node_records_with_range(save_app_version)
+            .and_then(|(decoded_flags, decoded, actual_start, actual_end)| {
+                if decoded_flags.encode() != current_flags.encode()
+                    || decoded.encode() != replacement
+                    || decoded.records() != edited.records()
+                {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager node records do not match the editor",
+                    ));
+                }
+                let expected_end = body_start
+                    .checked_add(replacement.len())
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager node-record end"))?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager node records have an unexpected boundary",
+                    ));
+                }
+                let (updated_flags, updated_start, updated_end) =
+                    self.decode_net_segment_flags_with_range(save_app_version)?;
+                let expected_flags_end = updated_start
+                    .checked_add(following_flag_bytes.len())
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "NetManager following segment-flag end",
+                    ))?;
+                if updated_start != expected_end
+                    || updated_end != expected_flags_end
+                    || updated_flags.encode() != following_flag_bytes
+                {
+                    return Err(invalid(
+                        updated_start,
+                        "rewritten node records changed the following segment-flag boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager node records failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes the versioned segment-flag arrays after node records.
@@ -11815,6 +11937,65 @@ mod manager_boundary_tests {
 
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_net_lane_prefix(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph, updated_graph);
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_records_editor_resizes_and_preserves_following_segment_flags()
+    -> Result<(), crate::CrpError> {
+        let path_fixture = include_bytes!("../tests/fixtures/path-manager-body-v116020-desert.bin");
+        let (mut manager, _) = synthetic_path_manager(path_fixture);
+
+        let mut net_body = Vec::new();
+        write_encoded_ushort_array(&mut net_body, &vec![0; 262_143]);
+        let mut node_flags = vec![0_u32; 32_767];
+        node_flags[0] = 1;
+        write_encoded_uint_array(&mut net_body, &node_flags);
+        write_encoded_uint_array(&mut net_body, &[0]); // One legacy node-problem value.
+        write_encoded_byte_array(&mut net_body, &[0]);
+        write_encoded_ushort_array(&mut net_body, &[0, 0]);
+        net_body.extend_from_slice(&[
+            0x3f, 0x80, 0, 0, // X = 1.0
+            0x40, 0, 0, 0, // Y = 2.0
+            0x40, 0x40, 0, 0, // Z = 3.0
+            2, 0, 12, 0, 34, // Two segment IDs.
+            0, 0, 0, 5, // Build index.
+            0, 6, // Building.
+            0, 7, // Next building node.
+            0, 0, 8, 9, 10, 11, 12, // Lane and trailing bytes.
+        ]);
+        write_encoded_uint_array(&mut net_body, &vec![0; 36_863]);
+        net_body.extend_from_slice(&[0xaa, 0xbb]);
+        manager.serialized_object_graph.extend_from_slice(&net_body);
+
+        let (original_segment_flags, original_segment_end) =
+            manager.decode_net_segment_flags_prefix(Some(0))?;
+        let following_bytes = manager.serialized_object_graph[original_segment_end..].to_vec();
+        let original_graph_len = manager.serialized_object_graph.len();
+        let mut edited = manager.decode_net_node_records_editor(Some(0))?;
+        assert_eq!(edited.records().len(), 1);
+        assert_eq!(edited.records()[0].index, 1);
+        assert_eq!(edited.records()[0].segments, [12, 34]);
+        edited.records_mut()[0].segments.insert(1, 23);
+        edited.records_mut()[0].lane = 0x01_02_03;
+
+        manager.replace_net_node_records(&edited, Some(0))?;
+        assert_eq!(
+            manager.serialized_object_graph.len(),
+            original_graph_len + 2
+        );
+        let (records, _) = manager.decode_net_node_records_prefix(Some(0))?;
+        assert_eq!(records.records(), edited.records());
+        let (segment_flags, segment_end) = manager.decode_net_segment_flags_prefix(Some(0))?;
+        assert_eq!(segment_flags.encode(), original_segment_flags.encode());
+        assert_eq!(
+            &manager.serialized_object_graph[segment_end..],
+            following_bytes
+        );
+
+        let updated_graph = manager.serialized_object_graph.clone();
+        assert!(manager.replace_net_node_records(&edited, Some(0)).is_err());
         assert_eq!(manager.serialized_object_graph, updated_graph);
         Ok(())
     }

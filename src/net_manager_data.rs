@@ -186,7 +186,22 @@ pub struct NetNodeRecord {
 pub struct NetNodeRecordsPrefix {
     format_version: u32,
     records: Vec<NetNodeRecord>,
+    source_node_flags: Vec<u8>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for variable-length records belonging to active nodes.
+///
+/// The active-node order is fixed by the source node flags. A changed segment
+/// list can change the encoded prefix length; following NetManager fields are
+/// preserved by the manager-level replacement method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeRecordsEditor {
+    format_version: u32,
+    records: Vec<NetNodeRecord>,
+    original_records: Vec<NetNodeRecord>,
+    source_node_flags: Vec<u8>,
+    original_prefix: Vec<u8>,
 }
 
 /// Serialized flags for one one-based `NetSegment` buffer position.
@@ -1179,6 +1194,7 @@ impl NetNodeRecordsPrefix {
             Self {
                 format_version,
                 records,
+                source_node_flags: node_flags.encode(),
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -1198,6 +1214,122 @@ impl NetNodeRecordsPrefix {
     /// Writes the original node-record bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit active node records.
+    pub fn into_editor(self) -> NetNodeRecordsEditor {
+        NetNodeRecordsEditor {
+            format_version: self.format_version,
+            original_records: self.records.clone(),
+            records: self.records,
+            source_node_flags: self.source_node_flags,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetNodeRecordsEditor {
+    /// Returns the inner DataSerializer version associated with these records.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns records in ascending active-node buffer order.
+    pub fn records(&self) -> &[NetNodeRecord] {
+        &self.records
+    }
+
+    /// Returns mutable records in ascending active-node buffer order.
+    pub fn records_mut(&mut self) -> &mut [NetNodeRecord] {
+        &mut self.records
+    }
+
+    /// Encodes edited records with their version-specific fields and byte order.
+    ///
+    /// Unchanged records retain their source bytes. The active-node count and
+    /// indexes cannot change, each segment list is limited to eight entries,
+    /// and lane IDs must fit their 24-bit field.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.records.len() != self.original_records.len() {
+            return Err(invalid_node_record(
+                0,
+                "edited node-record count does not match the source",
+            ));
+        }
+        if self.records == self.original_records {
+            return Ok(self.original_prefix.clone());
+        }
+
+        let mut output = Vec::with_capacity(self.original_prefix.len());
+        for (record, original) in self.records.iter().zip(&self.original_records) {
+            if record.index != original.index {
+                return Err(invalid_node_record(
+                    output.len(),
+                    "node record index is derived from flags and cannot be changed",
+                ));
+            }
+            if record.segments.len() > MAX_NODE_SEGMENTS {
+                return Err(invalid_node_record(
+                    output.len() + 12,
+                    format!(
+                        "node {} has {} segments; maximum is {MAX_NODE_SEGMENTS}",
+                        record.index,
+                        record.segments.len()
+                    ),
+                ));
+            }
+            if self.format_version < NODE_EVENT_ROUTE_VERSION
+                && record.event_route != original.event_route
+            {
+                return Err(invalid_node_record(
+                    output.len(),
+                    "event-route field is not serialized before inner version 121007",
+                ));
+            }
+            if record.lane > 0x00ff_ffff {
+                return Err(invalid_node_record(
+                    output.len(),
+                    "node lane ID exceeds 24-bit storage",
+                ));
+            }
+
+            for coordinate_bits in record.position_bits {
+                output.extend_from_slice(&coordinate_bits.to_be_bytes());
+            }
+            output.push(u8::try_from(record.segments.len()).map_err(|_| {
+                invalid_node_record(
+                    output.len(),
+                    "node segment count does not fit its byte field",
+                )
+            })?);
+            for segment in &record.segments {
+                output.extend_from_slice(&segment.to_be_bytes());
+            }
+            output.extend_from_slice(&record.build_index.to_be_bytes());
+            output.extend_from_slice(&record.building.to_be_bytes());
+            output.extend_from_slice(&record.next_building_node.to_be_bytes());
+            output.extend_from_slice(&[
+                ((record.lane >> 16) & 0xff) as u8,
+                ((record.lane >> 8) & 0xff) as u8,
+                (record.lane & 0xff) as u8,
+                record.lane_offset,
+                record.elevation,
+                record.height_offset,
+                record.connect_count,
+            ]);
+            if self.format_version >= NODE_EVENT_ROUTE_VERSION {
+                output.extend_from_slice(&record.event_route.to_be_bytes());
+            }
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn source_node_flags(&self) -> &[u8] {
+        &self.source_node_flags
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 
@@ -3705,6 +3837,14 @@ fn write_record_u24(output: &mut Vec<u8>, value: u32) -> Result<(), CrpError> {
 fn invalid_record(offset: usize, reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "NetManager+Data segment records".to_owned(),
+        offset,
+        reason: reason.into(),
+    }
+}
+
+fn invalid_node_record(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "NetManager+Data node records".to_owned(),
         offset,
         reason: reason.into(),
     }
