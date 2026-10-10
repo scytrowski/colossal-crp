@@ -3,7 +3,7 @@ use crate::data_serializer::Reader;
 use crate::encoded_array::{
     read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
     read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
-    write_encoded_uint_array, write_encoded_ushort_array,
+    write_encoded_uint_array, write_encoded_ulong_array, write_encoded_ushort_array,
 };
 
 const LANE_COUNT: usize = 262_144;
@@ -241,7 +241,20 @@ pub struct NetSegmentProblem {
 pub struct NetSegmentProblemsPrefix {
     format_version: u32,
     problems: Vec<NetSegmentProblem>,
+    source_segment_flags: Vec<u8>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for versioned problem-bit arrays attached to active segments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSegmentProblemsEditor {
+    format_version: u32,
+    problems1: Vec<u64>,
+    problems2: Option<Vec<u64>>,
+    original_problems1: Vec<u64>,
+    original_problems2: Option<Vec<u64>>,
+    original_segment_flags: Vec<u8>,
+    original_prefix: Vec<u8>,
 }
 
 /// Traffic-light state for one segment with nonzero primary flags.
@@ -1253,6 +1266,7 @@ impl NetSegmentProblemsPrefix {
             Self {
                 format_version,
                 problems,
+                source_segment_flags: segment_flags.encode(),
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -1272,6 +1286,108 @@ impl NetSegmentProblemsPrefix {
     /// Writes the original encoded problem-array bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit its stored problem-bit arrays.
+    pub fn into_editor(self) -> NetSegmentProblemsEditor {
+        let problems1 = self
+            .problems
+            .iter()
+            .map(|problem| problem.problems1)
+            .collect::<Vec<_>>();
+        let problems2 = (self.format_version >= TWO_PROBLEMS_VERSION).then(|| {
+            self.problems
+                .iter()
+                .map(|problem| problem.problems2)
+                .collect::<Vec<_>>()
+        });
+        NetSegmentProblemsEditor {
+            format_version: self.format_version,
+            original_problems1: problems1.clone(),
+            original_problems2: problems2.clone(),
+            problems1,
+            problems2,
+            original_segment_flags: self.source_segment_flags,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetSegmentProblemsEditor {
+    /// Returns the inner DataSerializer version associated with this prefix.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns first problem-bit values for active segments in buffer order.
+    pub fn problems1_mut(&mut self) -> &mut [u64] {
+        &mut self.problems1
+    }
+
+    /// Returns second problem-bit values from inner version 115000 onward.
+    pub fn problems2_mut(&mut self) -> Option<&mut [u64]> {
+        self.problems2.as_deref_mut()
+    }
+
+    /// Encodes the original segment problem arrays with edited values.
+    ///
+    /// Unchanged values preserve their original bytes. Versions before 226 do
+    /// not store problem arrays, so changing their synthesized zeroes is an
+    /// error. Versions 226–114999 store one value per active segment; later
+    /// versions store interleaved pairs.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.problems1.len() != self.original_problems1.len()
+            || self.problems2.as_ref().map(Vec::len)
+                != self.original_problems2.as_ref().map(Vec::len)
+        {
+            return Err(invalid(
+                0,
+                "edited segment problem counts do not match the source",
+            ));
+        }
+        if self.problems1 == self.original_problems1 && self.problems2 == self.original_problems2 {
+            return Ok(self.original_prefix.clone());
+        }
+        if self.format_version < SEGMENT_PROBLEMS_VERSION {
+            return Err(invalid(
+                0,
+                "segment problem values are synthesized before inner version 226",
+            ));
+        }
+        if (self.format_version >= TWO_PROBLEMS_VERSION) != self.problems2.is_some() {
+            return Err(invalid(
+                0,
+                "second segment problem values do not match this NetManager version",
+            ));
+        }
+
+        let mut output = Vec::new();
+        if let Some(problems2) = &self.problems2 {
+            let value_count =
+                self.problems1
+                    .len()
+                    .checked_mul(2)
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "NetManager segment problem count",
+                    ))?;
+            let mut interleaved = Vec::with_capacity(value_count);
+            for (&first, &second) in self.problems1.iter().zip(problems2) {
+                interleaved.push(first);
+                interleaved.push(second);
+            }
+            write_encoded_ulong_array(&mut output, &interleaved);
+        } else {
+            write_encoded_ulong_array(&mut output, &self.problems1);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_segment_flags(&self) -> &[u8] {
+        &self.original_segment_flags
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 

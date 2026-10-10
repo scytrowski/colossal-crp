@@ -42,7 +42,7 @@ use crate::info_manager_data::InfoManagerData;
 use crate::message_manager_data::{MessageManagerData, MessageManagerDataEditor};
 use crate::net_manager_data::{
     NetLaneEditor, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor, NetObjectHeader,
-    NetSegmentFlagsEditor, read_net_object_header,
+    NetSegmentFlagsEditor, NetSegmentProblemsEditor, read_net_object_header,
 };
 use crate::statistics_manager_data::{
     StatisticArrayReferences, StatisticInt32Editor, StatisticInt64Editor, StatisticsManagerData,
@@ -3184,16 +3184,119 @@ impl SimulationManagerData {
         &self,
         save_app_version: Option<u32>,
     ) -> Result<(NetSegmentProblemsPrefix, usize), CrpError> {
-        let (segment_flags, flags_end) = self.decode_net_segment_flags_prefix(save_app_version)?;
+        let (_, data, _, end) = self.decode_net_segment_problems_with_range(save_app_version)?;
+        Ok((data, end))
+    }
+
+    fn decode_net_segment_problems_with_range(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<
+        (
+            NetSegmentFlagsPrefix,
+            NetSegmentProblemsPrefix,
+            usize,
+            usize,
+        ),
+        CrpError,
+    > {
+        let (segment_flags, _, flags_end) =
+            self.decode_net_segment_flags_with_range(save_app_version)?;
         let mut reader = Reader::new(&self.serialized_object_graph);
         reader.read_bytes(flags_end)?;
+        let body_start = reader.offset();
         let (data, body_length) = NetSegmentProblemsPrefix::decode_prefix(
             self.format_version,
             &segment_flags,
             reader.remaining_bytes(),
         )?;
         reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        Ok((segment_flags, data, body_start, reader.offset()))
+    }
+
+    /// Decodes NetManager's active-segment problem arrays into an editor.
+    pub fn decode_net_segment_problems_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetSegmentProblemsEditor, CrpError> {
+        let (_, problems, _, _) = self.decode_net_segment_problems_with_range(save_app_version)?;
+        Ok(problems.into_editor())
+    }
+
+    /// Replaces NetManager's active-segment problem arrays with edited values.
+    ///
+    /// The editor must match this stream's inner version, source segment flags,
+    /// and original problem bytes. Changed values may resize the section and
+    /// shift later segment fields while preserving their bytes.
+    pub fn replace_net_segment_problems(
+        &mut self,
+        edited: &NetSegmentProblemsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager segment-problem version does not match this stream",
+            ));
+        }
+        let (current_flags, current, body_start, body_end) =
+            self.decode_net_segment_problems_with_range(save_app_version)?;
+        if current_flags.encode().as_slice() != edited.original_segment_flags() {
+            return Err(invalid(
+                body_start,
+                "NetManager segment flags do not match the problem editor's source",
+            ));
+        }
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager segment-problem bytes do not match the editor's source prefix",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager segment-problem prefix range is inconsistent",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_net_segment_problems_with_range(save_app_version)
+            .and_then(|(decoded_flags, decoded, actual_start, actual_end)| {
+                if decoded_flags.encode() != current_flags.encode() {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager segment problems changed their source flags",
+                    ));
+                }
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager segment problems do not match the editor",
+                    ));
+                }
+                let expected_end = body_start.checked_add(replacement.len()).ok_or(
+                    CrpError::ArithmeticOverflow("NetManager segment-problem end"),
+                )?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager segment problems have an unexpected boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager segment problems failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes sparse segment traffic-light states after segment problems.
@@ -10528,7 +10631,7 @@ mod manager_boundary_tests {
     };
     use crate::encoded_array::{
         EncodedLongArrayReader, write_encoded_bool_array, write_encoded_byte_array,
-        write_encoded_uint_array, write_encoded_ulong_array, write_encoded_ushort_array,
+        write_encoded_uint_array, write_encoded_ushort_array,
     };
     use crate::net_manager_data::NetObjectHeader;
     use crate::{
@@ -10913,7 +11016,7 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn net_segment_flag_editor_resizes_prefix_and_preserves_sparse_fields()
+    fn net_segment_editors_resize_prefixes_and_preserve_sparse_fields()
     -> Result<(), crate::CrpError> {
         let path_fixture = include_bytes!("../tests/fixtures/path-manager-body-v116020-desert.bin");
         let (mut manager, _) = synthetic_path_manager(path_fixture);
@@ -10927,7 +11030,11 @@ mod manager_boundary_tests {
         net_body.extend_from_slice(include_bytes!(
             "../tests/fixtures/net-segment-flags-v241-co.bin"
         ));
-        write_encoded_ulong_array(&mut net_body, &[0x1234; 30]);
+        net_body.push(0); // One literal ULong problem value.
+        net_body.extend_from_slice(&0x1234_u64.to_be_bytes());
+        net_body.push(0x40); // One close delta resets the delta to zero.
+        net_body.extend_from_slice(&(-0x1234_i32).to_be_bytes());
+        net_body.push(0x9b); // Repeat that value for the remaining 28 active segments.
         write_encoded_byte_array(&mut net_body, &[34, 35].repeat(30));
         write_encoded_byte_array(&mut net_body, &[31; 30]);
         write_encoded_byte_array(&mut net_body, &[42; 30]);
@@ -10972,6 +11079,32 @@ mod manager_boundary_tests {
         let (problems, problems_end) = manager.decode_net_segment_problems_prefix(Some(0))?;
         assert_eq!(problems.problems().len(), 30);
         assert_eq!(problems.problems()[0].problems1, 0x1234);
+        assert!(
+            problems
+                .problems()
+                .iter()
+                .all(|item| item.problems1 == 0x1234)
+        );
+        assert_eq!(problems.encode().len(), 15);
+        let original_problem_tail = manager.serialized_object_graph[problems_end..].to_vec();
+        let mut problem_editor = problems.into_editor();
+        problem_editor.problems1_mut()[0] = 0x5678;
+        let replacement_problem_len = problem_editor.encode()?.len();
+        assert!(replacement_problem_len > 15);
+        manager.replace_net_segment_problems(&problem_editor, Some(0))?;
+        let (edited_problems, edited_problems_end) =
+            manager.decode_net_segment_problems_prefix(Some(0))?;
+        assert_eq!(edited_problems.problems()[0].problems1, 0x5678);
+        assert!(
+            edited_problems.problems()[1..]
+                .iter()
+                .all(|item| item.problems1 == 0x1234)
+        );
+        assert!(edited_problems_end > problems_end);
+        assert_eq!(
+            &manager.serialized_object_graph[edited_problems_end..],
+            original_problem_tail
+        );
         let (lights, lights_end) = manager.decode_net_segment_traffic_lights_prefix(Some(0))?;
         assert_eq!(lights.states().len(), 30);
         assert_eq!(
@@ -10982,7 +11115,15 @@ mod manager_boundary_tests {
         assert_eq!(coverage.coverage().len(), 30);
         assert_eq!(coverage.coverage()[0].fire_coverage, 31);
         assert_eq!(coverage.coverage()[0].wetness, 42);
-        assert!(problems_end < lights_end && lights_end < coverage_end);
+        assert!(edited_problems_end < lights_end && lights_end < coverage_end);
+
+        let graph_after_problem_edit = manager.serialized_object_graph.clone();
+        assert!(
+            manager
+                .replace_net_segment_problems(&problem_editor, Some(0))
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph, graph_after_problem_edit);
 
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_net_segment_flags(&editor, Some(0)).is_err());

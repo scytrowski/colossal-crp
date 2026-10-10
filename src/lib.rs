@@ -85,8 +85,9 @@ pub use net_manager_data::{
     NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsPrefix, NetObjectHeader,
     NetSegmentCoverage, NetSegmentCoveragePrefix, NetSegmentEnvironment,
     NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsEditor, NetSegmentFlagsPrefix,
-    NetSegmentProblem, NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsPrefix,
-    NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix, NetTreePrefabPrefix,
+    NetSegmentProblem, NetSegmentProblemsEditor, NetSegmentProblemsPrefix, NetSegmentRecord,
+    NetSegmentRecordsPrefix, NetSegmentTrafficLight, NetSegmentTrafficLightsPrefix,
+    NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathManagerEditor, PathPosition, PathUnit};
 pub use prop_manager_data::{PropManagerDataPrefix, PropManagerEditor};
@@ -1726,6 +1727,10 @@ mod tests {
             }]
         );
         assert!(old.encode().is_empty());
+        let mut old_editor = old.into_editor();
+        assert!(old_editor.problems2_mut().is_none());
+        old_editor.problems1_mut()[0] = 1;
+        assert!(old_editor.encode().is_err());
 
         let single_flags = one_active_segment_flags(226)?;
         let mut one_value = vec![0];
@@ -1742,6 +1747,14 @@ mod tests {
             }]
         );
         assert_eq!(single.encode(), one_value);
+        let mut single_editor = single.into_editor();
+        assert!(single_editor.problems2_mut().is_none());
+        single_editor.problems1_mut()[0] = 0x0102_0304_0506_0708;
+        let single_edited_bytes = single_editor.encode()?;
+        assert_eq!(single_edited_bytes, [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let (single_edited, _) =
+            NetSegmentProblemsPrefix::decode_prefix(226, &single_flags, &single_edited_bytes)?;
+        assert_eq!(single_edited.problems()[0].problems1, 0x0102_0304_0506_0708);
         assert!(
             NetSegmentProblemsPrefix::decode_prefix(226, &single_flags, &one_value[..8]).is_err()
         );
@@ -1762,6 +1775,18 @@ mod tests {
             }]
         );
         assert_eq!(paired.encode(), two_values);
+        let mut paired_editor = paired.into_editor();
+        paired_editor.problems1_mut()[0] = 0x1122_3344_5566_7788;
+        paired_editor.problems2_mut().expect("version stores pairs")[0] = 0x99aa_bbcc_ddee_ff00;
+        let paired_edited_bytes = paired_editor.encode()?;
+        let mut expected_paired_bytes = vec![1];
+        expected_paired_bytes.extend_from_slice(&0x1122_3344_5566_7788_u64.to_be_bytes());
+        expected_paired_bytes.extend_from_slice(&0x99aa_bbcc_ddee_ff00_u64.to_be_bytes());
+        assert_eq!(paired_edited_bytes, expected_paired_bytes);
+        let (paired_edited, _) =
+            NetSegmentProblemsPrefix::decode_prefix(115_000, &paired_flags, &paired_edited_bytes)?;
+        assert_eq!(paired_edited.problems()[0].problems1, 0x1122_3344_5566_7788);
+        assert_eq!(paired_edited.problems()[0].problems2, 0x99aa_bbcc_ddee_ff00);
         assert!(
             NetSegmentProblemsPrefix::decode_prefix(115_000, &paired_flags, &two_values[..16])
                 .is_err()
