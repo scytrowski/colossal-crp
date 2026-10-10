@@ -38,6 +38,7 @@ use crate::guide_data::{
     GuideTriggerBaseEditor, GuideTriggerBasePrefix,
 };
 use crate::guide_manager_data::GuideManagerReferences;
+use crate::immaterial_resource_manager_data::ImmaterialResourceManagerData;
 use crate::info_manager_data::InfoManagerData;
 use crate::message_manager_data::{MessageManagerData, MessageManagerDataEditor};
 use crate::natural_resource_manager_data::NaturalResourceManagerData;
@@ -2239,6 +2240,27 @@ impl SimulationManagerData {
         NaturalResourceManagerData::decode(self.format_version, bytes)
     }
 
+    /// Decodes ImmaterialResourceManager's local grids and aggregate values
+    /// between its manager tag and ElectricityManager. Resource-slot counts,
+    /// aggregate-array lengths, and multiplier widths follow the inner
+    /// DataSerializer version. The original body remains available for exact
+    /// unchanged writing.
+    pub fn decode_immaterial_resource_manager_data(
+        &self,
+    ) -> Result<ImmaterialResourceManagerData, CrpError> {
+        let field_range = self.immaterial_resource_manager_field_range()?;
+        let bytes = self
+            .serialized_object_graph
+            .get(field_range)
+            .ok_or_else(|| {
+                invalid(
+                    0,
+                    "ImmaterialResourceManager body range exceeds manager graph",
+                )
+            })?;
+        ImmaterialResourceManagerData::decode(self.format_version, bytes)
+    }
+
     /// Replaces TransferManager's amount values, reason-count distribution,
     /// and existing offer fields. The edited body may change length; the
     /// following manager bytes are retained and the new boundary is checked.
@@ -2310,6 +2332,27 @@ impl SimulationManagerData {
             return Err(invalid(
                 body_start,
                 "NaturalResourceManager body range is reversed",
+            ));
+        }
+        Ok(body_start..next_tag_start)
+    }
+
+    fn immaterial_resource_manager_field_range(&self) -> Result<Range<usize>, CrpError> {
+        expect_manager_type(
+            self.manager_objects.as_deref(),
+            10,
+            "ImmaterialResourceManager+Data",
+        )?;
+        expect_manager_type(
+            self.manager_objects.as_deref(),
+            11,
+            "ElectricityManager+Data",
+        )?;
+        let (body_start, next_tag_start) = self.manager_body_boundary(10)?;
+        if body_start > next_tag_start {
+            return Err(invalid(
+                body_start,
+                "ImmaterialResourceManager body range is reversed",
             ));
         }
         Ok(body_start..next_tag_start)
@@ -12882,6 +12925,45 @@ mod manager_boundary_tests {
         manager
     }
 
+    fn immaterial_resource_manager_with_next(
+        next_type: &str,
+        next_tag_name: &str,
+    ) -> SimulationManagerData {
+        const FORMAT_VERSION: u32 = 265;
+        const SLOTS: usize = 20;
+        const LOCAL_VALUES: usize = 65_536 * SLOTS;
+        let mut graph = profiler_tag("ImmaterialResourceManager");
+        for _ in 0..2 {
+            append_zero_encoded_long_array(&mut graph, LOCAL_VALUES);
+        }
+        for _ in 0..2 {
+            graph.extend((0..SLOTS).flat_map(|index| (index as i32).to_be_bytes()));
+        }
+        for _ in 0..SLOTS {
+            graph.extend_from_slice(&0_i64.to_be_bytes());
+        }
+        for _ in 0..2 {
+            graph.extend((0..SLOTS).flat_map(|index| (index as i32).to_be_bytes()));
+        }
+        graph.extend_from_slice(&[0x12, 0x34]);
+        graph.extend(profiler_tag(next_tag_name));
+        graph.extend_from_slice(&[0xaa, 0xbb]);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = FORMAT_VERSION;
+        let mut references = vec![None; 12];
+        references[10] = Some(ManagerObjectReference {
+            object_id: 10,
+            type_name: "ImmaterialResourceManager+Data, Assembly-CSharp".to_owned(),
+        });
+        references[11] = Some(ManagerObjectReference {
+            object_id: 11,
+            type_name: next_type.to_owned(),
+        });
+        manager.manager_objects = Some(references);
+        manager
+    }
+
     #[test]
     fn info_manager_mask_decodes_and_replaces_at_versioned_boundary() {
         for (version, original, replacement) in [
@@ -13094,6 +13176,49 @@ mod manager_boundary_tests {
             "ElectricityManager",
         );
         assert!(wrong_tag.decode_natural_resource_manager_data().is_err());
+    }
+
+    #[test]
+    fn immaterial_resource_manager_decoder_checks_adjacent_boundary_and_preserves_body() {
+        let manager = immaterial_resource_manager_with_next(
+            "ElectricityManager+Data, Assembly-CSharp",
+            "ElectricityManager",
+        );
+        let tag = profiler_tag("ImmaterialResourceManager");
+        let body_start = tag.len();
+        let next_tag = profiler_tag("ElectricityManager");
+        let next_start = manager
+            .serialized_object_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        let data = manager.decode_immaterial_resource_manager_data().unwrap();
+        assert_eq!(data.format_version(), 265);
+        assert_eq!(data.resource_slots_per_cell(), 20);
+        assert_eq!(data.final_resources().len(), 65_536 * 20);
+        assert_eq!(data.temporary_resources().len(), 65_536 * 20);
+        assert_eq!(data.total_final().len(), 20);
+        assert_eq!(data.total_temporary_multiplier().len(), 20);
+        assert_eq!(data.multiplier_width_bytes(), 8);
+        assert_eq!(
+            data.encode_unchanged(),
+            manager.serialized_object_graph[body_start..next_start]
+        );
+
+        let wrong_type = immaterial_resource_manager_with_next(
+            "WaterManager+Data, Assembly-CSharp",
+            "ElectricityManager",
+        );
+        assert!(
+            wrong_type
+                .decode_immaterial_resource_manager_data()
+                .is_err()
+        );
+        let wrong_tag = immaterial_resource_manager_with_next(
+            "ElectricityManager+Data, Assembly-CSharp",
+            "WaterManager",
+        );
+        assert!(wrong_tag.decode_immaterial_resource_manager_data().is_err());
     }
 
     #[test]

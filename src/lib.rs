@@ -17,6 +17,7 @@ mod event_manager_data;
 mod game_area_data;
 mod guide_data;
 mod guide_manager_data;
+mod immaterial_resource_manager_data;
 mod info_manager_data;
 mod instance_manager_data;
 mod message_manager_data;
@@ -76,6 +77,7 @@ pub use guide_data::{
 pub use guide_manager_data::{
     GuideManagerReference, GuideManagerReferenceField, GuideManagerReferences,
 };
+pub use immaterial_resource_manager_data::ImmaterialResourceManagerData;
 pub use info_manager_data::InfoManagerData;
 pub use instance_manager_data::{InstanceManagerData, InstanceManagerEditor, InstanceName};
 pub use message_manager_data::{MessageDataEntry, MessageManagerData, MessageManagerDataEditor};
