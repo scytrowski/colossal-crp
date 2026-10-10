@@ -550,6 +550,133 @@ pub struct TransportManagerSelection {
     pub value: TransportManagerSharedStringValue,
 }
 
+/// Legacy per-line vehicle selection stored before the manager-level table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportLineVehicleSelection {
+    /// Numeric vehicle-selection value serialized from versions 112004–112021.
+    Index(u16),
+    /// Nullable unique string serialized from versions 112022–114000.
+    Name(Option<String>),
+}
+
+/// Three serialized passenger counters for one TransportManager population.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportPassengerCounts {
+    temporary: u32,
+    final_count: u32,
+    average: u32,
+}
+
+impl TransportPassengerCounts {
+    /// Returns the temporary passenger count.
+    pub fn temporary(&self) -> u32 {
+        self.temporary
+    }
+
+    /// Returns the final passenger count.
+    pub fn final_count(&self) -> u32 {
+        self.final_count
+    }
+
+    /// Returns the average passenger count.
+    pub fn average(&self) -> u32 {
+        self.average
+    }
+}
+
+/// Passenger counts in serialized population order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportPassengerRecord {
+    groups: Vec<TransportPassengerCounts>,
+}
+
+impl TransportPassengerRecord {
+    /// Returns groups in resident, tourist, child, teen, young, adult, senior,
+    /// then car-owning order. The final group is present from version 176.
+    pub fn groups(&self) -> &[TransportPassengerCounts] {
+        &self.groups
+    }
+}
+
+/// Decoded values from one active TransportManager line record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportManagerLineRecord {
+    line_number: Option<u16>,
+    stop_count: u16,
+    color: Option<[u8; 3]>,
+    building: Option<u16>,
+    budget: Option<u16>,
+    total_length_bits: Option<u32>,
+    average_interval: Option<u8>,
+    ticket_price: Option<u16>,
+    passengers: Option<TransportPassengerRecord>,
+    legacy_vehicle_selection: Option<TransportLineVehicleSelection>,
+    serialized_bytes: Vec<u8>,
+}
+
+impl TransportManagerLineRecord {
+    /// Returns the per-line number from version 153.
+    pub fn line_number(&self) -> Option<u16> {
+        self.line_number
+    }
+
+    /// Returns the serialized stop count.
+    pub fn stop_count(&self) -> u16 {
+        self.stop_count
+    }
+
+    /// Returns the RGB color from version 121.
+    pub fn color(&self) -> Option<[u8; 3]> {
+        self.color
+    }
+
+    /// Returns the building reference from version 288.
+    pub fn building(&self) -> Option<u16> {
+        self.building
+    }
+
+    /// Returns the budget from version 314.
+    pub fn budget(&self) -> Option<u16> {
+        self.budget
+    }
+
+    /// Returns the total-length float as its original IEEE-754 bit pattern.
+    pub fn total_length_bits(&self) -> Option<u32> {
+        self.total_length_bits
+    }
+
+    /// Returns the average interval from version 320.
+    pub fn average_interval(&self) -> Option<u8> {
+        self.average_interval
+    }
+
+    /// Returns the ticket price from version 110023.
+    pub fn ticket_price(&self) -> Option<u16> {
+        self.ticket_price
+    }
+
+    /// Returns the version-gated passenger groups.
+    pub fn passengers(&self) -> Option<&TransportPassengerRecord> {
+        self.passengers.as_ref()
+    }
+
+    /// Returns the legacy per-line selection, absent outside versions
+    /// 112004–114000.
+    pub fn legacy_vehicle_selection(&self) -> Option<&TransportLineVehicleSelection> {
+        self.legacy_vehicle_selection.as_ref()
+    }
+
+    /// Returns the original record bytes for unchanged writing.
+    pub fn encode_unchanged(&self) -> Vec<u8> {
+        self.serialized_bytes.clone()
+    }
+
+    /// Returns the original record length.
+    pub fn encoded_len(&self) -> usize {
+        self.serialized_bytes.len()
+    }
+}
+
 /// Version-gated TransportManager vehicle-selection table.
 ///
 /// The original field bytes are retained for exact unchanged writing. Existing
@@ -4388,6 +4515,25 @@ impl SimulationManagerData {
             .ok_or_else(|| invalid(TRANSPORT_MANAGER_SLOT, "selection fields were not decoded"))
     }
 
+    /// Decodes the active TransportManager line records.
+    ///
+    /// Returns records in active-flag order. The reader checks the complete
+    /// bounded manager body, including its reference tail and closing tag, but
+    /// leaves manager-level passenger arrays and object headers opaque. Each
+    /// returned line retains its original bytes for unchanged writing.
+    pub fn decode_transport_manager_line_records(
+        &self,
+    ) -> Result<Vec<TransportManagerLineRecord>, CrpError> {
+        let (body_range, _) = self.transport_manager_body_range()?;
+        let body = self
+            .serialized_object_graph
+            .get(body_range)
+            .ok_or_else(|| invalid(0, "TransportManager body range exceeds manager graph"))?;
+        let fields =
+            decode_transport_manager_reference_body(self.format_version, body, None, None)?;
+        Ok(fields.line_records)
+    }
+
     /// Resolves EconomyManager's trailing guide object references.
     ///
     /// The reader supports inner version 164 and newer. The base references
@@ -7592,6 +7738,82 @@ fn transport_manager_line_number_count(format_version: u32) -> usize {
     }
 }
 
+fn decode_transport_manager_line_record(
+    format_version: u32,
+    reader: &mut Reader<'_>,
+) -> Result<TransportManagerLineRecord, CrpError> {
+    let start = reader.offset();
+    let line_number = if format_version >= 153 {
+        Some(reader.read_u16_be()?)
+    } else {
+        None
+    };
+    let stop_count = reader.read_u16_be()?;
+    let color = if format_version >= 121 {
+        Some([reader.read_u8()?, reader.read_u8()?, reader.read_u8()?])
+    } else {
+        None
+    };
+    let building = if format_version >= 288 {
+        Some(reader.read_u16_be()?)
+    } else {
+        None
+    };
+    let (budget, total_length_bits) = if format_version >= 314 {
+        (Some(reader.read_u16_be()?), Some(reader.read_u32_be()?))
+    } else {
+        (None, None)
+    };
+    let average_interval = if format_version >= 320 {
+        Some(reader.read_u8()?)
+    } else {
+        None
+    };
+    let ticket_price = if format_version >= 110_023 {
+        Some(reader.read_u16_be()?)
+    } else {
+        None
+    };
+    let passengers = if format_version >= 122 {
+        let group_count = if format_version >= 176 { 8 } else { 7 };
+        let mut groups = Vec::with_capacity(group_count);
+        for _ in 0..group_count {
+            groups.push(TransportPassengerCounts {
+                temporary: reader.read_u24_be()?,
+                final_count: reader.read_u24_be()?,
+                average: reader.read_u24_be()?,
+            });
+        }
+        Some(TransportPassengerRecord { groups })
+    } else {
+        None
+    };
+    let legacy_vehicle_selection = if (112_004..112_022).contains(&format_version) {
+        Some(TransportLineVehicleSelection::Index(reader.read_u16_be()?))
+    } else if (112_022..114_001).contains(&format_version) {
+        Some(TransportLineVehicleSelection::Name(
+            reader.read_unique_string()?,
+        ))
+    } else {
+        None
+    };
+    let end = reader.offset();
+    let serialized_bytes = reader.consumed_bytes()[start..end].to_vec();
+    Ok(TransportManagerLineRecord {
+        line_number,
+        stop_count,
+        color,
+        building,
+        budget,
+        total_length_bits,
+        average_interval,
+        ticket_price,
+        passengers,
+        legacy_vehicle_selection,
+        serialized_bytes,
+    })
+}
+
 fn decode_transport_manager_reference_body(
     format_version: u32,
     bytes: &[u8],
@@ -7648,35 +7870,12 @@ fn decode_transport_manager_reference_body(
             .ok_or(CrpError::ArithmeticOverflow(
                 "TransportManager passenger record length",
             ))?;
+    let mut line_records = Vec::with_capacity(active_line_count);
     for _ in 0..active_line_count {
-        if format_version >= 153 {
-            reader.read_u16_be()?;
-        }
-        reader.read_u16_be()?;
-        if format_version >= 121 {
-            reader.read_bytes(3)?;
-        }
-        if format_version >= 288 {
-            reader.read_u16_be()?;
-        }
-        if format_version >= 314 {
-            reader.read_u16_be()?;
-            reader.read_f32_be()?;
-        }
-        if format_version >= 320 {
-            reader.read_u8()?;
-        }
-        if format_version >= 110_023 {
-            reader.read_u16_be()?;
-        }
-        if format_version >= 122 {
-            reader.read_bytes(passenger_record_bytes)?;
-        }
-        if (112_004..112_022).contains(&format_version) {
-            reader.read_u16_be()?;
-        } else if (112_022..114_001).contains(&format_version) {
-            reader.read_unique_string()?;
-        }
+        line_records.push(decode_transport_manager_line_record(
+            format_version,
+            &mut reader,
+        )?);
     }
     if format_version >= 122 {
         let passenger_record_count = line_number_count;
@@ -7758,6 +7957,7 @@ fn decode_transport_manager_reference_body(
     Ok(TransportManagerReferenceFields {
         milestone_object_headers,
         object_headers: headers,
+        line_records,
         selection_prefix,
         #[cfg(test)]
         selection_count,
@@ -7768,6 +7968,7 @@ fn decode_transport_manager_reference_body(
 struct TransportManagerReferenceFields {
     milestone_object_headers: Vec<NetObjectHeader>,
     object_headers: Vec<NetObjectHeader>,
+    line_records: Vec<TransportManagerLineRecord>,
     selection_prefix: Option<TransportManagerSelectionPrefix>,
     #[cfg(test)]
     selection_count: usize,
@@ -8099,9 +8300,10 @@ mod manager_boundary_tests {
         DataSerializerObjectTable, ECONOMY_MANAGER_CASH_VALUE_COUNT, ECONOMY_MANAGER_LOAN_COUNT,
         EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
         EconomyManagerBodyLayout, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
-        QueuedDataObject, SimulationManagerData, TransportManagerSelection,
-        TransportManagerSharedStringValue, decode_economy_manager_body_layout,
-        decode_economy_manager_budget_editor, decode_economy_manager_income_expense_editor,
+        QueuedDataObject, SimulationManagerData, TransportLineVehicleSelection,
+        TransportManagerSelection, TransportManagerSharedStringValue,
+        decode_economy_manager_body_layout, decode_economy_manager_budget_editor,
+        decode_economy_manager_income_expense_editor,
         decode_economy_manager_income_expense_editor_with_layout,
         decode_economy_manager_investment_editor,
         decode_economy_manager_investment_flags_from_body,
@@ -9308,7 +9510,7 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn transport_manager_skips_active_line_records_across_version_gates() {
+    fn transport_manager_decodes_active_line_records_across_version_gates() {
         let cases = [
             (175, 5, 0),
             (176, 5, 0),
@@ -9330,7 +9532,7 @@ mod manager_boundary_tests {
         ];
 
         for (format_version, line_number_count, object_header_count) in cases {
-            let (bytes, _) = active_transport_manager_reference_body(
+            let (bytes, line_record_start) = active_transport_manager_reference_body(
                 format_version,
                 line_number_count,
                 0,
@@ -9347,10 +9549,117 @@ mod manager_boundary_tests {
                 panic!("version {format_version} active-line record failed: {error}")
             });
             assert_eq!(decoded.object_headers.len(), object_header_count);
+            assert_eq!(decoded.line_records.len(), 1);
+            let line = &decoded.line_records[0];
+            assert_eq!(line.line_number(), Some(0x1234), "version {format_version}");
+            assert_eq!(line.stop_count(), 9, "version {format_version}");
+            assert_eq!(
+                line.color(),
+                (format_version >= 121).then_some([0x12, 0x34, 0x56]),
+                "version {format_version}"
+            );
+            assert_eq!(
+                line.building(),
+                (format_version >= 288).then_some(0x2345),
+                "version {format_version}"
+            );
+            assert_eq!(
+                line.budget(),
+                (format_version >= 314).then_some(0x3456),
+                "version {format_version}"
+            );
+            assert_eq!(
+                line.total_length_bits(),
+                (format_version >= 314).then_some(1.5_f32.to_bits()),
+                "version {format_version}"
+            );
+            assert_eq!(
+                line.average_interval(),
+                (format_version >= 320).then_some(0x45),
+                "version {format_version}"
+            );
+            assert_eq!(
+                line.ticket_price(),
+                (format_version >= 110_023).then_some(0x4567),
+                "version {format_version}"
+            );
+            assert_eq!(
+                line.passengers()
+                    .map(|passengers| passengers.groups().len()),
+                (format_version >= 122).then_some(if format_version >= 176 { 8 } else { 7 }),
+                "version {format_version}"
+            );
+            if let Some(passengers) = line.passengers() {
+                assert!(passengers.groups().iter().all(|group| {
+                    group.temporary() == 0x5a_5a_5a
+                        && group.final_count() == 0x5a_5a_5a
+                        && group.average() == 0x5a_5a_5a
+                }));
+            }
+            match (format_version, line.legacy_vehicle_selection()) {
+                (112_004..=112_021, Some(TransportLineVehicleSelection::Index(0x5678))) => {}
+                (112_022..=114_000, Some(TransportLineVehicleSelection::Name(Some(name))))
+                    if name == "TramVehicle" => {}
+                (..=112_003 | 114_001.., None) => {}
+                _ => panic!("legacy selection does not match version {format_version}"),
+            }
+            assert_eq!(
+                line.encode_unchanged(),
+                bytes[line_record_start..line_record_start + line.encoded_len()],
+                "version {format_version}"
+            );
             if format_version >= 114_001 {
                 assert!(decoded.selection_prefix.unwrap().selections().is_empty());
             }
         }
+
+        let (mut truncated_line, line_start) =
+            active_transport_manager_reference_body(320, 10, 0, 7);
+        truncated_line.remove(line_start + 2); // Remove part of the stop-count field.
+        assert!(decode_transport_manager_reference_body(320, &truncated_line, None, None).is_err());
+    }
+
+    #[test]
+    fn transport_manager_line_record_api_checks_manager_boundary_and_preserves_bytes() {
+        let (body, line_record_start) = active_transport_manager_reference_body(320, 10, 0, 7);
+        let mut graph = profiler_tag("TransportManager");
+        let body_start = graph.len();
+        graph.extend_from_slice(&body);
+        graph.extend_from_slice(&[0, 0]);
+        graph.extend(profiler_tag("EconomyManager"));
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 320;
+        let mut manager_objects = vec![None; 20];
+        for (slot, type_name) in [
+            (15, "TreeManager+Data, Assembly-CSharp"),
+            (16, "WeatherManager+Data, Assembly-CSharp"),
+            (17, "VehicleManager+Data, Assembly-CSharp"),
+            (18, "TransportManager+Data, Assembly-CSharp"),
+            (19, "EconomyManager+Data, Assembly-CSharp"),
+        ] {
+            manager_objects[slot] = Some(ManagerObjectReference {
+                object_id: slot as u32,
+                type_name: type_name.to_owned(),
+            });
+        }
+        manager.manager_objects = Some(manager_objects);
+
+        let records = manager.decode_transport_manager_line_records().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.line_number(), Some(0x1234));
+        assert_eq!(record.stop_count(), 9);
+        assert_eq!(record.average_interval(), Some(0x45));
+        assert_eq!(record.passengers().unwrap().groups().len(), 8);
+        assert_eq!(
+            record.encode_unchanged(),
+            manager.serialized_object_graph()[body_start + line_record_start
+                ..body_start + line_record_start + record.encoded_len()]
+        );
+
+        manager.serialized_object_graph[body_start + body.len()] = 0xfe;
+        assert!(manager.decode_transport_manager_line_records().is_err());
     }
 
     #[test]
