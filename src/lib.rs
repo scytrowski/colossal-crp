@@ -98,8 +98,8 @@ pub use simulation_manager_data::{
     ResolvedObjectReference, SerializableDataEntry, SimulationManagerData,
     TransportLineVehicleSelection, TransportManagerActiveLineEditor, TransportManagerLineData,
     TransportManagerLineDataEditor, TransportManagerLineRecord, TransportManagerSelection,
-    TransportManagerSelectionPrefix, TransportManagerSharedStringValue, TransportPassengerCounts,
-    TransportPassengerRecord,
+    TransportManagerSelectionEditor, TransportManagerSelectionPrefix,
+    TransportManagerSharedStringValue, TransportPassengerCounts, TransportPassengerRecord,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use statistics_manager_data::{
