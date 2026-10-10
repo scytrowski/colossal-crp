@@ -1275,6 +1275,8 @@ pub struct TransportManagerSelectionPrefix {
     selections: Vec<TransportManagerSelection>,
     serialized_prefix: Vec<u8>,
     key_ranges: Vec<Range<usize>>,
+    new_string_ranges: Vec<Option<Range<usize>>>,
+    new_string_indexes: Vec<Option<u16>>,
 }
 
 impl TransportManagerSelectionPrefix {
@@ -1316,14 +1318,17 @@ impl TransportManagerSelectionPrefix {
             values,
             original_prefix: self.serialized_prefix,
             key_ranges: self.key_ranges,
+            new_string_ranges: self.new_string_ranges,
+            new_string_indexes: self.new_string_indexes,
         }
     }
 }
 
 /// Editor for signed keys in the TransportManager vehicle-selection table.
 ///
-/// The original shared-string encodings are retained verbatim. Entries and
-/// values cannot be added, removed, or rewritten by this editor.
+/// The original shared-string encodings are retained verbatim. Entries cannot
+/// be added or removed; newly declared strings can change only at the same
+/// serialized width.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerSelectionEditor {
     format_version: u32,
@@ -1331,6 +1336,8 @@ pub struct TransportManagerSelectionEditor {
     values: Vec<TransportManagerSharedStringValue>,
     original_prefix: Vec<u8>,
     key_ranges: Vec<Range<usize>>,
+    new_string_ranges: Vec<Option<Range<usize>>>,
+    new_string_indexes: Vec<Option<u16>>,
 }
 
 impl TransportManagerSelectionEditor {
@@ -1349,17 +1356,83 @@ impl TransportManagerSelectionEditor {
         &mut self.keys
     }
 
-    /// Returns the original decoded shared-string values in entry order.
+    /// Returns current decoded shared-string values in entry order.
+    ///
+    /// Existing entries in this table that point to an edited new-string index
+    /// reflect the updated value. References later in the serialized stream are
+    /// affected as well, but are not decoded here.
     pub fn values(&self) -> &[TransportManagerSharedStringValue] {
         &self.values
     }
 
-    /// Writes edited keys into the original table bytes without changing
-    /// entry count, string encodings, or table length.
+    /// Changes the value of an entry that declares a new shared string.
+    ///
+    /// Existing-index entries cannot be changed here. Updating a new string
+    /// changes the shared-string value at its stream index, so later references
+    /// to that same index resolve to the updated value. The replacement must
+    /// retain the source null state, encoding mode, and serialized length.
+    pub fn set_new_string_value(
+        &mut self,
+        entry_index: usize,
+        value: Option<String>,
+    ) -> Result<(), CrpError> {
+        if entry_index >= self.values.len() {
+            return Err(invalid(
+                entry_index,
+                "TransportManager selection entry index is out of bounds",
+            ));
+        }
+        let string_index = self
+            .new_string_indexes
+            .get(entry_index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| {
+                invalid(
+                    entry_index,
+                    "TransportManager selection entry does not declare a new shared string",
+                )
+            })?;
+        let replacement_value = value.clone();
+        let selection = self.values.get_mut(entry_index).ok_or_else(|| {
+            invalid(
+                entry_index,
+                "TransportManager selection entry index is out of bounds",
+            )
+        })?;
+        match selection {
+            TransportManagerSharedStringValue::New(current) => *current = value,
+            TransportManagerSharedStringValue::Existing { .. } => {
+                return Err(invalid(
+                    entry_index,
+                    "TransportManager selection value refers to an existing shared string",
+                ));
+            }
+        }
+        for (index, selection) in self.values.iter_mut().enumerate() {
+            if index == entry_index {
+                continue;
+            }
+            if let TransportManagerSharedStringValue::Existing {
+                index: existing_index,
+                value: resolved_value,
+            } = selection
+                && *existing_index == string_index
+            {
+                *resolved_value = replacement_value.clone();
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes edited keys and new-string values into the original table bytes
+    /// without changing entry count, string encodings, or table length.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         if self.format_version < 114_001
             || self.keys.len() != self.key_ranges.len()
             || self.values.len() != self.keys.len()
+            || self.new_string_ranges.len() != self.keys.len()
+            || self.new_string_indexes.len() != self.keys.len()
         {
             return Err(invalid(
                 0,
@@ -1384,7 +1457,82 @@ impl TransportManagerSelectionEditor {
                 })?
                 .copy_from_slice(&key.to_be_bytes());
         }
+        for ((value, range), string_index) in self
+            .values
+            .iter()
+            .zip(&self.new_string_ranges)
+            .zip(&self.new_string_indexes)
+        {
+            match (value, range, string_index) {
+                (TransportManagerSharedStringValue::New(value), Some(range), Some(_)) => {
+                    let original = self.original_prefix.get(range.clone()).ok_or_else(|| {
+                        invalid(
+                            range.start,
+                            "TransportManager new-string range exceeds source table",
+                        )
+                    })?;
+                    let encoded = encode_selection_unique_string(value.as_deref(), original)?;
+                    if encoded.len() != range.len() {
+                        return Err(invalid(
+                            range.start,
+                            "TransportManager selection string changes its serialized length",
+                        ));
+                    }
+                    bytes
+                        .get_mut(range.clone())
+                        .ok_or_else(|| {
+                            invalid(
+                                range.start,
+                                "TransportManager new-string range exceeds source table",
+                            )
+                        })?
+                        .copy_from_slice(&encoded);
+                }
+                (TransportManagerSharedStringValue::Existing { .. }, None, None) => {}
+                _ => {
+                    return Err(invalid(
+                        0,
+                        "TransportManager selection value and source range disagree",
+                    ));
+                }
+            }
+        }
         Ok(bytes)
+    }
+}
+
+fn encode_selection_unique_string(
+    value: Option<&str>,
+    original: &[u8],
+) -> Result<Vec<u8>, CrpError> {
+    match (value, original) {
+        (None, [0xff]) => Ok(vec![0xff]),
+        (None, _) => Err(invalid(
+            0,
+            "TransportManager selection string nullness cannot change in a fixed-width edit",
+        )),
+        (Some(_), [0xff]) => Err(invalid(
+            0,
+            "TransportManager selection string nullness cannot change in a fixed-width edit",
+        )),
+        (Some(value), [first, second, third, ..]) => {
+            let encoded_length =
+                (u32::from(*first) << 16) | (u32::from(*second) << 8) | u32::from(*third);
+            let compact = encoded_length & COMPACT_STRING_FLAG != 0;
+            let mut encoded = Vec::new();
+            write_unique_string_with_mode(&mut encoded, value, compact)?;
+            if encoded.get(..3) != Some(&original[..3]) {
+                return Err(invalid(
+                    0,
+                    "TransportManager selection string changes its encoded character count",
+                ));
+            }
+            Ok(encoded)
+        }
+        (Some(_), _) => Err(invalid(
+            0,
+            "TransportManager selection string has an invalid source encoding",
+        )),
     }
 }
 
@@ -8868,6 +9016,8 @@ fn decode_transport_manager_reference_body(
     let selection_start = reader.offset();
     let mut selections = Vec::new();
     let mut selection_key_ranges = Vec::new();
+    let mut selection_new_string_ranges = Vec::new();
+    let mut selection_new_string_indexes = Vec::new();
     let capture_selections = shared_strings.is_some();
     #[cfg(test)]
     let mut selection_count = 0;
@@ -8900,6 +9050,8 @@ fn decode_transport_manager_reference_body(
         if capture_selections {
             selections.reserve(parsed_selection_count);
             selection_key_ranges.reserve(parsed_selection_count);
+            selection_new_string_ranges.reserve(parsed_selection_count);
+            selection_new_string_indexes.reserve(parsed_selection_count);
         }
         for _ in 0..parsed_selection_count {
             let key_start = reader.offset();
@@ -8917,8 +9069,39 @@ fn decode_transport_manager_reference_body(
                 selection_key_ranges.push(relative_start..relative_end);
             }
             if let Some(shared_strings) = shared_strings.as_deref_mut() {
+                let value_start = reader.offset();
+                let shared_string_index = shared_strings.len();
                 let value =
                     read_transport_manager_shared_string_value(&mut reader, shared_strings)?;
+                let value_range = if matches!(&value, TransportManagerSharedStringValue::New(_)) {
+                    let range_start = value_start
+                        .checked_add(1)
+                        .ok_or(CrpError::ArithmeticOverflow(
+                            "TransportManager selection string start",
+                        ))?
+                        .checked_sub(selection_start)
+                        .ok_or(CrpError::ArithmeticOverflow(
+                            "TransportManager selection string start",
+                        ))?;
+                    let range_end = reader.offset().checked_sub(selection_start).ok_or(
+                        CrpError::ArithmeticOverflow("TransportManager selection string end"),
+                    )?;
+                    Some(range_start..range_end)
+                } else {
+                    None
+                };
+                let new_string_index =
+                    if matches!(&value, TransportManagerSharedStringValue::New(_)) {
+                        Some(u16::try_from(shared_string_index).map_err(|_| {
+                            reader.invalid(
+                                "new shared-string index does not fit in its reference field",
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
+                selection_new_string_ranges.push(value_range);
+                selection_new_string_indexes.push(new_string_index);
                 selections.push(TransportManagerSelection { key, value });
             } else {
                 skip_transport_manager_shared_string_value(&mut reader)?;
@@ -8942,6 +9125,8 @@ fn decode_transport_manager_reference_body(
         selections,
         serialized_prefix: reader.consumed_bytes()[selection_start..reader.offset()].to_vec(),
         key_ranges: selection_key_ranges,
+        new_string_ranges: selection_new_string_ranges,
+        new_string_indexes: selection_new_string_indexes,
     });
     let selection_range = (format_version >= 114_001).then_some(selection_start..reader.offset());
     Ok(TransportManagerReferenceFields {
@@ -10388,13 +10573,15 @@ mod manager_boundary_tests {
         selection_bytes.extend_from_slice(&[0; 17 * 2 + 17 * 8 * 9]);
         selection_bytes.extend([0xff; 7]);
         let count_offset = selection_bytes.len();
-        selection_bytes.extend_from_slice(&2_i16.to_be_bytes());
+        selection_bytes.extend_from_slice(&3_i16.to_be_bytes());
         selection_bytes.extend_from_slice(&(-3_i16).to_be_bytes());
         selection_bytes.push(0xfe);
         write_unique_string(&mut selection_bytes, "TramVehicle").unwrap();
         selection_bytes.extend_from_slice(&5_i16.to_be_bytes());
         let second_shared_string_offset = selection_bytes.len();
         selection_bytes.extend_from_slice(&[0x00, 0x00]);
+        selection_bytes.extend_from_slice(&6_i16.to_be_bytes());
+        selection_bytes.extend_from_slice(&[0x00, 0x01]);
         let mut shared_strings = vec![Some("SimulationManager".to_owned())];
         let decoded = decode_transport_manager_reference_body(
             114_001,
@@ -10420,6 +10607,13 @@ mod manager_boundary_tests {
                         value: Some("SimulationManager".to_owned()),
                     },
                 },
+                TransportManagerSelection {
+                    key: 6,
+                    value: TransportManagerSharedStringValue::Existing {
+                        index: 1,
+                        value: Some("TramVehicle".to_owned()),
+                    },
+                },
             ]
         );
         assert_eq!(
@@ -10427,14 +10621,35 @@ mod manager_boundary_tests {
             selection_bytes[count_offset..]
         );
         let mut selection_editor = selection_prefix.into_editor();
-        assert_eq!(selection_editor.keys(), [-3, 5]);
-        assert_eq!(selection_editor.values().len(), 2);
-        selection_editor.keys_mut().copy_from_slice(&[12, -34]);
+        assert_eq!(selection_editor.keys(), [-3, 5, 6]);
+        assert_eq!(selection_editor.values().len(), 3);
+        assert!(
+            selection_editor
+                .set_new_string_value(1, Some("TrainEngine".to_owned()))
+                .is_err()
+        );
+        selection_editor
+            .set_new_string_value(0, Some("TrainEngine".to_owned()))
+            .unwrap();
+        assert_eq!(
+            selection_editor.values()[2],
+            TransportManagerSharedStringValue::Existing {
+                index: 1,
+                value: Some("TrainEngine".to_owned()),
+            }
+        );
+        selection_editor.keys_mut().copy_from_slice(&[12, -34, 20]);
         let mut expected_selection_bytes = selection_bytes[count_offset..].to_vec();
         expected_selection_bytes[2..4].copy_from_slice(&12_i16.to_be_bytes());
+        expected_selection_bytes[5..19].copy_from_slice(&[
+            0x80, 0x00, 0x0b, 0xd4, 0x1e, 0xef, 0x08, 0x05, 0xd7, 0x29, 0xf9, 0x02, 0x05, 0xf7,
+        ]);
         let second_key_offset = second_shared_string_offset - count_offset - 2;
         expected_selection_bytes[second_key_offset..second_key_offset + 2]
             .copy_from_slice(&(-34_i16).to_be_bytes());
+        expected_selection_bytes[second_shared_string_offset - count_offset + 2
+            ..second_shared_string_offset - count_offset + 4]
+            .copy_from_slice(&20_i16.to_be_bytes());
         assert_eq!(selection_editor.encode().unwrap(), expected_selection_bytes);
 
         let mut negative_count = selection_bytes.clone();
@@ -10605,12 +10820,19 @@ mod manager_boundary_tests {
         );
         let mut editor = selection.into_editor();
         editor.keys_mut()[0] = 0x1234;
+        editor
+            .set_new_string_value(0, Some("Car".to_owned()))
+            .unwrap();
 
         let original_graph = manager.serialized_object_graph().to_vec();
         let relative_key_offset = selection_count_start + 2;
+        let relative_string_offset = selection_count_start + 5;
         let mut expected_graph = original_graph.clone();
         expected_graph[body_start + relative_key_offset..body_start + relative_key_offset + 2]
             .copy_from_slice(&0x1234_i16.to_be_bytes());
+        expected_graph
+            [body_start + relative_string_offset..body_start + relative_string_offset + 6]
+            .copy_from_slice(&[0x80, 0x00, 0x03, 0xc3, 0x1e, 0x11]);
         manager
             .replace_transport_manager_selection_prefix(&editor)
             .unwrap();
@@ -10635,11 +10857,20 @@ mod manager_boundary_tests {
         assert_eq!(selection_after.selections()[0].key, 0x1234);
         assert_eq!(
             selection_after.selections()[0].value,
-            TransportManagerSharedStringValue::New(Some("Bus".to_owned()))
+            TransportManagerSharedStringValue::New(Some("Car".to_owned()))
         );
         assert!(
             manager
                 .replace_transport_manager_selection_prefix(&editor)
+                .is_err()
+        );
+        let mut wrong_length = selection_after.into_editor();
+        wrong_length
+            .set_new_string_value(0, Some("Boat".to_owned()))
+            .unwrap();
+        assert!(
+            manager
+                .replace_transport_manager_selection_prefix(&wrong_length)
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph(), expected_graph);
