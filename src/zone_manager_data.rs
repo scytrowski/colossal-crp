@@ -2,6 +2,7 @@ use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::read_encoded_uint_array;
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
+use std::ops::Range;
 
 const ZONE_BLOCK_COUNT: usize = 49_152;
 const ZONE_FLAGS_OLD_COUNT: usize = 16_383;
@@ -17,6 +18,7 @@ const ZONE_BLOCKS_VERSION: u32 = 160;
 const ZONE_DEMAND_COUNT: usize = 3;
 const GOOD_AREA_COUNT: usize = 8;
 const INITIAL_OBJECT_COUNT: usize = 11;
+const ZONE_BLOCK_RECORD_LEN: usize = 70;
 
 /// One active `ZoneBlock` record from `ZoneManager+Data`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +60,20 @@ pub struct ZoneManagerDataPrefix {
     actual_demand: [i8; ZONE_DEMAND_COUNT],
     good_area_found: [i16; GOOD_AREA_COUNT],
     object_references: Vec<NetObjectHeader>,
+    blocks_range: Range<usize>,
+    demand_range: Option<Range<usize>>,
+    actual_demand_range: Option<Range<usize>>,
+    good_area_range: Option<Range<usize>>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for existing ZoneBlock values and versioned demand fields.
+///
+/// The selected block slots, flags, and queued object references remain fixed.
+/// All edited fields have fixed-width serialized representations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZoneManagerEditor {
+    data: ZoneManagerDataPrefix,
 }
 
 impl ZoneManagerDataPrefix {
@@ -83,6 +98,7 @@ impl ZoneManagerDataPrefix {
         let mut flags = read_encoded_uint_array(&mut reader, serialized_flag_count)?;
         flags.resize(ZONE_BLOCK_COUNT - 1, 0);
 
+        let blocks_start = reader.offset();
         let active_count = flags.iter().filter(|flag| **flag != 0).count();
         let mut blocks = Vec::with_capacity(active_count);
         for (index, flag) in flags.iter().enumerate() {
@@ -119,33 +135,39 @@ impl ZoneManagerDataPrefix {
                 segment,
             });
         }
+        let blocks_range = blocks_start..reader.offset();
 
-        let demand = if format_version >= ZONE_DEMAND_VERSION {
-            [
+        let (demand, demand_range) = if format_version >= ZONE_DEMAND_VERSION {
+            let start = reader.offset();
+            let values = [
                 reader.read_u8()? as i8,
                 reader.read_u8()? as i8,
                 reader.read_u8()? as i8,
-            ]
+            ];
+            (values, Some(start..reader.offset()))
         } else {
-            [50; ZONE_DEMAND_COUNT]
+            ([50; ZONE_DEMAND_COUNT], None)
         };
-        let actual_demand = if format_version >= ZONE_ACTUAL_DEMAND_VERSION {
-            [
+        let (actual_demand, actual_demand_range) = if format_version >= ZONE_ACTUAL_DEMAND_VERSION {
+            let start = reader.offset();
+            let values = [
                 reader.read_u8()? as i8,
                 reader.read_u8()? as i8,
                 reader.read_u8()? as i8,
-            ]
+            ];
+            (values, Some(start..reader.offset()))
         } else {
-            demand
+            (demand, None)
         };
-        let good_area_found = if format_version >= ZONE_GOOD_AREA_VERSION {
+        let (good_area_found, good_area_range) = if format_version >= ZONE_GOOD_AREA_VERSION {
+            let start = reader.offset();
             let mut values = [0_i16; GOOD_AREA_COUNT];
             for value in &mut values {
                 *value = reader.read_i16_be()?;
             }
-            values
+            (values, Some(start..reader.offset()))
         } else {
-            [0; GOOD_AREA_COUNT]
+            ([0; GOOD_AREA_COUNT], None)
         };
 
         let mut object_references = Vec::with_capacity(INITIAL_OBJECT_COUNT + 2);
@@ -178,6 +200,10 @@ impl ZoneManagerDataPrefix {
                 actual_demand,
                 good_area_found,
                 object_references,
+                blocks_range,
+                demand_range,
+                actual_demand_range,
+                good_area_range,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -225,10 +251,152 @@ impl ZoneManagerDataPrefix {
         &self.object_references
     }
 
+    /// Creates an editor for existing blocks and serialized demand fields.
+    pub fn into_editor(self) -> ZoneManagerEditor {
+        ZoneManagerEditor { data: self }
+    }
+
     /// Writes the original known prefix exactly, including encoded array runs.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
+}
+
+impl ZoneManagerEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.data.format_version
+    }
+
+    /// Returns mutable records for existing nonzero-flag blocks.
+    ///
+    /// Block indexes cannot be changed, and this slice cannot add or remove
+    /// records. The serialized flags remain unchanged.
+    pub fn blocks_mut(&mut self) -> &mut [ZoneBlockRecord] {
+        &mut self.data.blocks
+    }
+
+    /// Returns mutable residential, commercial, and workplace demand from
+    /// inner version 74. Earlier layouts expose no serialized demand fields.
+    pub fn demand_mut(&mut self) -> Option<&mut [i8; ZONE_DEMAND_COUNT]> {
+        self.data.demand_range.as_ref()?;
+        Some(&mut self.data.demand)
+    }
+
+    /// Returns mutable actual demand from inner version 168 onward.
+    pub fn actual_demand_mut(&mut self) -> Option<&mut [i8; ZONE_DEMAND_COUNT]> {
+        self.data.actual_demand_range.as_ref()?;
+        Some(&mut self.data.actual_demand)
+    }
+
+    /// Returns mutable good-area values from inner version 194 onward.
+    pub fn good_area_found_mut(&mut self) -> Option<&mut [i16; GOOD_AREA_COUNT]> {
+        self.data.good_area_range.as_ref()?;
+        Some(&mut self.data.good_area_found)
+    }
+
+    /// Writes edited fixed-width fields and retains every other source byte.
+    /// The serialized flags, block slots, and object references are unchanged.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let mut bytes = self.data.serialized_prefix.clone();
+        let active_indices = self
+            .data
+            .flags
+            .iter()
+            .enumerate()
+            .filter_map(|(index, flag)| (*flag != 0).then_some(index + 1));
+        let mut active_indices = active_indices;
+        if self.data.blocks.len() != self.data.flags.iter().filter(|flag| **flag != 0).count()
+            || self
+                .data
+                .blocks
+                .iter()
+                .zip(&mut active_indices)
+                .any(|(block, index)| usize::from(block.index) != index)
+        {
+            return Err(invalid_zone_manager(
+                0,
+                "ZoneBlock indexes and count must match the source flags",
+            ));
+        }
+
+        let expected_blocks_len = self
+            .data
+            .blocks
+            .len()
+            .checked_mul(ZONE_BLOCK_RECORD_LEN)
+            .ok_or(CrpError::ArithmeticOverflow("ZoneBlock record bytes"))?;
+        validate_zone_range(
+            &bytes,
+            &self.data.blocks_range,
+            expected_blocks_len,
+            "ZoneBlock records",
+        )?;
+        let mut encoded_blocks = Vec::with_capacity(expected_blocks_len);
+        for block in &self.data.blocks {
+            append_zone_block(&mut encoded_blocks, block);
+        }
+        bytes[self.data.blocks_range.clone()].copy_from_slice(&encoded_blocks);
+
+        if let Some(range) = self.data.demand_range.as_ref() {
+            validate_zone_range(&bytes, range, 3, "demand values")?;
+            for (target, value) in bytes[range.clone()].iter_mut().zip(self.data.demand) {
+                *target = value as u8;
+            }
+        }
+        if let Some(range) = self.data.actual_demand_range.as_ref() {
+            validate_zone_range(&bytes, range, 3, "actual-demand values")?;
+            for (target, value) in bytes[range.clone()].iter_mut().zip(self.data.actual_demand) {
+                *target = value as u8;
+            }
+        }
+        if let Some(range) = self.data.good_area_range.as_ref() {
+            validate_zone_range(&bytes, range, GOOD_AREA_COUNT * 2, "good-area values")?;
+            for (index, value) in self.data.good_area_found.iter().enumerate() {
+                let start = range.start + index * 2;
+                bytes[start..start + 2].copy_from_slice(&value.to_be_bytes());
+            }
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.data.serialized_prefix
+    }
+}
+
+fn append_zone_block(output: &mut Vec<u8>, block: &ZoneBlockRecord) {
+    output.extend_from_slice(&block.build_index.to_be_bytes());
+    for position in block.position_bits {
+        output.extend_from_slice(&position.to_be_bytes());
+    }
+    output.extend_from_slice(&block.angle_bits.to_be_bytes());
+    for value in [
+        block.valid,
+        block.shared,
+        block.occupied1,
+        block.occupied2,
+        block.zone1,
+        block.zone2,
+    ] {
+        output.extend_from_slice(&value.to_be_bytes());
+    }
+    output.extend_from_slice(&block.segment.to_be_bytes());
+}
+
+fn validate_zone_range(
+    source: &[u8],
+    range: &Range<usize>,
+    expected_len: usize,
+    field: &str,
+) -> Result<(), CrpError> {
+    if range.start > range.end || range.end > source.len() || range.len() != expected_len {
+        return Err(invalid_zone_manager(
+            range.start,
+            format!("{field} range does not match its decoded values"),
+        ));
+    }
+    Ok(())
 }
 
 fn invalid_zone_manager(offset: usize, reason: impl Into<String>) -> CrpError {
@@ -312,6 +480,11 @@ mod tests {
             assert_eq!(used, bytes.len());
             assert_eq!(zone.encode(), bytes);
             assert_eq!(zone.object_references().len(), 13);
+            if version == 164 {
+                let mut editor = zone.clone().into_editor();
+                assert!(editor.actual_demand_mut().is_none());
+                assert!(editor.good_area_found_mut().is_none());
+            }
         }
     }
 
@@ -354,6 +527,78 @@ mod tests {
                 .all(|header| *header == NetObjectHeader::Null)
         );
         assert!(ZoneManagerDataPrefix::decode_prefix(164, &bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn zone_manager_editor_patches_active_records_and_versioned_demand_values() {
+        let mut flags = vec![0; 16_383];
+        flags[0] = 1;
+        flags[2] = 7;
+        let mut bytes = Vec::new();
+        write_encoded_uint_array(&mut bytes, &flags);
+        let blocks_start = bytes.len();
+        for block in [0_u32, 1] {
+            bytes.extend_from_slice(&(0x1000 + block).to_be_bytes());
+            for bits in [0x3f80_0000_u32 + block, 0xc020_0000, 0x4040_0000] {
+                bytes.extend_from_slice(&bits.to_be_bytes());
+            }
+            bytes.extend_from_slice(&0x3f00_0000_u32.to_be_bytes());
+            for value in 1_u64..=6 {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            bytes.extend_from_slice(&(0x20 + block as u16).to_be_bytes());
+        }
+        let demand_start = bytes.len();
+        bytes.extend_from_slice(&[10, 20, 30]);
+        let actual_demand_start = bytes.len();
+        bytes.extend_from_slice(&[40, 50, 60]);
+        let good_area_start = bytes.len();
+        for value in [-4_i16, -3, -2, -1, 0, 1, 2, 3] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        null_references(&mut bytes, 194);
+
+        let (zone, _) = ZoneManagerDataPrefix::decode_prefix(194, &bytes).unwrap();
+        let mut editor = zone.into_editor();
+        let block = &mut editor.blocks_mut()[1];
+        block.build_index = 0xdead_beef;
+        block.position_bits[0] = 0x4120_0000;
+        block.valid = 0x1122_3344_5566_7788;
+        block.segment = 0x7788;
+        editor.demand_mut().unwrap()[0] = -5;
+        editor.actual_demand_mut().unwrap()[2] = 42;
+        editor.good_area_found_mut().unwrap()[7] = -1234;
+
+        let second_block_start = blocks_start + 70;
+        let mut expected = bytes;
+        expected[second_block_start..second_block_start + 4]
+            .copy_from_slice(&0xdead_beef_u32.to_be_bytes());
+        expected[second_block_start + 4..second_block_start + 8]
+            .copy_from_slice(&0x4120_0000_u32.to_be_bytes());
+        expected[second_block_start + 20..second_block_start + 28]
+            .copy_from_slice(&0x1122_3344_5566_7788_u64.to_be_bytes());
+        expected[second_block_start + 68..second_block_start + 70]
+            .copy_from_slice(&0x7788_u16.to_be_bytes());
+        expected[demand_start] = (-5_i8) as u8;
+        expected[actual_demand_start + 2] = 42;
+        expected[good_area_start + 14..good_area_start + 16]
+            .copy_from_slice(&(-1234_i16).to_be_bytes());
+        assert_eq!(editor.encode().unwrap(), expected);
+
+        let (updated, used) = ZoneManagerDataPrefix::decode_prefix(194, &expected).unwrap();
+        assert_eq!(used, expected.len());
+        assert_eq!(updated.blocks()[1].build_index, 0xdead_beef);
+        assert_eq!(updated.blocks()[1].position_bits[0], 0x4120_0000);
+        assert_eq!(updated.blocks()[1].valid, 0x1122_3344_5566_7788);
+        assert_eq!(updated.blocks()[1].segment, 0x7788);
+        assert_eq!(updated.demand(), [-5, 20, 30]);
+        assert_eq!(updated.actual_demand(), [40, 50, 42]);
+        assert_eq!(updated.good_area_found()[7], -1234);
+
+        let (zone, _) = ZoneManagerDataPrefix::decode_prefix(194, &expected).unwrap();
+        let mut invalid_editor = zone.into_editor();
+        invalid_editor.blocks_mut()[0].index = 2;
+        assert!(invalid_editor.encode().is_err());
     }
 
     #[test]

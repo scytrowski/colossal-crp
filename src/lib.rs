@@ -151,7 +151,7 @@ pub use water_simulation_data::{
     WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
 };
 pub use weather_manager_data::{WeatherLightningStrike, WeatherManagerData, WeatherManagerEditor};
-pub use zone_manager_data::{ZoneBlockRecord, ZoneManagerDataPrefix};
+pub use zone_manager_data::{ZoneBlockRecord, ZoneManagerDataPrefix, ZoneManagerEditor};
 
 const MAGIC: &[u8; 4] = b"CRAP";
 const ASSET_TYPE_PACKAGE: i32 = 53;

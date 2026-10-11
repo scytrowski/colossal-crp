@@ -20,6 +20,7 @@ use crate::VehicleParkedRecordsPrefix;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
 use crate::ZoneManagerDataPrefix;
+use crate::ZoneManagerEditor;
 use crate::audio_manager_data::{AudioManagerData, AudioManagerEditor};
 use crate::citizen_manager_data::{
     CitizenInstanceDataPrefix, CitizenManagerData, CitizenManagerDataPrefix, CitizenUnitDataPrefix,
@@ -5000,6 +5001,79 @@ impl SimulationManagerData {
             ));
         }
         Ok((zone, prop_tag_start))
+    }
+
+    /// Replaces editable ZoneManager block and demand fields in the graph.
+    ///
+    /// The editor must come from this graph and inner version. Block slots,
+    /// flags, and queued references remain fixed; replacement preserves the
+    /// body length and validates the adjacent PropManager boundary.
+    pub fn replace_zone_manager_data(
+        &mut self,
+        edited: &ZoneManagerEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                13,
+                "edited ZoneManager version does not match this stream",
+            ));
+        }
+        let (current, next_tag_start) = self.decode_zone_manager_prefix()?;
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                13,
+                "ZoneManager bytes do not match the editor's source prefix",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != edited.original_prefix_bytes().len() {
+            return Err(invalid(
+                13,
+                "ZoneManager edits cannot change the serialized prefix length",
+            ));
+        }
+
+        let zone_tag = new_profiler_tag_bytes("ZoneManager")?;
+        let body_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &zone_tag,
+            "ZoneManager profiler tag",
+        )?
+        .checked_add(zone_tag.len())
+        .ok_or(CrpError::ArithmeticOverflow("ZoneManager body start"))?;
+        let body_end = body_start
+            .checked_add(edited.original_prefix_bytes().len())
+            .ok_or(CrpError::ArithmeticOverflow("ZoneManager prefix end"))?;
+        let bounded_end = body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES).ok_or(
+            CrpError::ArithmeticOverflow("ZoneManager closing reference end"),
+        )?;
+        if bounded_end != next_tag_start {
+            return Err(invalid(
+                body_end,
+                "ZoneManager prefix does not end at the following manager boundary",
+            ));
+        }
+
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(body_start..body_end, replacement);
+        let original = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        match self.decode_zone_manager_prefix() {
+            Ok((_, updated_next_tag_start)) if updated_next_tag_start == next_tag_start => Ok(()),
+            Ok(_) => {
+                self.serialized_object_graph = original;
+                Err(invalid(
+                    body_end,
+                    "edited ZoneManager changed the following manager boundary",
+                ))
+            }
+            Err(error) => {
+                self.serialized_object_graph = original;
+                Err(invalid(
+                    body_start,
+                    format!("edited ZoneManager failed boundary validation: {error}"),
+                ))
+            }
+        }
     }
 
     /// Decodes PropManager after the ZoneManager boundary in the manager graph.
@@ -18838,6 +18912,43 @@ mod manager_boundary_tests {
         assert_eq!(districts.district_flags(), &[0; 128]);
         assert_eq!(districts.park_flags(), &[0; 128]);
         assert_eq!(district_end, data.serialized_object_graph().len());
+    }
+
+    #[test]
+    fn zone_manager_editor_patches_fields_and_preserves_prop_boundary() {
+        let mut manager = synthetic_manager_data();
+        let (zone, following_tag_start) = manager.decode_zone_manager_prefix().unwrap();
+        let zone_tag = profiler_tag("ZoneManager");
+        let zone_body_start = manager
+            .serialized_object_graph()
+            .windows(zone_tag.len())
+            .position(|window| window == zone_tag)
+            .unwrap()
+            + zone_tag.len();
+        let zone_body_end = zone_body_start + zone.encode().len();
+        let following_bytes = manager.serialized_object_graph()[zone_body_end..].to_vec();
+        let original_len = manager.serialized_object_graph().len();
+
+        let mut editor = zone.into_editor();
+        editor.demand_mut().unwrap()[0] = -7;
+        editor.actual_demand_mut().unwrap()[2] = 42;
+        editor.good_area_found_mut().unwrap()[7] = -1234;
+        manager.replace_zone_manager_data(&editor).unwrap();
+
+        assert_eq!(manager.serialized_object_graph().len(), original_len);
+        assert_eq!(
+            &manager.serialized_object_graph()[zone_body_end..],
+            following_bytes
+        );
+        let (updated, updated_following_tag_start) = manager.decode_zone_manager_prefix().unwrap();
+        assert_eq!(updated.demand(), [-7, 0, 0]);
+        assert_eq!(updated.actual_demand(), [0, 0, 42]);
+        assert_eq!(updated.good_area_found()[7], -1234);
+        assert_eq!(updated_following_tag_start, following_tag_start);
+
+        let updated_graph = manager.serialized_object_graph().to_vec();
+        assert!(manager.replace_zone_manager_data(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), updated_graph);
     }
 
     #[test]
