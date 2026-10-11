@@ -10,14 +10,15 @@ use std::ops::Range;
 
 const MAX_EVENT_SLOTS: usize = u16::MAX as usize + 1;
 const FIRST_EVENT_RECORD_VERSION: u32 = 210;
-const LAST_SUPPORTED_EVENT_RECORD_VERSION: u32 = 121_030;
+const LAST_SUPPORTED_EVENT_RECORD_VERSION: u32 = 121_032;
+const LAST_SUPPORTED_EVENT_ROUTE_VERSION: u32 = 121_030;
 const CUSTOM_EVENT_SEED_FLAG: u32 = 1 << 10;
 const MAX_RACE_EVENT_ENTRIES: usize = 1_000_000;
 const MAX_EVENT_ROUTE_SCHEDULES: usize = 4;
 
 /// One decoded active event from the versioned EventManager record layout.
 ///
-/// This layout is supported for inner versions 210 through 121030. Its four
+/// This layout is supported for inner versions 210 through 121032. Its four
 /// pre-245 color words are retained raw because their meaning is not
 /// established; version 245 stores the color as RGB bytes. Version-gated event
 /// values are exposed when present. The nested race-event data added at 120004
@@ -70,7 +71,7 @@ pub struct EventManagerEventRecord {
 /// route-spline fields are editable. Three prefab scopes expose their
 /// assignments and names with fixed counts and encoded widths. Other
 /// unmodeled nested values remain preserved as raw source bytes. The fields
-/// are available for EventManager inner versions 120004–121030.
+/// are available for EventManager inner versions 120004–121032.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerRaceEventData {
     /// Existing racers in serialized order. The count and optional-reference
@@ -110,6 +111,13 @@ pub struct EventManagerRaceEventData {
     pub racer_oscillation_records: Vec<[u8; 8]>,
     /// Opaque eight-byte racer state-timer records.
     pub racer_state_timer_records: Vec<[u8; 8]>,
+    /// Tier value serialized from inner version 121032.
+    pub tier: Option<i32>,
+    /// Spawned-entity count stored as a signed 32-bit value.
+    pub spawned_entities: i32,
+    /// Original DataSerializer bool byte for collision handling from version
+    /// 121031.
+    pub collisions_enabled_raw: Option<u8>,
     /// Prefab scope for per-racer `RaceTeamInfo` assignments.
     pub race_team_reference_scope: EventManagerRaceEventPrefabScope,
     /// Prefab scope for per-racer `ParadeGroupInfo` assignments.
@@ -274,14 +282,14 @@ pub struct EventManagerTailData {
 
 /// Supported fields decoded from a bounded `EventManager+Data` body.
 ///
-/// Active event records in versions 210–121030 are decoded and retained.
+/// Active event records in versions 210–121032 are decoded and retained.
 /// Race-event blocks are boundary-checked and retained raw, with selected
 /// fixed-width scalar fields exposed for editing, including nonempty legacy
 /// route splines. Active event routes from version 121005 are boundary-checked
-/// and their known values are exposed for edits. Active event records from
-/// version 121031 onward are unsupported. Reader, writer, and one
-/// corpus-observed counted block candidate are boundary-checked. The counted
-/// block is retained as raw bytes because its meaning and type are unknown.
+/// through version 121030 and their known values are exposed for edits. The
+/// legacy counted UShort block in race-event data is retained raw because its
+/// meaning is unknown. Reader, writer, and one corpus-observed counted block
+/// candidate are boundary-checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EventManagerReferenceData {
     format_version: u32,
@@ -328,7 +336,7 @@ pub struct EventManagerTypeDataEditor {
 /// Editor for existing versioned active EventManager records.
 ///
 /// The record count, slot indexes, and activity flags are fixed. It edits
-/// same-width scalar values for inner versions 210–121030, including selected
+/// same-width scalar values for inner versions 210–121032, including selected
 /// `RaceEventData` fields, opaque fixed-size arrays, and racer-name contents
 /// that retain their source encoding and width. Other nested race-event bytes
 /// and the surrounding EventManager body are preserved.
@@ -548,6 +556,10 @@ struct EventManagerRaceEventDataFieldRanges {
     race_team_reference_scope: EventPrefabScope,
     parade_group_reference_scope: EventPrefabScope,
     race_team_scope: EventPrefabScope,
+    tier: Option<Range<usize>>,
+    spawned_entities: Range<usize>,
+    legacy_counted_values: Option<Range<usize>>,
+    collisions_enabled_raw: Option<Range<usize>>,
     racer_state_records: Range<usize>,
     schedule_id: Range<usize>,
     lap_count: Range<usize>,
@@ -1002,6 +1014,21 @@ impl EventManagerEventRecordsEditor {
                         &data.racer_path_index_records,
                         "racer path index",
                     )?;
+                    match (data.tier, ranges.tier.as_ref()) {
+                        (Some(value), Some(range)) => patch_race_event_field(
+                            &mut output,
+                            range,
+                            &value.to_be_bytes(),
+                            "tier",
+                        )?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(invalid_event_record(
+                                ranges.event_end_frame.start,
+                                "race-event tier presence cannot change in this editor",
+                            ));
+                        }
+                    }
                     patch_race_event_field(
                         &mut output,
                         &ranges.finished_racer_data,
@@ -1038,6 +1065,30 @@ impl EventManagerEventRecordsEditor {
                         &data.racer_state_timer_records,
                         "racer state timer",
                     )?;
+                    if let Some(range) = ranges.legacy_counted_values.as_ref() {
+                        let source_values = self
+                            .original
+                            .serialized_body
+                            .get(range.clone())
+                            .ok_or_else(|| {
+                                invalid_event_record(
+                                    range.start,
+                                    "legacy race-event values exceed source body",
+                                )
+                            })?;
+                        patch_race_event_field(
+                            &mut output,
+                            range,
+                            source_values,
+                            "legacy race-event values",
+                        )?;
+                    }
+                    patch_race_event_field(
+                        &mut output,
+                        &ranges.spawned_entities,
+                        &data.spawned_entities.to_be_bytes(),
+                        "spawned-entity count",
+                    )?;
                     patch_race_event_prefab_scope(
                         &mut output,
                         &self.original.serialized_body,
@@ -1067,6 +1118,29 @@ impl EventManagerEventRecordsEditor {
                                     .as_ref()
                                     .map_or(ranges.schedule_id.start, |range| range.start),
                                 "race-event route-spline presence cannot change in this editor",
+                            ));
+                        }
+                    }
+                    match (
+                        data.collisions_enabled_raw,
+                        ranges.collisions_enabled_raw.as_ref(),
+                    ) {
+                        (Some(value), Some(range)) => {
+                            patch_race_event_field(
+                                &mut output,
+                                range,
+                                &[value],
+                                "collision-enabled flag",
+                            )?;
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(invalid_event_record(
+                                ranges
+                                    .collisions_enabled_raw
+                                    .as_ref()
+                                    .map_or(ranges.spawned_entities.start, |range| range.start),
+                                "race-event collision-flag presence cannot change in this editor",
                             ));
                         }
                     }
@@ -1919,6 +1993,11 @@ fn read_active_event_routes(
     CrpError,
 > {
     let active_count = flags.iter().filter(|flag| **flag != 0).count();
+    if active_count > 0 && format_version > LAST_SUPPORTED_EVENT_ROUTE_VERSION {
+        return Err(reader.invalid(format!(
+            "active EventManager routes are unsupported at inner version {format_version}"
+        )));
+    }
     let mut routes = Vec::with_capacity(active_count);
     let mut route_ranges = Vec::with_capacity(active_count);
     let mut schedule_name_ranges = Vec::with_capacity(active_count);
@@ -2403,6 +2482,12 @@ fn skip_race_event_data(
     let (racer_path_index_records, racer_path_index_record_range) =
         read_race_event_raw_records::<4>(reader, racer_count, "racer path index")?;
 
+    let (tier, tier_range) = if format_version >= 121_032 {
+        let start = reader.offset();
+        (Some(reader.read_i32_be()?), Some(start..reader.offset()))
+    } else {
+        (None, None)
+    };
     let event_end_frame_start = reader.offset();
     let event_end_frame = reader.read_u32_be()?;
     let event_end_frame_range = event_end_frame_start..reader.offset();
@@ -2431,6 +2516,19 @@ fn skip_race_event_data(
         read_race_event_raw_records::<8>(reader, racer_count, "racer oscillation")?;
     let (racer_state_timer_records, racer_state_timer_record_range) =
         read_race_event_raw_records::<8>(reader, racer_count, "racer state timer")?;
+    let spawned_entities_start = reader.offset();
+    let spawned_entities = reader.read_i32_be()?;
+    let spawned_entities_range = spawned_entities_start..reader.offset();
+    let legacy_counted_values = if format_version < 121_032 {
+        let start = reader.offset();
+        let count = read_race_event_count(reader, "legacy race-event value", 2)?;
+        for _ in 0..count {
+            reader.read_u16_be()?;
+        }
+        Some(start..reader.offset())
+    } else {
+        None
+    };
 
     let route_spline = if data_serializer_bool_is_true(reader.read_u8()?) {
         let start = reader.offset();
@@ -2442,6 +2540,12 @@ fn skip_race_event_data(
     let (route_spline, route_spline_range) = match route_spline {
         Some((route_spline, range)) => (Some(route_spline), Some(range)),
         None => (None, None),
+    };
+    let (collisions_enabled_raw, collisions_enabled_range) = if format_version >= 121_031 {
+        let start = reader.offset();
+        (Some(reader.read_u8()?), Some(start..reader.offset()))
+    } else {
+        (None, None)
     };
     Ok((
         EventManagerRaceEventData {
@@ -2475,6 +2579,9 @@ fn skip_race_event_data(
                 indexes: race_team_scope.indexes.clone(),
                 names: race_team_scope.names.clone(),
             },
+            tier,
+            spawned_entities,
+            collisions_enabled_raw,
             route_spline,
         },
         EventManagerRaceEventDataFieldRanges {
@@ -2482,6 +2589,10 @@ fn skip_race_event_data(
             race_team_reference_scope,
             parade_group_reference_scope,
             race_team_scope,
+            tier: tier_range,
+            spawned_entities: spawned_entities_range,
+            legacy_counted_values,
+            collisions_enabled_raw: collisions_enabled_range,
             racer_state_records: racer_state_record_range,
             schedule_id: schedule_id_range,
             lap_count: lap_count_range,
@@ -3382,9 +3493,10 @@ mod tests {
         EventManagerEventRecord, EventManagerRaceEventData, EventManagerReferenceData,
         EventManagerTailData, EventManagerTypeData,
     };
+    use crate::data_serializer::Reader;
     use crate::net_manager_data::NetObjectHeader;
 
-    const EMPTY_RACE_EVENT_DATA: [u8; 66] = [
+    const EMPTY_RACE_EVENT_DATA: [u8; 74] = [
         0x00, 0x00, 0x00, 0x00, // No racers.
         0x00, 0x00, // Empty RaceTeamInfo reference scope.
         0x00, 0x00, // Empty ParadeGroupInfo reference scope.
@@ -3404,8 +3516,35 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, // No race teams.
         0x00, 0x00, // Empty RaceTeamInfo team scope.
         0x00, 0x00, 0x00, 0x00, // No team members.
+        0x31, 0x32, 0x33, 0x34, // Spawned-entity count.
+        0x00, 0x00, 0x00, 0x00, // Empty legacy counted UShort block.
         0x00, // No route spline.
     ];
+
+    fn race_event_data_for_version(source: &[u8], format_version: u32) -> Vec<u8> {
+        if format_version < 121_031 {
+            return source.to_vec();
+        }
+        let mut reader = Reader::new(source);
+        let (_, field_ranges) =
+            super::skip_race_event_data(&mut reader, 120_004).expect("base race-event fixture");
+        assert_eq!(reader.offset(), source.len());
+        let mut output = source.to_vec();
+        if format_version >= 121_032 {
+            let legacy_range = field_ranges
+                .legacy_counted_values
+                .expect("pre-121032 fixture has a legacy counted block");
+            output.drain(legacy_range);
+            output.splice(
+                field_ranges.event_end_frame.start..field_ranges.event_end_frame.start,
+                0_i32.to_be_bytes(),
+            );
+        }
+        if format_version >= 121_031 {
+            output.push(0); // collisionsEnabled is false.
+        }
+        output
+    }
 
     fn one_active_event(format_version: u32, flags: u32) -> Vec<u8> {
         let mut bytes = vec![
@@ -3457,10 +3596,16 @@ mod tests {
             bytes.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
         }
         if (120_004..=121_005).contains(&format_version) {
-            bytes.extend_from_slice(&EMPTY_RACE_EVENT_DATA);
-        } else if (121_006..=121_030).contains(&format_version) {
+            bytes.extend_from_slice(&race_event_data_for_version(
+                &EMPTY_RACE_EVENT_DATA,
+                format_version,
+            ));
+        } else if (121_006..=super::LAST_SUPPORTED_EVENT_RECORD_VERSION).contains(&format_version) {
             bytes.push(1); // RaceEventData is present.
-            bytes.extend_from_slice(&EMPTY_RACE_EVENT_DATA);
+            bytes.extend_from_slice(&race_event_data_for_version(
+                &EMPTY_RACE_EVENT_DATA,
+                format_version,
+            ));
         }
         if format_version >= 121_005 {
             bytes.extend_from_slice(&[0x00, 0x00]); // One route slot; no active routes.
@@ -3492,13 +3637,15 @@ mod tests {
 
     fn one_active_event_with_race_data(format_version: u32, race_data: &[u8]) -> Vec<u8> {
         let mut bytes = one_active_event(format_version, 1);
+        let empty_race_data = race_event_data_for_version(&EMPTY_RACE_EVENT_DATA, format_version);
+        let serialized_race_data = race_event_data_for_version(race_data, format_version);
         let race_data_start = bytes
-            .windows(EMPTY_RACE_EVENT_DATA.len())
-            .position(|window| window == EMPTY_RACE_EVENT_DATA)
+            .windows(empty_race_data.len())
+            .position(|window| window == empty_race_data)
             .expect("empty race-event fixture occurs in the event record");
         bytes.splice(
-            race_data_start..race_data_start + EMPTY_RACE_EVENT_DATA.len(),
-            race_data.iter().copied(),
+            race_data_start..race_data_start + empty_race_data.len(),
+            serialized_race_data,
         );
         bytes
     }
@@ -3659,6 +3806,8 @@ mod tests {
         bytes.extend_from_slice(&[0x40, 0x00, 0x00, 0x00]); // Speed oscillation.
         bytes.extend_from_slice(&0x4243_4445_i32.to_be_bytes()); // Racer state.
         bytes.extend_from_slice(&0x4647_4849_i32.to_be_bytes()); // Frames in state.
+        bytes.extend_from_slice(&0x4a4b_4c4d_i32.to_be_bytes()); // Spawned-entity count.
+        bytes.extend_from_slice(&0_i32.to_be_bytes()); // Empty legacy counted UShort block.
         bytes.push(0); // No route spline.
         bytes
     }
@@ -4190,9 +4339,17 @@ mod tests {
             0x00, 0x00, 0x00, 0x01, // One active event flag.
         ];
         assert!(EventManagerReferenceData::decode_reader(120_004, &active_event).is_err());
-        assert!(
-            EventManagerReferenceData::decode_reader(121_031, &one_active_event(121_031, 1))
-                .is_err()
+        let version_121031_event = one_active_event(121_031, 1);
+        let (decoded_121031_event, consumed_121031_event) =
+            EventManagerReferenceData::decode_reader(121_031, &version_121031_event)
+                .expect("version-121031 race-event fields decode");
+        assert_eq!(consumed_121031_event, version_121031_event.len());
+        assert_eq!(
+            decoded_121031_event.active_event_race_data[0]
+                .as_ref()
+                .expect("race-event data exists")
+                .collisions_enabled_raw,
+            Some(0)
         );
 
         let active_route = [
@@ -4201,6 +4358,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x01, // One active route flag.
         ];
         assert!(EventManagerReferenceData::decode_reader(121_005, &active_route).is_err());
+        let (version_121031_route, _) = one_active_route_layout(121_031, 1);
+        assert!(EventManagerReferenceData::decode_reader(121_031, &version_121031_route).is_err());
 
         let bytes = empty_reader_layout(109_011);
         for end in 0..bytes.len() {
@@ -4564,6 +4723,22 @@ mod tests {
                 Some(0x0506_0708),
                 expected_times,
             ),
+            (
+                121_031,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                expected_times,
+            ),
+            (
+                121_032,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                expected_times,
+            ),
         ] {
             let bytes = one_active_event(version, flags);
             let (decoded, consumed) =
@@ -4636,7 +4811,7 @@ mod tests {
                 }
             }
 
-            if (120_004..=121_030).contains(&version) {
+            if (120_004..=121_032).contains(&version) {
                 let range = decoded.active_event_record_ranges[0].clone();
                 let race_data_range = decoded.active_event_race_data_ranges[0]
                     .as_ref()
@@ -4644,12 +4819,14 @@ mod tests {
                     .clone();
                 assert_eq!(
                     decoded.serialized_body.get(race_data_range),
-                    Some(EMPTY_RACE_EVENT_DATA.as_slice()),
+                    Some(race_event_data_for_version(&EMPTY_RACE_EVENT_DATA, version).as_slice()),
                     "race data for version {version}"
                 );
+                let expected_race_data =
+                    race_event_data_for_version(&EMPTY_RACE_EVENT_DATA, version);
                 assert_eq!(
-                    &bytes[range.end - EMPTY_RACE_EVENT_DATA.len()..range.end],
-                    EMPTY_RACE_EVENT_DATA,
+                    &bytes[range.end - expected_race_data.len()..range.end],
+                    expected_race_data,
                     "race-data bytes for version {version}"
                 );
                 assert_eq!(
@@ -4703,6 +4880,9 @@ mod tests {
                 race_team_reference_scope: Default::default(),
                 parade_group_reference_scope: Default::default(),
                 race_team_scope: Default::default(),
+                tier: None,
+                spawned_entities: 0x3132_3334,
+                collisions_enabled_raw: None,
                 route_spline: None,
             })
         );
@@ -4787,6 +4967,9 @@ mod tests {
             race_team_reference_scope: Default::default(),
             parade_group_reference_scope: Default::default(),
             race_team_scope: Default::default(),
+            tier: None,
+            spawned_entities: 0,
+            collisions_enabled_raw: None,
             route_spline: None,
         });
         assert!(invalid_editor.encode().is_err());
@@ -4866,6 +5049,9 @@ mod tests {
                     names: Vec::new(),
                 },
                 race_team_scope: Default::default(),
+                tier: None,
+                spawned_entities: 0x4a4b_4c4d,
+                collisions_enabled_raw: None,
                 route_spline: None,
             })
         );
@@ -5372,6 +5558,124 @@ mod tests {
             .copy_from_slice(&1_000_001_u32.to_be_bytes());
         let malformed = one_active_event_with_race_data(120_004, &excessive_race_data);
         assert!(EventManagerReferenceData::decode_reader(120_004, &malformed).is_err());
+    }
+
+    #[test]
+    fn race_event_fields_follow_121031_and_121032_reader_gates() {
+        let mut race_data = one_racer_race_event_data();
+        let mut reader = Reader::new(&race_data);
+        let (_, base_ranges) =
+            super::skip_race_event_data(&mut reader, 120_004).expect("base race-event fixture");
+        let legacy_values_range = base_ranges
+            .legacy_counted_values
+            .expect("legacy values exist before version 121032");
+        race_data[legacy_values_range.start..legacy_values_range.start + 4]
+            .copy_from_slice(&1_i32.to_be_bytes());
+        race_data.splice(
+            legacy_values_range.end..legacy_values_range.end,
+            [0x12, 0x34],
+        );
+
+        let version_121031_body = race_event_data_for_version(&race_data, 121_031);
+        let version_121031_event = one_active_event_with_race_data(121_031, &race_data);
+        let (decoded_121031, consumed_121031) =
+            EventManagerReferenceData::decode_reader(121_031, &version_121031_event)
+                .expect("version-121031 RaceEventData decodes");
+        assert_eq!(consumed_121031, version_121031_event.len());
+        let decoded_121031_data = decoded_121031.active_event_race_data[0]
+            .as_ref()
+            .expect("race-event data is present");
+        assert_eq!(decoded_121031_data.tier, None);
+        assert_eq!(decoded_121031_data.spawned_entities, 0x4a4b_4c4d);
+        assert_eq!(decoded_121031_data.collisions_enabled_raw, Some(0));
+        assert_eq!(
+            decoded_121031.active_event_race_data_ranges[0]
+                .as_ref()
+                .and_then(|range| decoded_121031.serialized_body.get(range.clone())),
+            Some(version_121031_body.as_slice())
+        );
+        let field_ranges_121031 = decoded_121031.active_event_race_data_field_ranges[0]
+            .as_ref()
+            .expect("race-event field ranges are present")
+            .clone();
+        assert_eq!(
+            field_ranges_121031
+                .legacy_counted_values
+                .as_ref()
+                .and_then(|range| decoded_121031.serialized_body.get(range.clone())),
+            Some(&[0, 0, 0, 1, 0x12, 0x34][..])
+        );
+        let mut editor_121031 = decoded_121031.into_event_records_editor();
+        let edited_121031 = editor_121031.race_event_data_mut()[0]
+            .as_mut()
+            .expect("race-event data is present");
+        edited_121031.spawned_entities = -101;
+        edited_121031.collisions_enabled_raw = Some(2);
+        let mut expected_121031 = version_121031_event;
+        expected_121031[field_ranges_121031.spawned_entities.clone()]
+            .copy_from_slice(&(-101_i32).to_be_bytes());
+        expected_121031[field_ranges_121031
+            .collisions_enabled_raw
+            .clone()
+            .unwrap()
+            .start] = 2;
+        assert_eq!(editor_121031.encode().unwrap(), expected_121031);
+
+        let version_121032_body = race_event_data_for_version(&race_data, 121_032);
+        let version_121032_event = one_active_event_with_race_data(121_032, &race_data);
+        let (decoded_121032, consumed_121032) =
+            EventManagerReferenceData::decode_reader(121_032, &version_121032_event)
+                .expect("version-121032 RaceEventData decodes");
+        assert_eq!(consumed_121032, version_121032_event.len());
+        let decoded_121032_data = decoded_121032.active_event_race_data[0]
+            .as_ref()
+            .expect("race-event data is present");
+        assert_eq!(decoded_121032_data.tier, Some(0));
+        assert_eq!(decoded_121032_data.spawned_entities, 0x4a4b_4c4d);
+        assert_eq!(decoded_121032_data.collisions_enabled_raw, Some(0));
+        assert_eq!(
+            decoded_121032.active_event_race_data_ranges[0]
+                .as_ref()
+                .and_then(|range| decoded_121032.serialized_body.get(range.clone())),
+            Some(version_121032_body.as_slice())
+        );
+        let field_ranges_121032 = decoded_121032.active_event_race_data_field_ranges[0]
+            .as_ref()
+            .expect("race-event field ranges are present")
+            .clone();
+        assert_eq!(field_ranges_121032.legacy_counted_values, None);
+        let mut editor_121032 = decoded_121032.into_event_records_editor();
+        let edited_121032 = editor_121032.race_event_data_mut()[0]
+            .as_mut()
+            .expect("race-event data is present");
+        edited_121032.tier = Some(-17);
+        edited_121032.spawned_entities = 303;
+        edited_121032.collisions_enabled_raw = Some(1);
+        let mut expected_121032 = version_121032_event;
+        expected_121032[field_ranges_121032.tier.clone().unwrap()]
+            .copy_from_slice(&(-17_i32).to_be_bytes());
+        expected_121032[field_ranges_121032.spawned_entities.clone()]
+            .copy_from_slice(&303_i32.to_be_bytes());
+        expected_121032[field_ranges_121032
+            .collisions_enabled_raw
+            .clone()
+            .unwrap()
+            .start] = 1;
+        assert_eq!(editor_121032.encode().unwrap(), expected_121032);
+
+        for invalid_count in [-1_i32, 1_000_001_i32] {
+            let mut malformed = race_data.clone();
+            malformed[legacy_values_range.start..legacy_values_range.start + 4]
+                .copy_from_slice(&invalid_count.to_be_bytes());
+            let mut malformed_reader = Reader::new(&malformed);
+            assert!(super::skip_race_event_data(&mut malformed_reader, 120_004).is_err());
+        }
+        let mut truncated = race_data;
+        truncated[legacy_values_range.start..legacy_values_range.start + 4]
+            .copy_from_slice(&1_i32.to_be_bytes());
+        truncated.drain(legacy_values_range.end..legacy_values_range.end + 2);
+        let mut truncated_reader = Reader::new(&truncated);
+        assert!(super::skip_race_event_data(&mut truncated_reader, 120_004).is_err());
     }
 
     #[test]

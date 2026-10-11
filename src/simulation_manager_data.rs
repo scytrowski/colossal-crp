@@ -2160,10 +2160,9 @@ impl SimulationManagerData {
     ///
     /// This table is available only when the bounded EventManager body matches
     /// one unambiguous supported reader/writer candidate. Legacy active-event
-    /// records from inner versions 210 through 121030 are preserved unchanged;
-    /// nested race-event blocks and active event routes are boundary-checked
-    /// and retained raw. Versions 121031 and newer remain unsupported for
-    /// active event records.
+    /// records from inner versions 210 through 121032 are preserved unchanged;
+    /// nested race-event blocks are decoded through version 121032 and active
+    /// routes are supported through version 121030.
     pub fn decode_event_manager_type_data(&self) -> Result<EventManagerTypeDataEditor, CrpError> {
         let managers = self
             .manager_objects
@@ -2175,17 +2174,17 @@ impl SimulationManagerData {
             .into_type_data_editor())
     }
 
-    /// Decodes active EventManager records for inner versions 210–121030.
+    /// Decodes active EventManager records for inner versions 210–121032.
     ///
     /// Pre-245 color words are returned raw; version 245 records expose RGB
     /// bytes. Version-gated event, ticket, reward, popularity, and security
     /// values are exposed when present. From version 120004 through 121005,
     /// nested race-event data follows unconditionally. From version 121006,
-    /// the source bool and optional nested data are preserved. Legacy route
-    /// splines remain raw, while active event routes have a separate editor
-    /// for their fields and schedule names.
-    /// Active records from version 121031 onward are rejected. The bounded
-    /// manager body must match one unambiguous reader/writer candidate.
+    /// the source bool and optional nested data are preserved. Race-event tier
+    /// and collision fields follow their 121032 and 121031 gates. Active event
+    /// routes have a separate editor through version 121030.
+    /// The bounded manager body must match one unambiguous reader/writer
+    /// candidate.
     pub fn decode_event_manager_event_records(
         &self,
     ) -> Result<EventManagerEventRecordsEditor, CrpError> {
@@ -14560,7 +14559,7 @@ mod manager_boundary_tests {
 
     #[test]
     fn event_manager_replaces_selected_race_event_scalars_in_place() {
-        const EMPTY_RACE_EVENT_DATA: [u8; 66] = [
+        const EMPTY_RACE_EVENT_DATA: [u8; 74] = [
             0, 0, 0, 0, // No racers.
             0, 0, // Empty RaceTeamInfo reference scope.
             0, 0, // Empty ParadeGroupInfo reference scope.
@@ -14580,6 +14579,8 @@ mod manager_boundary_tests {
             0, 0, 0, 0, // No race teams.
             0, 0, // Empty RaceTeamInfo team scope.
             0, 0, 0, 0, // No team members.
+            0, 0, 0, 0, // No spawned entities.
+            0, 0, 0, 0, // Empty legacy counted UShort block.
             0, // No route spline.
         ];
         let mut body = vec![0, 1, 0]; // Two event slots; one literal flag follows.
@@ -14636,6 +14637,9 @@ mod manager_boundary_tests {
                 race_team_reference_scope: Default::default(),
                 parade_group_reference_scope: Default::default(),
                 race_team_scope: Default::default(),
+                tier: None,
+                spawned_entities: 0,
+                collisions_enabled_raw: None,
                 route_spline: None,
             })]
         );
