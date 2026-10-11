@@ -2421,8 +2421,7 @@ impl SimulationManagerData {
     /// Decodes the shared EventManager event, milestone, and type-data prefab indexes.
     ///
     /// The three groups occupy one encoded UShort array. Active routes remain
-    /// unsupported; this editor preserves their related schedule scope and all
-    /// other body bytes without interpreting them.
+    /// unsupported; their schedule scope is retained as source bytes.
     pub fn decode_event_manager_prefab_indices(
         &self,
     ) -> Result<EventManagerPrefabIndicesEditor, CrpError> {
@@ -2439,8 +2438,9 @@ impl SimulationManagerData {
     /// Replaces existing EventManager prefab indexes and resizes the encoded scope as needed.
     ///
     /// The editor must match this stream's version and exact source body. Index
-    /// counts and group order remain fixed; prefab-name bytes, later body fields,
-    /// and the following manager tag are preserved byte-for-byte.
+    /// counts and group order remain fixed. Unchanged names, later body fields,
+    /// and the following manager tag are preserved byte-for-byte; changed names
+    /// keep the source string encoding when possible and may resize the body.
     pub fn replace_event_manager_prefab_indices(
         &mut self,
         edited: &EventManagerPrefabIndicesEditor,
@@ -2495,6 +2495,7 @@ impl SimulationManagerData {
             .and_then(|decoded| {
                 if decoded.serialized_body != replacement
                     || decoded.prefab_indexes != edited.all_indexes()
+                    || decoded.prefab_names() != edited.all_prefab_names()
                 {
                     return Err(invalid(
                         body_start,
@@ -14261,7 +14262,6 @@ mod manager_boundary_tests {
             0x3c,
             // Six indexes in one literal block.
         ];
-        let names_start = body.len();
         body.extend_from_slice(&[0x00, 0x01]); // One unique prefab name.
         write_unique_string(&mut body, "EventPrefab").expect("short test name is encodable");
         let names_end = body.len();
@@ -14290,10 +14290,14 @@ mod manager_boundary_tests {
         editor
             .type_data_indexes_mut()
             .copy_from_slice(&[3, 4, 5, 6]);
+        editor.set_prefab_name(0, Some("City".to_owned())).unwrap();
 
         let mut expected_body = body[..6].to_vec();
         expected_body.extend_from_slice(&[0x00, 0x00, 0x01, 0x84]);
-        expected_body.extend_from_slice(&body[names_start..]);
+        expected_body.extend_from_slice(&[
+            0x00, 0x01, 0x80, 0x00, 0x04, 0xc3, 0x26, 0x0b, 0x05, // One compact "City" name.
+        ]);
+        expected_body.extend_from_slice(&body[names_end..]);
         let new_body_end = body_start + expected_body.len();
         let original_boundary = manager.manager_body_boundary(0).unwrap().1;
         assert_eq!(original_boundary, original_body_end);
@@ -14314,11 +14318,7 @@ mod manager_boundary_tests {
         assert_eq!(rewritten.event_indexes(), []);
         assert_eq!(rewritten.milestone_indexes(), [1, 2]);
         assert_eq!(rewritten.type_data_indexes(), [3, 4, 5, 6]);
-        assert_eq!(
-            &manager.serialized_object_graph()
-                [body_start + 6 + 4..body_start + 6 + 4 + (names_end - names_start)],
-            &body[names_start..names_end]
-        );
+        assert_eq!(rewritten.prefab_names(), [Some("City".to_owned())]);
 
         let updated_graph = manager.serialized_object_graph().to_vec();
         assert!(

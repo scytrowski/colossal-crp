@@ -1,5 +1,7 @@
 use crate::CrpError;
-use crate::data_serializer::Reader;
+use crate::data_serializer::{
+    COMPACT_STRING_FLAG, Reader, write_unique_string, write_unique_string_with_mode,
+};
 use crate::encoded_array::{
     read_encoded_uint_array, read_encoded_ushort_array, write_encoded_ushort_array,
 };
@@ -75,6 +77,9 @@ pub(crate) struct EventManagerReferenceData {
     prefab_index_group_counts: [usize; 3],
     prefab_scope_range: Range<usize>,
     prefab_names_range: Range<usize>,
+    prefab_names: Vec<Option<String>>,
+    prefab_name_ranges: Vec<Range<usize>>,
+    prefab_name_compact_modes: Vec<Option<bool>>,
     pub(crate) tail_data: EventManagerTailData,
     type_data_has_ticket_price: bool,
     type_data_range: Range<usize>,
@@ -115,26 +120,33 @@ pub struct EventManagerTailEditor {
     tail_data: EventManagerTailData,
 }
 
-/// Editor for existing EventManager event, milestone, and type-data indexes.
+/// Editor for existing EventManager event, milestone, and type-data prefab data.
 ///
 /// All indexes share one encoded UShort scope. A changed scope is written with
-/// the crate's canonical UShort encoding and can change the manager body size;
-/// the unique-string name table is preserved byte-for-byte.
+/// the crate's canonical UShort encoding and can change the manager body size.
+/// Changed names retain their original compact or wide string encoding when
+/// possible, and the table can also change the manager body size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerPrefabIndicesEditor {
     original: EventManagerReferenceData,
     event_indexes: Vec<u16>,
     milestone_indexes: Vec<u16>,
     type_data_indexes: Vec<u16>,
+    prefab_names: Vec<Option<String>>,
 }
 
 impl EventManagerReferenceData {
+    pub(crate) fn prefab_names(&self) -> &[Option<String>] {
+        &self.prefab_names
+    }
+
     pub(crate) fn equivalent_reference_layout(&self, other: &Self) -> bool {
         self.active_event_records == other.active_event_records
             && self.object_headers == other.object_headers
             && self.unidentified_counted_block == other.unidentified_counted_block
             && self.type_data == other.type_data
             && self.prefab_indexes == other.prefab_indexes
+            && self.prefab_names == other.prefab_names
             && (self.type_data.is_empty()
                 || (self.type_data_range == other.type_data_range
                     && self.type_data_has_ticket_price == other.type_data_has_ticket_price))
@@ -168,11 +180,13 @@ impl EventManagerReferenceData {
         let milestone_indexes = self.prefab_indexes[event_count..milestone_end].to_vec();
         let type_data_indexes =
             self.prefab_indexes[milestone_end..milestone_end + type_data_count].to_vec();
+        let prefab_names = self.prefab_names.clone();
         EventManagerPrefabIndicesEditor {
             original: self,
             event_indexes,
             milestone_indexes,
             type_data_indexes,
+            prefab_names,
         }
     }
 }
@@ -188,6 +202,9 @@ struct EventPrefabScope {
     indexes: Vec<u16>,
     scope_range: Range<usize>,
     names_range: Range<usize>,
+    names: Vec<Option<String>>,
+    name_ranges: Vec<Range<usize>>,
+    name_compact_modes: Vec<Option<bool>>,
 }
 
 impl EventManagerReferenceData {
@@ -583,6 +600,29 @@ impl EventManagerPrefabIndicesEditor {
         &mut self.type_data_indexes
     }
 
+    /// Returns the EventInfo prefab-name table, preserving null entries.
+    pub fn prefab_names(&self) -> &[Option<String>] {
+        &self.prefab_names
+    }
+
+    pub(crate) fn all_prefab_names(&self) -> &[Option<String>] {
+        &self.prefab_names
+    }
+
+    /// Replaces one existing EventInfo prefab name without changing the table count.
+    ///
+    /// The original compact or wide encoding is retained when it can represent
+    /// the new value. Renaming a null entry chooses the standard encoding for
+    /// its new value; setting an entry to `None` writes a null string marker.
+    pub fn set_prefab_name(&mut self, index: usize, value: Option<String>) -> Result<(), CrpError> {
+        let name = self
+            .prefab_names
+            .get_mut(index)
+            .ok_or_else(|| invalid_event_prefabs(index, "prefab-name index is out of range"))?;
+        *name = value;
+        Ok(())
+    }
+
     pub(crate) fn all_indexes(&self) -> Vec<u16> {
         let mut indexes = Vec::with_capacity(self.original.prefab_indexes.len());
         indexes.extend_from_slice(&self.event_indexes);
@@ -593,23 +633,37 @@ impl EventManagerPrefabIndicesEditor {
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let indexes = self.all_indexes();
-        if indexes.len() != self.original.prefab_indexes.len()
-            || indexes != self.original.prefab_indexes
-        {
-            let mut encoded_indexes = Vec::new();
-            write_encoded_ushort_array(&mut encoded_indexes, &indexes);
-            let names = self
-                .original
-                .serialized_body
-                .get(self.original.prefab_names_range.clone())
-                .ok_or_else(|| {
-                    invalid_event_prefabs(
-                        self.original.prefab_names_range.start,
-                        "EventManager prefab-name table exceeds body",
+        let indexes_changed = indexes != self.original.prefab_indexes;
+        let names_changed = self.prefab_names != self.original.prefab_names;
+        if indexes_changed || names_changed {
+            let encoded_indexes = if indexes_changed {
+                if indexes.len() != self.original.prefab_indexes.len() {
+                    return Err(invalid_event_prefabs(
+                        self.original.prefab_scope_range.start,
+                        "EventManager prefab-index counts changed",
+                    ));
+                }
+                let mut encoded = Vec::new();
+                write_encoded_ushort_array(&mut encoded, &indexes);
+                encoded
+            } else {
+                self.original
+                    .serialized_body
+                    .get(
+                        self.original.prefab_scope_range.start
+                            ..self.original.prefab_names_range.start,
                     )
-                })?;
+                    .ok_or_else(|| {
+                        invalid_event_prefabs(
+                            self.original.prefab_scope_range.start,
+                            "EventManager prefab index bytes exceed body",
+                        )
+                    })?
+                    .to_vec()
+            };
+            let names = self.encode_prefab_names()?;
             let mut replacement_scope = encoded_indexes;
-            replacement_scope.extend_from_slice(names);
+            replacement_scope.extend_from_slice(&names);
             let mut output = self.original.serialized_body.clone();
             output
                 .splice(self.original.prefab_scope_range.clone(), replacement_scope)
@@ -618,6 +672,93 @@ impl EventManagerPrefabIndicesEditor {
         } else {
             Ok(self.original.serialized_body.clone())
         }
+    }
+
+    fn encode_prefab_names(&self) -> Result<Vec<u8>, CrpError> {
+        let original_names = &self.original.prefab_names;
+        let ranges = &self.original.prefab_name_ranges;
+        let compact_modes = &self.original.prefab_name_compact_modes;
+        if self.prefab_names.len() != original_names.len()
+            || ranges.len() != original_names.len()
+            || compact_modes.len() != original_names.len()
+        {
+            return Err(invalid_event_prefabs(
+                self.original.prefab_names_range.start,
+                "EventManager prefab-name counts changed",
+            ));
+        }
+        let source_table = self
+            .original
+            .serialized_body
+            .get(self.original.prefab_names_range.clone())
+            .ok_or_else(|| {
+                invalid_event_prefabs(
+                    self.original.prefab_names_range.start,
+                    "EventManager prefab-name table exceeds body",
+                )
+            })?;
+        let count_prefix = source_table.get(..2).ok_or_else(|| {
+            invalid_event_prefabs(
+                self.original.prefab_names_range.start,
+                "EventManager prefab-name count is truncated",
+            )
+        })?;
+        let mut output = Vec::with_capacity(source_table.len());
+        output.extend_from_slice(count_prefix);
+        let mut expected_source_start = self
+            .original
+            .prefab_names_range
+            .start
+            .checked_add(2)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EventManager prefab-name start",
+            ))?;
+        for (index, name) in self.prefab_names.iter().enumerate() {
+            let range = &ranges[index];
+            if range.start != expected_source_start || range.end < range.start {
+                return Err(invalid_event_prefabs(
+                    range.start,
+                    "EventManager prefab-name ranges are not contiguous",
+                ));
+            }
+            let raw_name = self
+                .original
+                .serialized_body
+                .get(range.clone())
+                .ok_or_else(|| {
+                    invalid_event_prefabs(range.start, "EventManager prefab name exceeds body")
+                })?;
+            if name == &original_names[index] {
+                output.extend_from_slice(raw_name);
+            } else {
+                let mut encoded_name = Vec::new();
+                match name {
+                    None => encoded_name.push(0xff),
+                    Some(value) => {
+                        let can_keep_compact =
+                            value.chars().all(|character| u32::from(character) < 256);
+                        match compact_modes[index] {
+                            Some(true) if can_keep_compact => {
+                                write_unique_string_with_mode(&mut encoded_name, value, true)?;
+                            }
+                            Some(false) => {
+                                write_unique_string_with_mode(&mut encoded_name, value, false)?;
+                            }
+                            _ => write_unique_string(&mut encoded_name, value)?,
+                        }
+                    }
+                }
+                output.extend_from_slice(&encoded_name);
+            }
+            expected_source_start = range.end;
+        }
+        if expected_source_start != self.original.prefab_names_range.end {
+            return Err(invalid_event_prefabs(
+                expected_source_start,
+                "EventManager prefab-name ranges do not cover the complete table",
+            ));
+        }
+        Ok(output)
     }
 
     pub(crate) fn original_body_bytes(&self) -> &[u8] {
@@ -720,21 +861,46 @@ fn read_event_prefab_scope(
     let scope_start = reader.offset();
     let indexes = read_encoded_ushort_array(reader, index_count)?;
     let names_start = reader.offset();
-    skip_prefab_names(reader)?;
+    let (names, name_ranges, name_compact_modes) = read_prefab_names(reader)?;
     let scope_end = reader.offset();
     Ok(EventPrefabScope {
         indexes,
         scope_range: scope_start..scope_end,
         names_range: names_start..scope_end,
+        names,
+        name_ranges,
+        name_compact_modes,
     })
 }
 
-fn skip_prefab_names(reader: &mut Reader<'_>) -> Result<(), CrpError> {
+fn read_prefab_names(
+    reader: &mut Reader<'_>,
+) -> Result<(Vec<Option<String>>, Vec<Range<usize>>, Vec<Option<bool>>), CrpError> {
     let count = usize::from(reader.read_u16_be()?);
+    let mut names = Vec::with_capacity(count);
+    let mut ranges = Vec::with_capacity(count);
+    let mut compact_modes = Vec::with_capacity(count);
     for _ in 0..count {
-        reader.read_unique_string()?;
+        let start = reader.offset();
+        let name = reader.read_unique_string()?;
+        let end = reader.offset();
+        let compact = if name.is_some() {
+            let raw = reader
+                .consumed_bytes()
+                .get(start..end)
+                .ok_or_else(|| reader.invalid("EventManager prefab-name range is invalid"))?;
+            let first = *raw
+                .first()
+                .ok_or_else(|| reader.invalid("EventManager prefab name is empty"))?;
+            Some((u32::from(first) << 16) & COMPACT_STRING_FLAG != 0)
+        } else {
+            None
+        };
+        names.push(name);
+        ranges.push(start..end);
+        compact_modes.push(compact);
     }
-    Ok(())
+    Ok((names, ranges, compact_modes))
 }
 
 fn read_object_headers(
@@ -904,6 +1070,9 @@ fn finish(
             prefab_index_group_counts,
             prefab_scope_range: prefab_scope.scope_range,
             prefab_names_range: prefab_scope.names_range,
+            prefab_names: prefab_scope.names,
+            prefab_name_ranges: prefab_scope.name_ranges,
+            prefab_name_compact_modes: prefab_scope.name_compact_modes,
             tail_data,
             type_data_has_ticket_price,
             type_data_range,
@@ -1329,6 +1498,66 @@ mod tests {
         assert_eq!(editor.encode().unwrap(), expected);
         let (rewritten, _) = EventManagerReferenceData::decode_reader(244, &expected).unwrap();
         assert_eq!(rewritten.prefab_indexes, [0x1234]);
+    }
+
+    #[test]
+    fn prefab_name_editor_preserves_compact_and_wide_modes_and_resizes_table() {
+        let bytes = vec![
+            0x00, 0x00, // One event slot; no active events.
+            0x00, 0x00, // No unlock milestones.
+            0x00, 0x00, // No modified event types.
+            0x00, 0x04, // Four names.
+            0xff, // Null name.
+            0x80, 0x00, 0x01, 0xc1, // Compact "A".
+            0x80, 0x00, 0x01, 0xc3, // Compact "C".
+            0x00, 0x00, 0x01, 0x03, 0x29, // Wide "Ω".
+            0xff, // Match-preparing reference.
+            0x00, 0x09, // Band-popularity bonus.
+            0x12, 0x34, // Profiler end index.
+        ];
+        let (decoded, consumed) =
+            EventManagerReferenceData::decode_reader(108_004, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        let mut editor = decoded.into_prefab_indices_editor();
+        assert_eq!(
+            editor.prefab_names(),
+            [
+                None,
+                Some("A".to_owned()),
+                Some("C".to_owned()),
+                Some("Ω".to_owned())
+            ]
+        );
+        editor.set_prefab_name(0, Some("XY".to_owned())).unwrap();
+        editor.set_prefab_name(1, Some("B".to_owned())).unwrap();
+        editor.set_prefab_name(2, Some("Δ".to_owned())).unwrap();
+        editor.set_prefab_name(3, Some("Δ".to_owned())).unwrap();
+        assert!(editor.set_prefab_name(4, None).is_err());
+
+        let expected = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Counts unchanged.
+            0x00, 0x04, // Four names.
+            0x80, 0x00, 0x02, 0xd8, 0x01, // Compact "XY".
+            0x80, 0x00, 0x01, 0xc2, // Compact "B".
+            0x00, 0x00, 0x01, 0x03, 0x14, // Widened "Δ".
+            0x00, 0x00, 0x01, 0x03, 0x14, // Wide "Δ".
+            0xff, 0x00, 0x09, 0x12, 0x34,
+        ];
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+        assert!(encoded.len() > bytes.len());
+        let (rewritten, rewritten_len) =
+            EventManagerReferenceData::decode_reader(108_004, &encoded).unwrap();
+        assert_eq!(rewritten_len, encoded.len());
+        assert_eq!(
+            rewritten.prefab_names,
+            [
+                Some("XY".to_owned()),
+                Some("B".to_owned()),
+                Some("Δ".to_owned()),
+                Some("Δ".to_owned())
+            ]
+        );
     }
 
     #[test]
