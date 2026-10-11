@@ -3,8 +3,7 @@ use crate::data_serializer::{
     COMPACT_STRING_FLAG, Reader, write_unique_string, write_unique_string_with_mode,
 };
 use crate::encoded_array::{
-    read_encoded_uint_array, read_encoded_ushort_array, skip_encoded_ushort_array,
-    write_encoded_ushort_array,
+    read_encoded_uint_array, read_encoded_ushort_array, write_encoded_ushort_array,
 };
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 use std::ops::Range;
@@ -68,9 +67,10 @@ pub struct EventManagerEventRecord {
 /// Known values decoded from an active nested `RaceEventData` block.
 ///
 /// Fixed-width scalar fields, racer values, opaque fixed-size arrays, and
-/// route-spline fields are editable. Unmodeled team references and other
-/// nested values remain preserved as raw source bytes. The fields are
-/// available for EventManager inner versions 120004–121030.
+/// route-spline fields are editable. Three prefab scopes expose their
+/// assignments and names with fixed counts and encoded widths. Other
+/// unmodeled nested values remain preserved as raw source bytes. The fields
+/// are available for EventManager inner versions 120004–121030.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerRaceEventData {
     /// Existing racers in serialized order. The count and optional-reference
@@ -110,6 +110,12 @@ pub struct EventManagerRaceEventData {
     pub racer_oscillation_records: Vec<[u8; 8]>,
     /// Opaque eight-byte racer state-timer records.
     pub racer_state_timer_records: Vec<[u8; 8]>,
+    /// Prefab scope for per-racer `RaceTeamInfo` assignments.
+    pub race_team_reference_scope: EventManagerRaceEventPrefabScope,
+    /// Prefab scope for per-racer `ParadeGroupInfo` assignments.
+    pub parade_group_reference_scope: EventManagerRaceEventPrefabScope,
+    /// Prefab scope for the race-team collection.
+    pub race_team_scope: EventManagerRaceEventPrefabScope,
     /// Route spline when the source presence flag is true. Presence, count,
     /// closed/open layout, and record counts cannot change in the editor.
     pub route_spline: Option<EventManagerRaceEventRouteSpline>,
@@ -132,6 +138,19 @@ pub struct EventManagerRaceEventRouteSpline {
     pub records: Vec<EventManagerRaceEventSubBezierRecord>,
     /// Final type/source record stored by a legacy closed spline.
     pub terminal_record: Option<EventManagerRaceEventSubBezierRecord>,
+}
+
+/// Existing prefab assignments and names for one `RaceEventData` scope.
+///
+/// Assignment count and name count are fixed. Index edits must preserve the
+/// encoded-array width, and name edits must preserve the combined name-table
+/// width so later race-event fields stay in place.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EventManagerRaceEventPrefabScope {
+    /// Prefab assignment indexes in serialized order.
+    pub indexes: Vec<u16>,
+    /// Names declared in this scope, including null entries.
+    pub names: Vec<Option<String>>,
 }
 
 /// One serialized three-byte `RouteSpline` type/source record.
@@ -526,6 +545,9 @@ struct EventPrefabScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EventManagerRaceEventDataFieldRanges {
     racers: Vec<EventManagerRaceRacerFieldRanges>,
+    race_team_reference_scope: EventPrefabScope,
+    parade_group_reference_scope: EventPrefabScope,
+    race_team_scope: EventPrefabScope,
     racer_state_records: Range<usize>,
     schedule_id: Range<usize>,
     lap_count: Range<usize>,
@@ -942,6 +964,20 @@ impl EventManagerEventRecordsEditor {
                             "race-event racer count cannot change in this editor",
                         ));
                     }
+                    patch_race_event_prefab_scope(
+                        &mut output,
+                        &self.original.serialized_body,
+                        &ranges.race_team_reference_scope,
+                        &data.race_team_reference_scope,
+                        "RaceTeamInfo reference",
+                    )?;
+                    patch_race_event_prefab_scope(
+                        &mut output,
+                        &self.original.serialized_body,
+                        &ranges.parade_group_reference_scope,
+                        &data.parade_group_reference_scope,
+                        "ParadeGroupInfo reference",
+                    )?;
                     patch_race_event_raw_records(
                         &mut output,
                         &ranges.racer_state_records,
@@ -1001,6 +1037,13 @@ impl EventManagerEventRecordsEditor {
                         &ranges.racer_state_timer_records,
                         &data.racer_state_timer_records,
                         "racer state timer",
+                    )?;
+                    patch_race_event_prefab_scope(
+                        &mut output,
+                        &self.original.serialized_body,
+                        &ranges.race_team_scope,
+                        &data.race_team_scope,
+                        "race-team collection",
                     )?;
                     match (
                         data.route_spline.as_ref(),
@@ -2326,8 +2369,10 @@ fn skip_race_event_data(
         });
     }
 
-    skip_event_prefab_scope(reader, race_team_reference_count)?;
-    skip_event_prefab_scope(reader, parade_group_reference_count)?;
+    let race_team_reference_scope =
+        read_event_prefab_scope(reader, race_team_reference_count, 0, 0)?;
+    let parade_group_reference_scope =
+        read_event_prefab_scope(reader, parade_group_reference_count, 0, 0)?;
 
     reader.read_u32_be()?; // Last spawn frame.
     reader.read_u32_be()?; // Next spawn frame.
@@ -2372,7 +2417,7 @@ fn skip_race_event_data(
         read_race_event_raw_records::<16>(reader, racer_count, "racer overtake state")?;
 
     let race_team_count = read_race_event_count(reader, "race team", 1)?;
-    skip_event_prefab_scope(reader, race_team_count)?;
+    let race_team_scope = read_event_prefab_scope(reader, race_team_count, 0, 0)?;
     let race_team_member_count = read_race_event_count(reader, "race team member", 4)?;
     let (race_team_member_records, race_team_member_record_range) =
         read_race_event_raw_records::<4>(reader, race_team_member_count, "race team member")?;
@@ -2418,10 +2463,25 @@ fn skip_race_event_data(
             track_path_segments,
             racer_oscillation_records,
             racer_state_timer_records,
+            race_team_reference_scope: EventManagerRaceEventPrefabScope {
+                indexes: race_team_reference_scope.indexes.clone(),
+                names: race_team_reference_scope.names.clone(),
+            },
+            parade_group_reference_scope: EventManagerRaceEventPrefabScope {
+                indexes: parade_group_reference_scope.indexes.clone(),
+                names: parade_group_reference_scope.names.clone(),
+            },
+            race_team_scope: EventManagerRaceEventPrefabScope {
+                indexes: race_team_scope.indexes.clone(),
+                names: race_team_scope.names.clone(),
+            },
             route_spline,
         },
         EventManagerRaceEventDataFieldRanges {
             racers: racer_field_ranges,
+            race_team_reference_scope,
+            parade_group_reference_scope,
+            race_team_scope,
             racer_state_records: racer_state_record_range,
             schedule_id: schedule_id_range,
             lap_count: lap_count_range,
@@ -2553,18 +2613,6 @@ fn read_race_event_count(
     Ok(count)
 }
 
-fn skip_event_prefab_scope(reader: &mut Reader<'_>, count: usize) -> Result<(), CrpError> {
-    if count > MAX_RACE_EVENT_ENTRIES {
-        return Err(reader.invalid("race-event prefab reference count exceeds 1,000,000"));
-    }
-    skip_encoded_ushort_array(reader, count)?;
-    let name_count = usize::from(reader.read_u16_be()?);
-    for _ in 0..name_count {
-        reader.read_unique_string()?;
-    }
-    Ok(())
-}
-
 fn read_event_prefab_scope(
     reader: &mut Reader<'_>,
     active_event_count: usize,
@@ -2577,6 +2625,9 @@ fn read_event_prefab_scope(
         .ok_or(CrpError::ArithmeticOverflow(
             "EventManager prefab index count",
         ))?;
+    if index_count > MAX_RACE_EVENT_ENTRIES {
+        return Err(reader.invalid("EventManager prefab scope exceeds 1,000,000 indexes"));
+    }
     let scope_start = reader.offset();
     let indexes = read_encoded_ushort_array(reader, index_count)?;
     let names_start = reader.offset();
@@ -2909,6 +2960,71 @@ fn patch_race_event_u16_values(
         destination_value.copy_from_slice(&value.to_be_bytes());
     }
     Ok(())
+}
+
+fn patch_race_event_prefab_scope(
+    output: &mut [u8],
+    source_body: &[u8],
+    original: &EventPrefabScope,
+    edited: &EventManagerRaceEventPrefabScope,
+    description: &str,
+) -> Result<(), CrpError> {
+    if edited.indexes.len() != original.indexes.len() || edited.names.len() != original.names.len()
+    {
+        return Err(invalid_event_record(
+            original.scope_range.start,
+            format!("race-event {description} assignment and name counts cannot change"),
+        ));
+    }
+    let assignment_range = original.scope_range.start..original.names_range.start;
+    let encoded_indexes = if edited.indexes == original.indexes {
+        source_body
+            .get(assignment_range.clone())
+            .ok_or_else(|| {
+                invalid_event_record(
+                    assignment_range.start,
+                    format!("race-event {description} assignment bytes exceed source body"),
+                )
+            })?
+            .to_vec()
+    } else {
+        let mut encoded = Vec::new();
+        write_encoded_ushort_array(&mut encoded, &edited.indexes);
+        encoded
+    };
+    if encoded_indexes.len() != assignment_range.len() {
+        return Err(invalid_event_record(
+            assignment_range.start,
+            format!("race-event {description} edits change encoded assignment width"),
+        ));
+    }
+    patch_race_event_field(
+        output,
+        &assignment_range,
+        &encoded_indexes,
+        "prefab assignments",
+    )?;
+
+    let encoded_names = encode_prefab_name_table(
+        source_body,
+        original.names_range.clone(),
+        &original.names,
+        &original.name_ranges,
+        &original.name_compact_modes,
+        &edited.names,
+    )?;
+    if encoded_names.len() != original.names_range.len() {
+        return Err(invalid_event_record(
+            original.names_range.start,
+            format!("race-event {description} edits change name-table width"),
+        ));
+    }
+    patch_race_event_field(
+        output,
+        &original.names_range,
+        &encoded_names,
+        "prefab names",
+    )
 }
 
 fn encode_race_event_route_spline(
@@ -4584,6 +4700,9 @@ mod tests {
                 track_path_segments: Vec::new(),
                 racer_oscillation_records: Vec::new(),
                 racer_state_timer_records: Vec::new(),
+                race_team_reference_scope: Default::default(),
+                parade_group_reference_scope: Default::default(),
+                race_team_scope: Default::default(),
                 route_spline: None,
             })
         );
@@ -4665,6 +4784,9 @@ mod tests {
             track_path_segments: Vec::new(),
             racer_oscillation_records: Vec::new(),
             racer_state_timer_records: Vec::new(),
+            race_team_reference_scope: Default::default(),
+            parade_group_reference_scope: Default::default(),
+            race_team_scope: Default::default(),
             route_spline: None,
         });
         assert!(invalid_editor.encode().is_err());
@@ -4735,6 +4857,15 @@ mod tests {
                 track_path_segments: vec![0x000d],
                 racer_oscillation_records: vec![[0x3f, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,]],
                 racer_state_timer_records: vec![[0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,]],
+                race_team_reference_scope: crate::EventManagerRaceEventPrefabScope {
+                    indexes: vec![10],
+                    names: Vec::new(),
+                },
+                parade_group_reference_scope: crate::EventManagerRaceEventPrefabScope {
+                    indexes: vec![11],
+                    names: Vec::new(),
+                },
+                race_team_scope: Default::default(),
                 route_spline: None,
             })
         );
@@ -4797,6 +4928,133 @@ mod tests {
                 .name = Some("longer name".to_owned());
             assert!(invalid_length_editor.encode().is_err());
         }
+        let mut scoped_race_data = one_racer.clone();
+        // Each reference scope has one assignment and initially no names.
+        scoped_race_data.splice(33..35, [0x00, 0x01, 0x80, 0x00, 0x01, 0xc1]);
+        scoped_race_data.splice(42..44, [0x00, 0x01, 0x80, 0x00, 0x01, 0xc1]);
+        let mut scoped_bytes = one_racer_bytes.clone();
+        scoped_bytes.splice(race_range.clone(), scoped_race_data.iter().copied());
+        let (decoded_scopes, _) = EventManagerReferenceData::decode_reader(120_004, &scoped_bytes)
+            .expect("race-event prefab scopes decode");
+        let scoped_race_range = decoded_scopes.active_event_race_data_ranges[0]
+            .as_ref()
+            .expect("race-event data range exists")
+            .clone();
+        let decoded_scoped_data = decoded_scopes.active_event_race_data[0]
+            .as_ref()
+            .expect("race-event data is present");
+        assert_eq!(decoded_scoped_data.race_team_reference_scope.indexes, [10]);
+        assert_eq!(
+            decoded_scoped_data.race_team_reference_scope.names,
+            [Some("A".to_owned())]
+        );
+        assert_eq!(
+            decoded_scoped_data.parade_group_reference_scope.indexes,
+            [11]
+        );
+        assert_eq!(
+            decoded_scoped_data.parade_group_reference_scope.names,
+            [Some("A".to_owned())]
+        );
+        assert_eq!(decoded_scoped_data.race_team_scope, Default::default());
+        let mut scope_editor = decoded_scopes.clone().into_event_records_editor();
+        let edited_scoped_data = scope_editor.race_event_data_mut()[0]
+            .as_mut()
+            .expect("race-event data is present");
+        edited_scoped_data.race_team_reference_scope.indexes[0] = 12;
+        edited_scoped_data.race_team_reference_scope.names[0] = Some("B".to_owned());
+        edited_scoped_data.parade_group_reference_scope.indexes[0] = 13;
+        edited_scoped_data.parade_group_reference_scope.names[0] = Some("C".to_owned());
+        let mut expected_scoped_race = scoped_race_data.clone();
+        expected_scoped_race[31..33].copy_from_slice(&12_u16.to_be_bytes());
+        expected_scoped_race[38] = 0xc2; // Compact name "B".
+        expected_scoped_race[40..42].copy_from_slice(&13_u16.to_be_bytes());
+        expected_scoped_race[47] = 0xc3; // Compact name "C".
+        let mut expected_scoped_bytes = scoped_bytes.clone();
+        expected_scoped_bytes.splice(scoped_race_range, expected_scoped_race.iter().copied());
+        assert_eq!(scope_editor.encode().unwrap(), expected_scoped_bytes);
+
+        let mut team_collection_data = one_racer.clone();
+        team_collection_data[143..147].copy_from_slice(&1_i32.to_be_bytes());
+        team_collection_data.splice(
+            147..149,
+            [
+                0x00, 0x00, 0x0a, // One RaceTeamInfo assignment, index 10.
+                0x00, 0x01, 0x80, 0x00, 0x01, 0xc1, // One compact name, "A".
+            ],
+        );
+        let mut team_collection_bytes = one_racer_bytes.clone();
+        team_collection_bytes.splice(race_range.clone(), team_collection_data.iter().copied());
+        let (decoded_team_collection, consumed_team_collection) =
+            EventManagerReferenceData::decode_reader(120_004, &team_collection_bytes)
+                .expect("race-team collection scope decodes");
+        assert_eq!(consumed_team_collection, team_collection_bytes.len());
+        assert_eq!(
+            decoded_team_collection.active_event_race_data[0]
+                .as_ref()
+                .expect("race-event data is present")
+                .race_team_scope,
+            crate::EventManagerRaceEventPrefabScope {
+                indexes: vec![10],
+                names: vec![Some("A".to_owned())],
+            }
+        );
+        let mut team_collection_editor = decoded_team_collection.into_event_records_editor();
+        let team_scope = &mut team_collection_editor.race_event_data_mut()[0]
+            .as_mut()
+            .expect("race-event data is present")
+            .race_team_scope;
+        team_scope.indexes[0] = 11;
+        team_scope.names[0] = Some("B".to_owned());
+        let mut expected_team_collection_data = team_collection_data;
+        expected_team_collection_data[148..150].copy_from_slice(&11_u16.to_be_bytes());
+        expected_team_collection_data[155] = 0xc2; // Compact name "B".
+        let mut expected_team_collection_bytes = one_racer_bytes.clone();
+        expected_team_collection_bytes.splice(race_range.clone(), expected_team_collection_data);
+        assert_eq!(
+            team_collection_editor.encode().unwrap(),
+            expected_team_collection_bytes
+        );
+
+        let mut variable_width_team_data = one_racer.clone();
+        variable_width_team_data[143..147].copy_from_slice(&3_i32.to_be_bytes());
+        variable_width_team_data.splice(
+            147..149,
+            [
+                0x02, 0x00, 0x0a, 0x00, 0x14, 0x00, 0x1e, // Three literal indexes.
+                0x00, 0x00, // No names.
+            ],
+        );
+        let mut variable_width_team_bytes = one_racer_bytes.clone();
+        variable_width_team_bytes
+            .splice(race_range.clone(), variable_width_team_data.iter().copied());
+        let (decoded_variable_width_team, _) =
+            EventManagerReferenceData::decode_reader(120_004, &variable_width_team_bytes)
+                .expect("race-team literal assignment scope decodes");
+        let mut invalid_assignment_width_editor =
+            decoded_variable_width_team.into_event_records_editor();
+        invalid_assignment_width_editor.race_event_data_mut()[0]
+            .as_mut()
+            .expect("race-event data is present")
+            .race_team_scope
+            .indexes = vec![0, 0, 0];
+        assert!(invalid_assignment_width_editor.encode().is_err());
+
+        let mut invalid_scope_name_editor = decoded_scopes.clone().into_event_records_editor();
+        invalid_scope_name_editor.race_event_data_mut()[0]
+            .as_mut()
+            .unwrap()
+            .race_team_reference_scope
+            .names[0] = Some("A longer name".to_owned());
+        assert!(invalid_scope_name_editor.encode().is_err());
+        let mut invalid_scope_count_editor = decoded_scopes.into_event_records_editor();
+        invalid_scope_count_editor.race_event_data_mut()[0]
+            .as_mut()
+            .unwrap()
+            .race_team_reference_scope
+            .indexes
+            .push(14);
+        assert!(invalid_scope_count_editor.encode().is_err());
         let field_ranges = decoded_racer.active_event_race_data_field_ranges[0]
             .as_ref()
             .expect("race-event field ranges exist");
@@ -4825,6 +5083,8 @@ mod tests {
         data.racers[0].paths_assigned_raw = 2;
         data.racers[0].race_team_index = Some(0xbeef);
         data.racers[0].parade_group_index = Some(0xcafe);
+        data.race_team_reference_scope.indexes[0] = 12;
+        data.parade_group_reference_scope.indexes[0] = 13;
         data.racer_state_records[0][0] = 0xaa;
         data.racer_state_records[0][23] = 0xbb;
         data.schedule_id = -101;
@@ -4855,6 +5115,8 @@ mod tests {
             (22, vec![2]),
             (24, 0xbeef_u16.to_be_bytes().to_vec()),
             (28, 0xcafe_u16.to_be_bytes().to_vec()),
+            (31, 12_u16.to_be_bytes().to_vec()),
+            (36, 13_u16.to_be_bytes().to_vec()),
             (72, (-101_i32).to_be_bytes().to_vec()),
             (76, 202_i32.to_be_bytes().to_vec()),
             (80, (-303_i32).to_be_bytes().to_vec()),

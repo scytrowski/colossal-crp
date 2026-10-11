@@ -14633,6 +14633,9 @@ mod manager_boundary_tests {
                 track_path_segments: Vec::new(),
                 racer_oscillation_records: Vec::new(),
                 racer_state_timer_records: Vec::new(),
+                race_team_reference_scope: Default::default(),
+                parade_group_reference_scope: Default::default(),
+                race_team_scope: Default::default(),
                 route_spline: None,
             })]
         );
