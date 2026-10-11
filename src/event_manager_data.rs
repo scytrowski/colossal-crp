@@ -10,15 +10,16 @@ use std::ops::Range;
 
 const MAX_EVENT_SLOTS: usize = u16::MAX as usize + 1;
 const FIRST_EVENT_RECORD_VERSION: u32 = 210;
-const LAST_SUPPORTED_LEGACY_EVENT_RECORD_VERSION: u32 = 245;
+const LAST_SUPPORTED_EVENT_RECORD_VERSION: u32 = 254;
 const CUSTOM_EVENT_SEED_FLAG: u32 = 1 << 10;
 
 /// One decoded active event from the legacy EventManager record layout.
 ///
-/// This layout is supported for inner versions 210 through 245. Its four
+/// This layout is supported for inner versions 210 through 254. Its four
 /// pre-245 color words are retained raw because their meaning is not
-/// established; version 245 stores the color as RGB bytes. Later active-event
-/// layouts are not decoded yet.
+/// established; version 245 stores the color as RGB bytes. Versioned expiry,
+/// ticket, next-building-event, and reward fields are exposed when present.
+/// Versions 255 and later add fields that are not decoded yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventManagerEventRecord {
     /// One-based event slot represented by this record.
@@ -29,10 +30,21 @@ pub struct EventManagerEventRecord {
     pub building_index: u16,
     /// Event start frame.
     pub start_frame: u32,
+    /// Expiry frame serialized from inner version 246.
+    pub expiry_frame: Option<u32>,
+    /// Ticket price serialized from inner version 249.
+    pub ticket_price: Option<u16>,
+    /// Raw `m_nextBuildingEvent` value serialized in versions 245–251.
+    /// Its meaning is not established by the available research.
+    pub next_building_event: Option<u16>,
     /// Four pre-245 32-bit color values, retained without interpretation.
     pub legacy_color_words: Option<[u32; 4]>,
     /// RGB color bytes stored from version 245.
     pub color_rgb: Option<[u8; 3]>,
+    /// Reward amount and total serialized from inner version 250.
+    pub reward_totals: Option<[u64; 2]>,
+    /// Success and failure counts serialized from inner version 250.
+    pub result_counts: Option<[u16; 2]>,
     /// Optional custom event seed selected by flag bit `0x400`.
     pub custom_seed: Option<u64>,
 }
@@ -60,7 +72,7 @@ pub struct EventManagerTailData {
 
 /// Supported fields decoded from a bounded `EventManager+Data` body.
 ///
-/// Legacy event records in versions 210–245 are decoded and retained. Later
+/// Active event records in versions 210–254 are decoded and retained. Later
 /// active-event layouts and active routes remain unsupported. Reader, writer,
 /// and one corpus-observed counted-block candidate are boundary-checked. The
 /// counted block is retained as raw bytes because its meaning and type are
@@ -102,7 +114,7 @@ pub struct EventManagerTypeDataEditor {
 /// Editor for existing legacy active EventManager records.
 ///
 /// The record count, slot indexes, and activity flags are fixed. It edits only
-/// same-width scalar values for inner versions 210–245 and preserves the
+/// same-width scalar values for inner versions 210–254 and preserves the
 /// surrounding EventManager body bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerEventRecordsEditor {
@@ -792,8 +804,7 @@ fn read_active_event_records(
     if active_count == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
-    if !(FIRST_EVENT_RECORD_VERSION..=LAST_SUPPORTED_LEGACY_EVENT_RECORD_VERSION)
-        .contains(&format_version)
+    if !(FIRST_EVENT_RECORD_VERSION..=LAST_SUPPORTED_EVENT_RECORD_VERSION).contains(&format_version)
     {
         return Err(reader.invalid(format!(
             "active EventManager records are unsupported at inner version {format_version}"
@@ -811,6 +822,21 @@ fn read_active_event_records(
         let record_start = reader.offset();
         let building_index = reader.read_u16_be()?;
         let start_frame = reader.read_u32_be()?;
+        let expiry_frame = if format_version >= 246 {
+            Some(reader.read_u32_be()?)
+        } else {
+            None
+        };
+        let ticket_price = if format_version >= 249 {
+            Some(reader.read_u16_be()?)
+        } else {
+            None
+        };
+        let next_building_event = if (245..252).contains(&format_version) {
+            Some(reader.read_u16_be()?)
+        } else {
+            None
+        };
         let (legacy_color_words, color_rgb) = if format_version >= 245 {
             (
                 None,
@@ -827,6 +853,16 @@ fn read_active_event_records(
                 None,
             )
         };
+        let reward_totals = if format_version >= 250 {
+            Some([reader.read_u64_be()?, reader.read_u64_be()?])
+        } else {
+            None
+        };
+        let result_counts = if format_version >= 250 {
+            Some([reader.read_u16_be()?, reader.read_u16_be()?])
+        } else {
+            None
+        };
         let custom_seed = if flags & CUSTOM_EVENT_SEED_FLAG != 0 {
             Some(reader.read_u64_be()?)
         } else {
@@ -837,8 +873,13 @@ fn read_active_event_records(
             flags,
             building_index,
             start_frame,
+            expiry_frame,
+            ticket_price,
+            next_building_event,
             legacy_color_words,
             color_rgb,
+            reward_totals,
+            result_counts,
             custom_seed,
         });
         record_ranges.push(record_start..reader.offset());
@@ -1097,9 +1138,61 @@ fn encode_event_record(
     record: &EventManagerEventRecord,
     offset: usize,
 ) -> Result<Vec<u8>, CrpError> {
-    let mut output = Vec::with_capacity(if format_version >= 245 { 17 } else { 30 });
+    let mut output = Vec::new();
     output.extend_from_slice(&record.building_index.to_be_bytes());
     output.extend_from_slice(&record.start_frame.to_be_bytes());
+
+    match (format_version >= 246, record.expiry_frame) {
+        (true, Some(frame)) => output.extend_from_slice(&frame.to_be_bytes()),
+        (false, None) => {}
+        (true, None) => {
+            return Err(invalid_event_record(
+                offset,
+                "version-246-or-later event record requires an expiry frame",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_event_record(
+                offset,
+                "expiry frame is unavailable before version 246",
+            ));
+        }
+    }
+    match (format_version >= 249, record.ticket_price) {
+        (true, Some(price)) => output.extend_from_slice(&price.to_be_bytes()),
+        (false, None) => {}
+        (true, None) => {
+            return Err(invalid_event_record(
+                offset,
+                "version-249-or-later event record requires a ticket price",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_event_record(
+                offset,
+                "ticket price is unavailable before version 249",
+            ));
+        }
+    }
+    match (
+        (245..252).contains(&format_version),
+        record.next_building_event,
+    ) {
+        (true, Some(index)) => output.extend_from_slice(&index.to_be_bytes()),
+        (false, None) => {}
+        (true, None) => {
+            return Err(invalid_event_record(
+                offset,
+                "versions 245–251 require the next-building-event value",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_event_record(
+                offset,
+                "next-building-event value is unavailable outside versions 245–251",
+            ));
+        }
+    }
     match (
         format_version >= 245,
         record.legacy_color_words,
@@ -1114,13 +1207,40 @@ fn encode_event_record(
         (true, _, _) => {
             return Err(invalid_event_record(
                 offset,
-                "version-245 event record requires RGB bytes and no legacy color words",
+                "version-245-or-later event record requires RGB bytes and no legacy color words",
             ));
         }
         (false, _, _) => {
             return Err(invalid_event_record(
                 offset,
                 "pre-245 event record requires four legacy color words and no RGB bytes",
+            ));
+        }
+    }
+    match (
+        format_version >= 250,
+        record.reward_totals,
+        record.result_counts,
+    ) {
+        (true, Some(totals), Some(counts)) => {
+            for total in totals {
+                output.extend_from_slice(&total.to_be_bytes());
+            }
+            for count in counts {
+                output.extend_from_slice(&count.to_be_bytes());
+            }
+        }
+        (false, None, None) => {}
+        (true, _, _) => {
+            return Err(invalid_event_record(
+                offset,
+                "version-250-or-later event record requires reward totals and result counts",
+            ));
+        }
+        (false, _, _) => {
+            return Err(invalid_event_record(
+                offset,
+                "reward totals and result counts are unavailable before version 250",
             ));
         }
     }
@@ -1186,6 +1306,15 @@ mod tests {
         bytes.extend_from_slice(&flags.to_be_bytes());
         bytes.extend_from_slice(&[0x12, 0x34]); // Building index.
         bytes.extend_from_slice(&0x0102_0304_u32.to_be_bytes()); // Start frame.
+        if format_version >= 246 {
+            bytes.extend_from_slice(&0x0506_0708_u32.to_be_bytes()); // Expiry frame.
+        }
+        if format_version >= 249 {
+            bytes.extend_from_slice(&[0x12, 0x34]); // Ticket price.
+        }
+        if (245..252).contains(&format_version) {
+            bytes.extend_from_slice(&[0x45, 0x67]); // m_nextBuildingEvent.
+        }
         if format_version >= 245 {
             bytes.extend_from_slice(&[0x11, 0x22, 0x33]);
         } else {
@@ -1193,12 +1322,20 @@ mod tests {
                 bytes.extend_from_slice(&color_word.to_be_bytes());
             }
         }
+        if format_version >= 250 {
+            bytes.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes()); // Reward money.
+            bytes.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes()); // Total reward.
+            bytes.extend_from_slice(&[0x21, 0x22, 0x23, 0x24]); // Success/failure counts.
+        }
         if flags & (1 << 10) != 0 {
             bytes.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
         }
         bytes.extend_from_slice(&[0x00, 0x00]); // No unlock milestones.
         bytes.extend_from_slice(&[0x00, 0x00, 0x07]); // One event prefab index.
         bytes.extend_from_slice(&[0x00, 0x00]); // Empty prefab names.
+        if format_version >= 253 {
+            bytes.push(0xff); // Match-preparing reference.
+        }
         bytes.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
         bytes
     }
@@ -1597,7 +1734,7 @@ mod tests {
             0x00, 0x01, // Two event slots.
             0x00, 0x00, 0x00, 0x01, // One active event flag.
         ];
-        assert!(EventManagerReferenceData::decode_reader(253, &active_event).is_err());
+        assert!(EventManagerReferenceData::decode_reader(255, &active_event).is_err());
 
         let active_route = [
             0x00, 0x00, // One event slot.
@@ -1628,8 +1765,13 @@ mod tests {
                 flags,
                 building_index: 0x1234,
                 start_frame: 0x0102_0304,
+                expiry_frame: None,
+                ticket_price: None,
+                next_building_event: None,
                 legacy_color_words: Some([0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444,]),
                 color_rgb: None,
+                reward_totals: None,
+                result_counts: None,
                 custom_seed: Some(0x0102_0304_0506_0708),
             }]
         );
@@ -1669,6 +1811,10 @@ mod tests {
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.active_event_records[0].legacy_color_words, None);
         assert_eq!(
+            decoded.active_event_records[0].next_building_event,
+            Some(0x4567)
+        );
+        assert_eq!(
             decoded.active_event_records[0].color_rgb,
             Some([0x11, 0x22, 0x33])
         );
@@ -1679,11 +1825,134 @@ mod tests {
         let mut editor = decoded.into_event_records_editor();
         editor.records_mut()[0].color_rgb = Some([0xaa, 0xbb, 0xcc]);
         let expected = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04, 0x45,
+            0x67, 0xaa, 0xbb, 0xcc, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00,
+            0x00, 0x00, 0x07, 0x00, 0x00, 0x12, 0x34,
+        ];
+        assert_eq!(editor.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn versioned_event_records_decode_and_edit_through_version_254() {
+        let flags = 0x0000_0401;
+        for (version, expected_ticket, expected_next, expected_rewards) in [
+            (246, None, Some(0x4567), None),
+            (248, None, Some(0x4567), None),
+            (249, Some(0x1234), Some(0x4567), None),
+            (
+                250,
+                Some(0x1234),
+                Some(0x4567),
+                Some([0x0102_0304_0506_0708, 0x1112_1314_1516_1718]),
+            ),
+            (
+                251,
+                Some(0x1234),
+                Some(0x4567),
+                Some([0x0102_0304_0506_0708, 0x1112_1314_1516_1718]),
+            ),
+            (
+                252,
+                Some(0x1234),
+                None,
+                Some([0x0102_0304_0506_0708, 0x1112_1314_1516_1718]),
+            ),
+            (
+                253,
+                Some(0x1234),
+                None,
+                Some([0x0102_0304_0506_0708, 0x1112_1314_1516_1718]),
+            ),
+            (
+                254,
+                Some(0x1234),
+                None,
+                Some([0x0102_0304_0506_0708, 0x1112_1314_1516_1718]),
+            ),
+        ] {
+            let bytes = one_active_event(version, flags);
+            let (decoded, consumed) = EventManagerReferenceData::decode_reader(version, &bytes)
+                .unwrap_or_else(|error| panic!("version {version}: {error}"));
+            assert_eq!(consumed, bytes.len(), "version {version}");
+            let record = decoded.active_event_records[0];
+            assert_eq!(record.expiry_frame, Some(0x0506_0708), "version {version}");
+            assert_eq!(record.ticket_price, expected_ticket, "version {version}");
+            assert_eq!(
+                record.next_building_event, expected_next,
+                "version {version}"
+            );
+            assert_eq!(record.reward_totals, expected_rewards, "version {version}");
+            assert_eq!(
+                record.result_counts,
+                expected_rewards.map(|_| [0x2122, 0x2324]),
+                "version {version}"
+            );
+            let encoded = decoded.into_event_records_editor().encode().unwrap();
+            assert_eq!(encoded, bytes, "version {version}");
+            let independently_expected: Option<&[u8]> = match version {
+                246 => Some(&[
+                    0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04,
+                    0x05, 0x06, 0x07, 0x08, 0x45, 0x67, 0x11, 0x22, 0x33, 0x01, 0x02, 0x03, 0x04,
+                    0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x12, 0x34,
+                ]),
+                249 => Some(&[
+                    0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04,
+                    0x05, 0x06, 0x07, 0x08, 0x12, 0x34, 0x45, 0x67, 0x11, 0x22, 0x33, 0x01, 0x02,
+                    0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
+                    0x12, 0x34,
+                ]),
+                252 => Some(&[
+                    0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04,
+                    0x05, 0x06, 0x07, 0x08, 0x12, 0x34, 0x11, 0x22, 0x33, 0x01, 0x02, 0x03, 0x04,
+                    0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x21,
+                    0x22, 0x23, 0x24, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00,
+                    0x00, 0x00, 0x07, 0x00, 0x00, 0x12, 0x34,
+                ]),
+                _ => None,
+            };
+            if let Some(expected) = independently_expected {
+                assert_eq!(encoded, expected, "exact bytes for version {version}");
+            }
+        }
+
+        let bytes = one_active_event(250, flags);
+        let (decoded, _) = EventManagerReferenceData::decode_reader(250, &bytes).unwrap();
+        let mut editor = decoded.into_event_records_editor();
+        let record = &mut editor.records_mut()[0];
+        record.expiry_frame = Some(0xaabb_ccdd);
+        record.ticket_price = Some(0x5566);
+        record.next_building_event = Some(0x7788);
+        record.color_rgb = Some([0xaa, 0xbb, 0xcc]);
+        record.reward_totals = Some([0x2122_2324_2526_2728, 0x3132_3334_3536_3738]);
+        record.result_counts = Some([0x3344, 0x5566]);
+        let expected = [
             0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04, 0xaa,
-            0xbb, 0xcc, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x00,
+            0xbb, 0xcc, 0xdd, 0x55, 0x66, 0x77, 0x88, 0xaa, 0xbb, 0xcc, 0x21, 0x22, 0x23, 0x24,
+            0x25, 0x26, 0x27, 0x28, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x33, 0x44,
+            0x55, 0x66, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x00,
             0x07, 0x00, 0x00, 0x12, 0x34,
         ];
         assert_eq!(editor.encode().unwrap(), expected);
+
+        let mut invalid = editor.clone();
+        invalid.records_mut()[0].ticket_price = None;
+        assert!(invalid.encode().is_err());
+        let mut invalid = editor.clone();
+        invalid.records_mut()[0].next_building_event = None;
+        assert!(invalid.encode().is_err());
+        let mut invalid = editor.clone();
+        invalid.records_mut()[0].result_counts = None;
+        assert!(invalid.encode().is_err());
+
+        for end in 0..bytes.len() {
+            assert!(
+                EventManagerReferenceData::decode_reader(250, &bytes[..end]).is_err(),
+                "truncated version-250 active event at {end}"
+            );
+        }
+        assert!(
+            EventManagerReferenceData::decode_reader(255, &one_active_event(255, flags)).is_err()
+        );
     }
 
     #[test]

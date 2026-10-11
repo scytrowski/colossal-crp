@@ -2160,7 +2160,7 @@ impl SimulationManagerData {
     ///
     /// This table is available only when the bounded EventManager body matches
     /// one unambiguous supported reader/writer candidate. Legacy active-event
-    /// records from inner versions 210 through 245 are preserved unchanged;
+    /// records from inner versions 210 through 254 are preserved unchanged;
     /// later active-event layouts and active routes are unsupported.
     pub fn decode_event_manager_type_data(&self) -> Result<EventManagerTypeDataEditor, CrpError> {
         let managers = self
@@ -2173,13 +2173,14 @@ impl SimulationManagerData {
             .into_type_data_editor())
     }
 
-    /// Decodes legacy active EventManager records for inner versions 210–245.
+    /// Decodes active EventManager records for inner versions 210–254.
     ///
     /// Pre-245 color words are returned raw; version 245 records expose RGB
-    /// bytes. Active records in later layouts and active event routes are
-    /// rejected because their complete field layouts are not yet supported.
-    /// The bounded manager body must match one unambiguous reader/writer
-    /// candidate.
+    /// bytes. Version-gated expiry, ticket, next-building-event, and reward
+    /// values are exposed when present. Active records from version 255 onward
+    /// and active event routes are rejected because their complete layouts are
+    /// not yet supported. The bounded manager body must match one unambiguous
+    /// reader/writer candidate.
     pub fn decode_event_manager_event_records(
         &self,
     ) -> Result<EventManagerEventRecordsEditor, CrpError> {
@@ -2193,7 +2194,9 @@ impl SimulationManagerData {
             .into_event_records_editor())
     }
 
-    /// Replaces existing legacy EventManager event-record values in place.
+    /// Replaces existing EventManager event-record values in place using the
+    /// version-selected reader layout. This does not claim compatibility with
+    /// the supplied DLL's current, unconditionally written event layout.
     ///
     /// The editor must match this stream's version and exact source body.
     /// Record count, slot indexes, flags, and record widths cannot change.
@@ -14357,8 +14360,13 @@ mod manager_boundary_tests {
                 flags: 0x0000_0401,
                 building_index: 0x1234,
                 start_frame: 0x0102_0304,
+                expiry_frame: None,
+                ticket_price: None,
+                next_building_event: None,
                 legacy_color_words: Some([0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444,]),
                 color_rgb: None,
+                reward_totals: None,
+                result_counts: None,
                 custom_seed: Some(0x0102_0304_0506_0708),
             }]
         );
@@ -14402,6 +14410,70 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph(), expected_graph);
+    }
+
+    #[test]
+    fn event_manager_replaces_versioned_active_record_fields() {
+        let mut body = vec![
+            0x00, 0x01, // Two event slots.
+            0x00, // One literal event flag follows.
+            0x00, 0x00, 0x04, 0x01, // Active event with custom-seed flag.
+            0x12, 0x34, // Building index.
+            0x01, 0x02, 0x03, 0x04, // Start frame.
+            0x05, 0x06, 0x07, 0x08, // Expiry frame.
+            0x12, 0x34, // Ticket price.
+            0x45, 0x67, // m_nextBuildingEvent.
+            0x11, 0x22, 0x33, // RGB color.
+        ];
+        body.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes()); // Reward money.
+        body.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes()); // Total reward.
+        body.extend_from_slice(&[0x21, 0x22, 0x23, 0x24]); // Success/failure counts.
+        body.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes()); // Custom seed.
+        body.extend_from_slice(&[0x00, 0x00]); // No unlock milestones.
+        body.extend_from_slice(&[0x00, 0x00, 0x07]); // One event prefab index.
+        body.extend_from_slice(&[0x00, 0x00]); // Empty prefab names.
+        body.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
+
+        let (mut manager, body_start) = manager_with_event_manager_body(250, &body);
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let mut editor = manager.decode_event_manager_event_records().unwrap();
+        let record = editor.records()[0];
+        assert_eq!(record.expiry_frame, Some(0x0506_0708));
+        assert_eq!(record.ticket_price, Some(0x1234));
+        assert_eq!(record.next_building_event, Some(0x4567));
+        assert_eq!(
+            record.reward_totals,
+            Some([0x0102_0304_0506_0708, 0x1112_1314_1516_1718])
+        );
+        assert_eq!(record.result_counts, Some([0x2122, 0x2324]));
+
+        editor.records_mut()[0].expiry_frame = Some(0xaabb_ccdd);
+        editor.records_mut()[0].reward_totals =
+            Some([0x2122_2324_2526_2728, 0x3132_3334_3536_3738]);
+        manager
+            .replace_event_manager_event_records(&editor)
+            .unwrap();
+        let expected_body = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04, 0xaa,
+            0xbb, 0xcc, 0xdd, 0x12, 0x34, 0x45, 0x67, 0x11, 0x22, 0x33, 0x21, 0x22, 0x23, 0x24,
+            0x25, 0x26, 0x27, 0x28, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x21, 0x22,
+            0x23, 0x24, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x12, 0x34,
+        ];
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start..body_start + body.len()],
+            expected_body
+        );
+        let mut expected_graph = original_graph;
+        expected_graph[body_start..body_start + body.len()].copy_from_slice(&expected_body);
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+        assert_eq!(
+            manager
+                .decode_event_manager_event_records()
+                .unwrap()
+                .records(),
+            editor.records()
+        );
     }
 
     #[test]
