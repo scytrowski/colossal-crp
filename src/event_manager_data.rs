@@ -114,9 +114,9 @@ pub struct EventManagerRaceEventData {
 
 /// Known values from one racer entry in `RaceEventData`.
 ///
-/// All fixed-width values and performer IDs can be edited while keeping the
-/// existing counts. `name` is decoded for inspection but must remain unchanged
-/// so its original string encoding can be preserved exactly.
+/// Fixed-width values and performer IDs can be edited while keeping the
+/// existing counts. Names can be changed only when their existing nullness,
+/// string encoding, and serialized width can be preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerRaceRacer {
     /// Racer identifier.
@@ -138,7 +138,8 @@ pub struct EventManagerRaceRacer {
     pub paths_assigned_raw: u8,
     /// Optional race-team reference index.
     pub race_team_index: Option<u16>,
-    /// Decoded racer name, retained with its original string encoding.
+    /// Racer name. Edits must preserve its existing nullness, encoding mode,
+    /// and serialized width.
     pub name: Option<String>,
     /// Optional parade-group reference index.
     pub parade_group_index: Option<u16>,
@@ -276,10 +277,11 @@ pub struct EventManagerTypeDataEditor {
 
 /// Editor for existing versioned active EventManager records.
 ///
-/// The record count, slot indexes, and activity flags are fixed. It edits only
+/// The record count, slot indexes, and activity flags are fixed. It edits
 /// same-width scalar values for inner versions 210–121030, including selected
-/// `RaceEventData` fields and its opaque fixed-size arrays. Other nested
-/// race-event bytes and the surrounding EventManager body are preserved.
+/// `RaceEventData` fields, opaque fixed-size arrays, and racer-name contents
+/// that retain their source encoding and width. Other nested race-event bytes
+/// and the surrounding EventManager body are preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerEventRecordsEditor {
     original: EventManagerReferenceData,
@@ -523,6 +525,8 @@ struct EventManagerRaceRacerFieldRanges {
     second_path: Range<usize>,
     paths_assigned_raw: Range<usize>,
     race_team_index: Option<Range<usize>>,
+    name: Range<usize>,
+    name_compact_mode: Option<bool>,
     parade_group_index: Option<Range<usize>>,
 }
 
@@ -984,12 +988,32 @@ impl EventManagerEventRecordsEditor {
                             ));
                         }
                         if racer.name != original_racer.name {
-                            return Err(invalid_event_record(
-                                racer_ranges.racer_id.start,
-                                format!(
-                                    "race-event racer {racer_index} name cannot change in this editor"
-                                ),
-                            ));
+                            let mut encoded_name = Vec::new();
+                            match racer.name.as_deref() {
+                                None => encoded_name.push(0xff),
+                                Some(name) => match racer_ranges.name_compact_mode {
+                                    Some(compact) => write_unique_string_with_mode(
+                                        &mut encoded_name,
+                                        name,
+                                        compact,
+                                    )?,
+                                    None => write_unique_string(&mut encoded_name, name)?,
+                                },
+                            }
+                            if encoded_name.len() != racer_ranges.name.len() {
+                                return Err(invalid_event_record(
+                                    racer_ranges.name.start,
+                                    format!(
+                                        "race-event racer {racer_index} name cannot change nullness or serialized width"
+                                    ),
+                                ));
+                            }
+                            patch_race_event_field(
+                                &mut output,
+                                &racer_ranges.name,
+                                &encoded_name,
+                                "racer name",
+                            )?;
                         }
                         patch_race_event_field(
                             &mut output,
@@ -2190,7 +2214,22 @@ fn skip_race_event_data(
             } else {
                 (None, None)
             };
+        let name_start = reader.offset();
         let name = reader.read_unique_string()?;
+        let name_range = name_start..reader.offset();
+        let name_compact_mode = if name.is_some() {
+            let raw_name = reader
+                .consumed_bytes()
+                .get(name_range.clone())
+                .ok_or_else(|| reader.invalid("race-event racer name range is invalid"))?;
+            let first = raw_name
+                .first()
+                .copied()
+                .ok_or_else(|| reader.invalid("race-event racer name is empty"))?;
+            Some((u32::from(first) << 16) & COMPACT_STRING_FLAG != 0)
+        } else {
+            None
+        };
         let parade_group_presence = reader.read_u8()?;
         let (parade_group_index, parade_group_index_range) =
             if data_serializer_bool_is_true(parade_group_presence) {
@@ -2224,6 +2263,8 @@ fn skip_race_event_data(
             second_path: second_path_range,
             paths_assigned_raw: paths_assigned_range,
             race_team_index: race_team_index_range,
+            name: name_range,
+            name_compact_mode,
             parade_group_index: parade_group_index_range,
         });
     }
@@ -4536,6 +4577,65 @@ mod tests {
                 racer_state_timer_records: vec![[0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,]],
             })
         );
+        for (source_name, replacement_name, value) in [
+            (
+                &[0x80, 0x00, 0x01, 0xc1][..],
+                &[0x80, 0x00, 0x01, 0xc2][..],
+                "B",
+            ),
+            (
+                &[0x00, 0x00, 0x01, 0xff, 0xc1][..],
+                &[0x00, 0x00, 0x01, 0xff, 0xc2][..],
+                "B",
+            ),
+        ] {
+            let mut named_race_data = one_racer.clone();
+            // Racer name follows the fixed fields and optional team index.
+            named_race_data.splice(26..27, source_name.iter().copied());
+            let mut named_bytes = one_racer_bytes.clone();
+            named_bytes.splice(race_range.clone(), named_race_data.iter().copied());
+            let (decoded_named, _) =
+                EventManagerReferenceData::decode_reader(120_004, &named_bytes)
+                    .expect("named racer fixture decodes");
+            let name_range = decoded_named.active_event_race_data_field_ranges[0]
+                .as_ref()
+                .expect("named race-event field ranges exist")
+                .racers[0]
+                .name
+                .clone();
+            assert_eq!(
+                decoded_named.serialized_body.get(name_range.clone()),
+                Some(source_name)
+            );
+            let mut name_editor = decoded_named.clone().into_event_records_editor();
+            name_editor.race_event_data_mut()[0]
+                .as_mut()
+                .expect("named race-event data is present")
+                .racers[0]
+                .name = Some(value.to_owned());
+            let mut expected_named_bytes = named_bytes;
+            expected_named_bytes[name_range].copy_from_slice(replacement_name);
+            assert_eq!(name_editor.encode().unwrap(), expected_named_bytes);
+            let (decoded_renamed, _) =
+                EventManagerReferenceData::decode_reader(120_004, &expected_named_bytes)
+                    .expect("renamed racer fixture remains parseable");
+            assert_eq!(
+                decoded_renamed.active_event_race_data[0]
+                    .as_ref()
+                    .expect("renamed race-event data exists")
+                    .racers[0]
+                    .name
+                    .as_deref(),
+                Some(value)
+            );
+            let mut invalid_length_editor = decoded_named.into_event_records_editor();
+            invalid_length_editor.race_event_data_mut()[0]
+                .as_mut()
+                .expect("named race-event data is present")
+                .racers[0]
+                .name = Some("longer name".to_owned());
+            assert!(invalid_length_editor.encode().is_err());
+        }
         let field_ranges = decoded_racer.active_event_race_data_field_ranges[0]
             .as_ref()
             .expect("race-event field ranges exist");
