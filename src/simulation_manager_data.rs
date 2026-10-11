@@ -1485,6 +1485,7 @@ pub struct TransportManagerLineData {
     format_version: u32,
     line_flags: Vec<u32>,
     active_line_prefab_indices: Vec<u16>,
+    prefab_names: Vec<Option<String>>,
     line_numbers: Option<Vec<u16>>,
     active_lines: Vec<TransportManagerLineRecord>,
     global_passengers: Option<Vec<TransportPassengerRecord>>,
@@ -1520,6 +1521,11 @@ impl TransportManagerLineData {
         &self.active_line_prefab_indices
     }
 
+    /// Returns names from the TransportInfo prefab table in serialized order.
+    pub fn prefab_names(&self) -> &[Option<String>] {
+        &self.prefab_names
+    }
+
     /// Returns active line records in flag order.
     pub fn active_lines(&self) -> &[TransportManagerLineRecord] {
         &self.active_lines
@@ -1546,6 +1552,7 @@ impl TransportManagerLineData {
             format_version: self.format_version,
             line_flags: self.line_flags,
             active_line_prefab_indices: self.active_line_prefab_indices,
+            prefab_names: self.prefab_names,
             line_numbers: self.line_numbers.clone(),
             original_line_numbers: self.line_numbers,
             active_lines: self.active_lines,
@@ -1575,6 +1582,7 @@ pub struct TransportManagerLineDataEditor {
     format_version: u32,
     line_flags: Vec<u32>,
     active_line_prefab_indices: Vec<u16>,
+    prefab_names: Vec<Option<String>>,
     line_numbers: Option<Vec<u16>>,
     original_line_numbers: Option<Vec<u16>>,
     active_lines: Vec<TransportManagerLineRecord>,
@@ -1633,6 +1641,11 @@ impl TransportManagerLineDataEditor {
     /// Returns prefab indexes assigned to active lines in active-flag order.
     pub fn active_line_prefab_indices(&self) -> &[u16] {
         &self.active_line_prefab_indices
+    }
+
+    /// Returns names from the TransportInfo prefab table in serialized order.
+    pub fn prefab_names(&self) -> &[Option<String>] {
+        &self.prefab_names
     }
 
     /// Changes the prefab index assigned to an active line.
@@ -11075,6 +11088,7 @@ impl SimulationManagerData {
                     )
                 })?
                 .to_vec(),
+            prefab_names: fields.prefab_names,
             line_numbers: fields.line_numbers,
             active_lines: fields.line_records,
             global_passengers: fields.global_passengers,
@@ -14594,8 +14608,15 @@ fn decode_transport_manager_reference_body_with_milestones(
     };
 
     let prefab_name_count = usize::from(reader.read_u16_be()?);
+    let mut prefab_names = Vec::new();
+    if capture_milestones {
+        prefab_names.reserve(prefab_name_count);
+    }
     for _ in 0..prefab_name_count {
-        reader.read_unique_string()?;
+        let name = reader.read_unique_string()?;
+        if capture_milestones {
+            prefab_names.push(name);
+        }
     }
     if milestone_count > reader.remaining() {
         return Err(reader.invalid(format!(
@@ -14853,6 +14874,7 @@ fn decode_transport_manager_reference_body_with_milestones(
             Vec::new()
         },
         line_flags_range,
+        prefab_names,
         milestone_object_headers,
         milestone_prefab_indices,
         all_prefab_indices,
@@ -14883,6 +14905,7 @@ fn decode_transport_manager_reference_body_with_milestones(
 struct TransportManagerReferenceFields {
     line_flags: Vec<u32>,
     line_flags_range: Option<Range<usize>>,
+    prefab_names: Vec<Option<String>>,
     milestone_object_headers: Vec<NetObjectHeader>,
     milestone_prefab_indices: Vec<u16>,
     all_prefab_indices: Vec<u16>,
@@ -21042,6 +21065,33 @@ mod manager_boundary_tests {
         assert!(rewritten.line_flags()[1..].iter().all(|flag| *flag == 0));
         assert_eq!(rewritten.active_lines().len(), 1);
         assert_eq!(rewritten.active_line_prefab_indices(), [7]);
+    }
+
+    #[test]
+    fn transport_manager_line_data_exposes_and_preserves_prefab_names() {
+        let (mut body, _) = active_transport_manager_reference_body(112_004, 14, 0, 7);
+        let fields = decode_transport_manager_reference_body_with_milestones(
+            112_004, &body, None, None, true,
+        )
+        .unwrap();
+        let name_count_offset = fields.prefab_index_range.unwrap().end;
+        let mut name_table = 3_u16.to_be_bytes().to_vec();
+        name_table.push(0xff); // Null unique string.
+        write_unique_string(&mut name_table, "").unwrap();
+        write_unique_string(&mut name_table, "Metro").unwrap();
+        body.splice(name_count_offset..name_count_offset + 2, name_table);
+
+        let (mut manager, _) = manager_with_transport_body(112_004, &body);
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let line_data = manager.decode_transport_manager_line_data().unwrap();
+        let expected_names = [None, Some(String::new()), Some("Metro".to_owned())];
+        assert_eq!(line_data.prefab_names(), expected_names);
+        let editor = line_data.into_editor();
+        assert_eq!(editor.prefab_names(), expected_names);
+        manager
+            .replace_transport_manager_line_data(&editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), original_graph);
     }
 
     #[test]
