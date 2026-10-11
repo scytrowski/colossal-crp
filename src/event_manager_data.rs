@@ -45,6 +45,15 @@ pub struct EventManagerTypeData {
     pub ticket_price_offset: Option<u32>,
 }
 
+/// Known fixed-width EventManager tail values selected by inner version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EventManagerTailData {
+    /// Band popularity adjustment stored from the documented version gates.
+    pub band_popularity_bonus: Option<i16>,
+    /// Event schedule count stored from inner version 121027.
+    pub event_schedule_count: Option<i32>,
+}
+
 /// Supported fields decoded from a bounded `EventManager+Data` body.
 ///
 /// Legacy event records in versions 210–245 are decoded and retained. Later
@@ -60,8 +69,11 @@ pub(crate) struct EventManagerReferenceData {
     pub(crate) object_headers: Vec<NetObjectHeader>,
     pub(crate) unidentified_counted_block: Option<UnidentifiedCountedBlock>,
     pub(crate) type_data: Vec<EventManagerTypeData>,
+    pub(crate) tail_data: EventManagerTailData,
     type_data_has_ticket_price: bool,
     type_data_range: Range<usize>,
+    band_popularity_bonus_range: Option<Range<usize>>,
+    event_schedule_count_range: Option<Range<usize>>,
     pub(crate) serialized_body: Vec<u8>,
 }
 
@@ -87,6 +99,16 @@ pub struct EventManagerEventRecordsEditor {
     records: Vec<EventManagerEventRecord>,
 }
 
+/// Editor for existing versioned EventManager tail values.
+///
+/// It changes only fields present in the source body and preserves their
+/// version-selected widths and surrounding bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventManagerTailEditor {
+    original: EventManagerReferenceData,
+    tail_data: EventManagerTailData,
+}
+
 impl EventManagerReferenceData {
     pub(crate) fn equivalent_reference_layout(&self, other: &Self) -> bool {
         self.active_event_records == other.active_event_records
@@ -108,6 +130,13 @@ impl EventManagerReferenceData {
     pub(crate) fn into_event_records_editor(self) -> EventManagerEventRecordsEditor {
         EventManagerEventRecordsEditor {
             records: self.active_event_records.clone(),
+            original: self,
+        }
+    }
+
+    pub(crate) fn into_tail_editor(self) -> EventManagerTailEditor {
+        EventManagerTailEditor {
+            tail_data: self.tail_data,
             original: self,
         }
     }
@@ -200,7 +229,8 @@ impl EventManagerReferenceData {
         } else {
             None
         };
-        read_reader_tail(&mut reader, format_version, &mut object_headers)?;
+        let (tail_data, band_popularity_bonus_range, event_schedule_count_range) =
+            read_reader_tail(&mut reader, format_version, &mut object_headers)?;
         finish(
             &mut reader,
             format_version,
@@ -211,6 +241,9 @@ impl EventManagerReferenceData {
             type_data,
             type_data_has_ticket_price,
             type_data_range,
+            tail_data,
+            band_popularity_bonus_range,
+            event_schedule_count_range,
             bytes,
         )
     }
@@ -243,8 +276,12 @@ impl EventManagerReferenceData {
         object_headers.push(read_net_object_header(&mut reader)?);
         object_headers.push(read_net_object_header(&mut reader)?);
         object_headers.push(read_net_object_header(&mut reader)?);
-        reader.read_i16_be()?;
-        reader.read_i32_be()?;
+        let band_popularity_bonus_start = reader.offset();
+        let band_popularity_bonus = reader.read_i16_be()?;
+        let band_popularity_bonus_range = band_popularity_bonus_start..reader.offset();
+        let event_schedule_count_start = reader.offset();
+        let event_schedule_count = reader.read_i32_be()?;
+        let event_schedule_count_range = event_schedule_count_start..reader.offset();
         finish(
             &mut reader,
             format_version,
@@ -255,6 +292,12 @@ impl EventManagerReferenceData {
             type_data,
             type_data_has_ticket_price,
             type_data_range,
+            EventManagerTailData {
+                band_popularity_bonus: Some(band_popularity_bonus),
+                event_schedule_count: Some(event_schedule_count),
+            },
+            Some(band_popularity_bonus_range),
+            Some(event_schedule_count_range),
             bytes,
         )
     }
@@ -366,6 +409,86 @@ impl EventManagerEventRecordsEditor {
                     invalid_event_record(range.start, "EventManager record range exceeds body")
                 })?
                 .copy_from_slice(&encoded);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original.serialized_body
+    }
+}
+
+impl EventManagerTailEditor {
+    /// Returns the inner DataSerializer version used to select tail fields.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns the known version-gated tail values.
+    pub fn data(&self) -> EventManagerTailData {
+        self.tail_data
+    }
+
+    /// Returns mutable version-gated tail values while retaining their gates.
+    pub fn data_mut(&mut self) -> &mut EventManagerTailData {
+        &mut self.tail_data
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let mut output = self.original.serialized_body.clone();
+        match (
+            self.tail_data.band_popularity_bonus,
+            self.original.band_popularity_bonus_range.as_ref(),
+        ) {
+            (Some(value), Some(range)) => {
+                let destination = output.get_mut(range.clone()).ok_or_else(|| {
+                    invalid_event_tail(range.start, "band popularity field exceeds body")
+                })?;
+                if destination.len() != 2 {
+                    return Err(invalid_event_tail(
+                        range.start,
+                        "band popularity field does not have its two-byte width",
+                    ));
+                }
+                destination.copy_from_slice(&value.to_be_bytes());
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid_event_tail(
+                    self.original
+                        .band_popularity_bonus_range
+                        .as_ref()
+                        .map_or(0, |range| range.start),
+                    "band popularity value cannot be added or removed across its version gate",
+                ));
+            }
+        }
+        match (
+            self.tail_data.event_schedule_count,
+            self.original.event_schedule_count_range.as_ref(),
+        ) {
+            (Some(value), Some(range)) => {
+                let destination = output.get_mut(range.clone()).ok_or_else(|| {
+                    invalid_event_tail(range.start, "event schedule count exceeds body")
+                })?;
+                if destination.len() != 4 {
+                    return Err(invalid_event_tail(
+                        range.start,
+                        "event schedule count does not have its four-byte width",
+                    ));
+                }
+                destination.copy_from_slice(&value.to_be_bytes());
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid_event_tail(
+                    self.original
+                        .event_schedule_count_range
+                        .as_ref()
+                        .map_or(0, |range| range.start),
+                    "event schedule count cannot be added or removed across its version gate",
+                ));
+            }
         }
         Ok(output)
     }
@@ -573,7 +696,14 @@ fn read_reader_tail(
     reader: &mut Reader<'_>,
     format_version: u32,
     object_headers: &mut Vec<NetObjectHeader>,
-) -> Result<(), CrpError> {
+) -> Result<
+    (
+        EventManagerTailData,
+        Option<Range<usize>>,
+        Option<Range<usize>>,
+    ),
+    CrpError,
+> {
     if format_version >= 253 {
         object_headers.push(read_net_object_header(reader)?);
     }
@@ -583,13 +713,29 @@ fn read_reader_tail(
         object_headers.push(read_net_object_header(reader)?);
         object_headers.push(read_net_object_header(reader)?);
     }
-    if format_version >= 109_003 || (108_003..109_000).contains(&format_version) {
-        reader.read_i16_be()?;
-    }
-    if format_version >= 121_027 {
-        reader.read_i32_be()?;
-    }
-    Ok(())
+    let (band_popularity_bonus, band_popularity_bonus_range) =
+        if format_version >= 109_003 || (108_003..109_000).contains(&format_version) {
+            let start = reader.offset();
+            let value = reader.read_i16_be()?;
+            (Some(value), Some(start..reader.offset()))
+        } else {
+            (None, None)
+        };
+    let (event_schedule_count, event_schedule_count_range) = if format_version >= 121_027 {
+        let start = reader.offset();
+        let value = reader.read_i32_be()?;
+        (Some(value), Some(start..reader.offset()))
+    } else {
+        (None, None)
+    };
+    Ok((
+        EventManagerTailData {
+            band_popularity_bonus,
+            event_schedule_count,
+        },
+        band_popularity_bonus_range,
+        event_schedule_count_range,
+    ))
 }
 
 fn finish(
@@ -602,6 +748,9 @@ fn finish(
     type_data: Vec<EventManagerTypeData>,
     type_data_has_ticket_price: bool,
     type_data_range: Range<usize>,
+    tail_data: EventManagerTailData,
+    band_popularity_bonus_range: Option<Range<usize>>,
+    event_schedule_count_range: Option<Range<usize>>,
     bytes: &[u8],
 ) -> Result<(EventManagerReferenceData, usize), CrpError> {
     reader.read_u16_be()?;
@@ -614,8 +763,11 @@ fn finish(
             object_headers,
             unidentified_counted_block,
             type_data,
+            tail_data,
             type_data_has_ticket_price,
             type_data_range,
+            band_popularity_bonus_range,
+            event_schedule_count_range,
             serialized_body: bytes[..consumed].to_vec(),
         },
         consumed,
@@ -692,9 +844,20 @@ fn invalid_event_record(offset: usize, reason: impl Into<String>) -> CrpError {
     }
 }
 
+fn invalid_event_tail(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "EventManager+Data tail".to_owned(),
+        offset,
+        reason: reason.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EventManagerEventRecord, EventManagerReferenceData, EventManagerTypeData};
+    use super::{
+        EventManagerEventRecord, EventManagerReferenceData, EventManagerTailData,
+        EventManagerTypeData,
+    };
     use crate::net_manager_data::NetObjectHeader;
 
     fn one_active_event(format_version: u32, flags: u32) -> Vec<u8> {
@@ -1064,6 +1227,60 @@ mod tests {
             0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04, 0xaa,
             0xbb, 0xcc, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x00,
             0x07, 0x00, 0x00, 0x12, 0x34,
+        ];
+        assert_eq!(editor.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn reader_tail_editor_obeys_bonus_and_schedule_count_gates() {
+        let bytes = [
+            0x00, 0x00, // One event slot.
+            0x00, 0x00, // No unlock milestones.
+            0x00, 0x00, // Empty prefab names.
+            0xff, // Match-preparing reference.
+            0xff, 0xff, // Band-preparing and band-popularity references.
+            0x12, 0x34, // Band-popularity bonus.
+            0x56, 0x78, // Profiler end index.
+        ];
+        let (decoded, consumed) =
+            EventManagerReferenceData::decode_reader(109_011, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            decoded.tail_data,
+            EventManagerTailData {
+                band_popularity_bonus: Some(0x1234),
+                event_schedule_count: None,
+            }
+        );
+        let mut editor = decoded.into_tail_editor();
+        editor.data_mut().band_popularity_bonus = Some(-2);
+        let expected = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x56, 0x78,
+        ];
+        assert_eq!(editor.encode().unwrap(), expected);
+
+        let bytes = [
+            0x00, 0x00, // One event slot.
+            0x00, 0x00, // One event route slot.
+            0x00, 0x00, // No unlock milestones.
+            0x00, 0x00, // Empty EventInfo names.
+            0x00, 0x00, // Empty schedule prefab names.
+            0xff, // Match-preparing reference.
+            0xff, 0xff, // Band-preparing and band-popularity references.
+            0x00, 0x04, // Band-popularity bonus.
+            0x01, 0x02, 0x03, 0x04, // Event schedule count.
+            0x12, 0x34, // Profiler end index.
+        ];
+        let (decoded, consumed) =
+            EventManagerReferenceData::decode_reader(121_027, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.tail_data.event_schedule_count, Some(0x0102_0304));
+        let mut editor = decoded.into_tail_editor();
+        editor.data_mut().band_popularity_bonus = Some(-3);
+        editor.data_mut().event_schedule_count = Some(-2);
+        let expected = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+            0xfd, 0xff, 0xff, 0xff, 0xfe, 0x12, 0x34,
         ];
         assert_eq!(editor.encode().unwrap(), expected);
     }

@@ -47,7 +47,8 @@ use crate::encoded_array::{
     write_encoded_ushort_array,
 };
 use crate::event_manager_data::{
-    EventManagerEventRecordsEditor, EventManagerReferenceData, EventManagerTypeDataEditor,
+    EventManagerEventRecordsEditor, EventManagerReferenceData, EventManagerTailEditor,
+    EventManagerTypeDataEditor,
 };
 use crate::guide_data::{
     GUIDE_INSTANCE_BODY_LEN, GUIDE_TRIGGER_BASE_PREFIX_LEN, GuideInstanceBody, GuideInstanceEditor,
@@ -2253,6 +2254,88 @@ impl SimulationManagerData {
                     return Err(invalid(
                         body_start,
                         "rewritten EventManager event records failed validation",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph[body_start..body_end].copy_from_slice(&original);
+            return Err(invalid(
+                body_start,
+                format!("rewritten EventManager body failed validation: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Decodes EventManager's known version-gated tail counters.
+    pub fn decode_event_manager_tail(&self) -> Result<EventManagerTailEditor, CrpError> {
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "EventManager+Data")?;
+        Ok(self
+            .decode_event_manager_reference_data_at(slot)?
+            .into_tail_editor())
+    }
+
+    /// Replaces EventManager's existing tail counters without changing field gates.
+    pub fn replace_event_manager_tail(
+        &mut self,
+        edited: &EventManagerTailEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited EventManager version does not match this stream",
+            ));
+        }
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "EventManager+Data")?;
+        let current = self.decode_event_manager_reference_data_at(slot)?;
+        if current.serialized_body.as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                0,
+                "EventManager bytes do not match the tail editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != edited.original_body_bytes().len() {
+            return Err(invalid(
+                0,
+                "EventManager tail edits must preserve the manager body length",
+            ));
+        }
+        let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
+        let body_end =
+            body_start
+                .checked_add(replacement.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "EventManager tail replacement end",
+                ))?;
+        if body_end != next_tag_start {
+            return Err(invalid(
+                body_start,
+                "EventManager tail replacement does not reach the expected boundary",
+            ));
+        }
+        let original = self
+            .serialized_object_graph
+            .get(body_start..body_end)
+            .ok_or_else(|| invalid(body_start, "EventManager source body exceeds graph"))?
+            .to_vec();
+        self.serialized_object_graph[body_start..body_end].copy_from_slice(&replacement);
+        let validation = self
+            .decode_event_manager_reference_data_at(slot)
+            .and_then(|decoded| {
+                if decoded.serialized_body != replacement || decoded.tail_data != edited.data() {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten EventManager tail failed validation",
                     ));
                 }
                 Ok(())
@@ -14144,6 +14227,44 @@ mod manager_boundary_tests {
                 .replace_event_manager_event_records(&stale_editor)
                 .is_err()
         );
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+    }
+
+    #[test]
+    fn event_manager_tail_replacement_preserves_neighbor_boundary() {
+        let body = [
+            0x00, 0x00, // One event slot.
+            0x00, 0x00, // No unlock milestones.
+            0x00, 0x00, // Empty prefab names.
+            0xff, // Match-preparing reference.
+            0xff, 0xff, // Band-preparing and band-popularity references.
+            0x12, 0x34, // Band-popularity bonus.
+            0x56, 0x78, // Profiler end index.
+        ];
+        let (mut manager, body_start) = manager_with_event_manager_body(109_011, &body);
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let mut editor = manager.decode_event_manager_tail().unwrap();
+        assert_eq!(editor.data().band_popularity_bonus, Some(0x1234));
+        assert_eq!(editor.data().event_schedule_count, None);
+        let stale_editor = editor.clone();
+        editor.data_mut().band_popularity_bonus = Some(-2);
+        let mut invalid_editor = editor.clone();
+        invalid_editor.data_mut().event_schedule_count = Some(1);
+        assert!(manager.replace_event_manager_tail(&invalid_editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), original_graph);
+        manager.replace_event_manager_tail(&editor).unwrap();
+
+        let expected_body = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x56, 0x78,
+        ];
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start..body_start + body.len()],
+            expected_body
+        );
+        let mut expected_graph = original_graph;
+        expected_graph[body_start..body_start + body.len()].copy_from_slice(&expected_body);
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+        assert!(manager.replace_event_manager_tail(&stale_editor).is_err());
         assert_eq!(manager.serialized_object_graph(), expected_graph);
     }
 
