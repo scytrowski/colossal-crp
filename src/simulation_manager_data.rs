@@ -14616,13 +14616,23 @@ mod manager_boundary_tests {
             editor.race_event_data(),
             [Some(crate::EventManagerRaceEventData {
                 racers: Vec::new(),
+                racer_state_records: Vec::new(),
                 schedule_id: 0x090a_0b0c,
                 lap_count: 0x0d0e_0f10,
                 state: 0x1112_1314,
                 frames_in_state: 0x1516_1718,
                 race_marshal_id: 0x1920,
+                track_path_points: Vec::new(),
+                track_closed_raw: 0,
+                racer_path_index_records: Vec::new(),
                 event_end_frame: 0x2122_2324,
+                finished_racer_data: [0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c,],
                 frames_to_next_overtake: 0x2d2e_2f30,
+                racer_overtake_state_records: Vec::new(),
+                race_team_member_records: Vec::new(),
+                track_path_segments: Vec::new(),
+                racer_oscillation_records: Vec::new(),
+                racer_state_timer_records: Vec::new(),
             })]
         );
         editor.race_event_data_mut()[0]

@@ -67,14 +67,17 @@ pub struct EventManagerEventRecord {
 
 /// Known values decoded from an active nested `RaceEventData` block.
 ///
-/// Fixed-width scalar fields and racer values are editable. Track points, teams,
-/// spline bytes, and other nested values remain preserved as raw source bytes.
-/// The fields are available for EventManager inner versions 120004–121030.
+/// Fixed-width scalar fields, racer values, and opaque fixed-size arrays are
+/// editable. Unmodeled team references, spline bytes, and other nested values
+/// remain preserved as raw source bytes. The fields are available for
+/// EventManager inner versions 120004–121030.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerRaceEventData {
     /// Existing racers in serialized order. The count and optional-reference
     /// presence are fixed; changing racer names is rejected by the editor.
     pub racers: Vec<EventManagerRaceRacer>,
+    /// Opaque 24-byte state records in racer order.
+    pub racer_state_records: Vec<[u8; 24]>,
     /// Schedule identifier.
     pub schedule_id: i32,
     /// Number of race laps.
@@ -85,10 +88,28 @@ pub struct EventManagerRaceEventData {
     pub frames_in_state: i32,
     /// Race marshal identifier.
     pub race_marshal_id: u16,
+    /// Opaque 12-byte track points in serialized order.
+    pub track_path_points: Vec<[u8; 12]>,
+    /// Original DataSerializer bool byte for the track-closed flag.
+    pub track_closed_raw: u8,
+    /// Opaque four-byte path-index records in racer order.
+    pub racer_path_index_records: Vec<[u8; 4]>,
     /// Frame at which the event ends.
     pub event_end_frame: u32,
+    /// Opaque fixed array containing four 16-bit finished-racer values.
+    pub finished_racer_data: [u8; 8],
     /// Frames remaining until the next overtake.
     pub frames_to_next_overtake: i32,
+    /// Opaque 16-byte overtake records in racer order.
+    pub racer_overtake_state_records: Vec<[u8; 16]>,
+    /// Opaque four-byte race-team member records.
+    pub race_team_member_records: Vec<[u8; 4]>,
+    /// Track path segment indexes in serialized order.
+    pub track_path_segments: Vec<u16>,
+    /// Opaque eight-byte racer oscillation records.
+    pub racer_oscillation_records: Vec<[u8; 8]>,
+    /// Opaque eight-byte racer state-timer records.
+    pub racer_state_timer_records: Vec<[u8; 8]>,
 }
 
 /// Known values from one racer entry in `RaceEventData`.
@@ -257,8 +278,8 @@ pub struct EventManagerTypeDataEditor {
 ///
 /// The record count, slot indexes, and activity flags are fixed. It edits only
 /// same-width scalar values for inner versions 210–121030, including selected
-/// `RaceEventData` fields. Other nested race-event bytes and the surrounding
-/// EventManager body are preserved.
+/// `RaceEventData` fields and its opaque fixed-size arrays. Other nested
+/// race-event bytes and the surrounding EventManager body are preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerEventRecordsEditor {
     original: EventManagerReferenceData,
@@ -472,13 +493,23 @@ struct EventPrefabScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EventManagerRaceEventDataFieldRanges {
     racers: Vec<EventManagerRaceRacerFieldRanges>,
+    racer_state_records: Range<usize>,
     schedule_id: Range<usize>,
     lap_count: Range<usize>,
     state: Range<usize>,
     frames_in_state: Range<usize>,
     race_marshal_id: Range<usize>,
+    track_path_points: Range<usize>,
+    track_closed_raw: Range<usize>,
+    racer_path_index_records: Range<usize>,
     event_end_frame: Range<usize>,
+    finished_racer_data: Range<usize>,
     frames_to_next_overtake: Range<usize>,
+    racer_overtake_state_records: Range<usize>,
+    race_team_member_records: Range<usize>,
+    track_path_segments: Range<usize>,
+    racer_oscillation_records: Range<usize>,
+    racer_state_timer_records: Range<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -875,6 +906,66 @@ impl EventManagerEventRecordsEditor {
                             "race-event racer count cannot change in this editor",
                         ));
                     }
+                    patch_race_event_raw_records(
+                        &mut output,
+                        &ranges.racer_state_records,
+                        &data.racer_state_records,
+                        "racer state",
+                    )?;
+                    patch_race_event_raw_records(
+                        &mut output,
+                        &ranges.track_path_points,
+                        &data.track_path_points,
+                        "track path point",
+                    )?;
+                    patch_race_event_field(
+                        &mut output,
+                        &ranges.track_closed_raw,
+                        &[data.track_closed_raw],
+                        "track-closed flag",
+                    )?;
+                    patch_race_event_raw_records(
+                        &mut output,
+                        &ranges.racer_path_index_records,
+                        &data.racer_path_index_records,
+                        "racer path index",
+                    )?;
+                    patch_race_event_field(
+                        &mut output,
+                        &ranges.finished_racer_data,
+                        &data.finished_racer_data,
+                        "finished-racer data",
+                    )?;
+                    patch_race_event_raw_records(
+                        &mut output,
+                        &ranges.racer_overtake_state_records,
+                        &data.racer_overtake_state_records,
+                        "racer overtake state",
+                    )?;
+                    patch_race_event_raw_records(
+                        &mut output,
+                        &ranges.race_team_member_records,
+                        &data.race_team_member_records,
+                        "race-team member",
+                    )?;
+                    patch_race_event_u16_values(
+                        &mut output,
+                        &ranges.track_path_segments,
+                        &data.track_path_segments,
+                        "track path segment",
+                    )?;
+                    patch_race_event_raw_records(
+                        &mut output,
+                        &ranges.racer_oscillation_records,
+                        &data.racer_oscillation_records,
+                        "racer oscillation",
+                    )?;
+                    patch_race_event_raw_records(
+                        &mut output,
+                        &ranges.racer_state_timer_records,
+                        &data.racer_state_timer_records,
+                        "racer state timer",
+                    )?;
                     for (racer_index, ((racer, original_racer), racer_ranges)) in data
                         .racers
                         .iter()
@@ -2142,7 +2233,8 @@ fn skip_race_event_data(
 
     reader.read_u32_be()?; // Last spawn frame.
     reader.read_u32_be()?; // Next spawn frame.
-    skip_race_event_values(reader, racer_count, 24, "racer state")?;
+    let (racer_state_records, racer_state_record_range) =
+        read_race_event_raw_records::<24>(reader, racer_count, "racer state")?;
 
     let schedule_id_start = reader.offset();
     let schedule_id = reader.read_i32_be()?;
@@ -2160,26 +2252,42 @@ fn skip_race_event_data(
     let race_marshal_id = reader.read_u16_be()?;
     let race_marshal_id_range = race_marshal_id_start..reader.offset();
     let track_path_length = read_race_event_count(reader, "track path point", 12)?;
-    skip_race_event_values(reader, track_path_length, 12, "track path point")?;
-    reader.read_u8()?; // Track closed.
-    skip_race_event_values(reader, racer_count, 4, "racer path index")?;
+    let (track_path_points, track_path_point_range) =
+        read_race_event_raw_records::<12>(reader, track_path_length, "track path point")?;
+    let track_closed_start = reader.offset();
+    let track_closed_raw = reader.read_u8()?;
+    let track_closed_range = track_closed_start..reader.offset();
+    let (racer_path_index_records, racer_path_index_record_range) =
+        read_race_event_raw_records::<4>(reader, racer_count, "racer path index")?;
 
     let event_end_frame_start = reader.offset();
     let event_end_frame = reader.read_u32_be()?;
     let event_end_frame_range = event_end_frame_start..reader.offset();
-    skip_race_event_values(reader, 4, 2, "finished racer")?;
+    let finished_racer_start = reader.offset();
+    let mut finished_racer_data = [0; 8];
+    finished_racer_data.copy_from_slice(reader.read_bytes(8)?);
+    let finished_racer_range = finished_racer_start..reader.offset();
     let frames_to_next_overtake_start = reader.offset();
     let frames_to_next_overtake = reader.read_i32_be()?;
     let frames_to_next_overtake_range = frames_to_next_overtake_start..reader.offset();
-    skip_race_event_values(reader, racer_count, 16, "racer overtake state")?;
+    let (racer_overtake_state_records, racer_overtake_state_record_range) =
+        read_race_event_raw_records::<16>(reader, racer_count, "racer overtake state")?;
 
     let race_team_count = read_race_event_count(reader, "race team", 1)?;
     skip_event_prefab_scope(reader, race_team_count)?;
     let race_team_member_count = read_race_event_count(reader, "race team member", 4)?;
-    skip_race_event_values(reader, race_team_member_count, 4, "race team member")?;
-    skip_race_event_values(reader, track_path_length, 2, "track path segment")?;
-    skip_race_event_values(reader, racer_count, 8, "racer oscillation")?;
-    skip_race_event_values(reader, racer_count, 8, "racer state timer")?;
+    let (race_team_member_records, race_team_member_record_range) =
+        read_race_event_raw_records::<4>(reader, race_team_member_count, "race team member")?;
+    let mut track_path_segments = Vec::with_capacity(track_path_length);
+    let track_path_segment_start = reader.offset();
+    for _ in 0..track_path_length {
+        track_path_segments.push(reader.read_u16_be()?);
+    }
+    let track_path_segment_range = track_path_segment_start..reader.offset();
+    let (racer_oscillation_records, racer_oscillation_record_range) =
+        read_race_event_raw_records::<8>(reader, racer_count, "racer oscillation")?;
+    let (racer_state_timer_records, racer_state_timer_record_range) =
+        read_race_event_raw_records::<8>(reader, racer_count, "racer state timer")?;
 
     if data_serializer_bool_is_true(reader.read_u8()?) {
         skip_race_event_route_spline(reader, format_version)?;
@@ -2187,25 +2295,71 @@ fn skip_race_event_data(
     Ok((
         EventManagerRaceEventData {
             racers,
+            racer_state_records,
             schedule_id,
             lap_count,
             state,
             frames_in_state,
             race_marshal_id,
+            track_path_points,
+            track_closed_raw,
+            racer_path_index_records,
             event_end_frame,
+            finished_racer_data,
             frames_to_next_overtake,
+            racer_overtake_state_records,
+            race_team_member_records,
+            track_path_segments,
+            racer_oscillation_records,
+            racer_state_timer_records,
         },
         EventManagerRaceEventDataFieldRanges {
             racers: racer_field_ranges,
+            racer_state_records: racer_state_record_range,
             schedule_id: schedule_id_range,
             lap_count: lap_count_range,
             state: state_range,
             frames_in_state: frames_in_state_range,
             race_marshal_id: race_marshal_id_range,
+            track_path_points: track_path_point_range,
+            track_closed_raw: track_closed_range,
+            racer_path_index_records: racer_path_index_record_range,
             event_end_frame: event_end_frame_range,
+            finished_racer_data: finished_racer_range,
             frames_to_next_overtake: frames_to_next_overtake_range,
+            racer_overtake_state_records: racer_overtake_state_record_range,
+            race_team_member_records: race_team_member_record_range,
+            track_path_segments: track_path_segment_range,
+            racer_oscillation_records: racer_oscillation_record_range,
+            racer_state_timer_records: racer_state_timer_record_range,
         },
     ))
+}
+
+fn read_race_event_raw_records<const WIDTH: usize>(
+    reader: &mut Reader<'_>,
+    count: usize,
+    description: &str,
+) -> Result<(Vec<[u8; WIDTH]>, Range<usize>), CrpError> {
+    if WIDTH == 0 {
+        return Err(reader.invalid(format!(
+            "{description} record has an invalid zero-byte width"
+        )));
+    }
+    let byte_length = count
+        .checked_mul(WIDTH)
+        .ok_or_else(|| reader.invalid(format!("{description} byte length overflow")))?;
+    let start = reader.offset();
+    let bytes = reader
+        .read_bytes(byte_length)
+        .map_err(|error| reader.invalid(format!("truncated {description} records: {error}")))?;
+    let mut records = Vec::with_capacity(count);
+    for record_bytes in bytes.chunks_exact(WIDTH) {
+        let mut record = [0; WIDTH];
+        record.copy_from_slice(record_bytes);
+        records.push(record);
+    }
+    Ok((records, start..reader.offset()))
 }
 
 fn skip_race_event_route_spline(
@@ -2571,6 +2725,72 @@ fn patch_race_event_field(
             )
         })?
         .copy_from_slice(value);
+    Ok(())
+}
+
+fn patch_race_event_raw_records<const WIDTH: usize>(
+    output: &mut [u8],
+    range: &Range<usize>,
+    records: &[[u8; WIDTH]],
+    description: &str,
+) -> Result<(), CrpError> {
+    if WIDTH == 0 {
+        return Err(invalid_event_record(
+            range.start,
+            format!("race-event {description} has an invalid zero-byte record width"),
+        ));
+    }
+    let byte_length = records
+        .len()
+        .checked_mul(WIDTH)
+        .ok_or(CrpError::ArithmeticOverflow(
+            "EventManager race record length",
+        ))?;
+    if byte_length != range.len() {
+        return Err(invalid_event_record(
+            range.start,
+            format!("race-event {description} count cannot change in this editor"),
+        ));
+    }
+    let destination = output.get_mut(range.clone()).ok_or_else(|| {
+        invalid_event_record(
+            range.start,
+            format!("race-event {description} range exceeds source body"),
+        )
+    })?;
+    for (destination_record, record) in destination.chunks_exact_mut(WIDTH).zip(records) {
+        destination_record.copy_from_slice(record);
+    }
+    Ok(())
+}
+
+fn patch_race_event_u16_values(
+    output: &mut [u8],
+    range: &Range<usize>,
+    values: &[u16],
+    description: &str,
+) -> Result<(), CrpError> {
+    let byte_length = values
+        .len()
+        .checked_mul(2)
+        .ok_or(CrpError::ArithmeticOverflow(
+            "EventManager race segment length",
+        ))?;
+    if byte_length != range.len() {
+        return Err(invalid_event_record(
+            range.start,
+            format!("race-event {description} count cannot change in this editor"),
+        ));
+    }
+    let destination = output.get_mut(range.clone()).ok_or_else(|| {
+        invalid_event_record(
+            range.start,
+            format!("race-event {description} range exceeds source body"),
+        )
+    })?;
+    for (destination_value, value) in destination.chunks_exact_mut(2).zip(values) {
+        destination_value.copy_from_slice(&value.to_be_bytes());
+    }
     Ok(())
 }
 
@@ -4148,13 +4368,23 @@ mod tests {
             decoded.active_event_race_data[0],
             Some(EventManagerRaceEventData {
                 racers: Vec::new(),
+                racer_state_records: Vec::new(),
                 schedule_id: 0x090a_0b0c,
                 lap_count: 0x0d0e_0f10,
                 state: 0x1112_1314,
                 frames_in_state: 0x1516_1718,
                 race_marshal_id: 0x1920,
+                track_path_points: Vec::new(),
+                track_closed_raw: 0,
+                racer_path_index_records: Vec::new(),
                 event_end_frame: 0x2122_2324,
+                finished_racer_data: [0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c,],
                 frames_to_next_overtake: 0x2d2e_2f30,
+                racer_overtake_state_records: Vec::new(),
+                race_team_member_records: Vec::new(),
+                track_path_segments: Vec::new(),
+                racer_oscillation_records: Vec::new(),
+                racer_state_timer_records: Vec::new(),
             })
         );
         let race_data_range = decoded.active_event_race_data_ranges[0]
@@ -4218,13 +4448,23 @@ mod tests {
         let mut invalid_editor = decoded_noncanonical.into_event_records_editor();
         invalid_editor.race_event_data_mut()[0] = Some(EventManagerRaceEventData {
             racers: Vec::new(),
+            racer_state_records: Vec::new(),
             schedule_id: 1,
             lap_count: 1,
             state: 1,
             frames_in_state: 1,
             race_marshal_id: 1,
+            track_path_points: Vec::new(),
+            track_closed_raw: 0,
+            racer_path_index_records: Vec::new(),
             event_end_frame: 1,
+            finished_racer_data: [0; 8],
             frames_to_next_overtake: 1,
+            racer_overtake_state_records: Vec::new(),
+            race_team_member_records: Vec::new(),
+            track_path_segments: Vec::new(),
+            racer_oscillation_records: Vec::new(),
+            racer_state_timer_records: Vec::new(),
         });
         assert!(invalid_editor.encode().is_err());
 
@@ -4269,13 +4509,31 @@ mod tests {
                     name: None,
                     parade_group_index: Some(9),
                 }],
+                racer_state_records: vec![[
+                    0x3f, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x40,
+                    0x80, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x04,
+                ]],
                 schedule_id: 0x1112_1314,
                 lap_count: 0x1516_1718,
                 state: 0x1920_2122,
                 frames_in_state: 0x2324_2526,
                 race_marshal_id: 0x0027,
+                track_path_points: vec![[
+                    0x3f, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00,
+                ]],
+                track_closed_raw: 1,
+                racer_path_index_records: vec![[0x00, 0x00, 0x00, 0x28]],
                 event_end_frame: 0x2930_3132,
+                finished_racer_data: [0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04],
                 frames_to_next_overtake: 0x3334_3536,
+                racer_overtake_state_records: vec![[
+                    0x00, 0x00, 0x00, 0x37, 0x3f, 0xc0, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40,
+                    0x40, 0x00, 0x00,
+                ]],
+                race_team_member_records: vec![[0x38, 0x39, 0x40, 0x41]],
+                track_path_segments: vec![0x000d],
+                racer_oscillation_records: vec![[0x3f, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,]],
+                racer_state_timer_records: vec![[0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,]],
             })
         );
         let field_ranges = decoded_racer.active_event_race_data_field_ranges[0]
@@ -4306,13 +4564,24 @@ mod tests {
         data.racers[0].paths_assigned_raw = 2;
         data.racers[0].race_team_index = Some(0xbeef);
         data.racers[0].parade_group_index = Some(0xcafe);
+        data.racer_state_records[0][0] = 0xaa;
+        data.racer_state_records[0][23] = 0xbb;
         data.schedule_id = -101;
         data.lap_count = 202;
         data.state = -303;
         data.frames_in_state = 404;
         data.race_marshal_id = 0xabcd;
+        data.track_path_points[0][0] = 0xde;
+        data.track_closed_raw = 2;
+        data.racer_path_index_records[0][3] = 0xfe;
         data.event_end_frame = 0xdead_beef;
+        data.finished_racer_data[0] = 0xaa;
         data.frames_to_next_overtake = -505;
+        data.racer_overtake_state_records[0][15] = 0x99;
+        data.race_team_member_records[0] = [0xaa, 0xbb, 0xcc, 0xdd];
+        data.track_path_segments[0] = 0xbeef;
+        data.racer_oscillation_records[0][0] = 0x11;
+        data.racer_state_timer_records[0][7] = 0x22;
         let mut expected = one_racer_bytes.clone();
         for (offset, value) in [
             (4, 0xabcd_u16.to_be_bytes().to_vec()),
@@ -4330,13 +4599,30 @@ mod tests {
             (80, (-303_i32).to_be_bytes().to_vec()),
             (84, 404_i32.to_be_bytes().to_vec()),
             (88, 0xabcd_u16.to_be_bytes().to_vec()),
+            (94, vec![0xde]),
+            (106, vec![2]),
+            (110, vec![0xfe]),
             (111, 0xdead_beef_u32.to_be_bytes().to_vec()),
+            (115, vec![0xaa]),
             (123, (-505_i32).to_be_bytes().to_vec()),
+            (127 + 15, vec![0x99]),
+            (153, vec![0xaa, 0xbb, 0xcc, 0xdd]),
+            (157, 0xbeef_u16.to_be_bytes().to_vec()),
+            (159, vec![0x11]),
+            (174, vec![0x22]),
         ] {
             let start = race_range.start + offset;
             expected[start..start + value.len()].copy_from_slice(&value);
         }
+        expected[race_range.start + 48] = 0xaa;
+        expected[race_range.start + 71] = 0xbb;
         assert_eq!(editor.encode().unwrap(), expected);
+        let (decoded_edited, _) = EventManagerReferenceData::decode_reader(120_004, &expected)
+            .expect("edited race arrays remain parseable");
+        assert_eq!(
+            decoded_edited.active_event_race_data[0],
+            editor.race_event_data()[0]
+        );
 
         let mut invalid_editor = decoded_racer.clone().into_event_records_editor();
         invalid_editor.race_event_data_mut()[0] = None;
@@ -4366,6 +4652,14 @@ mod tests {
             .performer_ids
             .clear();
         assert!(invalid_count_editor.encode().is_err());
+
+        let mut invalid_array_count_editor = decoded_racer.clone().into_event_records_editor();
+        invalid_array_count_editor.race_event_data_mut()[0]
+            .as_mut()
+            .unwrap()
+            .track_path_points
+            .clear();
+        assert!(invalid_array_count_editor.encode().is_err());
 
         let mut invalid_racer_count_editor = decoded_racer.clone().into_event_records_editor();
         invalid_racer_count_editor.race_event_data_mut()[0]
