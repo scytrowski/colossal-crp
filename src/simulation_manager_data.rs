@@ -1525,6 +1525,7 @@ impl TransportManagerSelectionPrefix {
             .map(|selection| selection.value)
             .collect();
         let entry_count = keys.len();
+        let original_new_string_ranges = self.new_string_ranges.clone();
         TransportManagerSelectionEditor {
             format_version: self.format_version,
             keys,
@@ -1533,6 +1534,7 @@ impl TransportManagerSelectionPrefix {
             working_prefix: self.serialized_prefix,
             key_ranges: self.key_ranges,
             new_string_ranges: self.new_string_ranges,
+            original_new_string_ranges,
             new_string_indexes: self.new_string_indexes,
             new_string_encoding_overrides: vec![None; entry_count],
             existing_index_ranges: self.existing_index_ranges,
@@ -1559,6 +1561,7 @@ pub struct TransportManagerSelectionEditor {
     working_prefix: Vec<u8>,
     key_ranges: Vec<Range<usize>>,
     new_string_ranges: Vec<Option<Range<usize>>>,
+    original_new_string_ranges: Vec<Option<Range<usize>>>,
     new_string_indexes: Vec<Option<u16>>,
     new_string_encoding_overrides: Vec<Option<TransportManagerStringEncoding>>,
     existing_index_ranges: Vec<Option<Range<usize>>>,
@@ -1584,11 +1587,26 @@ impl TransportManagerSelectionEditor {
 
     /// Appends a selection entry that points to an already declared string.
     ///
-    /// This does not add a shared string, so indexes in the table and later
-    /// manager fields keep their original meanings. The entry count is limited
-    /// to the largest nonnegative signed 16-bit value stored by the format.
+    /// This is equivalent to inserting at `self.keys().len()`. It does not add
+    /// a shared string, so indexes in the table and later manager fields keep
+    /// their original meanings.
     pub fn push_existing_string_reference(
         &mut self,
+        key: i16,
+        string_index: u16,
+    ) -> Result<(), CrpError> {
+        self.insert_existing_string_reference(self.keys.len(), key, string_index)
+    }
+
+    /// Inserts a selection entry that points to a string already available at
+    /// that position in the serialized stream.
+    ///
+    /// Insertion does not add a shared-string declaration, so stream-wide
+    /// indexes retain their meanings. The entry index may be anywhere from
+    /// zero through the current entry count.
+    pub fn insert_existing_string_reference(
+        &mut self,
+        entry_index: usize,
         key: i16,
         string_index: u16,
     ) -> Result<(), CrpError> {
@@ -1596,6 +1614,12 @@ impl TransportManagerSelectionEditor {
             return Err(invalid(
                 0,
                 "TransportManager selection table is unavailable before version 114001",
+            ));
+        }
+        if entry_index > self.keys.len() {
+            return Err(invalid(
+                entry_index,
+                "TransportManager selection insertion index is out of bounds",
             ));
         }
         if self.keys.len() >= i16::MAX as usize {
@@ -1610,6 +1634,17 @@ impl TransportManagerSelectionEditor {
                 "TransportManager selection table is missing its count field",
             ));
         }
+        let available_count = self
+            .available_shared_string_counts
+            .get(entry_index)
+            .copied()
+            .unwrap_or(self.shared_string_values.len());
+        if usize::from(string_index) >= available_count {
+            return Err(invalid(
+                entry_index,
+                "TransportManager inserted entry references a string not yet available",
+            ));
+        }
         let shared_string = self
             .shared_string_values
             .get(usize::from(string_index))
@@ -1617,95 +1652,199 @@ impl TransportManagerSelectionEditor {
             .ok_or_else(|| {
                 invalid(
                     self.working_prefix.len(),
-                    "TransportManager appended entry references an unavailable shared string",
+                    "TransportManager inserted entry references an unavailable shared string",
                 )
             })?;
-        let entry_start = self.working_prefix.len();
+        let entry_start = if entry_index == self.keys.len() {
+            self.working_prefix.len()
+        } else {
+            self.key_ranges
+                .get(entry_index)
+                .map(|range| range.start)
+                .ok_or_else(|| {
+                    invalid(
+                        entry_index,
+                        "TransportManager selection key ranges are inconsistent",
+                    )
+                })?
+        };
         let key_end = entry_start
             .checked_add(2)
             .ok_or(CrpError::ArithmeticOverflow(
-                "TransportManager appended selection key end",
+                "TransportManager inserted selection key end",
             ))?;
         let entry_end = key_end.checked_add(2).ok_or(CrpError::ArithmeticOverflow(
-            "TransportManager appended selection end",
+            "TransportManager inserted selection end",
         ))?;
-
-        self.working_prefix.extend_from_slice(&key.to_be_bytes());
+        if entry_start > self.working_prefix.len() {
+            return Err(invalid(
+                entry_start,
+                "TransportManager selection insertion offset exceeds the table",
+            ));
+        }
         self.working_prefix
-            .extend_from_slice(&string_index.to_be_bytes());
-        self.keys.push(key);
-        self.values
-            .push(TransportManagerSharedStringValue::Existing {
+            .len()
+            .checked_add(4)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager selection table length",
+            ))?;
+
+        let mut new_working_prefix = self.working_prefix.clone();
+        new_working_prefix.splice(
+            entry_start..entry_start,
+            key.to_be_bytes()
+                .into_iter()
+                .chain(string_index.to_be_bytes()),
+        );
+        let key_ranges = shift_selection_ranges_for_insert(&self.key_ranges, entry_start, 4)?;
+        let new_string_ranges =
+            shift_optional_selection_ranges_for_insert(&self.new_string_ranges, entry_start, 4)?;
+        let existing_index_ranges = shift_optional_selection_ranges_for_insert(
+            &self.existing_index_ranges,
+            entry_start,
+            4,
+        )?;
+
+        self.working_prefix = new_working_prefix;
+        self.keys.insert(entry_index, key);
+        self.values.insert(
+            entry_index,
+            TransportManagerSharedStringValue::Existing {
                 index: string_index,
                 value: shared_string,
-            });
-        self.key_ranges.push(entry_start..key_end);
-        self.new_string_ranges.push(None);
-        self.new_string_indexes.push(None);
-        self.new_string_encoding_overrides.push(None);
-        self.existing_index_ranges.push(Some(key_end..entry_end));
+            },
+        );
+        self.key_ranges = key_ranges;
+        self.key_ranges.insert(entry_index, entry_start..key_end);
+        self.new_string_ranges = new_string_ranges;
+        self.new_string_ranges.insert(entry_index, None);
+        self.original_new_string_ranges.insert(entry_index, None);
+        self.new_string_indexes.insert(entry_index, None);
+        self.new_string_encoding_overrides.insert(entry_index, None);
+        self.existing_index_ranges = existing_index_ranges;
+        self.existing_index_ranges
+            .insert(entry_index, Some(key_end..entry_end));
         self.available_shared_string_counts
-            .push(self.shared_string_values.len());
+            .insert(entry_index, available_count);
         self.write_entry_count()
     }
 
     /// Removes and returns the last entry when it references an existing string.
     ///
-    /// A last entry that declares a new shared string cannot be removed because
-    /// other serialized fields may refer to that shared-string index.
+    /// This is a convenience wrapper around [`Self::remove_existing_entry`].
     pub fn remove_last_existing_entry(&mut self) -> Result<TransportManagerSelection, CrpError> {
         let entry_index = self
             .keys
             .len()
             .checked_sub(1)
             .ok_or_else(|| invalid(0, "TransportManager selection table is empty"))?;
-        let key_range = self
-            .key_ranges
-            .get(entry_index)
-            .ok_or_else(|| invalid(0, "TransportManager selection key ranges are inconsistent"))?;
+        self.remove_existing_entry(entry_index)
+    }
+
+    /// Removes an entry that references an existing shared string.
+    ///
+    /// Entries that declare a new shared string cannot be removed because
+    /// later fields may refer to that stream-wide index. Removing an existing
+    /// reference leaves all declarations and their indexes unchanged.
+    pub fn remove_existing_entry(
+        &mut self,
+        entry_index: usize,
+    ) -> Result<TransportManagerSelection, CrpError> {
+        if entry_index >= self.keys.len() {
+            return Err(invalid(
+                entry_index,
+                "TransportManager selection removal index is out of bounds",
+            ));
+        }
+        let key_range =
+            self.key_ranges.get(entry_index).cloned().ok_or_else(|| {
+                invalid(0, "TransportManager selection key ranges are inconsistent")
+            })?;
         let index_range = self
             .existing_index_ranges
             .get(entry_index)
             .and_then(Option::as_ref)
+            .cloned()
             .ok_or_else(|| {
                 invalid(
                     key_range.start,
-                    "last TransportManager selection entry declares a shared string",
+                    "TransportManager selection entry declares a shared string",
                 )
             })?;
+        let entry_end = key_range
+            .start
+            .checked_add(4)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager removed selection end",
+            ))?;
         if self
             .new_string_ranges
             .get(entry_index)
             .is_none_or(Option::is_some)
+            || self
+                .original_new_string_ranges
+                .get(entry_index)
+                .is_none_or(Option::is_some)
             || key_range.len() != 2
             || index_range.len() != 2
-            || index_range.end != self.working_prefix.len()
+            || index_range.start != key_range.end
+            || index_range.end != entry_end
+            || entry_end > self.working_prefix.len()
         {
             return Err(invalid(
                 key_range.start,
-                "last TransportManager selection entry has an invalid source range",
+                "TransportManager existing-reference entry has an invalid source range",
             ));
         }
         let key = *self
             .keys
             .get(entry_index)
-            .ok_or_else(|| invalid(key_range.start, "last selection key is missing"))?;
-        let value = self
-            .values
-            .get(entry_index)
-            .cloned()
-            .ok_or_else(|| invalid(key_range.start, "last selection value is missing"))?;
+            .ok_or_else(|| invalid(key_range.start, "TransportManager selection key is missing"))?;
+        let value = self.values.get(entry_index).cloned().ok_or_else(|| {
+            invalid(
+                key_range.start,
+                "TransportManager selection value is missing",
+            )
+        })?;
+        if !matches!(value, TransportManagerSharedStringValue::Existing { .. }) {
+            return Err(invalid(
+                key_range.start,
+                "TransportManager selection entry is not an existing string reference",
+            ));
+        }
         let removed = TransportManagerSelection { key, value };
 
-        self.working_prefix.truncate(key_range.start);
-        self.keys.pop();
-        self.values.pop();
-        self.key_ranges.pop();
-        self.new_string_ranges.pop();
-        self.new_string_indexes.pop();
-        self.new_string_encoding_overrides.pop();
-        self.existing_index_ranges.pop();
-        self.available_shared_string_counts.pop();
+        let mut new_working_prefix = self.working_prefix.clone();
+        new_working_prefix.drain(key_range.start..entry_end);
+        let key_ranges = shift_selection_ranges_for_remove(
+            &self.key_ranges,
+            entry_index,
+            key_range.start,
+            entry_end,
+        )?;
+        let new_string_ranges = shift_optional_selection_ranges_for_remove(
+            &self.new_string_ranges,
+            entry_index,
+            key_range.start,
+            entry_end,
+        )?;
+        let existing_index_ranges = shift_optional_selection_ranges_for_remove(
+            &self.existing_index_ranges,
+            entry_index,
+            key_range.start,
+            entry_end,
+        )?;
+
+        self.working_prefix = new_working_prefix;
+        self.keys.remove(entry_index);
+        self.values.remove(entry_index);
+        self.key_ranges = key_ranges;
+        self.new_string_ranges = new_string_ranges;
+        self.original_new_string_ranges.remove(entry_index);
+        self.new_string_indexes.remove(entry_index);
+        self.new_string_encoding_overrides.remove(entry_index);
+        self.existing_index_ranges = existing_index_ranges;
+        self.available_shared_string_counts.remove(entry_index);
         self.write_entry_count()?;
         Ok(removed)
     }
@@ -1904,6 +2043,7 @@ impl TransportManagerSelectionEditor {
             || self.keys.len() != self.key_ranges.len()
             || self.values.len() != self.keys.len()
             || self.new_string_ranges.len() != self.keys.len()
+            || self.original_new_string_ranges.len() != self.keys.len()
             || self.new_string_indexes.len() != self.keys.len()
             || self.new_string_encoding_overrides.len() != self.keys.len()
             || self.existing_index_ranges.len() != self.keys.len()
@@ -1946,12 +2086,25 @@ impl TransportManagerSelectionEditor {
             let existing_range = &self.existing_index_ranges[entry_index];
             match (value, new_range, new_string_index, existing_range) {
                 (TransportManagerSharedStringValue::New(value), Some(range), Some(_), None) => {
-                    let original = self.original_prefix.get(range.clone()).ok_or_else(|| {
-                        invalid(
-                            range.start,
-                            "TransportManager new-string range exceeds source table",
-                        )
-                    })?;
+                    let original_range = self
+                        .original_new_string_ranges
+                        .get(entry_index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            invalid(
+                                range.start,
+                                "TransportManager original new-string range is missing",
+                            )
+                        })?;
+                    let original = self
+                        .original_prefix
+                        .get(original_range.clone())
+                        .ok_or_else(|| {
+                            invalid(
+                                original_range.start,
+                                "TransportManager original new-string range exceeds source table",
+                            )
+                        })?;
                     let encoding_override = *self
                         .new_string_encoding_overrides
                         .get(entry_index)
@@ -2011,6 +2164,130 @@ impl TransportManagerSelectionEditor {
         }
         Ok(bytes)
     }
+}
+
+fn shift_selection_range_for_insert(
+    range: &Range<usize>,
+    insertion_offset: usize,
+    inserted_length: usize,
+) -> Result<Range<usize>, CrpError> {
+    if range.end <= insertion_offset {
+        return Ok(range.clone());
+    }
+    if range.start < insertion_offset {
+        return Err(invalid(
+            range.start,
+            "TransportManager inserted entry overlaps an existing selection field",
+        ));
+    }
+    Ok(range
+        .start
+        .checked_add(inserted_length)
+        .ok_or(CrpError::ArithmeticOverflow(
+            "TransportManager selection range start after insertion",
+        ))?
+        ..range
+            .end
+            .checked_add(inserted_length)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager selection range end after insertion",
+            ))?)
+}
+
+fn shift_selection_ranges_for_insert(
+    ranges: &[Range<usize>],
+    insertion_offset: usize,
+    inserted_length: usize,
+) -> Result<Vec<Range<usize>>, CrpError> {
+    ranges
+        .iter()
+        .map(|range| shift_selection_range_for_insert(range, insertion_offset, inserted_length))
+        .collect()
+}
+
+fn shift_optional_selection_ranges_for_insert(
+    ranges: &[Option<Range<usize>>],
+    insertion_offset: usize,
+    inserted_length: usize,
+) -> Result<Vec<Option<Range<usize>>>, CrpError> {
+    ranges
+        .iter()
+        .map(|range| {
+            range
+                .as_ref()
+                .map(|range| {
+                    shift_selection_range_for_insert(range, insertion_offset, inserted_length)
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+fn shift_selection_range_for_remove(
+    range: &Range<usize>,
+    removed_start: usize,
+    removed_end: usize,
+) -> Result<Range<usize>, CrpError> {
+    if range.end <= removed_start {
+        return Ok(range.clone());
+    }
+    if range.start < removed_end {
+        return Err(invalid(
+            range.start,
+            "TransportManager removed entry overlaps another selection field",
+        ));
+    }
+    let removed_length =
+        removed_end
+            .checked_sub(removed_start)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager removed selection length",
+            ))?;
+    Ok(range
+        .start
+        .checked_sub(removed_length)
+        .ok_or(CrpError::ArithmeticOverflow(
+            "TransportManager selection range start after removal",
+        ))?
+        ..range
+            .end
+            .checked_sub(removed_length)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager selection range end after removal",
+            ))?)
+}
+
+fn shift_selection_ranges_for_remove(
+    ranges: &[Range<usize>],
+    removed_index: usize,
+    removed_start: usize,
+    removed_end: usize,
+) -> Result<Vec<Range<usize>>, CrpError> {
+    ranges
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != removed_index)
+        .map(|(_, range)| shift_selection_range_for_remove(range, removed_start, removed_end))
+        .collect()
+}
+
+fn shift_optional_selection_ranges_for_remove(
+    ranges: &[Option<Range<usize>>],
+    removed_index: usize,
+    removed_start: usize,
+    removed_end: usize,
+) -> Result<Vec<Option<Range<usize>>>, CrpError> {
+    ranges
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != removed_index)
+        .map(|(_, range)| {
+            range
+                .as_ref()
+                .map(|range| shift_selection_range_for_remove(range, removed_start, removed_end))
+                .transpose()
+        })
+        .collect()
 }
 
 fn encode_selection_unique_string(
@@ -13833,11 +14110,7 @@ fn decode_transport_manager_reference_body_with_milestones(
             milestone_object_types = checked_table.object_types;
         }
     }
-    let shared_string_values = if selection_shared_string_counts.is_empty() {
-        Vec::new()
-    } else {
-        shared_strings.as_deref().cloned().unwrap_or_default()
-    };
+    let shared_string_values = shared_strings.as_deref().cloned().unwrap_or_default();
     let selection_prefix = capture_selections.then(|| TransportManagerSelectionPrefix {
         format_version,
         selections,
@@ -18736,6 +19009,153 @@ mod manager_boundary_tests {
             .replace_transport_manager_selection_prefix(&remove_editor)
             .unwrap();
         assert_eq!(manager.serialized_object_graph(), expected_graph);
+
+        let (source_body_range, _) = manager.transport_manager_body_range().unwrap();
+        let source_body = manager
+            .serialized_object_graph()
+            .get(source_body_range.clone())
+            .unwrap();
+        let source_fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            source_body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let source_table_range = source_fields.selection_range.unwrap();
+        let mut arbitrary_editor = source_fields.selection_prefix.unwrap().into_editor();
+        arbitrary_editor
+            .insert_existing_string_reference(0, 5, 0)
+            .unwrap();
+        arbitrary_editor
+            .set_new_string_value(1, Some("Carriage".to_owned()))
+            .unwrap();
+        arbitrary_editor
+            .insert_existing_string_reference(3, 9, 1)
+            .unwrap();
+        assert_eq!(
+            arbitrary_editor.remove_existing_entry(2).unwrap(),
+            TransportManagerSelection {
+                key: 8,
+                value: TransportManagerSharedStringValue::Existing {
+                    index: 1,
+                    value: Some("Carriage".to_owned()),
+                },
+            }
+        );
+        let arbitrary_table = [
+            0x00, 0x03, 0x00, 0x05, 0x00, 0x00, 0x12, 0x34, 0xfe, 0x80, 0x00, 0x08, 0xc3, 0x1e,
+            0x11, 0x00, 0xf7, 0xf8, 0x06, 0xfe, 0x00, 0x09, 0x00, 0x01,
+        ];
+        assert_eq!(arbitrary_editor.encode().unwrap(), arbitrary_table);
+        let arbitrary_start = source_body_range
+            .start
+            .checked_add(source_table_range.start)
+            .unwrap();
+        let arbitrary_end = source_body_range
+            .start
+            .checked_add(source_table_range.end)
+            .unwrap();
+        let mut expected_arbitrary_graph = expected_graph.clone();
+        expected_arbitrary_graph.splice(
+            arbitrary_start..arbitrary_end,
+            arbitrary_table.iter().copied(),
+        );
+        manager
+            .replace_transport_manager_selection_prefix(&arbitrary_editor)
+            .unwrap();
+        assert_eq!(
+            manager.serialized_object_graph(),
+            expected_arbitrary_graph.as_slice()
+        );
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            expected_graph.len() + 9
+        );
+
+        let (edited_body_range, _) = manager.transport_manager_body_range().unwrap();
+        let edited_body = manager
+            .serialized_object_graph()
+            .get(edited_body_range)
+            .unwrap();
+        let edited_fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            edited_body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let edited_selection = edited_fields.selection_prefix.unwrap();
+        assert_eq!(edited_selection.selections().len(), 3);
+        assert_eq!(
+            edited_selection.selections()[0].value,
+            TransportManagerSharedStringValue::Existing {
+                index: 0,
+                value: Some("Train".to_owned()),
+            }
+        );
+        assert_eq!(
+            edited_selection.selections()[1].value,
+            TransportManagerSharedStringValue::New(Some("Carriage".to_owned()))
+        );
+        assert_eq!(
+            edited_selection.selections()[2].value,
+            TransportManagerSharedStringValue::Existing {
+                index: 1,
+                value: Some("Carriage".to_owned()),
+            }
+        );
+
+        let (edited_body_range, _) = manager.transport_manager_body_range().unwrap();
+        let edited_body = manager
+            .serialized_object_graph()
+            .get(edited_body_range)
+            .unwrap();
+        let edited_fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            edited_body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let mut restore_editor = edited_fields.selection_prefix.unwrap().into_editor();
+        assert_eq!(
+            restore_editor.remove_existing_entry(0).unwrap(),
+            TransportManagerSelection {
+                key: 5,
+                value: TransportManagerSharedStringValue::Existing {
+                    index: 0,
+                    value: Some("Train".to_owned()),
+                },
+            }
+        );
+        restore_editor
+            .set_new_string_value(0, Some("Car".to_owned()))
+            .unwrap();
+        assert_eq!(
+            restore_editor.remove_existing_entry(1).unwrap(),
+            TransportManagerSelection {
+                key: 9,
+                value: TransportManagerSharedStringValue::Existing {
+                    index: 1,
+                    value: Some("Car".to_owned()),
+                },
+            }
+        );
+        restore_editor
+            .insert_existing_string_reference(1, 8, 1)
+            .unwrap();
+        let original_table_end = arbitrary_start
+            .checked_add(source_table_range.end - source_table_range.start)
+            .unwrap();
+        let original_table = expected_graph
+            .get(arbitrary_start..original_table_end)
+            .unwrap();
+        assert_eq!(restore_editor.encode().unwrap(), original_table);
+        manager
+            .replace_transport_manager_selection_prefix(&restore_editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
     }
 
     #[test]
@@ -18748,10 +19168,12 @@ mod manager_boundary_tests {
         )
         .0;
         body.truncate(body.len() - 2);
-        body.extend_from_slice(&1_i16.to_be_bytes());
+        body.extend_from_slice(&2_i16.to_be_bytes());
         body.extend_from_slice(&7_i16.to_be_bytes());
         body.push(0xfe);
         write_unique_string(&mut body, "Bus").unwrap();
+        body.extend_from_slice(&8_i16.to_be_bytes());
+        body.extend_from_slice(&0_u16.to_be_bytes());
         let fields = decode_transport_manager_reference_body(
             114_001,
             &body,
@@ -18763,20 +19185,86 @@ mod manager_boundary_tests {
         let prefix = fields.selection_prefix.unwrap();
         let source_table = prefix.encode_unchanged();
         let mut editor = prefix.into_editor();
-        assert!(editor.remove_last_existing_entry().is_err());
-        editor.push_existing_string_reference(8, 1).unwrap();
+        assert!(editor.remove_existing_entry(0).is_err());
+        assert!(editor.insert_existing_string_reference(3, 8, 1).is_err());
+        editor.insert_existing_string_reference(0, 5, 0).unwrap();
+        assert!(editor.insert_existing_string_reference(1, 6, 1).is_err());
+        editor.insert_existing_string_reference(2, 9, 1).unwrap();
+        editor
+            .set_new_string_value(1, Some("Carriage".to_owned()))
+            .unwrap();
+        let inserted_table = [
+            0x00, 0x04, 0x00, 0x05, 0x00, 0x00, 0x00, 0x07, 0xfe, 0x80, 0x00, 0x08, 0xc3, 0x1e,
+            0x11, 0x00, 0xf7, 0xf8, 0x06, 0xfe, 0x00, 0x09, 0x00, 0x01, 0x00, 0x08, 0x00, 0x00,
+        ];
+        assert_eq!(editor.encode().unwrap(), inserted_table);
         assert_eq!(
-            editor.remove_last_existing_entry().unwrap(),
+            editor.remove_existing_entry(2).unwrap(),
             TransportManagerSelection {
-                key: 8,
+                key: 9,
                 value: TransportManagerSharedStringValue::Existing {
                     index: 1,
-                    value: Some("Bus".to_owned()),
+                    value: Some("Carriage".to_owned()),
                 },
             }
         );
-        assert_eq!(editor.encode().unwrap(), source_table);
+        let middle_removed_table = [
+            0x00, 0x03, 0x00, 0x05, 0x00, 0x00, 0x00, 0x07, 0xfe, 0x80, 0x00, 0x08, 0xc3, 0x1e,
+            0x11, 0x00, 0xf7, 0xf8, 0x06, 0xfe, 0x00, 0x08, 0x00, 0x00,
+        ];
+        assert_eq!(editor.encode().unwrap(), middle_removed_table);
+        assert_eq!(
+            editor.remove_existing_entry(0).unwrap(),
+            TransportManagerSelection {
+                key: 5,
+                value: TransportManagerSharedStringValue::Existing {
+                    index: 0,
+                    value: Some("Train".to_owned()),
+                },
+            }
+        );
+        assert_eq!(
+            editor.remove_existing_entry(1).unwrap(),
+            TransportManagerSelection {
+                key: 8,
+                value: TransportManagerSharedStringValue::Existing {
+                    index: 0,
+                    value: Some("Train".to_owned()),
+                },
+            }
+        );
+        let declaration_only_table = [
+            0x00, 0x01, 0x00, 0x07, 0xfe, 0x80, 0x00, 0x08, 0xc3, 0x1e, 0x11, 0x00, 0xf7, 0xf8,
+            0x06, 0xfe,
+        ];
+        assert_eq!(editor.encode().unwrap(), declaration_only_table);
+        editor.insert_existing_string_reference(1, 9, 1).unwrap();
+        let reinserted_table = [
+            0x00, 0x02, 0x00, 0x07, 0xfe, 0x80, 0x00, 0x08, 0xc3, 0x1e, 0x11, 0x00, 0xf7, 0xf8,
+            0x06, 0xfe, 0x00, 0x09, 0x00, 0x01,
+        ];
+        assert_eq!(editor.encode().unwrap(), reinserted_table);
         assert_eq!(table_range.end - table_range.start, source_table.len());
+
+        let empty_body = active_transport_manager_reference_body(
+            114_001,
+            transport_manager_line_number_count(114_001),
+            0,
+            transport_manager_object_header_count(114_001),
+        )
+        .0;
+        let empty_fields = decode_transport_manager_reference_body(
+            114_001,
+            &empty_body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let mut empty_editor = empty_fields.selection_prefix.unwrap().into_editor();
+        empty_editor
+            .insert_existing_string_reference(0, 4, 0)
+            .unwrap();
+        assert_eq!(empty_editor.encode().unwrap(), [0, 1, 0, 4, 0, 0]);
     }
 
     #[test]
