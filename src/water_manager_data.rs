@@ -88,8 +88,11 @@ pub struct WaterManagerData {
     heating_pressure: Option<Vec<i16>>,
     heating_pressure_snapshot: Option<EncodedArraySnapshot<i16>>,
     water_pulse_group_indexes: Vec<u16>,
+    water_pulse_group_indexes_snapshot: EncodedArraySnapshot<u16>,
     sewage_pulse_group_indexes: Vec<u16>,
+    sewage_pulse_group_indexes_snapshot: EncodedArraySnapshot<u16>,
     heating_pulse_group_indexes: Option<Vec<u16>>,
+    heating_pulse_group_indexes_snapshot: Option<EncodedArraySnapshot<u16>>,
     closest_pipe_segments: Option<Vec<u16>>,
     closest_pipe_segments_range: Option<(usize, usize)>,
     original_closest_pipe_segments: Option<Vec<u16>>,
@@ -204,14 +207,17 @@ impl WaterManagerData {
             (None, None)
         };
 
-        let water_pulse_group_indexes =
-            read_encoded_ushort_array(&mut reader, conductive_cells.len())?;
-        let sewage_pulse_group_indexes =
-            read_encoded_ushort_array(&mut reader, conductive_cells.len())?;
-        let heating_pulse_group_indexes = if format_version >= HEATING_VERSION {
-            Some(read_encoded_ushort_array(&mut reader, heating_cells.len())?)
+        let (water_pulse_group_indexes, water_pulse_group_indexes_snapshot) =
+            read_captured_ushort_array(&mut reader, conductive_cells.len())?;
+        let (sewage_pulse_group_indexes, sewage_pulse_group_indexes_snapshot) =
+            read_captured_ushort_array(&mut reader, conductive_cells.len())?;
+        let (heating_pulse_group_indexes, heating_pulse_group_indexes_snapshot) = if format_version
+            >= HEATING_VERSION
+        {
+            let (values, snapshot) = read_captured_ushort_array(&mut reader, heating_cells.len())?;
+            (Some(values), Some(snapshot))
         } else {
-            None
+            (None, None)
         };
 
         let (closest_pipe_segments, closest_pipe_segments_range, original_closest_pipe_segments) =
@@ -443,8 +449,11 @@ impl WaterManagerData {
             heating_pressure,
             heating_pressure_snapshot,
             water_pulse_group_indexes,
+            water_pulse_group_indexes_snapshot,
             sewage_pulse_group_indexes,
+            sewage_pulse_group_indexes_snapshot,
             heating_pulse_group_indexes,
+            heating_pulse_group_indexes_snapshot,
             closest_pipe_segments,
             closest_pipe_segments_range,
             original_closest_pipe_segments,
@@ -622,14 +631,66 @@ impl WaterManagerData {
         &self.water_pulse_group_indexes
     }
 
+    /// Replaces the pulse-group index for one existing conductive water cell.
+    pub fn set_water_pulse_group_index_for_cell(
+        &mut self,
+        cell: usize,
+        pulse_group_index: u16,
+    ) -> Result<(), CrpError> {
+        set_sparse_ushort_cell(
+            &mut self.water_pulse_group_indexes,
+            &self.conductive_cells,
+            cell,
+            pulse_group_index,
+            "water pulse-group index",
+        )
+    }
+
     /// Returns sparse sewage pulse-group indexes in primary-conductive order.
     pub fn sewage_pulse_group_indexes(&self) -> &[u16] {
         &self.sewage_pulse_group_indexes
     }
 
+    /// Replaces the pulse-group index for one existing conductive sewage cell.
+    pub fn set_sewage_pulse_group_index_for_cell(
+        &mut self,
+        cell: usize,
+        pulse_group_index: u16,
+    ) -> Result<(), CrpError> {
+        set_sparse_ushort_cell(
+            &mut self.sewage_pulse_group_indexes,
+            &self.conductive_cells,
+            cell,
+            pulse_group_index,
+            "sewage pulse-group index",
+        )
+    }
+
     /// Returns sparse heating pulse-group indexes from version 227.
     pub fn heating_pulse_group_indexes(&self) -> Option<&[u16]> {
         self.heating_pulse_group_indexes.as_deref()
+    }
+
+    /// Replaces the pulse-group index for one existing heating-conductive cell
+    /// from inner version 227.
+    pub fn set_heating_pulse_group_index_for_cell(
+        &mut self,
+        cell: usize,
+        pulse_group_index: u16,
+    ) -> Result<(), CrpError> {
+        let Some(values) = self.heating_pulse_group_indexes.as_mut() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating pulse-group indexes are absent before inner version 227",
+            ));
+        };
+        set_sparse_ushort_cell(
+            values,
+            &self.heating_cells,
+            cell,
+            pulse_group_index,
+            "heating pulse-group index",
+        )
     }
 
     /// Returns the version-73 closest-pipe segment grid.
@@ -1551,6 +1612,51 @@ impl WaterManagerData {
                 ));
             }
         }
+        for (values, snapshot, field) in [
+            (
+                &self.water_pulse_group_indexes,
+                &self.water_pulse_group_indexes_snapshot,
+                "water sparse pulse-group indexes",
+            ),
+            (
+                &self.sewage_pulse_group_indexes,
+                &self.sewage_pulse_group_indexes_snapshot,
+                "sewage sparse pulse-group indexes",
+            ),
+        ] {
+            if let Some(encoded) = changed_ushort_array(
+                values,
+                Some(&snapshot.values),
+                self.conductive_cells.len(),
+                snapshot.range.0,
+                field,
+            )? {
+                replacements.push((snapshot.range.0, snapshot.range.1, encoded));
+            }
+        }
+        match (
+            self.heating_pulse_group_indexes.as_deref(),
+            self.heating_pulse_group_indexes_snapshot.as_ref(),
+        ) {
+            (Some(values), Some(snapshot)) => {
+                if let Some(encoded) = changed_ushort_array(
+                    values,
+                    Some(&snapshot.values),
+                    self.heating_cells.len(),
+                    snapshot.range.0,
+                    "heating sparse pulse-group indexes",
+                )? {
+                    replacements.push((snapshot.range.0, snapshot.range.1, encoded));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid_cell_grid(
+                    self.scalar_fields_offset,
+                    "heating sparse pulse-group indexes do not match the version gate",
+                ));
+            }
+        }
         let (start, end) = self.water_node_pulse_groups_range;
         if let Some(encoded) = changed_ushort_array(
             &self.water_node_pulse_groups,
@@ -2087,6 +2193,24 @@ fn set_sparse_i16_cell(
     Ok(())
 }
 
+fn set_sparse_ushort_cell(
+    values: &mut [u16],
+    cells: &[usize],
+    cell: usize,
+    value: u16,
+    field: &str,
+) -> Result<(), CrpError> {
+    let index = sparse_cell_position(cells, cell, field)?;
+    let Some(target) = values.get_mut(index) else {
+        return Err(invalid_cell_grid(
+            cell,
+            &format!("{field} values are shorter than the conductivity grid"),
+        ));
+    };
+    *target = value;
+    Ok(())
+}
+
 fn stored_node_count(format_version: u32) -> usize {
     if format_version >= FULL_NODE_COUNT_VERSION {
         NODE_COUNT
@@ -2314,6 +2438,22 @@ fn read_signed_ushort_array(reader: &mut Reader<'_>, count: usize) -> Result<Vec
         .into_iter()
         .map(|value| value as i16)
         .collect())
+}
+
+fn read_captured_ushort_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<(Vec<u16>, EncodedArraySnapshot<u16>), CrpError> {
+    let start = reader.offset();
+    let values = read_encoded_ushort_array(reader, count)?;
+    let end = reader.offset();
+    Ok((
+        values.clone(),
+        EncodedArraySnapshot {
+            range: (start, end),
+            values,
+        },
+    ))
 }
 
 fn read_captured_signed_ushort_array(
@@ -2887,6 +3027,58 @@ mod tests {
 
         let mut before_heating = WaterManagerData::decode(226, &empty_body(226)).unwrap();
         assert!(before_heating.set_heating_pressure(0, 1).is_err());
+    }
+
+    #[test]
+    fn sparse_pulse_group_indexes_edit_only_existing_conductive_cells() {
+        let body = active_body(265);
+        let mut data = WaterManagerData::decode(265, &body).unwrap();
+        let mut expected = body.clone();
+        let mut replacements = vec![
+            (
+                data.water_pulse_group_indexes_snapshot.range,
+                vec![0, 0x12, 0x34],
+            ),
+            (
+                data.sewage_pulse_group_indexes_snapshot.range,
+                vec![0, 0x23, 0x45],
+            ),
+            (
+                data.heating_pulse_group_indexes_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range,
+                vec![0, 0x34, 0x56],
+            ),
+        ];
+        data.set_water_pulse_group_index_for_cell(2, 0x1234)
+            .unwrap();
+        data.set_sewage_pulse_group_index_for_cell(2, 0x2345)
+            .unwrap();
+        data.set_heating_pulse_group_index_for_cell(4, 0x3456)
+            .unwrap();
+        replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in replacements.into_iter().rev() {
+            expected.splice(start..end, replacement);
+        }
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = WaterManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.water_pulse_group_indexes(), [0x1234]);
+        assert_eq!(decoded.sewage_pulse_group_indexes(), [0x2345]);
+        assert_eq!(
+            decoded.heating_pulse_group_indexes(),
+            Some([0x3456].as_slice())
+        );
+        assert!(data.set_water_pulse_group_index_for_cell(3, 1).is_err());
+
+        let mut before_heating = WaterManagerData::decode(226, &empty_body(226)).unwrap();
+        assert!(
+            before_heating
+                .set_heating_pulse_group_index_for_cell(0, 1)
+                .is_err()
+        );
     }
 
     #[test]
