@@ -13802,7 +13802,8 @@ mod manager_boundary_tests {
         append_zero_encoded_long_array(&mut graph, 65_536); // Closest heating segment.
         graph.extend_from_slice(&1_u16.to_be_bytes()); // One water pulse group.
         graph.extend_from_slice(&[0; 14]); // Fixed-width water pulse-group record.
-        graph.extend_from_slice(&0_u16.to_be_bytes()); // No water pulse units.
+        graph.extend_from_slice(&1_u16.to_be_bytes()); // One water pulse unit.
+        graph.extend_from_slice(&[0; 6]); // Fixed-width water pulse-unit record.
         graph.extend_from_slice(&[0; 8]); // Empty sewage and heating group/unit pairs.
         for _ in 0..9 {
             append_zero_encoded_long_array(&mut graph, 32_768);
@@ -14335,6 +14336,17 @@ mod manager_boundary_tests {
         pulse_group.current_pressure = 0x0102_0304;
         pulse_group.merge_index = 0x1122;
         edited.set_water_pulse_group(0, pulse_group).unwrap();
+        edited
+            .set_water_pulse_unit(
+                0,
+                crate::water_manager_data::WaterPulseUnit {
+                    group: 0x3344,
+                    node: 0x5566,
+                    x: 0x77,
+                    z: 0x88,
+                },
+            )
+            .unwrap();
         let expected_body = edited.encode().unwrap();
 
         manager.replace_water_manager_data(&edited).unwrap();
@@ -14367,6 +14379,8 @@ mod manager_boundary_tests {
             0x0102_0304
         );
         assert_eq!(decoded.water_pulse_groups()[0].merge_index, 0x1122);
+        assert_eq!(decoded.water_pulse_units()[0].group, 0x3344);
+        assert_eq!(decoded.water_pulse_units()[0].node, 0x5566);
 
         let replaced_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_water_manager_data(&stale_editor).is_err());

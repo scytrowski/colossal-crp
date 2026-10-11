@@ -11,6 +11,7 @@ const LEGACY_NODE_COUNT: usize = 16_384;
 const PULSE_GROUP_CAPACITY: usize = 1_024;
 const PULSE_UNIT_CAPACITY: usize = 32_768;
 const PULSE_GROUP_RECORD_LEN: usize = 14;
+const PULSE_UNIT_RECORD_LEN: usize = 6;
 const COLLECT_PRESSURE_FIELD_LEN: usize = 4;
 const CLOSEST_PIPE_SEGMENT_VERSION: u32 = 73;
 const GUIDE_REFERENCES_VERSION: u32 = 94;
@@ -57,12 +58,12 @@ pub struct WaterPulseUnit {
 /// Sparse cell columns use the corresponding conductivity plane's ascending
 /// cell-index order. Node arrays retain their full 32,768-entry size, with
 /// version-derived defaults in the legacy upper half. The complete source body
-/// remains available for exact unchanged writing. The processed-cell count,
-/// conductive-cell count, and continuation flag can be edited in place; all
-/// other fields remain byte-identical. The inner serializer version controls
-/// the 23, 73, 94, 202, 227, and 270–272 gates. Corpus samples cover versions
-/// 194–118011; active network values and gates 270–272 have synthetic coverage
-/// only.
+/// remains available for exact unchanged writing. Existing pulse-group and
+/// pulse-unit records, the processed-cell count, the conductive-cell count,
+/// and the continuation flag can be edited in place; all other fields remain
+/// byte-identical. The inner serializer version controls the 23, 73, 94, 202,
+/// 227, and 270–272 gates. Corpus samples cover versions 194–118011; active
+/// network values and gates 270–272 have synthetic coverage only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaterManagerData {
     format_version: u32,
@@ -88,12 +89,15 @@ pub struct WaterManagerData {
     water_pulse_groups: Vec<WaterPulseGroup>,
     water_pulse_groups_offset: usize,
     water_pulse_units: Vec<WaterPulseUnit>,
+    water_pulse_units_offset: usize,
     sewage_pulse_groups: Vec<WaterPulseGroup>,
     sewage_pulse_groups_offset: usize,
     sewage_pulse_units: Vec<WaterPulseUnit>,
+    sewage_pulse_units_offset: usize,
     heating_pulse_groups: Option<Vec<WaterPulseGroup>>,
     heating_pulse_groups_offset: Option<usize>,
     heating_pulse_units: Option<Vec<WaterPulseUnit>>,
+    heating_pulse_units_offset: Option<usize>,
     water_node_pulse_groups: Vec<u16>,
     water_node_pressure: Vec<u16>,
     water_node_extra_pressure: Vec<u16>,
@@ -193,21 +197,27 @@ impl WaterManagerData {
 
         let (water_pulse_groups, water_pulse_groups_offset) =
             read_pulse_groups(&mut reader, format_version, false)?;
-        let water_pulse_units = read_pulse_units(&mut reader)?;
+        let (water_pulse_units, water_pulse_units_offset) = read_pulse_units(&mut reader)?;
         let (sewage_pulse_groups, sewage_pulse_groups_offset) =
             read_pulse_groups(&mut reader, format_version, false)?;
-        let sewage_pulse_units = read_pulse_units(&mut reader)?;
-        let (heating_pulse_groups, heating_pulse_groups_offset, heating_pulse_units) =
-            if format_version >= HEATING_VERSION {
-                let (groups, groups_offset) = read_pulse_groups(&mut reader, format_version, true)?;
-                (
-                    Some(groups),
-                    Some(groups_offset),
-                    Some(read_pulse_units(&mut reader)?),
-                )
-            } else {
-                (None, None, None)
-            };
+        let (sewage_pulse_units, sewage_pulse_units_offset) = read_pulse_units(&mut reader)?;
+        let (
+            heating_pulse_groups,
+            heating_pulse_groups_offset,
+            heating_pulse_units,
+            heating_pulse_units_offset,
+        ) = if format_version >= HEATING_VERSION {
+            let (groups, groups_offset) = read_pulse_groups(&mut reader, format_version, true)?;
+            let (units, units_offset) = read_pulse_units(&mut reader)?;
+            (
+                Some(groups),
+                Some(groups_offset),
+                Some(units),
+                Some(units_offset),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
         let stored_node_count = if format_version >= FULL_NODE_COUNT_VERSION {
             NODE_COUNT
@@ -297,12 +307,15 @@ impl WaterManagerData {
             water_pulse_groups,
             water_pulse_groups_offset,
             water_pulse_units,
+            water_pulse_units_offset,
             sewage_pulse_groups,
             sewage_pulse_groups_offset,
             sewage_pulse_units,
+            sewage_pulse_units_offset,
             heating_pulse_groups,
             heating_pulse_groups_offset,
             heating_pulse_units,
+            heating_pulse_units_offset,
             water_node_pulse_groups,
             water_node_pressure,
             water_node_extra_pressure,
@@ -540,6 +553,69 @@ impl WaterManagerData {
         self.heating_pulse_units.as_deref()
     }
 
+    /// Replaces one existing water pulse unit without changing its serialized
+    /// count or body length.
+    pub fn set_water_pulse_unit(
+        &mut self,
+        index: usize,
+        unit: WaterPulseUnit,
+    ) -> Result<(), CrpError> {
+        let Some(existing) = self.water_pulse_units.get_mut(index) else {
+            return Err(invalid_pulse_unit(
+                self.water_pulse_units_offset,
+                "water pulse-unit index is outside the existing records",
+            ));
+        };
+        *existing = unit;
+        Ok(())
+    }
+
+    /// Replaces one existing sewage pulse unit without changing its serialized
+    /// count or body length.
+    pub fn set_sewage_pulse_unit(
+        &mut self,
+        index: usize,
+        unit: WaterPulseUnit,
+    ) -> Result<(), CrpError> {
+        let Some(existing) = self.sewage_pulse_units.get_mut(index) else {
+            return Err(invalid_pulse_unit(
+                self.sewage_pulse_units_offset,
+                "sewage pulse-unit index is outside the existing records",
+            ));
+        };
+        *existing = unit;
+        Ok(())
+    }
+
+    /// Replaces one existing heating pulse unit from inner version 227 without
+    /// changing its serialized count or body length.
+    pub fn set_heating_pulse_unit(
+        &mut self,
+        index: usize,
+        unit: WaterPulseUnit,
+    ) -> Result<(), CrpError> {
+        let Some(units_offset) = self.heating_pulse_units_offset else {
+            return Err(invalid_pulse_unit(
+                self.original_body.len(),
+                "heating pulse units are absent before inner version 227",
+            ));
+        };
+        let Some(units) = self.heating_pulse_units.as_mut() else {
+            return Err(invalid_pulse_unit(
+                units_offset,
+                "heating pulse units are absent from the decoded body",
+            ));
+        };
+        let Some(existing) = units.get_mut(index) else {
+            return Err(invalid_pulse_unit(
+                units_offset,
+                "heating pulse-unit index is outside the existing records",
+            ));
+        };
+        *existing = unit;
+        Ok(())
+    }
+
     /// Returns all 32,768 water node pulse-group indexes.
     pub fn water_node_pulse_groups(&self) -> &[u16] {
         &self.water_node_pulse_groups
@@ -662,6 +738,12 @@ impl WaterManagerData {
             self.format_version >= COLLECT_WATER_BOOL_VERSION,
             "water",
         )?;
+        encode_pulse_units(
+            &mut bytes,
+            self.water_pulse_units_offset,
+            &self.water_pulse_units,
+            "water",
+        )?;
         encode_pulse_groups(
             &mut bytes,
             self.sewage_pulse_groups_offset,
@@ -669,11 +751,23 @@ impl WaterManagerData {
             self.format_version >= COLLECT_WATER_BOOL_VERSION,
             "sewage",
         )?;
+        encode_pulse_units(
+            &mut bytes,
+            self.sewage_pulse_units_offset,
+            &self.sewage_pulse_units,
+            "sewage",
+        )?;
         if let (Some(offset), Some(groups)) = (
             self.heating_pulse_groups_offset,
             self.heating_pulse_groups.as_deref(),
         ) {
             encode_pulse_groups(&mut bytes, offset, groups, false, "heating")?;
+        }
+        if let (Some(offset), Some(units)) = (
+            self.heating_pulse_units_offset,
+            self.heating_pulse_units.as_deref(),
+        ) {
+            encode_pulse_units(&mut bytes, offset, units, "heating")?;
         }
         let processed_end =
             self.scalar_fields_offset
@@ -733,6 +827,48 @@ fn invalid_pulse_group(offset: usize, reason: &str) -> CrpError {
         offset,
         reason: reason.to_owned(),
     }
+}
+
+fn invalid_pulse_unit(offset: usize, reason: &str) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "WaterManager+Data".to_owned(),
+        offset,
+        reason: reason.to_owned(),
+    }
+}
+
+fn encode_pulse_units(
+    bytes: &mut [u8],
+    records_offset: usize,
+    units: &[WaterPulseUnit],
+    kind: &str,
+) -> Result<(), CrpError> {
+    for (index, unit) in units.iter().enumerate() {
+        let record_offset = index
+            .checked_mul(PULSE_UNIT_RECORD_LEN)
+            .and_then(|delta| records_offset.checked_add(delta))
+            .ok_or(CrpError::ArithmeticOverflow(
+                "WaterManager pulse-unit record offset",
+            ))?;
+        let record_end = record_offset.checked_add(PULSE_UNIT_RECORD_LEN).ok_or(
+            CrpError::ArithmeticOverflow("WaterManager pulse-unit record end"),
+        )?;
+        let mut encoded = Vec::with_capacity(PULSE_UNIT_RECORD_LEN);
+        encoded.extend_from_slice(&unit.group.to_be_bytes());
+        encoded.extend_from_slice(&unit.node.to_be_bytes());
+        encoded.push(unit.x);
+        encoded.push(unit.z);
+        bytes
+            .get_mut(record_offset..record_end)
+            .ok_or_else(|| {
+                invalid_pulse_unit(
+                    record_offset,
+                    &format!("{kind} pulse-unit record range is invalid"),
+                )
+            })?
+            .copy_from_slice(&encoded);
+    }
+    Ok(())
 }
 
 fn encode_pulse_groups(
@@ -864,8 +1000,9 @@ fn read_pulse_groups(
     Ok((groups, records_offset))
 }
 
-fn read_pulse_units(reader: &mut Reader<'_>) -> Result<Vec<WaterPulseUnit>, CrpError> {
+fn read_pulse_units(reader: &mut Reader<'_>) -> Result<(Vec<WaterPulseUnit>, usize), CrpError> {
     let count = usize::from(reader.read_u16_be()?);
+    let records_offset = reader.offset();
     if count > PULSE_UNIT_CAPACITY {
         return Err(reader.invalid(format!(
             "WaterManager pulse-unit count {count} exceeds capacity {PULSE_UNIT_CAPACITY}"
@@ -880,7 +1017,7 @@ fn read_pulse_units(reader: &mut Reader<'_>) -> Result<Vec<WaterPulseUnit>, CrpE
             z: reader.read_u8()?,
         });
     }
-    Ok(units)
+    Ok((units, records_offset))
 }
 
 fn read_guide_references(
@@ -928,7 +1065,8 @@ mod tests {
     use super::{
         CELL_COUNT, COLLECT_PRESSURE_FIELD_LEN, FULL_NODE_COUNT_VERSION, HEATING_VERSION,
         LEGACY_NODE_COUNT, NODE_COUNT, POLLUTION_VERSION, PULSE_GROUP_CAPACITY,
-        PULSE_GROUP_RECORD_LEN, PULSE_UNIT_CAPACITY, WaterManagerData, WaterPulseGroup,
+        PULSE_GROUP_RECORD_LEN, PULSE_UNIT_CAPACITY, PULSE_UNIT_RECORD_LEN, WaterManagerData,
+        WaterPulseGroup, WaterPulseUnit,
     };
 
     fn append_repeat_zeroes(output: &mut Vec<u8>, mut count: usize) {
@@ -1086,14 +1224,20 @@ mod tests {
         body.extend_from_slice(&0x5152_u16.to_be_bytes());
         body.extend_from_slice(&0x5354_u16.to_be_bytes());
         body.extend_from_slice(&0x5556_u16.to_be_bytes());
-        body.extend_from_slice(&0_u16.to_be_bytes()); // No sewage pulse units.
+        body.extend_from_slice(&1_u16.to_be_bytes()); // Sewage pulse unit.
+        body.extend_from_slice(&0x6162_u16.to_be_bytes());
+        body.extend_from_slice(&0x7172_u16.to_be_bytes());
+        body.extend_from_slice(&[0x81, 0x82]);
         body.extend_from_slice(&1_u16.to_be_bytes()); // Heating pulse group.
         body.extend_from_slice(&0x6162_6364_u32.to_be_bytes());
         body.extend_from_slice(&0x7172_7374_u32.to_be_bytes());
         body.extend_from_slice(&0x8182_u16.to_be_bytes());
         body.extend_from_slice(&0x8384_u16.to_be_bytes());
         body.extend_from_slice(&0x8586_u16.to_be_bytes());
-        body.extend_from_slice(&0_u16.to_be_bytes()); // No heating pulse units.
+        body.extend_from_slice(&1_u16.to_be_bytes()); // Heating pulse unit.
+        body.extend_from_slice(&0x9192_u16.to_be_bytes());
+        body.extend_from_slice(&0xa1a2_u16.to_be_bytes());
+        body.extend_from_slice(&[0xb1, 0xb2]);
 
         for value in [0x22, 0x1234, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29] {
             append_ushort_array_with_first(&mut body, stored_node_count, value);
@@ -1126,6 +1270,12 @@ mod tests {
         bytes.extend_from_slice(&group.merge_count.to_be_bytes());
         bytes.extend_from_slice(&group.node.to_be_bytes());
         bytes
+    }
+
+    fn expected_pulse_unit_bytes(unit: WaterPulseUnit) -> [u8; PULSE_UNIT_RECORD_LEN] {
+        let group = unit.group.to_be_bytes();
+        let node = unit.node.to_be_bytes();
+        [group[0], group[1], node[0], node[1], unit.x, unit.z]
     }
 
     #[test]
@@ -1197,6 +1347,9 @@ mod tests {
         assert_eq!(data.water_pulse_groups()[0].merge_index, 15);
         assert_eq!(data.water_pulse_units()[0].node, 19);
         assert_eq!(data.water_pulse_units()[0].z, 21);
+        assert_eq!(data.sewage_pulse_units()[0].group, 0x6162);
+        assert_eq!(data.sewage_pulse_units()[0].node, 0x7172);
+        assert_eq!(data.heating_pulse_units().unwrap()[0].x, 0xb1);
         assert_eq!(data.sewage_pulse_groups()[0].original_pressure, 0x2122_2324);
         assert_eq!(data.sewage_pulse_groups()[0].current_pressure, 0x3132_3334);
         assert_eq!(data.heating_pulse_groups().unwrap()[0].node, 0x8586);
@@ -1296,6 +1449,72 @@ mod tests {
                         merge_index: 0,
                         merge_count: 0,
                         node: 0,
+                    },
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn existing_pulse_units_edit_only_their_fixed_width_records() {
+        let body = active_body(265);
+        let mut data = WaterManagerData::decode(265, &body).unwrap();
+        let water_unit = WaterPulseUnit {
+            group: 0x1234,
+            node: 0x5678,
+            x: 0x9a,
+            z: 0xbc,
+        };
+        let sewage_unit = WaterPulseUnit {
+            group: 0x2345,
+            node: 0x6789,
+            x: 0xab,
+            z: 0xcd,
+        };
+        let heating_unit = WaterPulseUnit {
+            group: 0x3456,
+            node: 0x789a,
+            x: 0xbc,
+            z: 0xde,
+        };
+        let mut expected = body.clone();
+        let unit_records = [
+            (data.water_pulse_units_offset, water_unit),
+            (data.sewage_pulse_units_offset, sewage_unit),
+            (data.heating_pulse_units_offset.unwrap(), heating_unit),
+        ];
+        for (offset, unit) in unit_records {
+            expected[offset..offset + PULSE_UNIT_RECORD_LEN]
+                .copy_from_slice(&expected_pulse_unit_bytes(unit));
+        }
+
+        data.set_water_pulse_unit(0, water_unit).unwrap();
+        data.set_sewage_pulse_unit(0, sewage_unit).unwrap();
+        data.set_heating_pulse_unit(0, heating_unit).unwrap();
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = WaterManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.water_pulse_units(), &[water_unit]);
+        assert_eq!(decoded.sewage_pulse_units(), &[sewage_unit]);
+        assert_eq!(
+            decoded.heating_pulse_units(),
+            Some([heating_unit].as_slice())
+        );
+        assert!(data.set_water_pulse_unit(1, water_unit).is_err());
+        assert!(data.set_sewage_pulse_unit(1, sewage_unit).is_err());
+        assert!(data.set_heating_pulse_unit(1, heating_unit).is_err());
+
+        let mut before_heating = WaterManagerData::decode(226, &empty_body(226)).unwrap();
+        assert!(
+            before_heating
+                .set_heating_pulse_unit(
+                    0,
+                    WaterPulseUnit {
+                        group: 0,
+                        node: 0,
+                        x: 0,
+                        z: 0,
                     },
                 )
                 .is_err()
