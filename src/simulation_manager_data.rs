@@ -2245,6 +2245,78 @@ impl SimulationManagerData {
         NaturalResourceManagerData::decode(self.format_version, bytes)
     }
 
+    /// Replaces NaturalResourceManager's used-resource counters and
+    /// pollution-disposal rates in place. Encoded grids, area-resource arrays,
+    /// legacy columns, and all other body bytes remain unchanged.
+    pub fn replace_natural_resource_manager_data(
+        &mut self,
+        edited: &NaturalResourceManagerData,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                16,
+                "edited NaturalResourceManager version does not match this stream",
+            ));
+        }
+        let current = self.decode_natural_resource_manager_data()?;
+        if current.encode_unchanged() != edited.encode_unchanged() {
+            return Err(invalid(
+                16,
+                "NaturalResourceManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != edited.encode_unchanged().len() {
+            return Err(invalid(
+                16,
+                "NaturalResourceManager edits must preserve the decoded body length",
+            ));
+        }
+        let (body_start, next_tag_start) = self.manager_body_boundary(9)?;
+        let body_end =
+            body_start
+                .checked_add(replacement.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "NaturalResourceManager replacement end",
+                ))?;
+        if body_end != next_tag_start {
+            return Err(invalid(
+                body_end,
+                "NaturalResourceManager replacement no longer ends at the ImmaterialResourceManager boundary",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph
+            .get_mut(body_start..body_end)
+            .ok_or_else(|| {
+                invalid(
+                    body_start,
+                    "NaturalResourceManager replacement range is invalid",
+                )
+            })?
+            .copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_natural_resource_manager_data()
+            .and_then(|decoded| {
+                if decoded.encode_unchanged() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NaturalResourceManager body does not match the edited fields",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NaturalResourceManager body failed validation: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Decodes ImmaterialResourceManager's local grids and aggregate values
     /// between its manager tag and ElectricityManager. Resource-slot counts,
     /// aggregate-array lengths, and multiplier widths follow the inner
@@ -13899,6 +13971,64 @@ mod manager_boundary_tests {
             "ElectricityManager",
         );
         assert!(wrong_tag.decode_natural_resource_manager_data().is_err());
+    }
+
+    #[test]
+    fn natural_resource_manager_scalar_edits_replace_only_its_bounded_body() {
+        let mut manager = natural_resource_manager_with_next(
+            "ImmaterialResourceManager+Data, Assembly-CSharp",
+            "ImmaterialResourceManager",
+        );
+        let original_graph = manager.serialized_object_graph.clone();
+        let stale_editor = manager.decode_natural_resource_manager_data().unwrap();
+        let mut edited = manager.decode_natural_resource_manager_data().unwrap();
+        edited.set_used_resource_counter(2, 0xaabb_ccdd).unwrap();
+        edited.set_pollution_disposal_rate(0, -17).unwrap();
+        edited.set_pollution_disposal_rate(1, 29).unwrap();
+        let expected_body = edited.encode().unwrap();
+
+        manager
+            .replace_natural_resource_manager_data(&edited)
+            .unwrap();
+
+        let body_start = profiler_tag("NaturalResourceManager").len();
+        let next_tag = profiler_tag("ImmaterialResourceManager");
+        let next_start = original_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph.len(), original_graph.len());
+        assert_eq!(
+            &manager.serialized_object_graph[..body_start],
+            &original_graph[..body_start]
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[body_start..next_start],
+            expected_body
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[next_start..],
+            &original_graph[next_start..]
+        );
+        let decoded = manager.decode_natural_resource_manager_data().unwrap();
+        assert_eq!(decoded.used_resource_counters().unwrap()[2], 0xaabb_ccdd);
+        assert_eq!(decoded.pollution_disposal_rates(), Some([-17, 29]));
+
+        let replaced_graph = manager.serialized_object_graph.clone();
+        assert!(
+            manager
+                .replace_natural_resource_manager_data(&stale_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph, replaced_graph);
+
+        manager.format_version += 1;
+        assert!(
+            manager
+                .replace_natural_resource_manager_data(&edited)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph, replaced_graph);
     }
 
     #[test]
