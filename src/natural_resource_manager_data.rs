@@ -2,6 +2,7 @@ use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
     EncodedUIntArrayReader, read_encoded_byte_array, write_encoded_byte_array,
+    write_encoded_uint_array,
 };
 use std::ops::Range;
 
@@ -13,6 +14,12 @@ const END_PROFILER_REFERENCE_LEN: usize = 2;
 struct EncodedGridSnapshot {
     range: Range<usize>,
     values: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EncodedUIntScopeSnapshot {
+    range: Range<usize>,
+    arrays: Vec<Vec<u32>>,
 }
 
 /// Decoded reader fields from `NaturalResourceManager+Data`.
@@ -54,6 +61,7 @@ pub struct NaturalResourceManagerData {
     destroyed: Option<Vec<u8>>,
     destroyed_snapshot: Option<EncodedGridSnapshot>,
     area_resource_arrays: Vec<Vec<u32>>,
+    area_resource_snapshot: Option<EncodedUIntScopeSnapshot>,
     used_resource_counters: Option<Vec<u32>>,
     used_resource_counters_offset: Option<usize>,
     pollution_disposal_rates: Option<[i8; 2]>,
@@ -130,15 +138,21 @@ impl NaturalResourceManagerData {
             (None, None, None, None)
         };
 
+        let area_resource_start = reader.offset();
         let mut area_resource_arrays = Vec::new();
         if format_version >= 111 {
-            let array_count = if format_version >= 125 { 10 } else { 8 };
+            let array_count = area_resource_array_count(format_version);
             let mut array_reader = EncodedUIntArrayReader::default();
             area_resource_arrays.reserve(array_count);
             for _ in 0..array_count {
                 area_resource_arrays.push(array_reader.read_array(&mut reader, AREA_CELL_COUNT)?);
             }
         }
+        let area_resource_end = reader.offset();
+        let area_resource_snapshot = (format_version >= 111).then(|| EncodedUIntScopeSnapshot {
+            range: area_resource_start..area_resource_end,
+            arrays: area_resource_arrays.clone(),
+        });
 
         let (used_resource_counters_offset, used_resource_counters) = if format_version >= 116 {
             let offset = reader.offset();
@@ -195,6 +209,7 @@ impl NaturalResourceManagerData {
             destroyed,
             destroyed_snapshot,
             area_resource_arrays,
+            area_resource_snapshot,
             used_resource_counters,
             used_resource_counters_offset,
             pollution_disposal_rates,
@@ -436,6 +451,47 @@ impl NaturalResourceManagerData {
         &self.area_resource_arrays
     }
 
+    /// Replaces a positional value in one 81-cell area-resource UInt array.
+    /// Array indexes follow serialized order; versions before inner version
+    /// 111 and indexes outside the stored arrays return an error. Encoding an
+    /// edit rewrites the complete shared UInt-array scope canonically.
+    pub fn set_area_resource_value(
+        &mut self,
+        array_index: usize,
+        cell_index: usize,
+        value: u32,
+    ) -> Result<(), CrpError> {
+        let offset = self
+            .area_resource_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.range.start);
+        if cell_index >= AREA_CELL_COUNT {
+            return Err(invalid_manager_field(
+                offset,
+                format!(
+                    "area-resource cell index {cell_index} is outside the {AREA_CELL_COUNT}-cell array"
+                ),
+            ));
+        }
+        let stored_array_count = self.area_resource_arrays.len();
+        let Some(array) = self.area_resource_arrays.get_mut(array_index) else {
+            return Err(invalid_manager_field(
+                offset,
+                format!(
+                    "area-resource array index {array_index} is outside the {stored_array_count} stored arrays"
+                ),
+            ));
+        };
+        let Some(target) = array.get_mut(cell_index) else {
+            return Err(invalid_manager_field(
+                offset,
+                "area-resource array is shorter than 81 values",
+            ));
+        };
+        *target = value;
+        Ok(())
+    }
+
     /// Returns the eight direct used-resource counters from version 116.
     pub fn used_resource_counters(&self) -> Option<&[u32]> {
         self.used_resource_counters.as_deref()
@@ -514,8 +570,9 @@ impl NaturalResourceManagerData {
 
     /// Encodes edited direct grid values, used-resource counters, and
     /// pollution-disposal rates. Changed grids use the canonical byte-array
-    /// writer and can resize the body; unchanged grids and other source bytes
-    /// retain their original representation.
+    /// writer and can resize the body. Editing an area-resource value rewrites
+    /// the full shared UInt-array scope canonically; other source bytes retain
+    /// their original representation.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.original_body.clone();
         match (
@@ -655,6 +712,14 @@ impl NaturalResourceManagerData {
             CELL_COUNT,
             "destroyed",
         )?;
+        if let Some(replacement) = changed_area_resource_scope(
+            &self.area_resource_arrays,
+            self.area_resource_snapshot.as_ref(),
+            bytes.len(),
+            self.format_version,
+        )? {
+            replacements.push(replacement);
+        }
         replacements.sort_by_key(|(range, _)| range.start);
         for (range, encoded) in replacements.into_iter().rev() {
             bytes.splice(range, encoded);
@@ -840,6 +905,66 @@ fn push_changed_grid(
     Ok(())
 }
 
+fn changed_area_resource_scope(
+    arrays: &[Vec<u32>],
+    snapshot: Option<&EncodedUIntScopeSnapshot>,
+    source_body_len: usize,
+    format_version: u32,
+) -> Result<Option<(Range<usize>, Vec<u8>)>, CrpError> {
+    let expected_array_count = area_resource_array_count(format_version);
+    if arrays.len() != expected_array_count {
+        return Err(invalid_manager_field(
+            snapshot.map_or(0, |source| source.range.start),
+            format!(
+                "area-resource array count {} does not match the {expected_array_count} arrays stored by inner version {format_version}",
+                arrays.len()
+            ),
+        ));
+    }
+    let Some(snapshot) = snapshot else {
+        if expected_array_count == 0 {
+            return Ok(None);
+        }
+        return Err(invalid_manager_field(
+            0,
+            "area-resource arrays lack their source scope",
+        ));
+    };
+    if expected_array_count == 0
+        || snapshot.arrays.len() != expected_array_count
+        || snapshot.range.start > snapshot.range.end
+        || snapshot.range.end > source_body_len
+        || arrays
+            .iter()
+            .chain(snapshot.arrays.iter())
+            .any(|array| array.len() != AREA_CELL_COUNT)
+    {
+        return Err(invalid_manager_field(
+            snapshot.range.start,
+            "area-resource values do not match their versioned 81-cell UInt layout",
+        ));
+    }
+    if arrays == snapshot.arrays {
+        return Ok(None);
+    }
+
+    let mut encoded = Vec::new();
+    for array in arrays {
+        write_encoded_uint_array(&mut encoded, array);
+    }
+    Ok(Some((snapshot.range.clone(), encoded)))
+}
+
+fn area_resource_array_count(format_version: u32) -> usize {
+    if format_version >= 125 {
+        10
+    } else if format_version >= 111 {
+        8
+    } else {
+        0
+    }
+}
+
 fn invalid_manager_field(offset: usize, reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "NaturalResourceManager+Data".to_owned(),
@@ -933,6 +1058,19 @@ mod tests {
         }
     }
 
+    fn append_constant_uint_array(output: &mut Vec<u8>, count: usize, value: u32) {
+        assert!(count >= 2);
+        output.push(1); // Two literals establish a zero delta.
+        output.extend_from_slice(&value.to_be_bytes());
+        output.extend_from_slice(&value.to_be_bytes());
+        let mut remaining = count - 2;
+        while remaining > 0 {
+            let run = remaining.min(128);
+            output.push(0x7f + run as u8);
+            remaining -= run;
+        }
+    }
+
     fn literal_byte_grid_with_value(cell: usize, value: u8) -> Vec<u8> {
         let mut values = vec![0; CELL_COUNT];
         values[cell] = value;
@@ -994,8 +1132,7 @@ mod tests {
             0
         };
         for index in 0..area_array_count {
-            let values = vec![index as u32 + 1; AREA_CELL_COUNT];
-            append_literal_uint_array(&mut body, &values);
+            append_constant_uint_array(&mut body, AREA_CELL_COUNT, index as u32 + 1);
         }
         if format_version >= 116 {
             for index in 0..8_u32 {
@@ -1193,6 +1330,59 @@ mod tests {
         assert_eq!(decoded.forest()[1], 5);
         assert_eq!(decoded.trees_for_nonzero_forest(), [0x41, 0x32]);
         assert_eq!(decoded.fertility_for_zero_forest()[0], 0x51);
+    }
+
+    #[test]
+    fn area_resource_edits_rewrite_the_shared_uint_scope_with_expected_bytes() {
+        let body = synthetic_body(265, false);
+        let mut data = NaturalResourceManagerData::decode(265, &body).unwrap();
+        assert_eq!(data.area_resource_arrays().len(), 10);
+        data.set_area_resource_value(2, 5, 0x1122_3344).unwrap();
+        data.set_area_resource_value(9, 80, u32::MAX).unwrap();
+        assert!(data.set_area_resource_value(10, 0, 1).is_err());
+        assert!(data.set_area_resource_value(0, 81, 1).is_err());
+
+        let snapshot = data.area_resource_snapshot.as_ref().unwrap();
+        let mut expected_scope = Vec::new();
+        for values in &data.area_resource_arrays {
+            append_literal_uint_array(&mut expected_scope, values);
+        }
+        let mut expected = body.clone();
+        expected.splice(snapshot.range.clone(), expected_scope);
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        assert!(encoded.len() > body.len());
+        let decoded = NaturalResourceManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.area_resource_arrays()[2][5], 0x1122_3344);
+        assert_eq!(decoded.area_resource_arrays()[9][80], u32::MAX);
+        assert_eq!(decoded.area_resource_arrays()[3][5], 4);
+
+        let mut before_gate =
+            NaturalResourceManagerData::decode(110, &synthetic_body(110, false)).unwrap();
+        assert!(before_gate.area_resource_arrays().is_empty());
+        assert!(before_gate.set_area_resource_value(0, 0, 1).is_err());
+
+        let mut version_111 =
+            NaturalResourceManagerData::decode(111, &synthetic_body(111, false)).unwrap();
+        assert_eq!(version_111.area_resource_arrays().len(), 8);
+        version_111
+            .set_area_resource_value(7, 80, 0xaabb_ccdd)
+            .unwrap();
+        assert!(version_111.set_area_resource_value(8, 0, 1).is_err());
+        let decoded_111 =
+            NaturalResourceManagerData::decode(111, &version_111.encode().unwrap()).unwrap();
+        assert_eq!(decoded_111.area_resource_arrays()[7][80], 0xaabb_ccdd);
+
+        let mut version_125 =
+            NaturalResourceManagerData::decode(125, &synthetic_body(125, false)).unwrap();
+        assert_eq!(version_125.area_resource_arrays().len(), 10);
+        version_125
+            .set_area_resource_value(9, 80, 0x5566_7788)
+            .unwrap();
+        let decoded_125 =
+            NaturalResourceManagerData::decode(125, &version_125.encode().unwrap()).unwrap();
+        assert_eq!(decoded_125.area_resource_arrays()[9][80], 0x5566_7788);
     }
 
     #[test]

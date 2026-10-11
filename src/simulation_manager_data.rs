@@ -13640,7 +13640,9 @@ mod manager_boundary_tests {
             append_repeated_zero_encoded_byte_array(&mut graph, CELLS);
         }
         for _ in 0..10 {
-            write_encoded_uint_array(&mut graph, &[0; 81]);
+            graph.extend_from_slice(&[1]); // Two literals establish a zero delta.
+            graph.extend_from_slice(&[0; 8]);
+            graph.push(0xce); // Repeat the zero value 79 times to reach 81.
         }
         graph.extend_from_slice(&[0; 8 * 4]); // Used-resource counters.
         graph.extend_from_slice(&[0xfe, 0x03]); // Signed pollution-disposal rates.
@@ -14102,6 +14104,51 @@ mod manager_boundary_tests {
                 .unwrap()
                 .pollution()[7],
             0x42
+        );
+    }
+
+    #[test]
+    fn natural_resource_manager_area_edit_rewrites_shared_scope_and_preserves_next_manager() {
+        let mut manager = natural_resource_manager_with_next(
+            "ImmaterialResourceManager+Data, Assembly-CSharp",
+            "ImmaterialResourceManager",
+        );
+        let original_graph = manager.serialized_object_graph.clone();
+        let mut edited = manager.decode_natural_resource_manager_data().unwrap();
+        edited.set_area_resource_value(4, 17, 0x1234_5678).unwrap();
+        let expected_body = edited.encode().unwrap();
+        let source_body_len = edited.encode_unchanged().len();
+
+        let next_tag = profiler_tag("ImmaterialResourceManager");
+        let old_next_start = original_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        let following_bytes = original_graph[old_next_start..].to_vec();
+        let body_start = profiler_tag("NaturalResourceManager").len();
+        manager
+            .replace_natural_resource_manager_data(&edited)
+            .unwrap();
+
+        assert_eq!(
+            manager.serialized_object_graph.len(),
+            original_graph.len() + expected_body.len() - source_body_len
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[..body_start],
+            &original_graph[..body_start]
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[body_start..body_start + expected_body.len()],
+            expected_body
+        );
+        assert!(manager.serialized_object_graph.ends_with(&following_bytes));
+        assert_eq!(
+            manager
+                .decode_natural_resource_manager_data()
+                .unwrap()
+                .area_resource_arrays()[4][17],
+            0x1234_5678
         );
     }
 
