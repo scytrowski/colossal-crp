@@ -50,6 +50,7 @@ pub struct WeatherManagerData {
     ground_wetness: Option<f32>,
     northern_lights_and_rainbow: Option<[f32; 4]>,
     version_276_compatibility: Option<Vec<u8>>,
+    version_276_compatibility_range: Option<Range<usize>>,
     lightning_strikes: Option<Vec<WeatherLightningStrike>>,
     wind_directions_range: Range<usize>,
     temperature_range: Option<Range<usize>>,
@@ -65,9 +66,10 @@ pub struct WeatherManagerData {
 
 /// Editor for WeatherManager height planes, scalar fields, and lightning records.
 ///
-/// The version-276 compatibility block and all other unedited source bytes are
-/// retained. From version 277, lightning records can be added or removed
-/// within the serialized byte-count limit.
+/// The raw version-276 compatibility block can be edited without assigning it
+/// a meaning. All other unedited source bytes are retained. From version 277,
+/// lightning records can be added or removed within the serialized byte-count
+/// limit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WeatherManagerEditor {
     data: WeatherManagerData,
@@ -164,6 +166,7 @@ impl WeatherManagerData {
         };
         let northern_lights_and_rainbow_range =
             (format_version >= 241).then_some(northern_lights_start..reader.offset());
+        let version_276_compatibility_start = reader.offset();
         let version_276_compatibility = if format_version == 276 {
             Some(
                 reader
@@ -173,6 +176,8 @@ impl WeatherManagerData {
         } else {
             None
         };
+        let version_276_compatibility_range =
+            (format_version == 276).then_some(version_276_compatibility_start..reader.offset());
         let lightning_strikes_start = reader.offset();
         let lightning_strikes_count_offset =
             (format_version >= LIGHTNING_VERSION).then_some(lightning_strikes_start);
@@ -234,6 +239,7 @@ impl WeatherManagerData {
                 ground_wetness,
                 northern_lights_and_rainbow,
                 version_276_compatibility,
+                version_276_compatibility_range,
                 lightning_strikes,
                 wind_directions_range,
                 temperature_range,
@@ -255,8 +261,8 @@ impl WeatherManagerData {
         self.format_version
     }
 
-    /// Creates an editor for the height planes and scalar fields present in
-    /// this source version.
+    /// Creates an editor for the height planes, scalar fields, and version-276
+    /// raw compatibility block present in this source version.
     pub fn into_editor(self) -> WeatherManagerEditor {
         WeatherManagerEditor { data: self }
     }
@@ -385,6 +391,12 @@ impl WeatherManagerEditor {
         self.data.northern_lights_and_rainbow.as_mut()
     }
 
+    /// Returns mutable access to the raw 36-byte compatibility block present
+    /// only at inner version 276. Its meaning is not modeled.
+    pub fn version_276_compatibility_mut(&mut self) -> Option<&mut [u8]> {
+        self.data.version_276_compatibility.as_deref_mut()
+    }
+
     /// Returns mutable lightning records without changing their count.
     pub fn lightning_strikes_mut(&mut self) -> Option<&mut [WeatherLightningStrike]> {
         self.data.lightning_strikes.as_deref_mut()
@@ -505,6 +517,12 @@ impl WeatherManagerEditor {
                 .map(|values| values.as_slice()),
             "northern lights and rainbow",
         )?;
+        encode_optional_bytes_range(
+            &mut bytes,
+            self.data.version_276_compatibility_range.as_ref(),
+            self.data.version_276_compatibility.as_deref(),
+            "version 276 compatibility",
+        )?;
         let lightning_replacement = encode_lightning_strikes(
             &mut bytes,
             self.data.lightning_strikes_count_offset,
@@ -611,6 +629,37 @@ fn encode_optional_f32_range(
 ) -> Result<(), CrpError> {
     match (range, values) {
         (Some(range), Some(values)) => write_f32_range(output, range, values, field_name),
+        (None, None) => Ok(()),
+        _ => Err(invalid(
+            0,
+            format!("WeatherManager {field_name} values and source range disagree"),
+        )),
+    }
+}
+
+fn encode_optional_bytes_range(
+    output: &mut [u8],
+    range: Option<&Range<usize>>,
+    values: Option<&[u8]>,
+    field_name: &str,
+) -> Result<(), CrpError> {
+    match (range, values) {
+        (Some(range), Some(values)) => {
+            if range.len() != values.len() {
+                return Err(invalid(
+                    range.start,
+                    format!("WeatherManager {field_name} source range has an invalid length"),
+                ));
+            }
+            let destination = output.get_mut(range.clone()).ok_or_else(|| {
+                invalid(
+                    range.start,
+                    format!("WeatherManager {field_name} range exceeds source body"),
+                )
+            })?;
+            destination.copy_from_slice(values);
+            Ok(())
+        }
         (None, None) => Ok(()),
         _ => Err(invalid(
             0,
@@ -1050,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn weather_editor_keeps_version_276_compatibility_bytes_opaque() {
+    fn weather_editor_edits_version_276_compatibility_bytes_raw() {
         let bytes = base_body(276);
         let (weather, consumed) = WeatherManagerData::decode_prefix(276, &bytes).unwrap();
         let mut editor = weather.into_editor();
@@ -1066,6 +1115,26 @@ mod tests {
         expected[308..312].copy_from_slice(&42.0_f32.to_bits().to_be_bytes());
         assert_eq!(editor.encode().unwrap(), expected);
         assert_eq!(&expected[328..364], &bytes[328..364]);
+
+        let compatibility = editor
+            .version_276_compatibility_mut()
+            .expect("version-276 raw compatibility block");
+        compatibility[0] = 0xa5;
+        compatibility[35] = 0x5a;
+        expected[328] = 0xa5;
+        expected[363] = 0x5a;
+        assert_eq!(editor.encode().unwrap(), expected);
+        let (decoded, _) = WeatherManagerData::decode_prefix(276, &expected).unwrap();
+        assert_eq!(
+            decoded.version_276_compatibility(),
+            Some(&expected[328..364])
+        );
+
+        let older_body = base_body(275);
+        let (older, _) = WeatherManagerData::decode_prefix(275, &older_body).unwrap();
+        let mut older_editor = older.into_editor();
+        assert!(older_editor.version_276_compatibility_mut().is_none());
+        assert_eq!(older_editor.encode().unwrap(), older_body);
     }
 
     #[test]

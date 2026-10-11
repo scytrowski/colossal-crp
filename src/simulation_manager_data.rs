@@ -6003,10 +6003,11 @@ impl SimulationManagerData {
     /// Replaces the version 69+ CitizenUnit fields at slot 7 while preserving
     /// the rest of the CitizenManager body byte-for-byte.
     ///
-    /// The edited manager must have the same unit flags and reference masks,
-    /// source version, body length, and unchanged bytes outside the unit-field
-    /// range. Existing masked references can change without shifting the
-    /// following instance arrays or manager tags.
+    /// The edited manager must preserve unit-slot activity and reference
+    /// masks, use the source version and body length, and leave bytes outside
+    /// the unit-field range unchanged. Only edits that retain the encoded
+    /// section width fit this fixed-range replacement. Existing masked
+    /// references can change without shifting following arrays or tags.
     pub fn replace_citizen_manager_unit_fields(
         &mut self,
         edited: &CitizenManagerData,
@@ -6021,7 +6022,14 @@ impl SimulationManagerData {
         expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
 
         let (current, manager_end) = self.decode_citizen_manager_data()?;
-        let same_unit_layout = edited.units().unit_flags() == current.units().unit_flags()
+        let same_unit_layout = edited.units().unit_flags().len()
+            == current.units().unit_flags().len()
+            && edited
+                .units()
+                .unit_flags()
+                .iter()
+                .zip(current.units().unit_flags())
+                .all(|(edited, current)| (*edited == 0) == (*current == 0))
             && edited.units().active_units().len() == current.units().active_units().len()
             && edited
                 .units()
@@ -6030,7 +6038,7 @@ impl SimulationManagerData {
                 .zip(current.units().active_units())
                 .all(|(edited, current)| {
                     edited.index() == current.index()
-                        && edited.flags() == current.flags()
+                        && (edited.flags() == 0) == (current.flags() == 0)
                         && edited.reference_mask() == current.reference_mask()
                 });
         if !same_unit_layout {
@@ -6106,10 +6114,10 @@ impl SimulationManagerData {
 
     /// Replaces the complete version 69+ CitizenUnit section at slot 7.
     ///
-    /// This accepts same-width reference edits and goods-column edits that
-    /// resize the encoded section. Unit flags and reference masks must match
-    /// the destination; citizen and instance bytes outside the unit section
-    /// must remain unchanged.
+    /// This accepts same-width reference edits and flag or goods edits that
+    /// may resize the encoded section. Unit-slot activity and reference masks
+    /// must match the destination; citizen and instance bytes outside the
+    /// unit section must remain unchanged.
     pub fn replace_citizen_manager_units(
         &mut self,
         edited: &CitizenManagerData,
@@ -6124,7 +6132,14 @@ impl SimulationManagerData {
         expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
 
         let (current, manager_end) = self.decode_citizen_manager_data()?;
-        let same_unit_layout = edited.units().unit_flags() == current.units().unit_flags()
+        let same_unit_layout = edited.units().unit_flags().len()
+            == current.units().unit_flags().len()
+            && edited
+                .units()
+                .unit_flags()
+                .iter()
+                .zip(current.units().unit_flags())
+                .all(|(edited, current)| (*edited == 0) == (*current == 0))
             && edited.units().active_units().len() == current.units().active_units().len()
             && edited
                 .units()
@@ -6133,7 +6148,7 @@ impl SimulationManagerData {
                 .zip(current.units().active_units())
                 .all(|(edited, current)| {
                     edited.index() == current.index()
-                        && edited.flags() == current.flags()
+                        && (edited.flags() == 0) == (current.flags() == 0)
                         && edited.reference_mask() == current.reference_mask()
                 });
         if !same_unit_layout {
@@ -20160,6 +20175,55 @@ mod manager_boundary_tests {
     }
 
     #[test]
+    fn weather_manager_version_276_raw_edit_preserves_vehicle_boundary() {
+        let mut graph = profiler_tag("WeatherManager");
+        graph.extend([0xff; 2 * 128]);
+        for _ in 0..18 {
+            graph.extend_from_slice(&0.0_f32.to_bits().to_be_bytes());
+        }
+        let compatibility_start = graph.len();
+        graph.extend(0_u8..36);
+        graph.extend_from_slice(&[0x00, 0x10]);
+        graph.extend(profiler_tag("VehicleManager"));
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 276;
+        let mut manager_objects = vec![None; 18];
+        manager_objects[16] = Some(ManagerObjectReference {
+            object_id: 16,
+            type_name: "WeatherManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let (_, original_vehicle_start) = manager.decode_weather_manager_data().unwrap();
+        let mut editor = manager.decode_weather_manager_editor().unwrap();
+        let compatibility = editor.version_276_compatibility_mut().unwrap();
+        compatibility[0] = 0xa5;
+        compatibility[35] = 0x5a;
+        let mut expected = original_graph.clone();
+        expected[compatibility_start] = 0xa5;
+        expected[compatibility_start + 35] = 0x5a;
+
+        manager.replace_weather_manager_data(&editor).unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected);
+        let (decoded, vehicle_start) = manager.decode_weather_manager_data().unwrap();
+        assert_eq!(vehicle_start, original_vehicle_start);
+        assert_eq!(
+            decoded.version_276_compatibility(),
+            Some(&expected[compatibility_start..compatibility_start + 36])
+        );
+        assert!(
+            manager.serialized_object_graph()[vehicle_start..]
+                .starts_with(&profiler_tag("VehicleManager"))
+        );
+    }
+
+    #[test]
     fn weather_manager_lightning_edit_resizes_body_and_preserves_vehicle_boundary() {
         let mut graph = profiler_tag("WeatherManager");
         let body_start = graph.len();
@@ -21307,20 +21371,32 @@ mod manager_boundary_tests {
 
         let (mut edited, original_end) = manager.decode_citizen_manager_data().unwrap();
         assert_eq!(edited.units().active_units()[0].goods(), 0);
+        edited
+            .set_unit_flag_bits(0, 2)
+            .expect("change active unit flag bits");
         edited.set_unit_goods(0, 0x1234).unwrap();
 
         let mut expected_body = body.clone();
-        let goods_start = 1_048_575_usize.div_ceil(128) + unit_flags.len() + 1;
+        let mut expected_unit_flags = vec![2, 0, 2, 0, 0, 0, 0];
+        expected_unit_flags.extend(vec![0xff; 4095]);
+        expected_unit_flags.push(0xfb);
+        let citizen_flags_len = 1_048_575_usize.div_ceil(128);
+        expected_body.splice(
+            citizen_flags_len..citizen_flags_len + unit_flags.len(),
+            expected_unit_flags.clone(),
+        );
+        let goods_start = citizen_flags_len + expected_unit_flags.len() + 1;
         expected_body.splice(goods_start..goods_start + 1, [0, 0x12, 0x34]);
         assert_eq!(edited.encode(), expected_body);
-        assert_eq!(expected_body.len(), body.len() + 2);
+        assert_eq!(expected_body.len(), body.len() - 120);
 
         manager
             .replace_citizen_manager_units(&edited)
-            .expect("replace resized CitizenUnit section");
+            .expect("replace resized CitizenUnit flag and goods columns");
         let (updated, updated_end) = manager.decode_citizen_manager_data().unwrap();
+        assert_eq!(updated.units().unit_flags()[0], 2);
         assert_eq!(updated.units().active_units()[0].goods(), 0x1234);
-        assert_eq!(updated_end, original_end + 2);
+        assert_eq!(updated_end, original_end - 120);
         assert_eq!(updated.encode(), expected_body);
         assert!(manager.serialized_object_graph()[updated_end..].starts_with(&transfer_tag));
     }

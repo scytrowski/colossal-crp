@@ -638,6 +638,25 @@ fn shift_offset(
     }
 }
 
+fn shift_range(
+    range: &Range<usize>,
+    old_len: usize,
+    new_len: usize,
+    threshold: usize,
+    name: &str,
+) -> Result<Range<usize>, CrpError> {
+    if range.start > range.end {
+        return Err(invalid(
+            range.start,
+            format!("{name} byte range is invalid"),
+        ));
+    }
+    Ok(
+        shift_offset(range.start, old_len, new_len, threshold, name)?
+            ..shift_offset(range.end, old_len, new_len, threshold, name)?,
+    )
+}
+
 fn shift_manager_offset(
     value: usize,
     old_prefix_len: usize,
@@ -847,13 +866,16 @@ impl CitizenUnitRecord {
 /// The exact source bytes are retained for unchanged writing. The supplied
 /// map corpus contains no active units; nonzero records have synthetic
 /// expected-byte tests only. Pre-69 reference selection from the flag bits is
-/// not exposed by this reader. Existing references selected by the mask can
-/// be edited without changing the mask, goods column, or record widths. The
-/// sparse goods values can also be edited by re-encoding only their column.
+/// not exposed by this reader. Raw flag bits can be edited while preserving
+/// each slot's active state; re-encoding may resize the flag array and shifts
+/// later reference and goods offsets. Existing masked references can be
+/// edited without changing the mask or record widths. Sparse goods values can
+/// also be edited by re-encoding only their column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CitizenUnitDataPrefix {
     format_version: u32,
     unit_flags: Vec<u16>,
+    unit_flags_range: Range<usize>,
     active_units: Vec<CitizenUnitRecord>,
     goods_range: Range<usize>,
     serialized_prefix: Vec<u8>,
@@ -887,6 +909,7 @@ impl CitizenUnitDataPrefix {
 
         let mut reader = Reader::new(bytes);
         let unit_flags = read_encoded_ushort_array(&mut reader, flag_count)?;
+        let unit_flags_range = 0..reader.offset();
         let mut active_units = Vec::new();
         for (offset, flags) in unit_flags.iter().copied().enumerate() {
             if flags == 0 {
@@ -937,6 +960,7 @@ impl CitizenUnitDataPrefix {
             Self {
                 format_version,
                 unit_flags,
+                unit_flags_range,
                 active_units,
                 goods_range,
                 serialized_prefix: bytes[..consumed].to_vec(),
@@ -953,6 +977,101 @@ impl CitizenUnitDataPrefix {
     /// Returns all 524,287 serialized flags for one-based unit slots.
     pub fn unit_flags(&self) -> &[u16] {
         &self.unit_flags
+    }
+
+    /// Replaces the raw bits in one serialized unit flag while preserving
+    /// whether that slot is active. Index zero represents serialized unit
+    /// slot one. Re-encoding can change the flag-array length, so following
+    /// reference and goods offsets are adjusted. Flag meanings remain opaque.
+    pub fn set_unit_flag_bits(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        let current = *self
+            .unit_flags
+            .get(index)
+            .ok_or_else(|| invalid(index, "CitizenUnit flag index is out of range"))?;
+        if current == value {
+            return Ok(());
+        }
+        if (current == 0) != (value == 0) {
+            return Err(invalid(
+                index,
+                "CitizenUnit flag edits must preserve the slot's active state",
+            ));
+        }
+
+        let slot_number = u32::try_from(
+            index
+                .checked_add(1)
+                .ok_or(CrpError::ArithmeticOverflow("CitizenUnit slot index"))?,
+        )
+        .map_err(|_| CrpError::ArithmeticOverflow("CitizenUnit slot index"))?;
+        let active_index = self
+            .active_units
+            .iter()
+            .position(|unit| unit.index == slot_number)
+            .ok_or_else(|| invalid(index, "active CitizenUnit record is missing for flag"))?;
+
+        let range = self.unit_flags_range.clone();
+        if range.start > range.end || range.end > self.serialized_prefix.len() {
+            return Err(invalid(
+                range.start,
+                "CitizenUnit flag byte range is invalid",
+            ));
+        }
+        let mut flags = self.unit_flags.clone();
+        flags[index] = value;
+        let mut encoded = Vec::new();
+        write_encoded_ushort_array(&mut encoded, &flags);
+        let new_end = range
+            .start
+            .checked_add(encoded.len())
+            .ok_or(CrpError::ArithmeticOverflow("CitizenUnit flag array end"))?;
+        let old_len = range.end - range.start;
+        let retained_len = self
+            .serialized_prefix
+            .len()
+            .checked_sub(old_len)
+            .ok_or(CrpError::ArithmeticOverflow("CitizenUnit flag replacement"))?;
+        let new_len = retained_len
+            .checked_add(encoded.len())
+            .ok_or(CrpError::ArithmeticOverflow("CitizenUnit flag replacement"))?;
+        let mut replacement = Vec::with_capacity(new_len);
+        replacement.extend_from_slice(&self.serialized_prefix[..range.start]);
+        replacement.extend_from_slice(&encoded);
+        replacement.extend_from_slice(&self.serialized_prefix[range.end..]);
+
+        let mut active_units = self.active_units.clone();
+        for unit in &mut active_units {
+            for offset in unit
+                .citizen_offsets
+                .iter_mut()
+                .chain(std::iter::once(&mut unit.next_unit_offset))
+            {
+                if let Some(offset) = offset {
+                    *offset = shift_offset(
+                        *offset,
+                        old_len,
+                        encoded.len(),
+                        range.end,
+                        "CitizenUnit references",
+                    )?;
+                }
+            }
+        }
+        active_units[active_index].flags = value;
+        let goods_range = shift_range(
+            &self.goods_range,
+            old_len,
+            encoded.len(),
+            range.end,
+            "CitizenUnit goods",
+        )?;
+
+        self.serialized_prefix = replacement;
+        self.unit_flags = flags;
+        self.unit_flags_range = range.start..new_end;
+        self.active_units = active_units;
+        self.goods_range = goods_range;
+        Ok(())
     }
 
     /// Returns active units in ascending buffer-index order.
@@ -1925,6 +2044,15 @@ impl CitizenManagerData {
         )
     }
 
+    /// Replaces raw bits in one serialized CitizenUnit flag while preserving
+    /// its zero/nonzero active state. Index zero represents serialized slot
+    /// one. Re-encoding may resize the unit section and updates later offsets.
+    pub fn set_unit_flag_bits(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        let mut prefix = self.unit_prefix.clone();
+        prefix.set_unit_flag_bits(index, value)?;
+        self.replace_unit_prefix(prefix)
+    }
+
     /// Replaces one active CitizenUnit goods value.
     ///
     /// `unit_index` is zero-based among active units. Re-encoding the goods
@@ -1938,7 +2066,12 @@ impl CitizenManagerData {
 
     fn replace_unit_prefix(&mut self, prefix: CitizenUnitDataPrefix) -> Result<(), CrpError> {
         if prefix.format_version != self.format_version
-            || prefix.unit_flags != self.unit_prefix.unit_flags
+            || prefix.unit_flags.len() != self.unit_prefix.unit_flags.len()
+            || !prefix
+                .unit_flags
+                .iter()
+                .zip(&self.unit_prefix.unit_flags)
+                .all(|(edited, current)| (*edited == 0) == (*current == 0))
             || prefix.active_units.len() != self.unit_prefix.active_units.len()
             || !prefix
                 .active_units
@@ -1946,7 +2079,7 @@ impl CitizenManagerData {
                 .zip(&self.unit_prefix.active_units)
                 .all(|(edited, current)| {
                     edited.index == current.index
-                        && edited.flags == current.flags
+                        && (edited.flags == 0) == (current.flags == 0)
                         && edited.reference_mask == current.reference_mask
                 })
         {
@@ -3000,6 +3133,9 @@ mod tests {
             .set_citizen_wellbeing(63, 0x32)
             .expect("resize wellbeing column");
         decoded
+            .set_unit_flag_bits(0, 2)
+            .expect("resize CitizenUnit flags");
+        decoded
             .set_unit_goods(0, 0x7777)
             .expect("resize unit goods column");
         decoded
@@ -3016,6 +3152,7 @@ mod tests {
             reread.units().active_units()[0].citizens()[0],
             Some(0x00ab_cdef)
         );
+        assert_eq!(reread.units().unit_flags()[0], 2);
         assert_eq!(reread.units().active_units()[0].goods(), 0x7777);
         assert_eq!(reread.active_instances()[0].position(), [21.0, 22.0, 23.0]);
         assert_eq!(reread.end_profiler_reference(), [0x12, 0x34]);
@@ -3136,6 +3273,52 @@ mod tests {
         assert!(edited.set_next_unit_reference(1, 9).is_err());
         assert!(edited.set_next_unit_reference(0, 0x0100_0000).is_err());
         assert_eq!(edited.encode(), expected);
+    }
+
+    #[test]
+    fn edits_unit_flag_bits_and_shifts_following_unit_fields() {
+        let mut bytes = vec![1, 0, 1, 0, 1, 0x81]; // four active flags, all equal to one
+        for value in [1_u32, 2, 3, 4] {
+            bytes.extend_from_slice(&[1]); // first citizen reference present
+            bytes.extend_from_slice(&value.to_be_bytes()[1..]);
+        }
+        bytes.push(0x83); // four zero goods values
+
+        let (mut decoded, consumed) =
+            CitizenUnitDataPrefix::decode_prefix_with_count(69, 4, &bytes)
+                .expect("valid synthetic CitizenUnit prefix");
+        assert_eq!(consumed, bytes.len());
+        let original = decoded.encode();
+        decoded
+            .set_unit_flag_bits(2, 1)
+            .expect("unchanged unit flag is a no-op");
+        assert_eq!(decoded.encode(), original);
+        assert!(decoded.set_unit_flag_bits(4, 2).is_err());
+        assert!(decoded.set_unit_flag_bits(1, 0).is_err());
+        assert_eq!(decoded.encode(), original);
+
+        decoded
+            .set_unit_flag_bits(1, 2)
+            .expect("edit second serialized unit flag");
+        assert_eq!(decoded.unit_flags(), [1, 2, 1, 1]);
+        assert_eq!(decoded.active_units().len(), 4);
+        assert_eq!(decoded.active_units()[1].flags(), 2);
+        assert_eq!(decoded.active_units()[1].reference_mask(), 1);
+        decoded
+            .set_citizen_reference(0, 0, 0x00a1_b2c3)
+            .expect("reference offsets follow resized flag array");
+        decoded
+            .set_goods(3, 7)
+            .expect("goods range follows resized flags");
+
+        let mut expected = vec![3, 0, 1, 0, 2, 0, 1, 0, 1];
+        expected.extend_from_slice(&[
+            1, 0xa1, 0xb2, 0xc3, // first unit's updated citizen reference
+            1, 0, 0, 2, // remaining masked references
+            1, 0, 0, 3, 1, 0, 0, 4, 0x82, 0, 0,
+            7, // three zero goods values and the edited fourth value
+        ]);
+        assert_eq!(decoded.encode(), expected);
     }
 
     #[test]
