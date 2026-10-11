@@ -101,9 +101,13 @@ pub struct WaterManagerData {
     heating_pulse_units_offset: Option<usize>,
     water_node_pulse_groups: Vec<u16>,
     water_node_pressure: Vec<u16>,
+    water_node_pressure_range: (usize, usize),
+    original_water_node_pressure: Vec<u16>,
     water_node_extra_pressure: Vec<u16>,
     sewage_node_pulse_groups: Vec<u16>,
     sewage_node_pressure: Vec<u16>,
+    sewage_node_pressure_range: (usize, usize),
+    original_sewage_node_pressure: Vec<u16>,
     sewage_node_extra_pressure: Vec<u16>,
     heating_node_pulse_groups: Option<Vec<u16>>,
     heating_node_pressure: Option<Vec<u16>>,
@@ -231,11 +235,17 @@ impl WaterManagerData {
         };
         let water_node_pulse_groups =
             read_node_ushort_array(&mut reader, stored_node_count, u16::MAX)?;
+        let water_node_pressure_start = reader.offset();
         let water_node_pressure = read_node_ushort_array(&mut reader, stored_node_count, 0)?;
+        let water_node_pressure_end = reader.offset();
+        let original_water_node_pressure = water_node_pressure[..stored_node_count].to_vec();
         let water_node_extra_pressure = read_node_ushort_array(&mut reader, stored_node_count, 0)?;
         let sewage_node_pulse_groups =
             read_node_ushort_array(&mut reader, stored_node_count, u16::MAX)?;
+        let sewage_node_pressure_start = reader.offset();
         let sewage_node_pressure = read_node_ushort_array(&mut reader, stored_node_count, 0)?;
+        let sewage_node_pressure_end = reader.offset();
+        let original_sewage_node_pressure = sewage_node_pressure[..stored_node_count].to_vec();
         let sewage_node_extra_pressure = read_node_ushort_array(&mut reader, stored_node_count, 0)?;
         let (heating_node_pulse_groups, heating_node_pressure, heating_node_extra_pressure) =
             if format_version >= HEATING_VERSION {
@@ -335,9 +345,13 @@ impl WaterManagerData {
             heating_pulse_units_offset,
             water_node_pulse_groups,
             water_node_pressure,
+            water_node_pressure_range: (water_node_pressure_start, water_node_pressure_end),
+            original_water_node_pressure,
             water_node_extra_pressure,
             sewage_node_pulse_groups,
             sewage_node_pressure,
+            sewage_node_pressure_range: (sewage_node_pressure_start, sewage_node_pressure_end),
+            original_sewage_node_pressure,
             sewage_node_extra_pressure,
             heating_node_pulse_groups,
             heating_node_pressure,
@@ -647,6 +661,27 @@ impl WaterManagerData {
         &self.water_node_pressure
     }
 
+    /// Replaces one stored water node pressure. The serialized prefix contains
+    /// 16,384 nodes before inner version 202 and all 32,768 nodes from version
+    /// 202 onward.
+    pub fn set_water_node_pressure(&mut self, node: usize, pressure: u16) -> Result<(), CrpError> {
+        let stored_node_count = stored_node_count(self.format_version);
+        if node >= stored_node_count {
+            return Err(invalid_node_pressure(
+                node,
+                "water node-pressure index is outside the stored prefix",
+            ));
+        }
+        let Some(value) = self.water_node_pressure.get_mut(node) else {
+            return Err(invalid_node_pressure(
+                node,
+                "water node-pressure index is outside the decoded grid",
+            ));
+        };
+        *value = pressure;
+        Ok(())
+    }
+
     /// Returns all 32,768 extra water node pressures.
     pub fn water_node_extra_pressure(&self) -> &[u16] {
         &self.water_node_extra_pressure
@@ -660,6 +695,27 @@ impl WaterManagerData {
     /// Returns all 32,768 current sewage node pressures.
     pub fn sewage_node_pressure(&self) -> &[u16] {
         &self.sewage_node_pressure
+    }
+
+    /// Replaces one stored sewage node pressure. The serialized prefix contains
+    /// 16,384 nodes before inner version 202 and all 32,768 nodes from version
+    /// 202 onward.
+    pub fn set_sewage_node_pressure(&mut self, node: usize, pressure: u16) -> Result<(), CrpError> {
+        let stored_node_count = stored_node_count(self.format_version);
+        if node >= stored_node_count {
+            return Err(invalid_node_pressure(
+                node,
+                "sewage node-pressure index is outside the stored prefix",
+            ));
+        }
+        let Some(value) = self.sewage_node_pressure.get_mut(node) else {
+            return Err(invalid_node_pressure(
+                node,
+                "sewage node-pressure index is outside the decoded grid",
+            ));
+        };
+        *value = pressure;
+        Ok(())
     }
 
     /// Returns all 32,768 extra sewage node pressures.
@@ -808,12 +864,12 @@ impl WaterManagerData {
         self.original_body.clone()
     }
 
-    /// Encodes edited pulse records, collect-pressure arrays, counters, and
-    /// the continuation flag while preserving all unedited bytes, including
-    /// encoded grids, guide references, and the closing profiler reference.
-    /// Changed collect-pressure arrays use the canonical UShort encoding and
-    /// may change body length. Returns an error if a captured field range is
-    /// invalid.
+    /// Encodes edited pulse records, water and sewage node-pressure arrays,
+    /// collect-pressure arrays, counters, and the continuation flag while
+    /// preserving all unedited bytes, including conductivity grids, guide
+    /// references, and the closing profiler reference. Changed pressure arrays
+    /// use the canonical UShort encoding and may change body length. Returns an
+    /// error if a captured field range is invalid.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.original_body.clone();
         encode_pulse_groups(
@@ -904,6 +960,26 @@ impl WaterManagerData {
             .copy_from_slice(&[u8::from(self.can_continue)]);
         let stored_node_count = stored_node_count(self.format_version);
         let mut replacements = Vec::new();
+        let (start, end) = self.water_node_pressure_range;
+        if let Some(encoded) = changed_ushort_array(
+            &self.water_node_pressure,
+            Some(&self.original_water_node_pressure),
+            stored_node_count,
+            start,
+            "water node pressure",
+        )? {
+            replacements.push((start, end, encoded));
+        }
+        let (start, end) = self.sewage_node_pressure_range;
+        if let Some(encoded) = changed_ushort_array(
+            &self.sewage_node_pressure,
+            Some(&self.original_sewage_node_pressure),
+            stored_node_count,
+            start,
+            "sewage node pressure",
+        )? {
+            replacements.push((start, end, encoded));
+        }
         if let Some((start, end)) = self.collect_water_pressure_range {
             if let Some(encoded) = changed_ushort_array(
                 &self.collect_water_pressure,
@@ -957,6 +1033,14 @@ fn invalid_pulse_unit(offset: usize, reason: &str) -> CrpError {
 }
 
 fn invalid_collect_pressure(offset: usize, reason: &str) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "WaterManager+Data".to_owned(),
+        offset,
+        reason: reason.to_owned(),
+    }
+}
+
+fn invalid_node_pressure(offset: usize, reason: &str) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "WaterManager+Data".to_owned(),
         offset,
@@ -1440,7 +1524,11 @@ mod tests {
         [group[0], group[1], node[0], node[1], unit.x, unit.z]
     }
 
-    fn expected_collect_pressure_array(count: usize, first: u16, second: u16) -> Vec<u8> {
+    fn expected_ushort_array_with_two_nonzero_values(
+        count: usize,
+        first: u16,
+        second: u16,
+    ) -> Vec<u8> {
         let mut bytes = vec![3]; // Four literal UShort values.
         bytes.extend_from_slice(&first.to_be_bytes());
         bytes.extend_from_slice(&second.to_be_bytes());
@@ -1759,13 +1847,15 @@ mod tests {
             assert_eq!(data.encode().unwrap(), body);
             let mut expected = body.clone();
             let water_range = data.collect_water_pressure_range.unwrap();
-            let water_bytes = expected_collect_pressure_array(NODE_COUNT, 0x3210, 0x4567);
+            let water_bytes =
+                expected_ushort_array_with_two_nonzero_values(NODE_COUNT, 0x3210, 0x4567);
             let mut replacements = vec![(water_range, water_bytes)];
             data.set_collect_water_pressure(1, 0x4567).unwrap();
 
             if version >= 272 {
                 let sewage_range = data.collect_sewage_pressure_range.unwrap();
-                let sewage_bytes = expected_collect_pressure_array(NODE_COUNT, 0x4567, 0x789a);
+                let sewage_bytes =
+                    expected_ushort_array_with_two_nonzero_values(NODE_COUNT, 0x4567, 0x789a);
                 replacements.push((sewage_range, sewage_bytes));
                 data.set_collect_sewage_pressure(1, 0x789a).unwrap();
             } else {
@@ -1791,6 +1881,46 @@ mod tests {
 
         let mut legacy_bool = WaterManagerData::decode(270, &active_body(270)).unwrap();
         assert!(legacy_bool.set_collect_water_pressure(0, 0x1234).is_err());
+    }
+
+    #[test]
+    fn water_and_sewage_node_pressure_edits_reencode_only_selected_arrays() {
+        let body = active_body(265);
+        let mut data = WaterManagerData::decode(265, &body).unwrap();
+        assert_eq!(data.encode().unwrap(), body);
+        let mut expected = body.clone();
+        let mut replacements = vec![
+            (
+                data.water_node_pressure_range,
+                expected_ushort_array_with_two_nonzero_values(NODE_COUNT, 0x1234, 0x4567),
+            ),
+            (
+                data.sewage_node_pressure_range,
+                expected_ushort_array_with_two_nonzero_values(NODE_COUNT, 0x25, 0x789a),
+            ),
+        ];
+        data.set_water_node_pressure(1, 0x4567).unwrap();
+        data.set_sewage_node_pressure(1, 0x789a).unwrap();
+        replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in replacements.into_iter().rev() {
+            expected.splice(start..end, replacement);
+        }
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = WaterManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.water_node_pressure()[0], 0x1234);
+        assert_eq!(decoded.water_node_pressure()[1], 0x4567);
+        assert_eq!(decoded.sewage_node_pressure()[0], 0x25);
+        assert_eq!(decoded.sewage_node_pressure()[1], 0x789a);
+        assert!(data.set_water_node_pressure(NODE_COUNT, 1).is_err());
+
+        let mut legacy = WaterManagerData::decode(201, &empty_body(201)).unwrap();
+        assert!(
+            legacy
+                .set_water_node_pressure(LEGACY_NODE_COUNT, 1)
+                .is_err()
+        );
     }
 
     #[test]
