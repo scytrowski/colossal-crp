@@ -5197,11 +5197,12 @@ impl SimulationManagerData {
         Ok(trees.into_editor())
     }
 
-    /// Replaces existing TreeManager tree values in the serialized graph.
+    /// Replaces TreeManager values in the serialized graph.
     ///
     /// The editor must come from the current manager body and inner version.
-    /// Tree slots and record counts remain fixed, and the following manager
-    /// boundary is revalidated. Re-encoded array columns can change graph length.
+    /// Tree slots and their count remain fixed. From inner version 266, the
+    /// burning-tree list can change count up to the tree-buffer capacity. The
+    /// following manager boundary is revalidated after replacement.
     pub fn replace_tree_manager_data(
         &mut self,
         edited: &TreeManagerEditor,
@@ -18888,7 +18889,7 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn tree_manager_editor_replaces_burning_records_without_moving_weather_boundary() {
+    fn tree_manager_editor_resizes_burning_records_at_weather_boundary() {
         let mut tree_body = Vec::new();
         write_encoded_ushort_array(&mut tree_body, &vec![0; 262_143]);
         tree_body.extend_from_slice(&[0, 0]); // Empty prefab-name scope.
@@ -18915,25 +18916,29 @@ mod manager_boundary_tests {
         manager.manager_objects = Some(manager_objects);
 
         let original_graph = manager.serialized_object_graph().to_vec();
+        let original_graph_len = original_graph.len();
         let mut editor = manager.decode_tree_manager_editor().unwrap();
-        let records = editor.burning_trees_mut().unwrap();
-        records[0].tree_index = 0x01_0203;
-        records[0].fire_intensity = 9;
-        records[1].fire_damage = 10;
+        editor.burning_trees_mut().unwrap()[0].tree_index = 0x01_0203;
+        editor.burning_trees_mut().unwrap()[0].fire_intensity = 9;
+        let remaining_records = editor.burning_trees_mut().unwrap()[..1].to_vec();
+        editor.set_burning_trees(remaining_records).unwrap();
         manager.replace_tree_manager_data(&editor).unwrap();
 
         let mut expected_graph = original_graph;
         let record_start = body_start + tree_body.len() - 10;
-        expected_graph[record_start..record_start + 5].copy_from_slice(&[1, 2, 3, 9, 4]);
-        expected_graph[record_start + 9] = 10;
+        expected_graph.splice(
+            record_start - 3..record_start + 10,
+            [0, 0, 1, 1, 2, 3, 9, 4],
+        );
         assert_eq!(manager.serialized_object_graph(), expected_graph);
         assert_eq!(
             manager.serialized_object_graph().len(),
-            expected_graph.len()
+            original_graph_len - 5
         );
         let (updated, next_start) = manager.decode_tree_manager_prefix().unwrap();
         assert_eq!(updated.burning_trees().unwrap()[0].tree_index, 0x01_0203);
-        assert_eq!(updated.burning_trees().unwrap()[1].fire_damage, 10);
+        assert_eq!(updated.burning_trees().unwrap()[0].fire_intensity, 9);
+        assert_eq!(updated.burning_trees().unwrap().len(), 1);
         assert!(
             manager.serialized_object_graph()[next_start..]
                 .starts_with(&profiler_tag("WeatherManager"))

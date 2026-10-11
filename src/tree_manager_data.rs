@@ -48,9 +48,10 @@ pub struct TreeManagerDataPrefix {
 
 /// Editor for existing active trees and burning-tree records.
 ///
-/// Tree slots and record counts remain unchanged. Changed `EncodedArray.UShort`
-/// columns use the canonical encoding; unchanged columns and all other bytes
-/// retain their source representation.
+/// Tree slots and their count remain unchanged. Burning-tree records from
+/// version 266 can be replaced as a list. Changed `EncodedArray.UShort` columns
+/// use the canonical encoding; unchanged columns and all other bytes retain
+/// their source representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeManagerEditor {
     data: TreeManagerDataPrefix,
@@ -204,11 +205,34 @@ impl TreeManagerEditor {
         self.data.burning_trees.as_deref_mut()
     }
 
+    /// Replaces the burning-tree list from inner version 266.
+    ///
+    /// The list can contain at most 262,143 records, matching the serialized
+    /// tree buffer. Record indexes must fit in 24 bits when encoded. Returns an
+    /// error for versions before 266 or for a list larger than the tree buffer.
+    pub fn set_burning_trees(&mut self, records: Vec<BurningTreeRecord>) -> Result<(), CrpError> {
+        if self.data.burning_trees.is_none() {
+            return Err(invalid_tree_manager(
+                0,
+                "burning-tree records are unavailable before inner version 266",
+            ));
+        }
+        if records.len() > TREE_CAPACITY - 1 {
+            return Err(invalid_tree_manager(
+                0,
+                "burning tree count exceeds the tree buffer capacity",
+            ));
+        }
+        self.data.burning_trees = Some(records);
+        Ok(())
+    }
+
     /// Writes edited fields while retaining unchanged source bytes.
     ///
     /// Changing prefab indexes or positions re-encodes only the affected
     /// `EncodedArray.UShort` column. That column may change length. Burning-tree
-    /// records remain fixed-width, and tree slots and record counts cannot change.
+    /// records use fixed-width fields, and their list can be replaced from
+    /// version 266. Tree slots and their count cannot change.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.data.serialized_prefix.clone();
         if self.data.trees.len() != self.original_trees.len() {
@@ -296,12 +320,43 @@ impl TreeManagerEditor {
             self.data.burning_trees.as_deref(),
             self.data.burning_trees_range.as_ref(),
         ) {
-            let expected_len = records
+            let count_start = range.start.checked_sub(3).ok_or_else(|| {
+                invalid_tree_manager(range.start, "burning-tree count precedes the data prefix")
+            })?;
+            let replacement_range = count_start..range.end;
+            validate_range(
+                &bytes,
+                &replacement_range,
+                replacement_range.len(),
+                "burning-tree count and records",
+            )?;
+            if range.len() % 5 != 0 {
+                return Err(invalid_tree_manager(
+                    range.start,
+                    "burning-tree record byte range is not a multiple of five",
+                ));
+            }
+            let source_count = (usize::from(bytes[count_start]) << 16)
+                | (usize::from(bytes[count_start + 1]) << 8)
+                | usize::from(bytes[count_start + 2]);
+            if source_count != range.len() / 5 {
+                return Err(invalid_tree_manager(
+                    count_start,
+                    "burning-tree count does not match its source record bytes",
+                ));
+            }
+            let records_len = records
                 .len()
                 .checked_mul(5)
                 .ok_or(CrpError::ArithmeticOverflow("burning tree record bytes"))?;
-            validate_range(&bytes, range, expected_len, "burning-tree records")?;
-            let mut encoded_records = Vec::with_capacity(expected_len);
+            let encoded_count = u32::try_from(records.len())
+                .map_err(|_| CrpError::ArithmeticOverflow("burning tree count"))?;
+            let mut encoded_records = Vec::with_capacity(3 + records_len);
+            encoded_records.extend_from_slice(&[
+                (encoded_count >> 16) as u8,
+                (encoded_count >> 8) as u8,
+                encoded_count as u8,
+            ]);
             for record in records {
                 if record.tree_index > 0x00ff_ffff {
                     return Err(invalid_tree_manager(
@@ -317,8 +372,8 @@ impl TreeManagerEditor {
                     record.fire_damage,
                 ]);
             }
-            if bytes.get(range.clone()) != Some(encoded_records.as_slice()) {
-                replacements.push((range.clone(), encoded_records));
+            if bytes.get(replacement_range.clone()) != Some(encoded_records.as_slice()) {
+                replacements.push((replacement_range, encoded_records));
             }
         }
 
@@ -394,7 +449,7 @@ fn invalid_tree_manager(offset: usize, reason: impl Into<String>) -> CrpError {
 
 #[cfg(test)]
 mod tests {
-    use super::TreeManagerDataPrefix;
+    use super::{BurningTreeRecord, TREE_CAPACITY, TreeManagerDataPrefix};
     use crate::data_serializer::write_u24_be;
     use crate::encoded_array::write_encoded_ushort_array;
 
@@ -497,6 +552,73 @@ mod tests {
         let (updated, _) = TreeManagerDataPrefix::decode_prefix(266, &expected).unwrap();
         assert_eq!(updated.burning_trees().unwrap()[0].tree_index, 0x02_3456);
         assert_eq!(updated.burning_trees().unwrap()[1].fire_damage, 19);
+    }
+
+    #[test]
+    fn burning_tree_editor_grows_and_shrinks_the_record_list() {
+        let mut source = empty_prefix(266);
+        let count_offset = source.len() - 3;
+        source[count_offset..].copy_from_slice(&[0, 0, 1]);
+        write_u24_be(&mut source, 7).unwrap();
+        source.extend_from_slice(&[8, 9]);
+
+        let (tree_manager, _) = TreeManagerDataPrefix::decode_prefix(266, &source).unwrap();
+        let mut grow_editor = tree_manager.into_editor();
+        grow_editor
+            .set_burning_trees(vec![
+                BurningTreeRecord {
+                    tree_index: 7,
+                    fire_intensity: 8,
+                    fire_damage: 9,
+                },
+                BurningTreeRecord {
+                    tree_index: 0x01_0203,
+                    fire_intensity: 10,
+                    fire_damage: 11,
+                },
+            ])
+            .unwrap();
+
+        let mut expected_grown = source;
+        expected_grown.splice(count_offset.., [0, 0, 2, 0, 0, 7, 8, 9, 1, 2, 3, 10, 11]);
+        assert_eq!(grow_editor.encode().unwrap(), expected_grown);
+
+        let (grown, _) = TreeManagerDataPrefix::decode_prefix(266, &expected_grown).unwrap();
+        let mut shrink_editor = grown.into_editor();
+        shrink_editor.set_burning_trees(Vec::new()).unwrap();
+        let mut expected_shrunk = expected_grown;
+        expected_shrunk.truncate(count_offset);
+        expected_shrunk.extend_from_slice(&[0, 0, 0]);
+        assert_eq!(shrink_editor.encode().unwrap(), expected_shrunk);
+    }
+
+    #[test]
+    fn burning_tree_editor_rejects_unavailable_or_oversized_lists() {
+        let (legacy_tree_manager, _) =
+            TreeManagerDataPrefix::decode_prefix(265, &empty_prefix(265)).unwrap();
+        assert!(
+            legacy_tree_manager
+                .into_editor()
+                .set_burning_trees(Vec::new())
+                .is_err()
+        );
+
+        let (tree_manager, _) =
+            TreeManagerDataPrefix::decode_prefix(266, &empty_prefix(266)).unwrap();
+        let oversized = vec![
+            BurningTreeRecord {
+                tree_index: 1,
+                fire_intensity: 0,
+                fire_damage: 0,
+            };
+            TREE_CAPACITY
+        ];
+        assert!(
+            tree_manager
+                .into_editor()
+                .set_burning_trees(oversized)
+                .is_err()
+        );
     }
 
     #[test]
