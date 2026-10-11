@@ -139,7 +139,7 @@ pub use unlock_manager_data::{
 };
 pub use vehicle_manager_data::{
     VehicleInstanceFields, VehicleInstanceFieldsPrefix, VehicleLastFrameDataPrefix,
-    VehicleLastFrameRecord, VehicleManagerData, VehicleManagerDataPrefix,
+    VehicleLastFrameEditor, VehicleLastFrameRecord, VehicleManagerData, VehicleManagerDataPrefix,
     VehicleManagerSparseFieldsPrefix, VehicleManagerTailDataPrefix, VehicleParkedInstanceRecord,
     VehicleParkedRecordsEditor, VehicleParkedRecordsPrefix, VehicleTargetPosition0,
 };

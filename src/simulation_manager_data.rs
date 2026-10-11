@@ -14,6 +14,7 @@ use crate::TreeManagerDataPrefix;
 use crate::TreeManagerEditor;
 use crate::VehicleInstanceFieldsPrefix;
 use crate::VehicleLastFrameDataPrefix;
+use crate::VehicleLastFrameEditor;
 use crate::VehicleManagerData;
 use crate::VehicleManagerDataPrefix;
 use crate::VehicleManagerSparseFieldsPrefix;
@@ -6194,6 +6195,102 @@ impl SimulationManagerData {
                 "VehicleManager last-frame prefix end",
             ))?;
         Ok((frames, graph_end))
+    }
+
+    /// Decodes active-vehicle vectors into a fixed-width editor.
+    pub fn decode_vehicle_manager_last_frame_editor(
+        &self,
+    ) -> Result<VehicleLastFrameEditor, CrpError> {
+        let (frames, _) = self.decode_vehicle_manager_last_frame_prefix()?;
+        Ok(frames.into_editor())
+    }
+
+    /// Replaces fixed-width active-vehicle motion and target-position fields.
+    ///
+    /// The editor must come from this VehicleManager body and inner version.
+    /// Record counts and the encoded width remain fixed; the complete
+    /// VehicleManager body and following TransportManager bytes are validated
+    /// after the replacement.
+    pub fn replace_vehicle_manager_last_frame_records(
+        &mut self,
+        edited: &VehicleLastFrameEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                17,
+                "edited vehicle last-frame version does not match this stream",
+            ));
+        }
+        let (vehicle_data, original_manager_end) = self.decode_vehicle_manager_data()?;
+        let (current, original_records_end) = self.decode_vehicle_manager_last_frame_prefix()?;
+        if current.encode().as_slice() != edited.original_bytes()
+            || vehicle_data.last_frame_records().encode() != current.encode()
+        {
+            return Err(invalid(
+                17,
+                "vehicle last-frame bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode();
+        let original_records = current.encode();
+        if replacement.len() != original_records.len() {
+            return Err(invalid(
+                17,
+                "vehicle last-frame edit changed the serialized record width",
+            ));
+        }
+
+        let (_, records_start) = self.decode_vehicle_manager_sparse_columns()?;
+        let records_end = records_start.checked_add(original_records.len()).ok_or(
+            CrpError::ArithmeticOverflow("VehicleManager last-frame records end"),
+        )?;
+        if records_end != original_records_end {
+            return Err(invalid(
+                records_start,
+                "vehicle last-frame records do not end at their decoded boundary",
+            ));
+        }
+        if self.serialized_object_graph.get(records_start..records_end)
+            != Some(original_records.as_slice())
+        {
+            return Err(invalid(
+                records_start,
+                "vehicle last-frame range differs from its decoded source bytes",
+            ));
+        }
+
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate
+            .get_mut(records_start..records_end)
+            .ok_or_else(|| {
+                invalid(
+                    records_start,
+                    "vehicle last-frame range exceeds manager graph",
+                )
+            })?
+            .copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        let validation =
+            self.decode_vehicle_manager_data()
+                .and_then(|(data, updated_manager_end)| {
+                    if updated_manager_end != original_manager_end
+                        || data.last_frame_records().encode() != replacement
+                    {
+                        return Err(invalid(
+                            records_start,
+                            "edited vehicle last-frame fields changed the manager boundary",
+                        ));
+                    }
+                    Ok(())
+                });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                records_start,
+                format!("edited vehicle last-frame fields failed boundary validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes the remaining active-vehicle fields through the custom value.
@@ -19771,6 +19868,81 @@ mod manager_boundary_tests {
         let (tail, tail_end) = manager.decode_vehicle_manager_tail().unwrap();
         assert_eq!(tail.traffic_flow_totals(), None);
         assert_eq!(tail_end, data_end);
+    }
+
+    #[test]
+    fn vehicle_manager_last_frame_editor_patches_position_and_keeps_boundary() {
+        let mut flags = vec![0_u32; 16_383];
+        flags[0] = 1;
+        let mut vehicle_prefix = Vec::new();
+        write_encoded_uint_array(&mut vehicle_prefix, &flags);
+
+        let mut graph = profiler_tag("VehicleManager");
+        let body_start = graph.len();
+        graph.extend_from_slice(&vehicle_prefix);
+        let last_frame_start = graph.len();
+        for bits in [0x3f80_0000_u32, 0xc020_0000, 0x42f6_e979] {
+            graph.extend_from_slice(&bits.to_be_bytes());
+        }
+        graph.extend_from_slice(&[
+            0x01, 0x02, // source building
+            0x03, 0x04, // target building
+            0x05, 0x06, // transfer size
+            0x07, 0x08, // transfer type and wait counter
+        ]);
+        graph.extend_from_slice(&[0, 16]); // closing profiler reference
+        let transport_tag = profiler_tag("TransportManager");
+        graph.extend_from_slice(&transport_tag);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 29;
+        let mut manager_objects = vec![None; 19];
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[18] = Some(ManagerObjectReference {
+            object_id: 18,
+            type_name: "TransportManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let mut editor = manager.decode_vehicle_manager_last_frame_editor().unwrap();
+        assert_eq!(editor.records().len(), 1);
+        assert_eq!(
+            editor.records()[0].position(),
+            [0x3f80_0000, 0xc020_0000, 0x42f6_e979]
+        );
+        let new_position = [0x4120_0000, 0xc120_0000, 0x42a0_0000];
+        editor.set_position_bits(0, new_position).unwrap();
+
+        let mut expected = manager.serialized_object_graph().to_vec();
+        for (chunk, bits) in expected[last_frame_start..last_frame_start + 12]
+            .chunks_exact_mut(4)
+            .zip(new_position)
+        {
+            chunk.copy_from_slice(&bits.to_be_bytes());
+        }
+        let graph_len = expected.len();
+        manager
+            .replace_vehicle_manager_last_frame_records(&editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected);
+        assert_eq!(manager.serialized_object_graph().len(), graph_len);
+        assert!(manager.serialized_object_graph().ends_with(&transport_tag));
+
+        let (updated, manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(
+            updated.last_frame_records().records()[0].position(),
+            new_position
+        );
+        assert_eq!(updated.encode(), expected[body_start..manager_end]);
+        assert!(
+            manager
+                .replace_vehicle_manager_last_frame_records(&editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), expected);
     }
 
     #[test]

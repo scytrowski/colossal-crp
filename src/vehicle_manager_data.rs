@@ -415,6 +415,17 @@ pub struct VehicleLastFrameDataPrefix {
     serialized_prefix: Vec<u8>,
 }
 
+/// Editor for fixed-width active-vehicle motion and target-position vectors.
+///
+/// Record counts and version-gated fields remain fixed. Float values are
+/// exposed as IEEE-754 bit patterns so unchanged NaNs and signed zero retain
+/// their original representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleLastFrameEditor {
+    original: VehicleLastFrameDataPrefix,
+    records: Vec<VehicleLastFrameRecord>,
+}
+
 impl VehicleLastFrameDataPrefix {
     /// Returns the inner DataSerializer version.
     pub fn format_version(&self) -> u32 {
@@ -429,6 +440,14 @@ impl VehicleLastFrameDataPrefix {
     /// Writes the original last-frame bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Creates an editor for the existing active-vehicle vector records.
+    pub fn into_editor(self) -> VehicleLastFrameEditor {
+        VehicleLastFrameEditor {
+            records: self.records.clone(),
+            original: self,
+        }
     }
 
     /// Decodes the remaining scalar and reference fields of each active vehicle.
@@ -513,6 +532,164 @@ impl VehicleLastFrameDataPrefix {
             },
             consumed,
         ))
+    }
+}
+
+impl VehicleLastFrameEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns the current active-vehicle vector records.
+    pub fn records(&self) -> &[VehicleLastFrameRecord] {
+        &self.records
+    }
+
+    /// Changes an existing vehicle's velocity component bit patterns
+    /// (inner version 47 and newer).
+    pub fn set_velocity_bits(&mut self, index: usize, value: [u32; 3]) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let velocity = record.velocity.as_mut().ok_or_else(|| {
+            invalid(
+                index,
+                "vehicle velocity is not serialized before version 47",
+            )
+        })?;
+        *velocity = value;
+        Ok(())
+    }
+
+    /// Changes an existing vehicle's position component bit patterns.
+    pub fn set_position_bits(&mut self, index: usize, value: [u32; 3]) -> Result<(), CrpError> {
+        self.record_mut(index)?.position = value;
+        Ok(())
+    }
+
+    /// Changes an existing vehicle's rotation component bit patterns
+    /// (inner version 78 and newer).
+    pub fn set_rotation_bits(&mut self, index: usize, value: [u32; 4]) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let rotation = record.rotation.as_mut().ok_or_else(|| {
+            invalid(
+                index,
+                "vehicle rotation is not serialized before version 78",
+            )
+        })?;
+        *rotation = value;
+        Ok(())
+    }
+
+    /// Changes an existing vehicle's angle-velocity component bit patterns
+    /// (inner version 129 and newer).
+    pub fn set_angle_velocity_bits(
+        &mut self,
+        index: usize,
+        value: [u32; 3],
+    ) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let angle_velocity = record.angle_velocity.as_mut().ok_or_else(|| {
+            invalid(
+                index,
+                "vehicle angle velocity is not serialized before version 129",
+            )
+        })?;
+        *angle_velocity = value;
+        Ok(())
+    }
+
+    /// Changes `m_targetPos0` using the source version's stored vector width.
+    pub fn set_target_position0(
+        &mut self,
+        index: usize,
+        value: VehicleTargetPosition0,
+    ) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let width_matches = matches!(
+            (record.target_position0, value),
+            (
+                VehicleTargetPosition0::DerivedFromPosition,
+                VehicleTargetPosition0::DerivedFromPosition
+            ) | (
+                VehicleTargetPosition0::Vector3(_),
+                VehicleTargetPosition0::Vector3(_)
+            ) | (
+                VehicleTargetPosition0::Vector4(_),
+                VehicleTargetPosition0::Vector4(_)
+            )
+        );
+        if !width_matches {
+            return Err(invalid(
+                index,
+                "target position 0 width does not match the source version",
+            ));
+        }
+        record.target_position0 = value;
+        Ok(())
+    }
+
+    /// Changes target positions 1–3 (inner version 90 and newer).
+    pub fn set_target_positions1_to_3(
+        &mut self,
+        index: usize,
+        value: [[u32; 4]; 3],
+    ) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let targets = record.target_positions1_to_3.as_mut().ok_or_else(|| {
+            invalid(
+                index,
+                "target positions 1–3 are not serialized before version 90",
+            )
+        })?;
+        *targets = value;
+        Ok(())
+    }
+
+    /// Writes the same fixed-width record count and versioned field layout.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.original.serialized_prefix.len());
+        for record in &self.records {
+            if let Some(velocity) = record.velocity {
+                append_vector_bits(&mut bytes, &velocity);
+            }
+            append_vector_bits(&mut bytes, &record.position);
+            if let Some(rotation) = record.rotation {
+                append_vector_bits(&mut bytes, &rotation);
+            }
+            if let Some(angle_velocity) = record.angle_velocity {
+                append_vector_bits(&mut bytes, &angle_velocity);
+            }
+            match record.target_position0 {
+                VehicleTargetPosition0::DerivedFromPosition => {}
+                VehicleTargetPosition0::Vector3(value) => append_vector_bits(&mut bytes, &value),
+                VehicleTargetPosition0::Vector4(value) => append_vector_bits(&mut bytes, &value),
+            }
+            if let Some(targets) = record.target_positions1_to_3 {
+                for target in targets {
+                    append_vector_bits(&mut bytes, &target);
+                }
+            }
+        }
+        bytes
+    }
+
+    pub(crate) fn original_bytes(&self) -> &[u8] {
+        &self.original.serialized_prefix
+    }
+
+    fn record_mut(&mut self, index: usize) -> Result<&mut VehicleLastFrameRecord, CrpError> {
+        self.records.get_mut(index).ok_or_else(|| {
+            invalid(
+                index,
+                format!("vehicle record index {index} is out of range"),
+            )
+        })
+    }
+}
+
+fn append_vector_bits<const N: usize>(bytes: &mut Vec<u8>, values: &[u32; N]) {
+    for value in values {
+        bytes.extend_from_slice(&value.to_be_bytes());
     }
 }
 
@@ -1506,6 +1683,92 @@ mod tests {
         assert_eq!(decoded.records()[1].velocity(), Some([30, 31, 32]));
         assert_eq!(decoded.records()[1].position(), [33, 34, 35]);
         assert_eq!(decoded.encode(), bytes);
+    }
+
+    #[test]
+    fn last_frame_editor_patches_versioned_vectors_and_preserves_raw_float_bits() {
+        let fields = sparse_fields_with_count(129, 1);
+        let source = words_as_bytes(&(1..=29).collect::<Vec<_>>());
+        let (decoded, consumed) = fields.decode_last_frame_records(&source).unwrap();
+        assert_eq!(consumed, source.len());
+        let mut editor = decoded.into_editor();
+        assert_eq!(editor.encode(), source);
+        editor
+            .set_velocity_bits(0, [0x7fc0_1234, 0x8000_0000, 0xff80_0000])
+            .unwrap();
+        editor
+            .set_position_bits(0, [0x3f80_0000, 0xc020_0000, 0x42f6_e979])
+            .unwrap();
+        editor
+            .set_rotation_bits(0, [0, 0x3f80_0000, 0xbf00_0000, 0x7fc0_5678])
+            .unwrap();
+        editor
+            .set_angle_velocity_bits(0, [0x3f00_0000, 0xbf40_0000, 0x3e80_0000])
+            .unwrap();
+        editor
+            .set_target_position0(
+                0,
+                VehicleTargetPosition0::Vector4([0x4100_0000, 0xc120_0000, 0x4270_0000, 1]),
+            )
+            .unwrap();
+        editor
+            .set_target_positions1_to_3(0, [[31, 32, 33, 34], [35, 36, 37, 38], [39, 40, 41, 42]])
+            .unwrap();
+
+        let mut expected = source.clone();
+        let replacements = [
+            (0, [0x7fc0_1234, 0x8000_0000, 0xff80_0000].as_slice()),
+            (3, [0x3f80_0000, 0xc020_0000, 0x42f6_e979].as_slice()),
+            (6, [0, 0x3f80_0000, 0xbf00_0000, 0x7fc0_5678].as_slice()),
+            (10, [0x3f00_0000, 0xbf40_0000, 0x3e80_0000].as_slice()),
+            (13, [0x4100_0000, 0xc120_0000, 0x4270_0000, 1].as_slice()),
+        ];
+        for (word_offset, values) in replacements {
+            expected[word_offset * 4..(word_offset + values.len()) * 4]
+                .copy_from_slice(&words_as_bytes(values));
+        }
+        expected[17 * 4..29 * 4].copy_from_slice(&words_as_bytes(&[
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+        ]));
+        assert_eq!(editor.encode(), expected);
+        assert_eq!(editor.encode().len(), source.len());
+
+        let (decoded, consumed) = fields.decode_last_frame_records(&expected).unwrap();
+        assert_eq!(consumed, expected.len());
+        assert_eq!(
+            decoded.records()[0].velocity(),
+            Some([0x7fc0_1234, 0x8000_0000, 0xff80_0000])
+        );
+        assert_eq!(
+            decoded.records()[0].position(),
+            [0x3f80_0000, 0xc020_0000, 0x42f6_e979]
+        );
+        assert_eq!(decoded.encode(), expected);
+    }
+
+    #[test]
+    fn last_frame_editor_rejects_absent_fields_width_changes_and_bad_indexes() {
+        let fields = sparse_fields_with_count(46, 1);
+        let source = words_as_bytes(&[1, 2, 3]);
+        let (decoded, _) = fields.decode_last_frame_records(&source).unwrap();
+        let mut editor = decoded.into_editor();
+        assert!(editor.set_velocity_bits(0, [1, 2, 3]).is_err());
+        assert!(editor.set_rotation_bits(0, [1, 2, 3, 4]).is_err());
+        assert!(editor.set_angle_velocity_bits(0, [1, 2, 3]).is_err());
+        assert!(editor.set_target_positions1_to_3(0, [[0; 4]; 3]).is_err());
+        assert!(
+            editor
+                .set_target_position0(0, VehicleTargetPosition0::Vector3([1, 2, 3]))
+                .is_err()
+        );
+        assert!(editor.set_position_bits(1, [1, 2, 3]).is_err());
+        editor
+            .set_target_position0(0, VehicleTargetPosition0::DerivedFromPosition)
+            .unwrap();
+        editor
+            .set_position_bits(0, [0x1234, 0x5678, 0x9abc])
+            .unwrap();
+        assert_eq!(editor.encode(), words_as_bytes(&[0x1234, 0x5678, 0x9abc]));
     }
 
     #[test]
