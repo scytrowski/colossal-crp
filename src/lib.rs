@@ -85,6 +85,7 @@ pub use electricity_manager_data::{
 };
 pub use event_manager_data::{
     EventManagerEventRecord, EventManagerEventRecordsEditor, EventManagerPrefabIndicesEditor,
+    EventManagerRouteRecord, EventManagerRouteRecordsEditor, EventManagerRouteSchedule,
     EventManagerTailData, EventManagerTailEditor, EventManagerTypeData, EventManagerTypeDataEditor,
 };
 pub use game_area_data::{GameAreaManagerData, GameAreaManagerEditor, SavedCameraView};

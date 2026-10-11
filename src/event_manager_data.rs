@@ -77,6 +77,62 @@ pub struct EventManagerTypeData {
     pub ticket_price_offset: Option<u32>,
 }
 
+/// One schedule attached to an active EventManager route.
+///
+/// Fields gated by inner version 121027 are `None` in earlier layouts. Names
+/// retain their source compact or wide encoding when edited through the route
+/// editor; changing a name must keep its serialized width and nullness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventManagerRouteSchedule {
+    /// Schedule identifier serialized from inner version 121027.
+    pub schedule_id: Option<i32>,
+    /// Schedule tier.
+    pub tier: u16,
+    /// Number of laps.
+    pub lap_count: u16,
+    /// Raw ticket price value.
+    pub ticket_price: u16,
+    /// Optional schedule name, including a preserved null value.
+    pub name: Option<String>,
+    /// Schedule flags serialized from inner version 121027.
+    pub flags: Option<u16>,
+    /// Schedule frequency serialized from inner version 121027.
+    pub frequency: Option<u8>,
+    /// Schedule start day serialized from inner version 121027.
+    pub start_day: Option<u8>,
+    /// Schedule start month serialized from inner version 121027.
+    pub start_month: Option<u8>,
+}
+
+/// One active EventManager route in ascending slot order.
+///
+/// The seven base indexes and version-gated route metadata are exposed as raw
+/// values. Slot index, activity flags, and schedule count are fixed by the
+/// source body and cannot be changed by the route editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventManagerRouteRecord {
+    /// One-based route slot represented by this record.
+    pub slot_index: u16,
+    /// Raw route-slot activity flags.
+    pub flags: u32,
+    /// Route policies serialized from inner version 121018.
+    pub policies: Option<u32>,
+    /// Seven route, building, and segment indexes in serialized order.
+    pub indexes: [u16; 7],
+    /// Route version serialized from inner version 121007.
+    pub route_version: Option<u32>,
+    /// Packed route color serialized from inner version 121007.
+    pub color: Option<u32>,
+    /// Start node serialized from inner version 121007.
+    pub start_node: Option<u16>,
+    /// End node serialized from inner version 121007.
+    pub end_node: Option<u16>,
+    /// Event prefab index serialized from inner version 121009.
+    pub event_prefab_index: Option<u16>,
+    /// Schedules attached to this route, in serialized order.
+    pub schedules: Vec<EventManagerRouteSchedule>,
+}
+
 /// Known fixed-width EventManager tail values selected by inner version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EventManagerTailData {
@@ -91,11 +147,11 @@ pub struct EventManagerTailData {
 /// Active event records in versions 210–121030 are decoded and retained.
 /// Race-event blocks are retained raw after their versioned structure is
 /// boundary-checked, including nonempty legacy route splines. Active event
-/// routes from version 121005 are boundary-checked and retained raw. Versions
-/// 121031 and newer are not supported for active event records. Reader, writer,
-/// and one corpus-observed counted-block candidate are boundary-checked. The
-/// counted block is retained as raw bytes because its meaning and type are
-/// unknown.
+/// routes from version 121005 are boundary-checked and their known values are
+/// exposed for fixed-width edits. Active event records from version 121031
+/// onward are unsupported. Reader, writer, and one corpus-observed counted
+/// block candidate are boundary-checked. The counted block is retained as raw
+/// bytes because its meaning and type are unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EventManagerReferenceData {
     format_version: u32,
@@ -103,7 +159,10 @@ pub(crate) struct EventManagerReferenceData {
     active_event_record_ranges: Vec<Range<usize>>,
     active_event_race_data_ranges: Vec<Option<Range<usize>>>,
     active_event_race_data_presence_bytes: Vec<Option<u8>>,
+    pub(crate) active_event_routes: Vec<EventManagerRouteRecord>,
     active_event_route_ranges: Vec<Range<usize>>,
+    route_schedule_name_ranges: Vec<Vec<Range<usize>>>,
+    route_schedule_name_compact_modes: Vec<Vec<Option<bool>>>,
     route_schedule_prefab_scope_range: Option<Range<usize>>,
     pub(crate) object_headers: Vec<NetObjectHeader>,
     pub(crate) unidentified_counted_block: Option<UnidentifiedCountedBlock>,
@@ -143,6 +202,18 @@ pub struct EventManagerTypeDataEditor {
 pub struct EventManagerEventRecordsEditor {
     original: EventManagerReferenceData,
     records: Vec<EventManagerEventRecord>,
+}
+
+/// Editor for existing EventManager routes and their schedules.
+///
+/// It changes only same-width scalar values for inner versions 121005–121030.
+/// Route count, slot indexes, flags, schedule counts, name nullness, and each
+/// schedule-name byte width are fixed. Schedule prefab indexes and other body
+/// bytes are preserved raw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventManagerRouteRecordsEditor {
+    original: EventManagerReferenceData,
+    routes: Vec<EventManagerRouteRecord>,
 }
 
 /// Editor for existing versioned EventManager tail values.
@@ -213,7 +284,8 @@ impl EventManagerReferenceData {
     }
 
     fn equivalent_route_data(&self, other: &Self) -> bool {
-        self.active_event_route_ranges.len() == other.active_event_route_ranges.len()
+        self.active_event_routes == other.active_event_routes
+            && self.active_event_route_ranges.len() == other.active_event_route_ranges.len()
             && self
                 .active_event_route_ranges
                 .iter()
@@ -255,6 +327,13 @@ impl EventManagerReferenceData {
     pub(crate) fn into_event_records_editor(self) -> EventManagerEventRecordsEditor {
         EventManagerEventRecordsEditor {
             records: self.active_event_records.clone(),
+            original: self,
+        }
+    }
+
+    pub(crate) fn into_route_records_editor(self) -> EventManagerRouteRecordsEditor {
+        EventManagerRouteRecordsEditor {
+            routes: self.active_event_routes.clone(),
             original: self,
         }
     }
@@ -338,12 +417,18 @@ impl EventManagerReferenceData {
             active_event_race_data_presence_bytes,
         ) = read_active_event_records(&mut reader, format_version, &event_flags)?;
 
-        let (active_event_route_ranges, route_schedule_count) = if format_version >= 121_005 {
+        let (
+            active_event_routes,
+            active_event_route_ranges,
+            route_schedule_name_ranges,
+            route_schedule_name_compact_modes,
+            route_schedule_count,
+        ) = if format_version >= 121_005 {
             let route_capacity = read_capacity(&mut reader, "event route")?;
             let route_flags = read_encoded_uint_array(&mut reader, route_capacity - 1)?;
             read_active_event_routes(&mut reader, format_version, &route_flags)?
         } else {
-            (Vec::new(), 0)
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0)
         };
 
         let milestone_count = usize::from(reader.read_u16_be()?);
@@ -400,7 +485,10 @@ impl EventManagerReferenceData {
             active_event_record_ranges,
             active_event_race_data_ranges,
             active_event_race_data_presence_bytes,
+            active_event_routes,
             active_event_route_ranges,
+            route_schedule_name_ranges,
+            route_schedule_name_compact_modes,
             route_schedule_prefab_scope_range,
             object_headers,
             unidentified_counted_block,
@@ -456,6 +544,9 @@ impl EventManagerReferenceData {
         finish(
             &mut reader,
             format_version,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -622,6 +713,267 @@ impl EventManagerEventRecordsEditor {
     pub(crate) fn original_body_bytes(&self) -> &[u8] {
         &self.original.serialized_body
     }
+}
+
+impl EventManagerRouteRecordsEditor {
+    /// Returns the inner DataSerializer version used for these route records.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns active routes in ascending route-slot order.
+    pub fn routes(&self) -> &[EventManagerRouteRecord] {
+        &self.routes
+    }
+
+    /// Returns mutable routes without changing their slot topology.
+    pub fn routes_mut(&mut self) -> &mut [EventManagerRouteRecord] {
+        &mut self.routes
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.routes.len() != self.original.active_event_routes.len()
+            || self.routes.len() != self.original.active_event_route_ranges.len()
+            || self.routes.len() != self.original.route_schedule_name_ranges.len()
+            || self.routes.len() != self.original.route_schedule_name_compact_modes.len()
+        {
+            return Err(invalid_event_route(
+                0,
+                "EventManager route count cannot change in this editor",
+            ));
+        }
+        let mut output = self.original.serialized_body.clone();
+        for (((route, original_route), range), (name_ranges, compact_modes)) in self
+            .routes
+            .iter()
+            .zip(&self.original.active_event_routes)
+            .zip(&self.original.active_event_route_ranges)
+            .zip(
+                self.original
+                    .route_schedule_name_ranges
+                    .iter()
+                    .zip(&self.original.route_schedule_name_compact_modes),
+            )
+        {
+            if route.slot_index != original_route.slot_index || route.flags != original_route.flags
+            {
+                return Err(invalid_event_route(
+                    range.start,
+                    "EventManager route slot and activity flags cannot change in this editor",
+                ));
+            }
+            if route.schedules.len() != original_route.schedules.len()
+                || route.schedules.len() != name_ranges.len()
+                || route.schedules.len() != compact_modes.len()
+            {
+                return Err(invalid_event_route(
+                    range.start,
+                    "EventManager route schedule count cannot change in this editor",
+                ));
+            }
+            let encoded = encode_event_route(
+                self.original.format_version,
+                route,
+                original_route,
+                name_ranges,
+                compact_modes,
+                &self.original.serialized_body,
+                range.start,
+            )?;
+            if encoded.len() != range.len() {
+                return Err(invalid_event_route(
+                    range.start,
+                    "EventManager route edit changed its serialized width",
+                ));
+            }
+            output
+                .get_mut(range.clone())
+                .ok_or_else(|| {
+                    invalid_event_route(range.start, "EventManager route range exceeds body")
+                })?
+                .copy_from_slice(&encoded);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original.serialized_body
+    }
+}
+
+fn encode_event_route(
+    format_version: u32,
+    route: &EventManagerRouteRecord,
+    original_route: &EventManagerRouteRecord,
+    name_ranges: &[Range<usize>],
+    compact_modes: &[Option<bool>],
+    source_body: &[u8],
+    offset: usize,
+) -> Result<Vec<u8>, CrpError> {
+    let mut output = Vec::new();
+    match (format_version >= 121_018, route.policies) {
+        (true, Some(value)) => output.extend_from_slice(&value.to_be_bytes()),
+        (false, None) => {}
+        (true, None) => {
+            return Err(invalid_event_route(offset, "route policies are missing"));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_event_route(
+                offset,
+                "route policies are unavailable before version 121018",
+            ));
+        }
+    }
+    for index in route.indexes {
+        output.extend_from_slice(&index.to_be_bytes());
+    }
+    match (
+        format_version >= 121_007,
+        route.route_version,
+        route.color,
+        route.start_node,
+        route.end_node,
+    ) {
+        (true, Some(version), Some(color), Some(start), Some(end)) => {
+            output.extend_from_slice(&version.to_be_bytes());
+            output.extend_from_slice(&color.to_be_bytes());
+            output.extend_from_slice(&start.to_be_bytes());
+            output.extend_from_slice(&end.to_be_bytes());
+        }
+        (false, None, None, None, None) => {}
+        (true, _, _, _, _) => {
+            return Err(invalid_event_route(
+                offset,
+                "version-121007-or-later route metadata is incomplete",
+            ));
+        }
+        (false, _, _, _, _) => {
+            return Err(invalid_event_route(
+                offset,
+                "route metadata is unavailable before version 121007",
+            ));
+        }
+    }
+    match (format_version >= 121_009, route.event_prefab_index) {
+        (true, Some(index)) => output.extend_from_slice(&index.to_be_bytes()),
+        (false, None) => {}
+        (true, None) => {
+            return Err(invalid_event_route(offset, "event prefab index is missing"));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_event_route(
+                offset,
+                "event prefab index is unavailable before version 121009",
+            ));
+        }
+    }
+    if format_version >= 121_015 {
+        let schedule_count = u8::try_from(route.schedules.len())
+            .map_err(|_| invalid_event_route(offset, "route schedule count exceeds u8"))?;
+        if usize::from(schedule_count) > MAX_EVENT_ROUTE_SCHEDULES {
+            return Err(invalid_event_route(
+                offset,
+                format!("route schedule count exceeds {MAX_EVENT_ROUTE_SCHEDULES}"),
+            ));
+        }
+        output.push(schedule_count);
+    } else if !route.schedules.is_empty() {
+        return Err(invalid_event_route(
+            offset,
+            "route schedules are unavailable before version 121015",
+        ));
+    }
+    for (schedule_index, ((schedule, original_schedule), (name_range, compact_mode))) in route
+        .schedules
+        .iter()
+        .zip(&original_route.schedules)
+        .zip(name_ranges.iter().zip(compact_modes))
+        .enumerate()
+    {
+        let schedule_offset = name_range.start;
+        match (format_version >= 121_027, schedule.schedule_id) {
+            (true, Some(value)) => output.extend_from_slice(&value.to_be_bytes()),
+            (false, None) => {}
+            (true, None) => {
+                return Err(invalid_event_route(
+                    schedule_offset,
+                    "schedule ID is missing",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(invalid_event_route(
+                    schedule_offset,
+                    "schedule ID is unavailable before version 121027",
+                ));
+            }
+        }
+        output.extend_from_slice(&schedule.tier.to_be_bytes());
+        output.extend_from_slice(&schedule.lap_count.to_be_bytes());
+        output.extend_from_slice(&schedule.ticket_price.to_be_bytes());
+        if schedule.name == original_schedule.name {
+            let raw_name = source_body.get(name_range.clone()).ok_or_else(|| {
+                invalid_event_route(schedule_offset, "route schedule name exceeds source body")
+            })?;
+            output.extend_from_slice(raw_name);
+        } else {
+            match (&original_schedule.name, &schedule.name, compact_mode) {
+                (Some(_), Some(name), Some(compact)) => {
+                    let name_start = output.len();
+                    write_unique_string_with_mode(&mut output, name, *compact)?;
+                    if output.len() - name_start != name_range.len() {
+                        return Err(invalid_event_route(
+                            schedule_offset,
+                            format!(
+                                "edited schedule name at route schedule {} changes its serialized width",
+                                schedule_index + 1
+                            ),
+                        ));
+                    }
+                }
+                (None, None, None) => {
+                    let raw_name = source_body.get(name_range.clone()).ok_or_else(|| {
+                        invalid_event_route(
+                            schedule_offset,
+                            "null route schedule name exceeds source body",
+                        )
+                    })?;
+                    output.extend_from_slice(raw_name);
+                }
+                _ => {
+                    return Err(invalid_event_route(
+                        schedule_offset,
+                        "route schedule name nullness or source encoding cannot change",
+                    ));
+                }
+            }
+        }
+        match (
+            format_version >= 121_027,
+            schedule.flags,
+            schedule.frequency,
+            schedule.start_day,
+            schedule.start_month,
+        ) {
+            (true, Some(flags), Some(frequency), Some(day), Some(month)) => {
+                output.extend_from_slice(&flags.to_be_bytes());
+                output.extend_from_slice(&[frequency, day, month]);
+            }
+            (false, None, None, None, None) => {}
+            (true, _, _, _, _) => {
+                return Err(invalid_event_route(
+                    schedule_offset,
+                    "version-121027-or-later schedule metadata is incomplete",
+                ));
+            }
+            (false, _, _, _, _) => {
+                return Err(invalid_event_route(
+                    schedule_offset,
+                    "schedule metadata is unavailable before version 121027",
+                ));
+            }
+        }
+    }
+    Ok(output)
 }
 
 impl EventManagerTailEditor {
@@ -927,30 +1279,58 @@ fn read_active_event_routes(
     reader: &mut Reader<'_>,
     format_version: u32,
     flags: &[u32],
-) -> Result<(Vec<Range<usize>>, usize), CrpError> {
+) -> Result<
+    (
+        Vec<EventManagerRouteRecord>,
+        Vec<Range<usize>>,
+        Vec<Vec<Range<usize>>>,
+        Vec<Vec<Option<bool>>>,
+        usize,
+    ),
+    CrpError,
+> {
     let active_count = flags.iter().filter(|flag| **flag != 0).count();
+    let mut routes = Vec::with_capacity(active_count);
     let mut route_ranges = Vec::with_capacity(active_count);
+    let mut schedule_name_ranges = Vec::with_capacity(active_count);
+    let mut schedule_name_compact_modes = Vec::with_capacity(active_count);
     let mut total_schedule_count = 0_usize;
     for (slot, flags) in flags.iter().copied().enumerate() {
         if flags == 0 {
             continue;
         }
+        let slot_index = u16::try_from(slot + 1)
+            .map_err(|_| reader.invalid("EventManager route slot index exceeds u16"))?;
         let start = reader.offset();
-        if format_version >= 121_018 {
-            reader.read_u32_be()?; // Event policies.
-        }
-        for _ in 0..7 {
-            reader.read_u16_be()?; // Route and building/segment indexes.
-        }
-        if format_version >= 121_007 {
-            reader.read_u32_be()?; // Route version.
-            reader.read_u32_be()?; // Packed route color.
-            reader.read_u16_be()?; // Start node.
-            reader.read_u16_be()?; // End node.
-        }
-        if format_version >= 121_009 {
-            reader.read_u16_be()?; // Event prefab index.
-        }
+        let policies = if format_version >= 121_018 {
+            Some(reader.read_u32_be()?)
+        } else {
+            None
+        };
+        let indexes = [
+            reader.read_u16_be()?,
+            reader.read_u16_be()?,
+            reader.read_u16_be()?,
+            reader.read_u16_be()?,
+            reader.read_u16_be()?,
+            reader.read_u16_be()?,
+            reader.read_u16_be()?,
+        ];
+        let (route_version, color, start_node, end_node) = if format_version >= 121_007 {
+            (
+                Some(reader.read_u32_be()?),
+                Some(reader.read_u32_be()?),
+                Some(reader.read_u16_be()?),
+                Some(reader.read_u16_be()?),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        let event_prefab_index = if format_version >= 121_009 {
+            Some(reader.read_u16_be()?)
+        } else {
+            None
+        };
 
         let schedule_count = if format_version >= 121_015 {
             usize::from(reader.read_u8()?)
@@ -966,24 +1346,82 @@ fn read_active_event_routes(
         total_schedule_count = total_schedule_count
             .checked_add(schedule_count)
             .ok_or_else(|| reader.invalid("event route schedule count overflowed"))?;
+        let mut schedules = Vec::with_capacity(schedule_count);
+        let mut route_name_ranges = Vec::with_capacity(schedule_count);
+        let mut route_name_compact_modes = Vec::with_capacity(schedule_count);
         for _ in 0..schedule_count {
-            if format_version >= 121_027 {
-                reader.read_i32_be()?; // Schedule ID.
-            }
-            reader.read_u16_be()?; // Tier.
-            reader.read_u16_be()?; // Lap count.
-            reader.read_u16_be()?; // Ticket price.
-            reader.read_unique_string()?; // Schedule name.
-            if format_version >= 121_027 {
-                reader.read_u16_be()?; // Schedule flags.
-                reader.read_u8()?; // Frequency.
-                reader.read_u8()?; // Start day.
-                reader.read_u8()?; // Start month.
-            }
+            let schedule_id = if format_version >= 121_027 {
+                Some(reader.read_i32_be()?)
+            } else {
+                None
+            };
+            let tier = reader.read_u16_be()?;
+            let lap_count = reader.read_u16_be()?;
+            let ticket_price = reader.read_u16_be()?;
+            let name_start = reader.offset();
+            let name = reader.read_unique_string()?;
+            let name_end = reader.offset();
+            let compact_mode = if name.is_some() {
+                let raw = reader
+                    .consumed_bytes()
+                    .get(name_start..name_end)
+                    .ok_or_else(|| {
+                        reader.invalid("EventManager route schedule name range is invalid")
+                    })?;
+                let first = *raw
+                    .first()
+                    .ok_or_else(|| reader.invalid("EventManager route schedule name is empty"))?;
+                Some((u32::from(first) << 16) & COMPACT_STRING_FLAG != 0)
+            } else {
+                None
+            };
+            let (schedule_flags, frequency, start_day, start_month) = if format_version >= 121_027 {
+                (
+                    Some(reader.read_u16_be()?),
+                    Some(reader.read_u8()?),
+                    Some(reader.read_u8()?),
+                    Some(reader.read_u8()?),
+                )
+            } else {
+                (None, None, None, None)
+            };
+            schedules.push(EventManagerRouteSchedule {
+                schedule_id,
+                tier,
+                lap_count,
+                ticket_price,
+                name,
+                flags: schedule_flags,
+                frequency,
+                start_day,
+                start_month,
+            });
+            route_name_ranges.push(name_start..name_end);
+            route_name_compact_modes.push(compact_mode);
         }
+        routes.push(EventManagerRouteRecord {
+            slot_index,
+            flags,
+            policies,
+            indexes,
+            route_version,
+            color,
+            start_node,
+            end_node,
+            event_prefab_index,
+            schedules,
+        });
         route_ranges.push(start..reader.offset());
+        schedule_name_ranges.push(route_name_ranges);
+        schedule_name_compact_modes.push(route_name_compact_modes);
     }
-    Ok((route_ranges, total_schedule_count))
+    Ok((
+        routes,
+        route_ranges,
+        schedule_name_ranges,
+        schedule_name_compact_modes,
+        total_schedule_count,
+    ))
 }
 
 fn event_popularity_delta_present(format_version: u32) -> bool {
@@ -1510,7 +1948,10 @@ fn finish(
     active_event_record_ranges: Vec<Range<usize>>,
     active_event_race_data_ranges: Vec<Option<Range<usize>>>,
     active_event_race_data_presence_bytes: Vec<Option<u8>>,
+    active_event_routes: Vec<EventManagerRouteRecord>,
     active_event_route_ranges: Vec<Range<usize>>,
+    route_schedule_name_ranges: Vec<Vec<Range<usize>>>,
+    route_schedule_name_compact_modes: Vec<Vec<Option<bool>>>,
     route_schedule_prefab_scope_range: Option<Range<usize>>,
     object_headers: Vec<NetObjectHeader>,
     unidentified_counted_block: Option<UnidentifiedCountedBlock>,
@@ -1533,7 +1974,10 @@ fn finish(
             active_event_record_ranges,
             active_event_race_data_ranges,
             active_event_race_data_presence_bytes,
+            active_event_routes,
             active_event_route_ranges,
+            route_schedule_name_ranges,
+            route_schedule_name_compact_modes,
             route_schedule_prefab_scope_range,
             object_headers,
             unidentified_counted_block,
@@ -1794,6 +2238,14 @@ fn encode_event_record(
 fn invalid_event_record(offset: usize, reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "EventManager+Data event record".to_owned(),
+        offset,
+        reason: reason.into(),
+    }
+}
+
+fn invalid_event_route(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "EventManager+Data route".to_owned(),
         offset,
         reason: reason.into(),
     }
@@ -2130,7 +2582,7 @@ mod tests {
     }
 
     #[test]
-    fn active_event_routes_follow_version_gates_and_are_preserved_raw() {
+    fn active_event_routes_follow_version_gates_and_roundtrip() {
         for (version, schedule_count) in [
             (121_005, 0),
             (121_006, 0),
@@ -2151,6 +2603,36 @@ mod tests {
                 1,
                 "version {version}"
             );
+            let route = &decoded.active_event_routes[0];
+            assert_eq!(route.slot_index, 1, "version {version}");
+            assert_eq!(route.flags, 0x1020_3040, "version {version}");
+            assert_eq!(route.policies, (version >= 121_018).then_some(0x1122_3344));
+            assert_eq!(route.indexes, [1, 2, 3, 4, 5, 6, 7]);
+            assert_eq!(
+                route.route_version,
+                (version >= 121_007).then_some(0x89ab_cdef)
+            );
+            assert_eq!(route.color, (version >= 121_007).then_some(0x1020_3040));
+            assert_eq!(route.start_node, (version >= 121_007).then_some(8));
+            assert_eq!(route.end_node, (version >= 121_007).then_some(9));
+            assert_eq!(route.event_prefab_index, (version >= 121_009).then_some(10));
+            let expected_schedule_count = if version >= 121_015 {
+                usize::from(schedule_count)
+            } else {
+                0
+            };
+            assert_eq!(route.schedules.len(), expected_schedule_count);
+            if let Some(schedule) = route.schedules.first() {
+                assert_eq!(schedule.schedule_id, (version >= 121_027).then_some(-11));
+                assert_eq!(schedule.tier, 12);
+                assert_eq!(schedule.lap_count, 13);
+                assert_eq!(schedule.ticket_price, 14);
+                assert_eq!(schedule.name, None);
+                assert_eq!(schedule.flags, (version >= 121_027).then_some(15));
+                assert_eq!(schedule.frequency, (version >= 121_027).then_some(16));
+                assert_eq!(schedule.start_day, (version >= 121_027).then_some(17));
+                assert_eq!(schedule.start_month, (version >= 121_027).then_some(18));
+            }
             assert_eq!(
                 decoded
                     .serialized_body
@@ -2166,6 +2648,15 @@ mod tests {
                     .unwrap(),
                 bytes,
                 "version {version}"
+            );
+            assert_eq!(
+                decoded
+                    .clone()
+                    .into_route_records_editor()
+                    .encode()
+                    .unwrap(),
+                bytes,
+                "route editor version {version}"
             );
             assert_eq!(
                 decoded.route_schedule_prefab_scope_range.is_some(),
