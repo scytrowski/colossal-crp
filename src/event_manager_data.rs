@@ -11,13 +11,13 @@ use std::ops::Range;
 
 const MAX_EVENT_SLOTS: usize = u16::MAX as usize + 1;
 const FIRST_EVENT_RECORD_VERSION: u32 = 210;
-const LAST_SUPPORTED_EVENT_RECORD_VERSION: u32 = 121_005;
+const LAST_SUPPORTED_EVENT_RECORD_VERSION: u32 = 121_030;
 const CUSTOM_EVENT_SEED_FLAG: u32 = 1 << 10;
 const MAX_RACE_EVENT_ENTRIES: usize = 1_000_000;
 
 /// One decoded active event from the versioned EventManager record layout.
 ///
-/// This layout is supported for inner versions 210 through 121005. Its four
+/// This layout is supported for inner versions 210 through 121030. Its four
 /// pre-245 color words are retained raw because their meaning is not
 /// established; version 245 stores the color as RGB bytes. Version-gated event
 /// values are exposed when present. The nested race-event data added at 120004
@@ -87,10 +87,11 @@ pub struct EventManagerTailData {
 
 /// Supported fields decoded from a bounded `EventManager+Data` body.
 ///
-/// Active event records in versions 210–121005 are decoded and retained.
+/// Active event records in versions 210–121030 are decoded and retained.
 /// Race-event blocks are retained raw after their versioned structure is
 /// boundary-checked; nonempty route-spline control-point lists and active event
-/// routes remain unsupported. Reader, writer,
+/// routes remain unsupported. Versions 121031 and newer are not supported for
+/// active event records. Reader, writer,
 /// and one corpus-observed counted-block candidate are boundary-checked. The
 /// counted block is retained as raw bytes because its meaning and type are
 /// unknown.
@@ -100,6 +101,7 @@ pub(crate) struct EventManagerReferenceData {
     pub(crate) active_event_records: Vec<EventManagerEventRecord>,
     active_event_record_ranges: Vec<Range<usize>>,
     active_event_race_data_ranges: Vec<Option<Range<usize>>>,
+    active_event_race_data_presence_bytes: Vec<Option<u8>>,
     pub(crate) object_headers: Vec<NetObjectHeader>,
     pub(crate) unidentified_counted_block: Option<UnidentifiedCountedBlock>,
     pub(crate) type_data: Vec<EventManagerTypeData>,
@@ -132,7 +134,7 @@ pub struct EventManagerTypeDataEditor {
 /// Editor for existing versioned active EventManager records.
 ///
 /// The record count, slot indexes, and activity flags are fixed. It edits only
-/// same-width scalar values for inner versions 210–121005 and preserves nested
+/// same-width scalar values for inner versions 210–121030 and preserves nested
 /// race-event bytes and the surrounding EventManager body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerEventRecordsEditor {
@@ -184,23 +186,26 @@ impl EventManagerReferenceData {
     }
 
     fn equivalent_race_event_data(&self, other: &Self) -> bool {
-        self.active_event_race_data_ranges
-            .iter()
-            .zip(&other.active_event_race_data_ranges)
-            .all(|(left, right)| match (left, right) {
-                (None, None) => true,
-                (Some(left), Some(right)) => {
-                    match (
-                        self.serialized_body.get(left.clone()),
-                        other.serialized_body.get(right.clone()),
-                    ) {
-                        (Some(left), Some(right)) => left == right,
-                        _ => false,
+        self.active_event_race_data_ranges.len() == other.active_event_race_data_ranges.len()
+            && self.active_event_race_data_presence_bytes
+                == other.active_event_race_data_presence_bytes
+            && self
+                .active_event_race_data_ranges
+                .iter()
+                .zip(&other.active_event_race_data_ranges)
+                .all(|(left, right)| match (left, right) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => {
+                        match (
+                            self.serialized_body.get(left.clone()),
+                            other.serialized_body.get(right.clone()),
+                        ) {
+                            (Some(left), Some(right)) => left == right,
+                            _ => false,
+                        }
                     }
-                }
-                _ => false,
-            })
-            && self.active_event_race_data_ranges.len() == other.active_event_race_data_ranges.len()
+                    _ => false,
+                })
     }
 
     pub(crate) fn into_type_data_editor(self) -> EventManagerTypeDataEditor {
@@ -289,8 +294,12 @@ impl EventManagerReferenceData {
         } else {
             read_encoded_uint_array(&mut reader, event_capacity - 1)?
         };
-        let (active_event_records, active_event_record_ranges, active_event_race_data) =
-            read_active_event_records(&mut reader, format_version, &event_flags)?;
+        let (
+            active_event_records,
+            active_event_record_ranges,
+            active_event_race_data_ranges,
+            active_event_race_data_presence_bytes,
+        ) = read_active_event_records(&mut reader, format_version, &event_flags)?;
 
         if format_version >= 121_005 {
             let route_capacity = read_capacity(&mut reader, "event route")?;
@@ -347,7 +356,8 @@ impl EventManagerReferenceData {
             format_version,
             active_event_records,
             active_event_record_ranges,
-            active_event_race_data,
+            active_event_race_data_ranges,
+            active_event_race_data_presence_bytes,
             object_headers,
             unidentified_counted_block,
             type_data,
@@ -401,6 +411,7 @@ impl EventManagerReferenceData {
         finish(
             &mut reader,
             format_version,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -518,6 +529,15 @@ impl EventManagerEventRecordsEditor {
             }
             let mut encoded =
                 encode_event_record(self.original.format_version, record, range.start)?;
+            if let Some(presence_byte) = self
+                .original
+                .active_event_race_data_presence_bytes
+                .get(record_index)
+                .copied()
+                .flatten()
+            {
+                encoded.push(presence_byte);
+            }
             if let Some(race_range) = self
                 .original
                 .active_event_race_data_ranges
@@ -873,12 +893,13 @@ fn read_active_event_records(
         Vec<EventManagerEventRecord>,
         Vec<Range<usize>>,
         Vec<Option<Range<usize>>>,
+        Vec<Option<u8>>,
     ),
     CrpError,
 > {
     let active_count = flags.iter().filter(|flag| **flag != 0).count();
     if active_count == 0 {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
     }
     if !(FIRST_EVENT_RECORD_VERSION..=LAST_SUPPORTED_EVENT_RECORD_VERSION).contains(&format_version)
     {
@@ -890,6 +911,7 @@ fn read_active_event_records(
     let mut records = Vec::with_capacity(active_count);
     let mut record_ranges = Vec::with_capacity(active_count);
     let mut race_data_blocks = Vec::with_capacity(active_count);
+    let mut race_data_presence_bytes = Vec::with_capacity(active_count);
     for (slot, flags) in flags.iter().copied().enumerate() {
         if flags == 0 {
             continue;
@@ -970,12 +992,19 @@ fn read_active_event_records(
         } else {
             None
         };
-        let race_data = if (120_004..=121_005).contains(&format_version) {
-            let start = reader.offset();
-            skip_race_event_data(reader)?;
-            Some(start..reader.offset())
+        let (race_data, race_data_presence_byte) = if (120_004..=121_005).contains(&format_version)
+        {
+            (Some(read_race_event_data_range(reader)?), None)
+        } else if (121_006..=LAST_SUPPORTED_EVENT_RECORD_VERSION).contains(&format_version) {
+            let presence_byte = reader.read_u8()?;
+            let race_data = if data_serializer_bool_is_true(presence_byte) {
+                Some(read_race_event_data_range(reader)?)
+            } else {
+                None
+            };
+            (race_data, Some(presence_byte))
         } else {
-            None
+            (None, None)
         };
         records.push(EventManagerEventRecord {
             slot_index,
@@ -998,8 +1027,24 @@ fn read_active_event_records(
         });
         record_ranges.push(record_start..reader.offset());
         race_data_blocks.push(race_data);
+        race_data_presence_bytes.push(race_data_presence_byte);
     }
-    Ok((records, record_ranges, race_data_blocks))
+    Ok((
+        records,
+        record_ranges,
+        race_data_blocks,
+        race_data_presence_bytes,
+    ))
+}
+
+fn read_race_event_data_range(reader: &mut Reader<'_>) -> Result<Range<usize>, CrpError> {
+    let start = reader.offset();
+    skip_race_event_data(reader)?;
+    Ok(start..reader.offset())
+}
+
+fn data_serializer_bool_is_true(value: u8) -> bool {
+    value == 1
 }
 
 fn skip_race_event_data(reader: &mut Reader<'_>) -> Result<(), CrpError> {
@@ -1016,12 +1061,12 @@ fn skip_race_event_data(reader: &mut Reader<'_>) -> Result<(), CrpError> {
         reader.read_u16_be()?; // First path.
         reader.read_u16_be()?; // Second path.
         reader.read_u8()?; // Paths assigned.
-        if reader.read_u8()? != 0 {
+        if data_serializer_bool_is_true(reader.read_u8()?) {
             reader.read_u16_be()?;
             race_team_reference_count += 1;
         }
         reader.read_unique_string()?;
-        if reader.read_u8()? != 0 {
+        if data_serializer_bool_is_true(reader.read_u8()?) {
             reader.read_u16_be()?;
             parade_group_reference_count += 1;
         }
@@ -1057,7 +1102,7 @@ fn skip_race_event_data(reader: &mut Reader<'_>) -> Result<(), CrpError> {
     skip_race_event_values(reader, racer_count, 8, "racer oscillation")?;
     skip_race_event_values(reader, racer_count, 8, "racer state timer")?;
 
-    if reader.read_u8()? != 0 {
+    if data_serializer_bool_is_true(reader.read_u8()?) {
         let bezier_count = usize::try_from(reader.read_u32_be()?)
             .map_err(|_| reader.invalid("route-spline count does not fit this platform"))?;
         reader.read_bytes(8)?; // Start/end buildings and nodes.
@@ -1316,6 +1361,7 @@ fn finish(
     active_event_records: Vec<EventManagerEventRecord>,
     active_event_record_ranges: Vec<Range<usize>>,
     active_event_race_data_ranges: Vec<Option<Range<usize>>>,
+    active_event_race_data_presence_bytes: Vec<Option<u8>>,
     object_headers: Vec<NetObjectHeader>,
     unidentified_counted_block: Option<UnidentifiedCountedBlock>,
     type_data: Vec<EventManagerTypeData>,
@@ -1336,6 +1382,7 @@ fn finish(
             active_event_records,
             active_event_record_ranges,
             active_event_race_data_ranges,
+            active_event_race_data_presence_bytes,
             object_headers,
             unidentified_counted_block,
             type_data,
@@ -1698,6 +1745,9 @@ mod tests {
         }
         if (120_004..=121_005).contains(&format_version) {
             bytes.extend_from_slice(&EMPTY_RACE_EVENT_DATA);
+        } else if (121_006..=121_030).contains(&format_version) {
+            bytes.push(1); // RaceEventData is present.
+            bytes.extend_from_slice(&EMPTY_RACE_EVENT_DATA);
         }
         if format_version >= 121_005 {
             bytes.extend_from_slice(&[0x00, 0x00]); // One route slot; no active routes.
@@ -1708,6 +1758,9 @@ mod tests {
         }
         bytes.extend_from_slice(&[0x00, 0x00, 0x07]); // One event prefab index.
         bytes.extend_from_slice(&[0x00, 0x00]); // Empty prefab names.
+        if format_version >= 121_015 {
+            bytes.extend_from_slice(&[0x00, 0x00]); // Empty event-schedule prefab names.
+        }
         if format_version >= 253 {
             bytes.push(0xff); // Match-preparing reference.
         }
@@ -1716,6 +1769,9 @@ mod tests {
         }
         if format_version >= 109_003 || (108_003..109_000).contains(&format_version) {
             bytes.extend_from_slice(&[0x34, 0x56]); // Band-popularity bonus.
+        }
+        if format_version >= 121_027 {
+            bytes.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // Event-schedule count.
         }
         bytes.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
         bytes
@@ -2181,6 +2237,10 @@ mod tests {
             0x00, 0x00, 0x00, 0x01, // One active event flag.
         ];
         assert!(EventManagerReferenceData::decode_reader(120_004, &active_event).is_err());
+        assert!(
+            EventManagerReferenceData::decode_reader(121_031, &one_active_event(121_031, 1))
+                .is_err()
+        );
 
         let active_route = [
             0x00, 0x00, // One event slot.
@@ -2404,7 +2464,7 @@ mod tests {
     }
 
     #[test]
-    fn late_event_record_fields_follow_version_gates_through_121005() {
+    fn late_event_record_fields_follow_version_gates_through_121030() {
         let flags = 0x0000_0401;
         let expected_tickets = Some([0x2122_2324_2526_2728, 0x3132_3334_3536_3738]);
         let expected_times = Some([0x3f80_0000, 0xbf00_0000]);
@@ -2503,6 +2563,54 @@ mod tests {
                 Some(0x0506_0708),
                 expected_times,
             ),
+            (
+                121_006,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                expected_times,
+            ),
+            (
+                121_014,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                expected_times,
+            ),
+            (
+                121_015,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                expected_times,
+            ),
+            (
+                121_026,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                expected_times,
+            ),
+            (
+                121_027,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                expected_times,
+            ),
+            (
+                121_030,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                expected_times,
+            ),
         ] {
             let bytes = one_active_event(version, flags);
             let (decoded, consumed) =
@@ -2575,7 +2683,7 @@ mod tests {
                 }
             }
 
-            if (120_004..=121_005).contains(&version) {
+            if (120_004..=121_030).contains(&version) {
                 let range = decoded.active_event_record_ranges[0].clone();
                 let race_data_range = decoded.active_event_race_data_ranges[0]
                     .as_ref()
@@ -2590,6 +2698,11 @@ mod tests {
                     &bytes[range.end - EMPTY_RACE_EVENT_DATA.len()..range.end],
                     EMPTY_RACE_EVENT_DATA,
                     "race-data bytes for version {version}"
+                );
+                assert_eq!(
+                    decoded.active_event_race_data_presence_bytes[0],
+                    (version >= 121_006).then_some(1),
+                    "race-data presence byte for version {version}"
                 );
                 for end in 0..bytes.len() {
                     assert!(
@@ -2628,6 +2741,45 @@ mod tests {
                 .encode()
                 .unwrap(),
             bytes
+        );
+
+        let versioned_presence = one_active_event(121_006, 1);
+        let versioned_race_start = versioned_presence
+            .windows(EMPTY_RACE_EVENT_DATA.len())
+            .position(|window| window == EMPTY_RACE_EVENT_DATA)
+            .expect("version-121006 race-event fixture occurs in the event record");
+        let presence_offset = versioned_race_start - 1;
+        let mut absent_race = versioned_presence.clone();
+        absent_race[presence_offset] = 0;
+        absent_race.drain(versioned_race_start..versioned_race_start + EMPTY_RACE_EVENT_DATA.len());
+        let (decoded_absent, consumed_absent) =
+            EventManagerReferenceData::decode_reader(121_006, &absent_race).unwrap();
+        assert_eq!(consumed_absent, absent_race.len());
+        assert_eq!(decoded_absent.active_event_race_data_ranges[0], None);
+        assert_eq!(
+            decoded_absent.active_event_race_data_presence_bytes[0],
+            Some(0)
+        );
+        assert_eq!(
+            decoded_absent.into_event_records_editor().encode().unwrap(),
+            absent_race
+        );
+
+        absent_race[presence_offset] = 2;
+        let (decoded_noncanonical, consumed_noncanonical) =
+            EventManagerReferenceData::decode_reader(121_006, &absent_race).unwrap();
+        assert_eq!(consumed_noncanonical, absent_race.len());
+        assert_eq!(decoded_noncanonical.active_event_race_data_ranges[0], None);
+        assert_eq!(
+            decoded_noncanonical.active_event_race_data_presence_bytes[0],
+            Some(2)
+        );
+        assert_eq!(
+            decoded_noncanonical
+                .into_event_records_editor()
+                .encode()
+                .unwrap(),
+            absent_race
         );
 
         let mut one_racer_bytes = bytes.clone();
