@@ -141,8 +141,8 @@ pub use vehicle_manager_data::{
     VehicleInstanceFields, VehicleInstanceFieldsEditor, VehicleInstanceFieldsPrefix,
     VehicleLastFrameDataPrefix, VehicleLastFrameEditor, VehicleLastFrameRecord, VehicleManagerData,
     VehicleManagerDataPrefix, VehicleManagerSparseFieldsEditor, VehicleManagerSparseFieldsPrefix,
-    VehicleManagerTailDataPrefix, VehicleParkedInstanceRecord, VehicleParkedRecordsEditor,
-    VehicleParkedRecordsPrefix, VehicleTargetPosition0,
+    VehicleManagerTailDataPrefix, VehicleManagerTailEditor, VehicleParkedInstanceRecord,
+    VehicleParkedRecordsEditor, VehicleParkedRecordsPrefix, VehicleTargetPosition0,
 };
 pub use water_manager_data::{
     HeatingConductiveCellData, WaterConductiveCellData, WaterManagerData, WaterPulseGroup,

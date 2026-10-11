@@ -21,6 +21,7 @@ use crate::VehicleManagerDataPrefix;
 use crate::VehicleManagerSparseFieldsEditor;
 use crate::VehicleManagerSparseFieldsPrefix;
 use crate::VehicleManagerTailDataPrefix;
+use crate::VehicleManagerTailEditor;
 use crate::VehicleParkedRecordsEditor;
 use crate::VehicleParkedRecordsPrefix;
 use crate::WaterSimulationData;
@@ -6623,6 +6624,93 @@ impl SimulationManagerData {
     ) -> Result<(VehicleManagerTailDataPrefix, usize), CrpError> {
         let (data, manager_end) = self.decode_vehicle_manager_data()?;
         Ok((data.tail().clone(), manager_end))
+    }
+
+    /// Decodes VehicleManager counters into a fixed-width editor.
+    pub fn decode_vehicle_manager_tail_editor(&self) -> Result<VehicleManagerTailEditor, CrpError> {
+        let (tail, _) = self.decode_vehicle_manager_tail()?;
+        Ok(tail.into_editor())
+    }
+
+    /// Replaces versioned VehicleManager counters without changing their width.
+    ///
+    /// The editor must come from this manager body and inner version. The
+    /// source bytes, closing profiler reference, and following TransportManager
+    /// boundary are checked after replacement.
+    pub fn replace_vehicle_manager_tail(
+        &mut self,
+        edited: &VehicleManagerTailEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                17,
+                "edited VehicleManager counter version does not match this stream",
+            ));
+        }
+        let (vehicle_data, original_manager_end) = self.decode_vehicle_manager_data()?;
+        let original_tail = vehicle_data.tail().encode();
+        if original_tail.as_slice() != edited.original_bytes() {
+            return Err(invalid(
+                17,
+                "VehicleManager counter bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode();
+        if replacement.len() != original_tail.len() {
+            return Err(invalid(
+                17,
+                "edited VehicleManager counters changed their serialized width",
+            ));
+        }
+
+        let (_, tail_start) = self.decode_vehicle_manager_parked_records_prefix()?;
+        let tail_end = tail_start
+            .checked_add(original_tail.len())
+            .ok_or(CrpError::ArithmeticOverflow("VehicleManager counter end"))?;
+        let closing_reference_end = tail_end.checked_add(2).ok_or(CrpError::ArithmeticOverflow(
+            "VehicleManager closing reference end",
+        ))?;
+        if closing_reference_end != original_manager_end {
+            return Err(invalid(
+                tail_start,
+                "VehicleManager counters do not end before its closing profiler reference",
+            ));
+        }
+        if self.serialized_object_graph.get(tail_start..tail_end) != Some(original_tail.as_slice())
+        {
+            return Err(invalid(
+                tail_start,
+                "VehicleManager counter range differs from its decoded source bytes",
+            ));
+        }
+
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate
+            .get_mut(tail_start..tail_end)
+            .ok_or_else(|| invalid(tail_start, "VehicleManager counter range is out of bounds"))?
+            .copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        let validation =
+            self.decode_vehicle_manager_data()
+                .and_then(|(data, updated_manager_end)| {
+                    if updated_manager_end != original_manager_end
+                        || data.tail().encode() != replacement
+                    {
+                        return Err(invalid(
+                            tail_start,
+                            "edited VehicleManager counters changed an unexpected manager boundary",
+                        ));
+                    }
+                    Ok(())
+                });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                tail_start,
+                format!("edited VehicleManager counters failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes the known DistrictManager prefix for the requested inner version.
@@ -20127,6 +20215,64 @@ mod manager_boundary_tests {
             updated_manager_end,
             original_manager_end - original_sparse_len + replacement.len()
         );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_manager_end..],
+            original_suffix.as_slice()
+        );
+    }
+
+    #[test]
+    fn vehicle_manager_tail_editor_patches_counters_and_keeps_manager_boundary() {
+        let mut graph = profiler_tag("VehicleManager");
+        write_encoded_uint_array(&mut graph, &vec![0; 16_383]);
+        write_encoded_uint_array(&mut graph, &vec![0; 16_383]); // version-274 flags2
+        write_encoded_ushort_array(&mut graph, &vec![0; 32_767]);
+        graph.extend_from_slice(&[0, 0]); // empty prefab-name table
+        graph.extend_from_slice(&[
+            0, 0, 0, 1, // first traffic total
+            0, 0, 0, 2, // second traffic total
+            3, // traffic-flow byte
+            0, 0, 0, 4, // temporary vehicle count
+            0, 0, 0, 5, // final vehicle count
+            0, 16, // closing profiler reference
+        ]);
+        let transport_tag = profiler_tag("TransportManager");
+        graph.extend_from_slice(&transport_tag);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 116_013;
+        let mut manager_objects = vec![None; 19];
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[18] = Some(ManagerObjectReference {
+            object_id: 18,
+            type_name: "TransportManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (original, original_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(original.tail().temporary_vehicle_count(), Some(4));
+        let original_suffix = manager.serialized_object_graph()[original_manager_end..].to_vec();
+        let mut editor = manager.decode_vehicle_manager_tail_editor().unwrap();
+        editor
+            .set_traffic_flow_totals([0x1020_3040, 0x5060_7080])
+            .unwrap();
+        editor.set_traffic_flow_byte(0x90).unwrap();
+        editor.set_temporary_vehicle_count(0x1234_5678).unwrap();
+        editor.set_final_vehicle_count(0x9abc_def0).unwrap();
+
+        manager.replace_vehicle_manager_tail(&editor).unwrap();
+        let (updated, updated_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(
+            updated.tail().traffic_flow_totals(),
+            Some([0x1020_3040, 0x5060_7080])
+        );
+        assert_eq!(updated.tail().traffic_flow_byte(), Some(0x90));
+        assert_eq!(updated.tail().temporary_vehicle_count(), Some(0x1234_5678));
+        assert_eq!(updated.tail().final_vehicle_count(), Some(0x9abc_def0));
+        assert_eq!(updated_manager_end, original_manager_end);
         assert_eq!(
             &manager.serialized_object_graph()[updated_manager_end..],
             original_suffix.as_slice()

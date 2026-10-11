@@ -1436,6 +1436,19 @@ pub struct VehicleManagerTailDataPrefix {
     serialized_prefix: Vec<u8>,
 }
 
+/// Editor for the fixed-width VehicleManager counter tail.
+///
+/// Setters return errors when a field is absent at the source version. The
+/// editor preserves the original bytes when values are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleManagerTailEditor {
+    original: VehicleManagerTailDataPrefix,
+    traffic_flow_totals: Option<[u32; 2]>,
+    traffic_flow_byte: Option<u8>,
+    temporary_vehicle_count: Option<u32>,
+    final_vehicle_count: Option<u32>,
+}
+
 impl VehicleManagerTailDataPrefix {
     /// Returns the inner DataSerializer version.
     pub fn format_version(&self) -> u32 {
@@ -1466,6 +1479,114 @@ impl VehicleManagerTailDataPrefix {
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
+
+    /// Creates an editor for the versioned manager counters.
+    pub fn into_editor(self) -> VehicleManagerTailEditor {
+        VehicleManagerTailEditor {
+            traffic_flow_totals: self.traffic_flow_totals,
+            traffic_flow_byte: self.traffic_flow_byte,
+            temporary_vehicle_count: self.temporary_vehicle_count,
+            final_vehicle_count: self.final_vehicle_count,
+            original: self,
+        }
+    }
+}
+
+impl VehicleManagerTailEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns the two traffic-flow totals from version 315.
+    pub fn traffic_flow_totals(&self) -> Option<[u32; 2]> {
+        self.traffic_flow_totals
+    }
+
+    /// Changes the two traffic-flow totals (version 315+).
+    pub fn set_traffic_flow_totals(&mut self, values: [u32; 2]) -> Result<(), CrpError> {
+        set_tail_value(&mut self.traffic_flow_totals, values, "traffic-flow totals")
+    }
+
+    /// Returns the trailing traffic-flow byte from version 315.
+    pub fn traffic_flow_byte(&self) -> Option<u8> {
+        self.traffic_flow_byte
+    }
+
+    /// Changes the trailing traffic-flow byte (version 315+).
+    pub fn set_traffic_flow_byte(&mut self, value: u8) -> Result<(), CrpError> {
+        set_tail_value(&mut self.traffic_flow_byte, value, "traffic-flow byte")
+    }
+
+    /// Returns the temporary vehicle count from version 116013.
+    pub fn temporary_vehicle_count(&self) -> Option<u32> {
+        self.temporary_vehicle_count
+    }
+
+    /// Changes the temporary vehicle count (version 116013+).
+    pub fn set_temporary_vehicle_count(&mut self, value: u32) -> Result<(), CrpError> {
+        set_tail_value(
+            &mut self.temporary_vehicle_count,
+            value,
+            "temporary vehicle count",
+        )
+    }
+
+    /// Returns the final vehicle count from version 116013.
+    pub fn final_vehicle_count(&self) -> Option<u32> {
+        self.final_vehicle_count
+    }
+
+    /// Changes the final vehicle count (version 116013+).
+    pub fn set_final_vehicle_count(&mut self, value: u32) -> Result<(), CrpError> {
+        set_tail_value(&mut self.final_vehicle_count, value, "final vehicle count")
+    }
+
+    /// Writes the counters in the fixed-width versioned field order.
+    pub fn encode(&self) -> Vec<u8> {
+        if self.traffic_flow_totals == self.original.traffic_flow_totals
+            && self.traffic_flow_byte == self.original.traffic_flow_byte
+            && self.temporary_vehicle_count == self.original.temporary_vehicle_count
+            && self.final_vehicle_count == self.original.final_vehicle_count
+        {
+            return self.original.serialized_prefix.clone();
+        }
+
+        let mut bytes = Vec::with_capacity(self.original.serialized_prefix.len());
+        if let Some(values) = self.traffic_flow_totals {
+            bytes.extend_from_slice(&values[0].to_be_bytes());
+            bytes.extend_from_slice(&values[1].to_be_bytes());
+        }
+        if let Some(value) = self.traffic_flow_byte {
+            bytes.push(value);
+        }
+        if let Some(value) = self.temporary_vehicle_count {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        if let Some(value) = self.final_vehicle_count {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes
+    }
+
+    pub(crate) fn original_bytes(&self) -> &[u8] {
+        &self.original.serialized_prefix
+    }
+}
+
+fn set_tail_value<T: Copy>(
+    field: &mut Option<T>,
+    value: T,
+    name: &'static str,
+) -> Result<(), CrpError> {
+    let slot = field.as_mut().ok_or_else(|| {
+        invalid(
+            0,
+            format!("VehicleManager {name} is not serialized at this version"),
+        )
+    })?;
+    *slot = value;
+    Ok(())
 }
 
 /// Fully decoded known `VehicleManager+Data` sections through its counters.
@@ -2457,6 +2578,55 @@ mod tests {
                 .decode_tail(&[0; 16])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn vehicle_manager_tail_editor_writes_counters_in_versioned_order() {
+        let source = [
+            0x01, 0x02, 0x03, 0x04, // first traffic total
+            0x11, 0x22, 0x33, 0x44, // second traffic total
+            0x55, // traffic-flow byte
+            0x66, 0x77, 0x88, 0x99, // temporary vehicle count
+            0xaa, 0xbb, 0xcc, 0xdd, // final vehicle count
+        ];
+        let (decoded, consumed) = parked_records_prefix(116_013).decode_tail(&source).unwrap();
+        assert_eq!(consumed, source.len());
+        let mut editor = decoded.into_editor();
+        assert_eq!(editor.encode(), source);
+        editor
+            .set_traffic_flow_totals([0x1020_3040, 0x5060_7080])
+            .unwrap();
+        editor.set_traffic_flow_byte(0x90).unwrap();
+        editor.set_temporary_vehicle_count(0x1234_5678).unwrap();
+        editor.set_final_vehicle_count(0x9abc_def0).unwrap();
+        let expected = [
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0x12, 0x34, 0x56, 0x78, 0x9a,
+            0xbc, 0xde, 0xf0,
+        ];
+        assert_eq!(editor.encode(), expected);
+        assert_eq!(
+            editor.traffic_flow_totals(),
+            Some([0x1020_3040, 0x5060_7080])
+        );
+        assert_eq!(editor.traffic_flow_byte(), Some(0x90));
+        assert_eq!(editor.temporary_vehicle_count(), Some(0x1234_5678));
+        assert_eq!(editor.final_vehicle_count(), Some(0x9abc_def0));
+
+        let (old, consumed) = parked_records_prefix(314).decode_tail(&[]).unwrap();
+        assert_eq!(consumed, 0);
+        let mut old_editor = old.into_editor();
+        assert!(old_editor.set_traffic_flow_totals([1, 2]).is_err());
+        assert!(old_editor.set_traffic_flow_byte(3).is_err());
+        assert!(old_editor.set_temporary_vehicle_count(4).is_err());
+        assert!(old_editor.set_final_vehicle_count(5).is_err());
+
+        let (traffic_only, consumed) = parked_records_prefix(315)
+            .decode_tail(&source[..9])
+            .unwrap();
+        assert_eq!(consumed, 9);
+        let mut traffic_editor = traffic_only.into_editor();
+        assert!(traffic_editor.set_temporary_vehicle_count(1).is_err());
+        assert!(traffic_editor.set_final_vehicle_count(2).is_err());
     }
 
     #[test]
