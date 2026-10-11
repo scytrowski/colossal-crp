@@ -1,5 +1,7 @@
 use crate::CrpError;
-use crate::data_serializer::{Reader, write_nullable_unique_string};
+use crate::data_serializer::{
+    Reader, write_nullable_unique_string, write_u24_be, write_unique_string,
+};
 use crate::encoded_array::{
     read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
     read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
@@ -605,6 +607,63 @@ pub enum NetObjectHeader {
     NewSharedType(u16),
     /// Existing object referring to an earlier object by 24-bit index.
     Existing(u32),
+}
+
+impl NetObjectHeader {
+    /// Decodes one object header and returns the number of bytes consumed.
+    ///
+    /// Any following bytes are left for the caller. This resolves only the
+    /// header form; object IDs and shared-type indexes are not checked against
+    /// a surrounding DataSerializer table.
+    pub fn decode_from(bytes: &[u8]) -> Result<(Self, usize), CrpError> {
+        let mut reader = Reader::new(bytes);
+        let header = read_net_object_header(&mut reader)?;
+        Ok((header, reader.offset()))
+    }
+
+    /// Encodes this header using the canonical DataSerializer string encoding.
+    ///
+    /// A decoded `NewType` does not retain whether its type name used compact
+    /// or wide string encoding, so this method deliberately canonicalizes that
+    /// string. Existing-body writers should preserve their original bytes when
+    /// no semantic edit is intended. Reserved marker prefixes and IDs are
+    /// rejected because they cannot be represented as this header variant.
+    pub fn encode_canonical(&self) -> Result<Vec<u8>, CrpError> {
+        let mut bytes = Vec::new();
+        match self {
+            Self::Null => bytes.push(0xff),
+            Self::NewType(type_name) => {
+                bytes.extend_from_slice(&[0xfe, 0xfe]);
+                write_unique_string(&mut bytes, type_name)?;
+            }
+            Self::NewSharedType(index) => {
+                if index.to_be_bytes()[0] >= 0xfe {
+                    return Err(invalid_object_header(
+                        "shared-type index uses a reserved marker prefix",
+                    ));
+                }
+                bytes.push(0xfe);
+                bytes.extend_from_slice(&index.to_be_bytes());
+            }
+            Self::Existing(object_id) => {
+                if *object_id >= 0xfe_0000 {
+                    return Err(invalid_object_header(
+                        "existing-object ID uses a reserved marker prefix",
+                    ));
+                }
+                write_u24_be(&mut bytes, *object_id)?;
+            }
+        }
+        Ok(bytes)
+    }
+}
+
+fn invalid_object_header(reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "DataSerializer object header".to_owned(),
+        offset: 0,
+        reason: reason.into(),
+    }
 }
 
 /// Guide object headers and final scalar fields of `NetManager+Data`.
@@ -4063,5 +4122,91 @@ mod guide_tests {
         *editor.problems_mut() = 0x0123_4567_89ab_cdef;
         let encoded = editor.encode().expect("wide problem edits encode");
         assert_eq!(&encoded[11..19], &0x0123_4567_89ab_cdef_u64.to_be_bytes());
+    }
+}
+
+#[cfg(test)]
+mod net_object_header_tests {
+    use super::NetObjectHeader;
+
+    #[test]
+    fn object_header_variants_match_independent_expected_bytes() {
+        let cases = [
+            (NetObjectHeader::Null, vec![0xff]),
+            (NetObjectHeader::Existing(0x12_3456), vec![0x12, 0x34, 0x56]),
+            (
+                NetObjectHeader::NewSharedType(0x1234),
+                vec![0xfe, 0x12, 0x34],
+            ),
+            (
+                NetObjectHeader::NewType("A".to_owned()),
+                vec![0xfe, 0xfe, 0x80, 0x00, 0x01, 0xc1],
+            ),
+            (
+                NetObjectHeader::NewType("Ā".to_owned()),
+                vec![0xfe, 0xfe, 0x00, 0x00, 0x01, 0x00, 0x80],
+            ),
+        ];
+
+        for (header, expected) in cases {
+            let encoded = header
+                .encode_canonical()
+                .expect("valid object header encodes");
+            assert_eq!(encoded, expected);
+            let (decoded, consumed) =
+                NetObjectHeader::decode_from(&expected).expect("expected bytes decode");
+            assert_eq!(decoded, header);
+            assert_eq!(consumed, expected.len());
+        }
+    }
+
+    #[test]
+    fn object_header_decoder_leaves_following_bytes_and_checks_truncation() {
+        let (header, consumed) = NetObjectHeader::decode_from(&[0xff, 0x42])
+            .expect("null header decodes before trailing field");
+        assert_eq!(header, NetObjectHeader::Null);
+        assert_eq!(consumed, 1);
+
+        for truncated in [&[][..], &[0xfe][..], &[0xfe, 0x12][..], &[0x01, 0x02][..]] {
+            assert!(NetObjectHeader::decode_from(truncated).is_err());
+        }
+        assert!(NetObjectHeader::decode_from(&[0xfe, 0xff]).is_err());
+    }
+
+    #[test]
+    fn object_header_writer_rejects_reserved_marker_ranges() {
+        assert!(
+            NetObjectHeader::Existing(0xfe_0000)
+                .encode_canonical()
+                .is_err()
+        );
+        assert!(
+            NetObjectHeader::Existing(u32::MAX)
+                .encode_canonical()
+                .is_err()
+        );
+        assert!(
+            NetObjectHeader::NewSharedType(0xfe00)
+                .encode_canonical()
+                .is_err()
+        );
+        assert!(
+            NetObjectHeader::NewSharedType(u16::MAX)
+                .encode_canonical()
+                .is_err()
+        );
+
+        assert_eq!(
+            NetObjectHeader::Existing(0xfd_ffff)
+                .encode_canonical()
+                .expect("largest non-reserved object ID encodes"),
+            [0xfd, 0xff, 0xff]
+        );
+        assert_eq!(
+            NetObjectHeader::NewSharedType(0xfdff)
+                .encode_canonical()
+                .expect("largest non-reserved shared-type index encodes"),
+            [0xfe, 0xfd, 0xff]
+        );
     }
 }
