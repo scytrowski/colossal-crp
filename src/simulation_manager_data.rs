@@ -18,6 +18,7 @@ use crate::VehicleLastFrameDataPrefix;
 use crate::VehicleLastFrameEditor;
 use crate::VehicleManagerData;
 use crate::VehicleManagerDataPrefix;
+use crate::VehicleManagerPrefabEditor;
 use crate::VehicleManagerSparseFieldsEditor;
 use crate::VehicleManagerSparseFieldsPrefix;
 use crate::VehicleManagerTailDataPrefix;
@@ -5677,6 +5678,102 @@ impl SimulationManagerData {
             .checked_add(consumed)
             .ok_or(CrpError::ArithmeticOverflow("VehicleManager prefix end"))?;
         Ok((vehicles, graph_end))
+    }
+
+    /// Decodes existing active and parked vehicle prefab assignments into an editor.
+    ///
+    /// Requires VehicleManager at slot 17 and TransportManager at slot 18;
+    /// missing references, truncation, and malformed fields return errors.
+    pub fn decode_vehicle_manager_prefab_editor(
+        &self,
+    ) -> Result<VehicleManagerPrefabEditor, CrpError> {
+        let (prefix, _) = self.decode_vehicle_manager_prefix()?;
+        Ok(prefix.into_prefab_editor())
+    }
+
+    /// Replaces existing active and parked vehicle prefab assignments.
+    ///
+    /// Flags, assignment counts, prefab names, and other prefix bytes remain
+    /// unchanged. Canonical index encoding can change the prefix and manager
+    /// lengths; the complete VehicleManager body and following boundary are
+    /// checked after replacement. A version mismatch, stale editor source,
+    /// malformed body, or invalid following boundary returns an error.
+    pub fn replace_vehicle_manager_prefabs(
+        &mut self,
+        edited: &VehicleManagerPrefabEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                17,
+                "edited VehicleManager prefab version does not match this stream",
+            ));
+        }
+        let (vehicle_data, original_manager_end) = self.decode_vehicle_manager_data()?;
+        let original_prefix = vehicle_data.prefix().encode();
+        if original_prefix.as_slice() != edited.original_bytes() {
+            return Err(invalid(
+                17,
+                "VehicleManager prefix bytes do not match the prefab editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        let (current_prefix, prefix_end) = self.decode_vehicle_manager_prefix()?;
+        if current_prefix.encode() != original_prefix {
+            return Err(invalid(
+                17,
+                "VehicleManager prefab prefix differs from its decoded source body",
+            ));
+        }
+
+        let (body_start, _) = self.manager_body_boundary(17)?;
+        let original_prefix_end =
+            body_start
+                .checked_add(original_prefix.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "VehicleManager prefab prefix end",
+                ))?;
+        if original_prefix_end != prefix_end
+            || self
+                .serialized_object_graph
+                .get(body_start..original_prefix_end)
+                != Some(original_prefix.as_slice())
+        {
+            return Err(invalid(
+                body_start,
+                "VehicleManager prefab prefix range differs from its decoded source bytes",
+            ));
+        }
+
+        let expected_manager_end = original_manager_end
+            .checked_sub(original_prefix.len())
+            .and_then(|start| start.checked_add(replacement.len()))
+            .ok_or(CrpError::ArithmeticOverflow(
+                "VehicleManager edited prefab boundary",
+            ))?;
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(body_start..original_prefix_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        let validation = self
+            .decode_vehicle_manager_data()
+            .and_then(|(data, updated_manager_end)| {
+                if updated_manager_end != expected_manager_end
+                    || data.prefix().encode() != replacement
+                {
+                    return Err(invalid(
+                        body_start,
+                        "edited VehicleManager prefab assignments changed an unexpected manager boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("edited VehicleManager prefab assignments failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes CitizenManager's citizen flags and sparse citizen columns at
@@ -20214,6 +20311,74 @@ mod manager_boundary_tests {
         assert_eq!(
             updated_manager_end,
             original_manager_end - original_sparse_len + replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_manager_end..],
+            original_suffix.as_slice()
+        );
+    }
+
+    #[test]
+    fn vehicle_prefab_editor_resizes_prefix_and_preserves_name_table_and_boundary() {
+        let mut graph = profiler_tag("VehicleManager");
+        let mut flags = vec![0_u32; 16_383];
+        flags[..5].fill(1);
+        write_encoded_uint_array(&mut graph, &flags);
+        write_encoded_ushort_array(&mut graph, &[1, 3, 2, 4, 0]);
+        graph.extend_from_slice(&[0, 6]);
+        for name in ["Unused", "Sedan", "Bus", "Truck", "Van", "Taxi"] {
+            write_unique_string(&mut graph, name).unwrap();
+        }
+        for _ in 0..5 {
+            graph.extend_from_slice(&[0; 12]); // positions
+            graph.extend_from_slice(&[0; 8]); // scalar fields
+        }
+        graph.extend_from_slice(&[0, 16]); // closing profiler reference
+        let transport_tag = profiler_tag("TransportManager");
+        graph.extend_from_slice(&transport_tag);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 30;
+        let mut manager_objects = vec![None; 19];
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[18] = Some(ManagerObjectReference {
+            object_id: 18,
+            type_name: "TransportManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (original, original_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(
+            original.prefix().vehicle_prefab_indices(),
+            Some([1, 3, 2, 4, 0].as_slice())
+        );
+        let original_prefix = original.prefix().encode();
+        let original_names = original.prefix().prefab_names().unwrap().to_vec();
+        let original_suffix = manager.serialized_object_graph()[original_manager_end..].to_vec();
+        let mut editor = manager.decode_vehicle_manager_prefab_editor().unwrap();
+        for (index, value) in [1, 2, 3, 4, 5].into_iter().enumerate() {
+            editor.set_vehicle_prefab_index(index, value).unwrap();
+        }
+        assert_eq!(editor.prefab_names(), Some(original_names.as_slice()));
+        let replacement = editor.encode().unwrap();
+        assert!(replacement.len() < original_prefix.len());
+
+        manager.replace_vehicle_manager_prefabs(&editor).unwrap();
+        let (updated, updated_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(
+            updated.prefix().vehicle_prefab_indices(),
+            Some([1, 2, 3, 4, 5].as_slice())
+        );
+        assert_eq!(
+            updated.prefix().prefab_names(),
+            Some(original_names.as_slice())
+        );
+        assert_eq!(
+            updated_manager_end,
+            original_manager_end - original_prefix.len() + replacement.len()
         );
         assert_eq!(
             &manager.serialized_object_graph()[updated_manager_end..],

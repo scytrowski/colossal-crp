@@ -140,9 +140,10 @@ pub use unlock_manager_data::{
 pub use vehicle_manager_data::{
     VehicleInstanceFields, VehicleInstanceFieldsEditor, VehicleInstanceFieldsPrefix,
     VehicleLastFrameDataPrefix, VehicleLastFrameEditor, VehicleLastFrameRecord, VehicleManagerData,
-    VehicleManagerDataPrefix, VehicleManagerSparseFieldsEditor, VehicleManagerSparseFieldsPrefix,
-    VehicleManagerTailDataPrefix, VehicleManagerTailEditor, VehicleParkedInstanceRecord,
-    VehicleParkedRecordsEditor, VehicleParkedRecordsPrefix, VehicleTargetPosition0,
+    VehicleManagerDataPrefix, VehicleManagerPrefabEditor, VehicleManagerSparseFieldsEditor,
+    VehicleManagerSparseFieldsPrefix, VehicleManagerTailDataPrefix, VehicleManagerTailEditor,
+    VehicleParkedInstanceRecord, VehicleParkedRecordsEditor, VehicleParkedRecordsPrefix,
+    VehicleTargetPosition0,
 };
 pub use water_manager_data::{
     HeatingConductiveCellData, WaterConductiveCellData, WaterManagerData, WaterPulseGroup,
