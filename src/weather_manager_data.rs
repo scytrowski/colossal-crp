@@ -46,7 +46,7 @@ pub struct WeatherManagerData {
     temperature: Option<[f32; 3]>,
     rain_and_fog: Option<[f32; 4]>,
     clouds: Option<[f32; 2]>,
-    force_weather_on: Option<bool>,
+    force_weather_on: Option<f32>,
     ground_wetness: Option<f32>,
     northern_lights_and_rainbow: Option<[f32; 4]>,
     version_276_compatibility: Option<Vec<u8>>,
@@ -127,7 +127,7 @@ impl WeatherManagerData {
         let clouds_start = reader.offset();
         let (clouds, force_weather_on) = if format_version >= 275 {
             let clouds = [reader.read_f32_be()?, reader.read_f32_be()?];
-            let force_weather_on = reader.read_u8()? == 1;
+            let force_weather_on = reader.read_f32_be()?;
             (Some(clouds), Some(force_weather_on))
         } else {
             (None, None)
@@ -140,19 +140,9 @@ impl WeatherManagerData {
         } else {
             None
         };
-        let force_weather_on_range = if format_version >= 275 {
-            let start = clouds_start
-                .checked_add(8)
-                .ok_or(CrpError::ArithmeticOverflow(
-                    "WeatherManager force-weather offset",
-                ))?;
-            let end = start.checked_add(1).ok_or(CrpError::ArithmeticOverflow(
-                "WeatherManager force-weather range",
-            ))?;
-            Some(start..end)
-        } else {
-            None
-        };
+        let force_weather_on_range = clouds_range
+            .as_ref()
+            .map(|range| range.end..reader.offset());
         let ground_wetness_start = reader.offset();
         let ground_wetness = if format_version >= 235 {
             Some(reader.read_f32_be()?)
@@ -306,8 +296,8 @@ impl WeatherManagerData {
         self.clouds
     }
 
-    /// Returns the version-275-and-newer force-weather flag.
-    pub fn force_weather_on(&self) -> Option<bool> {
+    /// Returns the version-275-and-newer force-weather value serialized as an `f32`.
+    pub fn force_weather_on(&self) -> Option<f32> {
         self.force_weather_on
     }
 
@@ -380,8 +370,8 @@ impl WeatherManagerEditor {
         self.data.clouds.as_mut()
     }
 
-    /// Returns the version-275-and-newer force-weather flag when present.
-    pub fn force_weather_on_mut(&mut self) -> Option<&mut bool> {
+    /// Returns the version-275-and-newer force-weather `f32` when present.
+    pub fn force_weather_on_mut(&mut self) -> Option<&mut f32> {
         self.data.force_weather_on.as_mut()
     }
 
@@ -491,10 +481,14 @@ impl WeatherManagerEditor {
             self.data.clouds.as_ref().map(|values| values.as_slice()),
             "clouds",
         )?;
-        encode_force_weather_flag(
+        encode_optional_f32_range(
             &mut bytes,
             self.data.force_weather_on_range.as_ref(),
-            self.data.force_weather_on,
+            self.data
+                .force_weather_on
+                .as_ref()
+                .map(std::slice::from_ref),
+            "force weather",
         )?;
         encode_optional_f32_range(
             &mut bytes,
@@ -658,36 +652,6 @@ fn write_f32_range(
     Ok(())
 }
 
-fn encode_force_weather_flag(
-    output: &mut [u8],
-    range: Option<&Range<usize>>,
-    value: Option<bool>,
-) -> Result<(), CrpError> {
-    match (range, value) {
-        (Some(range), Some(value)) if range.len() == 1 => {
-            let byte = output.get_mut(range.clone()).ok_or_else(|| {
-                invalid(
-                    range.start,
-                    "WeatherManager force-weather range exceeds source body",
-                )
-            })?;
-            if value != (byte[0] == 1) {
-                byte[0] = u8::from(value);
-            }
-            Ok(())
-        }
-        (None, None) => Ok(()),
-        (Some(range), _) => Err(invalid(
-            range.start,
-            "WeatherManager force-weather value and source range disagree",
-        )),
-        _ => Err(invalid(
-            0,
-            "WeatherManager force-weather value and source range disagree",
-        )),
-    }
-}
-
 fn encode_lightning_strikes(
     output: &mut [u8],
     count_offset: Option<usize>,
@@ -819,7 +783,7 @@ mod tests {
         }
         if format_version >= 275 {
             append_floats(&mut bytes, &[11.0, 12.0]);
-            bytes.push(1);
+            append_floats(&mut bytes, &[13.5]);
         }
         if format_version >= 235 {
             append_floats(&mut bytes, &[13.0]);
@@ -863,7 +827,7 @@ mod tests {
                 (version >= 233).then_some([7.0, 8.0, 9.0, 10.0])
             );
             assert_eq!(weather.clouds(), (version >= 275).then_some([11.0, 12.0]));
-            assert_eq!(weather.force_weather_on(), (version >= 275).then_some(true));
+            assert_eq!(weather.force_weather_on(), (version >= 275).then_some(13.5));
             assert_eq!(weather.ground_wetness(), (version >= 235).then_some(13.0));
             assert_eq!(
                 weather.northern_lights_and_rainbow(),
@@ -903,12 +867,13 @@ mod tests {
     }
 
     #[test]
-    fn weather_reader_preserves_version_276_bytes_and_bool_wire_value() {
+    fn weather_reader_preserves_version_276_bytes_and_force_weather_float() {
         let mut bytes = base_body(276);
-        let bool_offset = 256 + 3 * 4 + 3 * 4 + 4 * 4 + 2 * 4;
-        bytes[bool_offset] = 0x80;
+        let force_weather_offset = 256 + 3 * 4 + 3 * 4 + 4 * 4 + 2 * 4;
+        bytes[force_weather_offset..force_weather_offset + 4]
+            .copy_from_slice(&2.5_f32.to_bits().to_be_bytes());
         let (weather, consumed) = WeatherManagerData::decode_prefix(276, &bytes).unwrap();
-        assert!(!weather.force_weather_on().unwrap());
+        assert_eq!(weather.force_weather_on(), Some(2.5));
         assert_eq!(
             weather.version_276_compatibility().unwrap(),
             &(0_u8..36).collect::<Vec<_>>()
@@ -917,12 +882,14 @@ mod tests {
 
         let mut editor = weather.into_editor();
         assert_eq!(editor.encode().unwrap(), bytes[..consumed]);
-        *editor.force_weather_on_mut().unwrap() = true;
+        *editor.force_weather_on_mut().unwrap() = 4.25;
         let mut expected = bytes[..consumed].to_vec();
-        expected[bool_offset] = 1;
+        expected[force_weather_offset..force_weather_offset + 4]
+            .copy_from_slice(&4.25_f32.to_bits().to_be_bytes());
         assert_eq!(editor.encode().unwrap(), expected);
-        *editor.force_weather_on_mut().unwrap() = false;
-        expected[bool_offset] = 0x80;
+        *editor.force_weather_on_mut().unwrap() = 2.5;
+        expected[force_weather_offset..force_weather_offset + 4]
+            .copy_from_slice(&2.5_f32.to_bits().to_be_bytes());
         assert_eq!(editor.encode().unwrap(), expected);
     }
 
@@ -995,7 +962,7 @@ mod tests {
             .unwrap()
             .copy_from_slice(&[27.0, 28.0, 29.0, 30.0]);
         editor.clouds_mut().unwrap().copy_from_slice(&[31.0, 32.0]);
-        *editor.force_weather_on_mut().unwrap() = false;
+        *editor.force_weather_on_mut().unwrap() = 0.0;
         *editor.ground_wetness_mut().unwrap() = 33.0;
         editor
             .northern_lights_and_rainbow_mut()
@@ -1012,11 +979,11 @@ mod tests {
         append_floats(&mut scalar_bytes, &[24.0, 25.0, 26.0]);
         append_floats(&mut scalar_bytes, &[27.0, 28.0, 29.0, 30.0]);
         append_floats(&mut scalar_bytes, &[31.0, 32.0]);
-        scalar_bytes.push(0);
+        append_floats(&mut scalar_bytes, &[0.0]);
         append_floats(&mut scalar_bytes, &[33.0]);
         append_floats(&mut scalar_bytes, &[34.0, 35.0, 36.0, 37.0]);
-        expected[256..325].copy_from_slice(&scalar_bytes);
-        let strike_start = 326;
+        expected[256..328].copy_from_slice(&scalar_bytes);
+        let strike_start = 329;
         expected[strike_start..strike_start + 4].copy_from_slice(&0x0a0b_0c0d_u32.to_be_bytes());
         let mut strike_fields = Vec::new();
         append_floats(&mut strike_fields, &[38.0, 39.0, 40.0, 0.5, 0.6, 0.7, 0.8]);
@@ -1096,9 +1063,9 @@ mod tests {
         assert!(editor.remove_lightning_strike(0).is_err());
         *editor.ground_wetness_mut().unwrap() = 42.0;
         let mut expected = bytes[..consumed].to_vec();
-        expected[305..309].copy_from_slice(&42.0_f32.to_bits().to_be_bytes());
+        expected[308..312].copy_from_slice(&42.0_f32.to_bits().to_be_bytes());
         assert_eq!(editor.encode().unwrap(), expected);
-        assert_eq!(&expected[325..361], &bytes[325..361]);
+        assert_eq!(&expected[328..364], &bytes[328..364]);
     }
 
     #[test]

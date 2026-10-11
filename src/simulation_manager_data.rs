@@ -5540,14 +5540,22 @@ impl SimulationManagerData {
             .ok_or(CrpError::ArithmeticOverflow(
                 "WeatherManager end profiler reference",
             ))?;
-        if decoded_next_tag_start != next_tag_start
-            || graph
-                .get(end_tag_start)
-                .is_none_or(|marker| *marker >= 0xfe)
+        if decoded_next_tag_start != next_tag_start {
+            let trailing_bytes = graph.get(end_tag_start..next_tag_start).unwrap_or_default();
+            return Err(invalid(
+                end_tag_start,
+                format!(
+                    "WeatherManager fields end at graph offset {end_tag_start}, its closing profiler reference would end at {decoded_next_tag_start}, but VehicleManager starts at {next_tag_start}; intervening bytes are {trailing_bytes:02x?}"
+                ),
+            ));
+        }
+        if graph
+            .get(end_tag_start)
+            .is_none_or(|marker| *marker >= 0xfe)
         {
             return Err(invalid(
                 end_tag_start,
-                "WeatherManager fields do not end before its closing profiler reference and VehicleManager tag",
+                "WeatherManager closing profiler reference is missing or malformed",
             ));
         }
         Ok((weather, next_tag_start))
@@ -19509,6 +19517,41 @@ mod manager_boundary_tests {
             assert!(manager.serialized_object_graph()[end..].starts_with(&vehicle_tag));
         }
 
+        let mut graph = profiler_tag("WeatherManager");
+        graph.extend([0xff; 2 * 128]);
+        for value in [
+            1.0_f32, 2.0, 3.0, // wind directions
+            4.0, 5.0, 6.0, // temperature
+            7.0, 8.0, 9.0, 10.0, // rain and fog
+            11.0, 12.0, // clouds
+            2.5,  // force weather (f32)
+            14.0, // ground wetness
+            15.0, 16.0, 17.0, 18.0, // northern lights and rainbow
+        ] {
+            graph.extend_from_slice(&value.to_bits().to_be_bytes());
+        }
+        let body_end = graph.len();
+        graph.extend_from_slice(&[0, 16]);
+        let vehicle_tag = profiler_tag("VehicleManager");
+        graph.extend_from_slice(&vehicle_tag);
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 275;
+        let mut manager_objects = vec![None; 18];
+        manager_objects[16] = Some(ManagerObjectReference {
+            object_id: 16,
+            type_name: "WeatherManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+        let (weather, vehicle_start) = manager.decode_weather_manager_data().unwrap();
+        assert_eq!(weather.force_weather_on(), Some(2.5));
+        assert_eq!(weather.ground_wetness(), Some(14.0));
+        assert_eq!(vehicle_start, body_end + 2);
+        assert!(manager.serialized_object_graph()[vehicle_start..].starts_with(&vehicle_tag));
+
         let profiler_name = "WeatherManager";
         let mut graph = profiler_tag(profiler_name);
         graph.extend([0xff; 2 * 128]);
@@ -19599,7 +19642,7 @@ mod manager_boundary_tests {
         for _ in 0..12 {
             graph.extend_from_slice(&0.0_f32.to_bits().to_be_bytes());
         }
-        graph.push(1); // force weather on
+        graph.extend_from_slice(&1.0_f32.to_bits().to_be_bytes()); // force weather on
         for _ in 0..5 {
             graph.extend_from_slice(&0.0_f32.to_bits().to_be_bytes());
         }
@@ -19649,7 +19692,7 @@ mod manager_boundary_tests {
             &manager.serialized_object_graph()[new_next_start..],
             &original_graph[old_next_start..]
         );
-        assert_eq!(body_len, 256 + 70);
+        assert_eq!(body_len, 256 + 73);
     }
 
     #[test]

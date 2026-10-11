@@ -6187,7 +6187,15 @@ mod tests {
                         assert_eq!(trees.flags().len(), 262_143);
                         assert!(trees_end < manager_data.serialized_object_graph().len());
                         checked_tree_manager_convenience = true;
-                        let (weather, weather_end) = manager_data.decode_weather_manager_data()?;
+                        let (weather, weather_end) = manager_data
+                            .decode_weather_manager_data()
+                            .map_err(|error| {
+                                std::io::Error::other(format!(
+                                    "WeatherManager decode failed in {} (inner version {}): {error}",
+                                    path.display(),
+                                    manager_data.format_version()
+                                ))
+                            })?;
                         assert_eq!(weather.format_version(), manager_data.format_version());
                         assert_eq!(weather.self_heights().len(), 16_384);
                         assert_eq!(weather.total_heights().len(), 16_384);
