@@ -151,16 +151,18 @@ impl TransportManagerMilestone {
 
 /// Editor for existing TransportManager milestone prefab indexes and references.
 ///
-/// Only references encoded as an existing object ID can be redirected. The
-/// replacement must point to an earlier object of the same runtime type.
-/// Null and newly allocated references retain their original form. Changing a
-/// prefab index may resize the encoded index scope and shift later body fields.
+/// References encoded as existing object IDs can be redirected to an earlier
+/// object of the same runtime type or cleared to null. The original type is
+/// retained so a cleared reference can be restored. Null and newly allocated
+/// references retain their original form. Changing a prefab index may resize
+/// the encoded index scope and shift later body fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerMilestoneEditor {
     format_version: u32,
     save_app_version: Option<u32>,
     milestones: Vec<TransportManagerMilestone>,
     original_headers: Vec<NetObjectHeader>,
+    original_reference_types: Vec<Option<String>>,
     header_ranges: Vec<Range<usize>>,
     available_object_counts: Vec<usize>,
     object_types: Vec<String>,
@@ -232,25 +234,58 @@ impl TransportManagerMilestoneEditor {
                 "TransportManager milestone target type is unresolved",
             )
         })?;
+        let original_type = self
+            .original_reference_types
+            .get(milestone_index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                invalid(
+                    milestone_index,
+                    "TransportManager milestone reference type was not captured",
+                )
+            })?;
+        if target_type != original_type {
+            return Err(invalid(
+                milestone_index,
+                "TransportManager milestone target has a different runtime type",
+            ));
+        }
         let milestone = self.milestones.get_mut(milestone_index).ok_or_else(|| {
             invalid(
                 milestone_index,
                 "TransportManager milestone index is out of bounds",
             )
         })?;
-        let reference = milestone.reference.as_mut().ok_or_else(|| {
+        milestone.reference = Some(ResolvedObjectReference {
+            object_id,
+            type_name: original_type.clone(),
+        });
+        Ok(())
+    }
+
+    /// Clears an existing milestone reference while retaining its prefab index.
+    ///
+    /// Null and newly declared references are not changed by this operation.
+    pub fn clear_reference(&mut self, milestone_index: usize) -> Result<(), CrpError> {
+        let header = self.original_headers.get(milestone_index).ok_or_else(|| {
             invalid(
                 milestone_index,
-                "TransportManager milestone reference is null",
+                "TransportManager milestone index is out of bounds",
             )
         })?;
-        if target_type != &reference.type_name {
+        if !matches!(header, NetObjectHeader::Existing(_)) {
             return Err(invalid(
                 milestone_index,
-                "TransportManager milestone target has a different runtime type",
+                "TransportManager milestone reference is not an existing object ID",
             ));
         }
-        reference.object_id = object_id;
+        let milestone = self.milestones.get_mut(milestone_index).ok_or_else(|| {
+            invalid(
+                milestone_index,
+                "TransportManager milestone index is out of bounds",
+            )
+        })?;
+        milestone.reference = None;
         Ok(())
     }
 
@@ -259,6 +294,7 @@ impl TransportManagerMilestoneEditor {
         let count = self.milestones.len();
         if self.format_version < 151
             || self.original_headers.len() != count
+            || self.original_reference_types.len() != count
             || self.header_ranges.len() != count
             || self.available_object_counts.len() != count
             || self.original_prefab_indices.len() < count
@@ -311,12 +347,6 @@ impl TransportManagerMilestoneEditor {
             let milestone = self.milestones.get(index).ok_or_else(|| {
                 invalid(index, "TransportManager milestone is missing from editor")
             })?;
-            let reference = milestone.reference.as_ref().ok_or_else(|| {
-                invalid(
-                    index,
-                    "existing TransportManager milestone reference became null",
-                )
-            })?;
             let range = header_ranges.get(index).ok_or_else(|| {
                 invalid(
                     index,
@@ -329,22 +359,27 @@ impl TransportManagerMilestoneEditor {
                     "existing TransportManager milestone header is not three bytes",
                 ));
             }
-            let object_index = usize::try_from(reference.object_id).map_err(|_| {
-                CrpError::ArithmeticOverflow("TransportManager milestone object ID")
-            })?;
-            if object_index >= self.available_object_counts[index]
-                || self.object_types.get(object_index) != Some(&reference.type_name)
-            {
-                return Err(invalid(
-                    range.start,
-                    "TransportManager milestone target is unavailable or has a different runtime type",
-                ));
-            }
-            let bytes = [
-                (reference.object_id >> 16) as u8,
-                (reference.object_id >> 8) as u8,
-                reference.object_id as u8,
-            ];
+            let bytes = if let Some(reference) = milestone.reference.as_ref() {
+                let object_index = usize::try_from(reference.object_id).map_err(|_| {
+                    CrpError::ArithmeticOverflow("TransportManager milestone object ID")
+                })?;
+                if object_index >= self.available_object_counts[index]
+                    || self.object_types.get(object_index) != Some(&reference.type_name)
+                    || self.original_reference_types[index].as_ref() != Some(&reference.type_name)
+                {
+                    return Err(invalid(
+                        range.start,
+                        "TransportManager milestone target is unavailable or has a different runtime type",
+                    ));
+                }
+                [
+                    (reference.object_id >> 16) as u8,
+                    (reference.object_id >> 8) as u8,
+                    reference.object_id as u8,
+                ]
+            } else {
+                [0xff; 3]
+            };
             body.get_mut(range.clone())
                 .ok_or_else(|| {
                     invalid(
@@ -10686,6 +10721,15 @@ impl SimulationManagerData {
                 })
             })
             .collect::<Result<Vec<_>, CrpError>>()?;
+        let original_reference_types = milestones
+            .iter()
+            .map(|milestone| {
+                milestone
+                    .reference
+                    .as_ref()
+                    .map(|reference| reference.type_name.clone())
+            })
+            .collect();
         let (body_range, _) = self.transport_manager_body_range()?;
         let bounded_end = body_range
             .end
@@ -10703,6 +10747,7 @@ impl SimulationManagerData {
             save_app_version,
             milestones,
             original_headers: fields.milestone_object_headers,
+            original_reference_types,
             header_ranges: fields.milestone_header_ranges,
             available_object_counts: fields.milestone_available_object_counts,
             object_types: fields.milestone_object_types,
@@ -10720,10 +10765,10 @@ impl SimulationManagerData {
     /// Replaces existing TransportManager milestone prefab indexes and references.
     ///
     /// The editor must come from this manager's current bytes and version.
-    /// Only existing IDs can change; each target must be available at that
-    /// point in the object stream and retain the original runtime type. The
-    /// prefab-index scope may resize the manager body; all other bytes remain
-    /// unchanged.
+    /// Existing IDs can be redirected to an earlier object of the same type
+    /// or cleared to null. Null and newly allocated headers remain unchanged.
+    /// The prefab-index scope may resize the manager body; all other bytes
+    /// remain unchanged.
     pub fn replace_transport_manager_milestone_references(
         &mut self,
         edited: &TransportManagerMilestoneEditor,
@@ -21267,6 +21312,7 @@ mod manager_boundary_tests {
                 }),
             }],
             original_headers: fields.milestone_object_headers,
+            original_reference_types: vec![Some("TransportLine+Data, Assembly-CSharp".to_owned())],
             header_ranges: fields.milestone_header_ranges,
             available_object_counts: fields.milestone_available_object_counts,
             object_types: fields.milestone_object_types,
@@ -21285,13 +21331,24 @@ mod manager_boundary_tests {
             })
         );
         let mut expected = bytes.clone();
-        expected[range].copy_from_slice(&[0x00, 0x00, 0x02]);
+        expected[range.clone()].copy_from_slice(&[0x00, 0x00, 0x02]);
         assert_eq!(editor.encode().unwrap(), expected);
 
         assert!(editor.set_reference_object_id(0, 0).is_err());
         assert!(editor.set_reference_object_id(0, 3).is_err());
         assert!(editor.set_reference_object_id(1, 2).is_err());
         assert_eq!(editor.encode().unwrap(), expected);
+
+        editor.clear_reference(0).unwrap();
+        assert_eq!(editor.milestones()[0].reference(), None);
+        let mut expected_null = expected;
+        expected_null[range.clone()].copy_from_slice(&[0xff; 3]);
+        assert_eq!(editor.encode().unwrap(), expected_null);
+        assert!(editor.clear_reference(1).is_err());
+
+        editor.set_reference_object_id(0, 1).unwrap();
+        assert_eq!(editor.milestones()[0].reference().unwrap().object_id, 1);
+        assert_eq!(editor.encode().unwrap(), bytes);
     }
 
     #[test]
@@ -21319,7 +21376,7 @@ mod manager_boundary_tests {
             &[4, 0, 7, 0, 8, 0, 9, 0, 10, 0, 11]
         );
 
-        let milestones = fields
+        let milestones: Vec<TransportManagerMilestone> = fields
             .milestone_prefab_indices
             .iter()
             .zip(&fields.milestone_object_ids)
@@ -21331,11 +21388,21 @@ mod manager_boundary_tests {
                 }),
             })
             .collect();
+        let original_reference_types = milestones
+            .iter()
+            .map(|milestone: &TransportManagerMilestone| {
+                milestone
+                    .reference
+                    .as_ref()
+                    .map(|reference| reference.type_name.clone())
+            })
+            .collect();
         let mut editor = TransportManagerMilestoneEditor {
             format_version: 112_004,
             save_app_version: None,
             milestones,
             original_headers: fields.milestone_object_headers,
+            original_reference_types,
             header_ranges: fields.milestone_header_ranges,
             available_object_counts: fields.milestone_available_object_counts,
             object_types: fields.milestone_object_types,
