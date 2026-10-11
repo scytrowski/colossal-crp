@@ -1,11 +1,18 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::read_encoded_ushort_array;
+use crate::encoded_array::{read_encoded_ushort_array, write_encoded_ushort_array};
+use std::ops::Range;
 
 const CELL_COUNT: usize = 65_536;
 const END_PROFILER_REFERENCE_LEN: usize = 2;
 const I32_MULTIPLIER_VERSION: u32 = 242;
 const FULL_TOTALS_VERSION: u32 = 147;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EncodedArraySnapshot<T> {
+    range: Range<usize>,
+    values: Vec<T>,
+}
 
 /// Decoded reader fields from `ImmaterialResourceManager+Data`.
 ///
@@ -19,7 +26,9 @@ pub struct ImmaterialResourceManagerData {
     format_version: u32,
     resource_slots_per_cell: usize,
     final_resources: Vec<u16>,
+    final_resources_snapshot: EncodedArraySnapshot<u16>,
     temporary_resources: Vec<u16>,
+    temporary_resources_snapshot: EncodedArraySnapshot<u16>,
     total_final: Vec<i32>,
     total_temporary: Vec<i32>,
     total_temporary_multiplier: Vec<i64>,
@@ -48,8 +57,10 @@ impl ImmaterialResourceManagerData {
                 .ok_or(CrpError::ArithmeticOverflow(
                     "ImmaterialResourceManager local array length",
                 ))?;
-        let final_resources = read_encoded_ushort_array(&mut reader, local_value_count)?;
-        let temporary_resources = read_encoded_ushort_array(&mut reader, local_value_count)?;
+        let (final_resources, final_resources_snapshot) =
+            read_captured_ushort_array(&mut reader, local_value_count)?;
+        let (temporary_resources, temporary_resources_snapshot) =
+            read_captured_ushort_array(&mut reader, local_value_count)?;
 
         let aggregate_read_count = if format_version >= FULL_TOTALS_VERSION {
             resource_slots_per_cell
@@ -107,7 +118,9 @@ impl ImmaterialResourceManagerData {
             format_version,
             resource_slots_per_cell,
             final_resources,
+            final_resources_snapshot,
             temporary_resources,
+            temporary_resources_snapshot,
             total_final,
             total_temporary,
             total_temporary_multiplier,
@@ -138,9 +151,49 @@ impl ImmaterialResourceManagerData {
         &self.final_resources
     }
 
+    /// Replaces one serialized final-resource value at a zero-based cell and
+    /// resource-slot index. The slot must exist in this inner version; an
+    /// out-of-range cell or slot returns an error.
+    pub fn set_final_resource(
+        &mut self,
+        cell_index: usize,
+        slot_index: usize,
+        value: u16,
+    ) -> Result<(), CrpError> {
+        set_local_resource_value(
+            &mut self.final_resources,
+            self.final_resources_snapshot.range.start,
+            self.resource_slots_per_cell,
+            cell_index,
+            slot_index,
+            value,
+            "final-resource",
+        )
+    }
+
     /// Returns the temporary-resource grid in cell-major order.
     pub fn temporary_resources(&self) -> &[u16] {
         &self.temporary_resources
+    }
+
+    /// Replaces one serialized temporary-resource value at a zero-based cell
+    /// and resource-slot index. The slot must exist in this inner version; an
+    /// out-of-range cell or slot returns an error.
+    pub fn set_temporary_resource(
+        &mut self,
+        cell_index: usize,
+        slot_index: usize,
+        value: u16,
+    ) -> Result<(), CrpError> {
+        set_local_resource_value(
+            &mut self.temporary_resources,
+            self.temporary_resources_snapshot.range.start,
+            self.resource_slots_per_cell,
+            cell_index,
+            slot_index,
+            value,
+            "temporary-resource",
+        )
     }
 
     /// Returns total-final values in resource-slot order. On versions below
@@ -304,8 +357,10 @@ impl ImmaterialResourceManagerData {
         self.original_body.clone()
     }
 
-    /// Encodes the edited aggregate values into their existing fixed-width
-    /// fields while retaining the local grids and closing profiler reference.
+    /// Encodes edited local-resource arrays and aggregate values. Changed
+    /// arrays use the canonical encoded-array writer and can change the body
+    /// length; unchanged arrays and the closing profiler reference retain
+    /// their original bytes.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.original_body.clone();
         write_i32_values(
@@ -347,8 +402,134 @@ impl ImmaterialResourceManagerData {
                 "global-temporary",
             )?;
         }
+        let expected_local_count = CELL_COUNT.checked_mul(self.resource_slots_per_cell).ok_or(
+            CrpError::ArithmeticOverflow("ImmaterialResourceManager local array length"),
+        )?;
+        if self.resource_slots_per_cell != resource_slot_count(self.format_version)
+            || self.final_resources.len() != expected_local_count
+            || self.temporary_resources.len() != expected_local_count
+            || self.final_resources_snapshot.values.len() != expected_local_count
+            || self.temporary_resources_snapshot.values.len() != expected_local_count
+        {
+            return Err(invalid_aggregate_value(
+                0,
+                "local-resource array lengths do not match the versioned slot count",
+            ));
+        }
+        let mut replacements = Vec::new();
+        if let Some(replacement) = changed_ushort_array(
+            &self.final_resources,
+            &self.final_resources_snapshot,
+            bytes.len(),
+            "final-resource grid",
+        )? {
+            replacements.push(replacement);
+        }
+        if let Some(replacement) = changed_ushort_array(
+            &self.temporary_resources,
+            &self.temporary_resources_snapshot,
+            bytes.len(),
+            "temporary-resource grid",
+        )? {
+            replacements.push(replacement);
+        }
+        replacements.sort_by_key(|(range, _)| range.start);
+        for (range, encoded) in replacements.into_iter().rev() {
+            bytes.splice(range, encoded);
+        }
         Ok(bytes)
     }
+}
+
+fn set_local_resource_value(
+    values: &mut [u16],
+    field_offset: usize,
+    slots_per_cell: usize,
+    cell_index: usize,
+    slot_index: usize,
+    value: u16,
+    field: &str,
+) -> Result<(), CrpError> {
+    if cell_index >= CELL_COUNT {
+        return Err(invalid_aggregate_value(
+            field_offset,
+            format!("{field} cell index {cell_index} is outside the {CELL_COUNT}-cell grid"),
+        ));
+    }
+    if slot_index >= slots_per_cell {
+        return Err(invalid_aggregate_value(
+            field_offset,
+            format!(
+                "{field} slot index {slot_index} is outside the {slots_per_cell} slots in this version"
+            ),
+        ));
+    }
+    let index = cell_index
+        .checked_mul(slots_per_cell)
+        .and_then(|start| start.checked_add(slot_index))
+        .ok_or(CrpError::ArithmeticOverflow(
+            "ImmaterialResourceManager local resource index",
+        ))?;
+    let Some(target) = values.get_mut(index) else {
+        return Err(invalid_aggregate_value(
+            field_offset,
+            format!("{field} local array is shorter than its versioned layout"),
+        ));
+    };
+    *target = value;
+    Ok(())
+}
+
+fn read_captured_ushort_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<(Vec<u16>, EncodedArraySnapshot<u16>), CrpError> {
+    let start = reader.offset();
+    let values = read_encoded_ushort_array(reader, count)?;
+    let end = reader.offset();
+    Ok((
+        values.clone(),
+        EncodedArraySnapshot {
+            range: start..end,
+            values,
+        },
+    ))
+}
+
+fn checked_source_range(
+    snapshot: &EncodedArraySnapshot<impl Sized>,
+    source_body_len: usize,
+    field: &str,
+) -> Result<(), CrpError> {
+    if snapshot.range.start <= snapshot.range.end && snapshot.range.end <= source_body_len {
+        Ok(())
+    } else {
+        Err(invalid_aggregate_value(
+            snapshot.range.start,
+            format!("{field} source range exceeds the body"),
+        ))
+    }
+}
+
+fn changed_ushort_array(
+    values: &[u16],
+    snapshot: &EncodedArraySnapshot<u16>,
+    source_body_len: usize,
+    field: &str,
+) -> Result<Option<(Range<usize>, Vec<u8>)>, CrpError> {
+    checked_source_range(snapshot, source_body_len, field)?;
+    if values.len() != snapshot.values.len() {
+        return Err(invalid_aggregate_value(
+            snapshot.range.start,
+            format!("{field} value count changed"),
+        ));
+    }
+    if values == snapshot.values {
+        return Ok(None);
+    }
+    let mut encoded = Vec::new();
+    write_encoded_ushort_array(&mut encoded, values);
+    Ok(Some((snapshot.range.clone(), encoded)))
 }
 
 fn require_stored_aggregate_index(
@@ -533,6 +714,15 @@ mod tests {
             output.push((0x7f + run) as u8);
             remaining -= run;
         }
+    }
+
+    fn encoded_ushort_array_with_first_value(count: usize, value: u16) -> Vec<u8> {
+        assert!(count >= 3);
+        let mut encoded = vec![2]; // Three literal values: value, zero, zero.
+        encoded.extend_from_slice(&value.to_be_bytes());
+        encoded.extend_from_slice(&[0, 0, 0, 0]);
+        append_repeat_ushort_values(&mut encoded, count - 3);
+        encoded
     }
 
     fn append_ramp_ushort_values(output: &mut Vec<u8>, count: usize) {
@@ -720,6 +910,66 @@ mod tests {
         );
         assert_eq!(decoded.global_final()[4], i32::MIN);
         assert_eq!(decoded.global_temporary()[5], i32::MAX);
+    }
+
+    #[test]
+    fn local_resource_edits_reencode_only_changed_arrays_with_expected_bytes() {
+        let body = synthetic_body(265, false);
+        let mut data = ImmaterialResourceManagerData::decode(265, &body).unwrap();
+        data.set_final_resource(0, 0, 0x1234).unwrap();
+        data.set_temporary_resource(0, 0, 0xabcd).unwrap();
+
+        let local_count = CELL_COUNT * 20;
+        let expected_final = encoded_ushort_array_with_first_value(local_count, 0x1234);
+        let expected_temporary = encoded_ushort_array_with_first_value(local_count, 0xabcd);
+        let mut expected = body.clone();
+        expected.splice(
+            data.temporary_resources_snapshot.range.clone(),
+            expected_temporary,
+        );
+        expected.splice(data.final_resources_snapshot.range.clone(), expected_final);
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        assert!(encoded.len() > body.len());
+        assert_eq!(data.encode_unchanged(), body);
+
+        let decoded = ImmaterialResourceManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.final_resources()[0], 0x1234);
+        assert_eq!(decoded.temporary_resources()[0], 0xabcd);
+        assert_eq!(decoded.final_resources()[1], 0);
+        assert_eq!(decoded.temporary_resources()[1], 0);
+
+        assert!(data.set_final_resource(CELL_COUNT, 0, 1).is_err());
+        assert!(data.set_temporary_resource(0, 20, 1).is_err());
+        assert_eq!(data.encode().unwrap(), encoded);
+    }
+
+    #[test]
+    fn local_resource_editors_follow_versioned_slot_counts() {
+        let mut before_slot_increase =
+            ImmaterialResourceManagerData::decode(111, &synthetic_body(111, false)).unwrap();
+        assert_eq!(before_slot_increase.resource_slots_per_cell(), 17);
+        before_slot_increase
+            .set_final_resource(1, 16, 0x1234)
+            .unwrap();
+        assert!(before_slot_increase.set_final_resource(1, 17, 1).is_err());
+
+        let mut after_slot_increase =
+            ImmaterialResourceManagerData::decode(112, &synthetic_body(112, false)).unwrap();
+        assert_eq!(after_slot_increase.resource_slots_per_cell(), 18);
+        after_slot_increase
+            .set_temporary_resource(1, 17, 0xabcd)
+            .unwrap();
+        assert!(
+            after_slot_increase
+                .set_temporary_resource(1, 18, 1)
+                .is_err()
+        );
+
+        let encoded = after_slot_increase.encode().unwrap();
+        let decoded = ImmaterialResourceManagerData::decode(112, &encoded).unwrap();
+        assert_eq!(decoded.temporary_resources()[18 + 17], 0xabcd);
     }
 
     #[test]
