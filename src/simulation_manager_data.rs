@@ -2160,8 +2160,8 @@ impl SimulationManagerData {
     ///
     /// This table is available only when the bounded EventManager body matches
     /// one unambiguous supported reader/writer candidate. Legacy active-event
-    /// records from inner versions 210 through 121032 are preserved unchanged;
-    /// nested race-event blocks are decoded through version 121032 and active
+    /// records from inner versions 210 through 121034 are preserved unchanged;
+    /// nested race-event blocks are decoded through version 121034 and active
     /// routes are supported through version 121030.
     pub fn decode_event_manager_type_data(&self) -> Result<EventManagerTypeDataEditor, CrpError> {
         let managers = self
@@ -2174,15 +2174,16 @@ impl SimulationManagerData {
             .into_type_data_editor())
     }
 
-    /// Decodes active EventManager records for inner versions 210–121032.
+    /// Decodes active EventManager records for inner versions 210–121034.
     ///
     /// Pre-245 color words are returned raw; version 245 records expose RGB
     /// bytes. Version-gated event, ticket, reward, popularity, and security
     /// values are exposed when present. From version 120004 through 121005,
     /// nested race-event data follows unconditionally. From version 121006,
-    /// the source bool and optional nested data are preserved. Race-event tier
-    /// and collision fields follow their 121032 and 121031 gates. Active event
-    /// routes have a separate editor through version 121030.
+    /// the source bool and optional nested data are preserved. Race-event tier,
+    /// collision, and route-spline fields follow their 121032, 121031, and
+    /// 121034 gates. Active event routes have a separate editor through version
+    /// 121030.
     /// The bounded manager body must match one unambiguous reader/writer
     /// candidate.
     pub fn decode_event_manager_event_records(

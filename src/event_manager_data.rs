@@ -10,7 +10,7 @@ use std::ops::Range;
 
 const MAX_EVENT_SLOTS: usize = u16::MAX as usize + 1;
 const FIRST_EVENT_RECORD_VERSION: u32 = 210;
-const LAST_SUPPORTED_EVENT_RECORD_VERSION: u32 = 121_032;
+const LAST_SUPPORTED_EVENT_RECORD_VERSION: u32 = 121_034;
 const LAST_SUPPORTED_EVENT_ROUTE_VERSION: u32 = 121_030;
 const CUSTOM_EVENT_SEED_FLAG: u32 = 1 << 10;
 const MAX_RACE_EVENT_ENTRIES: usize = 1_000_000;
@@ -18,7 +18,7 @@ const MAX_EVENT_ROUTE_SCHEDULES: usize = 4;
 
 /// One decoded active event from the versioned EventManager record layout.
 ///
-/// This layout is supported for inner versions 210 through 121032. Its four
+/// This layout is supported for inner versions 210 through 121034. Its four
 /// pre-245 color words are retained raw because their meaning is not
 /// established; version 245 stores the color as RGB bytes. Version-gated event
 /// values are exposed when present. The nested race-event data added at 120004
@@ -71,7 +71,7 @@ pub struct EventManagerEventRecord {
 /// route-spline fields are editable. Three prefab scopes expose their
 /// assignments and names with fixed counts and encoded widths. Other
 /// unmodeled nested values remain preserved as raw source bytes. The fields
-/// are available for EventManager inner versions 120004–121032.
+/// are available for EventManager inner versions 120004–121034.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerRaceEventData {
     /// Existing racers in serialized order. The count and optional-reference
@@ -111,7 +111,7 @@ pub struct EventManagerRaceEventData {
     pub racer_oscillation_records: Vec<[u8; 8]>,
     /// Opaque eight-byte racer state-timer records.
     pub racer_state_timer_records: Vec<[u8; 8]>,
-    /// Tier value serialized from inner version 121032.
+    /// Tier value serialized from inner version 121032 onward.
     pub tier: Option<i32>,
     /// Spawned-entity count stored as a signed 32-bit value.
     pub spawned_entities: i32,
@@ -282,7 +282,7 @@ pub struct EventManagerTailData {
 
 /// Supported fields decoded from a bounded `EventManager+Data` body.
 ///
-/// Active event records in versions 210–121032 are decoded and retained.
+/// Active event records in versions 210–121034 are decoded and retained.
 /// Race-event blocks are boundary-checked and retained raw, with selected
 /// fixed-width scalar fields exposed for editing, including nonempty legacy
 /// route splines. Active event routes from version 121005 are boundary-checked
@@ -336,7 +336,7 @@ pub struct EventManagerTypeDataEditor {
 /// Editor for existing versioned active EventManager records.
 ///
 /// The record count, slot indexes, and activity flags are fixed. It edits
-/// same-width scalar values for inner versions 210–121032, including selected
+/// same-width scalar values for inner versions 210–121034, including selected
 /// `RaceEventData` fields, opaque fixed-size arrays, and racer-name contents
 /// that retain their source encoding and width. Other nested race-event bytes
 /// and the surrounding EventManager body are preserved.
@@ -2663,7 +2663,6 @@ fn read_race_event_route_spline(
     let closed = data_serializer_bool_is_true(closed_raw);
 
     let record_count = if format_version >= 121_034 {
-        // This branch is currently outside the supported EventManager record range.
         serialized_bezier_count
     } else if closed {
         serialized_bezier_count
@@ -5421,7 +5420,7 @@ mod tests {
             0x80, 0x12, 0x34, // Legacy closed-spline terminal values.
         ]);
 
-        for version in [120_004, 121_005, 121_006, 121_030] {
+        for version in [120_004, 121_005, 121_006, 121_030, 121_033, 121_034] {
             for (race_data, description) in
                 [(&open_race_data, "open"), (&closed_race_data, "closed")]
             {
@@ -5433,9 +5432,10 @@ mod tests {
                     .as_ref()
                     .expect("race-event data range exists")
                     .clone();
+                let expected_race_data = race_event_data_for_version(race_data, version);
                 assert_eq!(
                     decoded.serialized_body.get(race_range.clone()),
-                    Some(race_data.as_slice()),
+                    Some(expected_race_data.as_slice()),
                     "{description}, version {version}"
                 );
                 let spline = decoded.active_event_race_data[0]
@@ -5450,7 +5450,16 @@ mod tests {
                     "{description}, version {version}"
                 );
                 assert_eq!(spline.closed_raw, u8::from(description == "closed"));
-                assert_eq!(spline.records.len(), 2, "{description}, version {version}");
+                let expected_record_count = if description == "closed" && version >= 121_034 {
+                    3
+                } else {
+                    2
+                };
+                assert_eq!(
+                    spline.records.len(),
+                    expected_record_count,
+                    "{description}, version {version}"
+                );
                 if description == "open" {
                     assert_eq!(spline.bezier_count, 2);
                     assert_eq!(spline.records[0].kind, 1);
@@ -5464,13 +5473,19 @@ mod tests {
                     assert_eq!(spline.records[0].source, 6);
                     assert_eq!(spline.records[1].kind, 4);
                     assert_eq!(spline.records[1].source, 7);
-                    assert_eq!(
-                        spline.terminal_record,
-                        Some(super::EventManagerRaceEventSubBezierRecord {
-                            kind: 0x80,
-                            source: 0x1234,
-                        })
-                    );
+                    if version >= 121_034 {
+                        assert_eq!(spline.terminal_record, None);
+                        assert_eq!(spline.records[2].kind, 0x80);
+                        assert_eq!(spline.records[2].source, 0x1234);
+                    } else {
+                        assert_eq!(
+                            spline.terminal_record,
+                            Some(super::EventManagerRaceEventSubBezierRecord {
+                                kind: 0x80,
+                                source: 0x1234,
+                            })
+                        );
+                    }
                 }
                 assert_eq!(
                     decoded
@@ -5493,6 +5508,8 @@ mod tests {
                 edited_spline.records[0].source = 0x1234;
                 if let Some(terminal) = edited_spline.terminal_record.as_mut() {
                     terminal.kind = 0x55;
+                } else if description == "closed" && version >= 121_034 {
+                    edited_spline.records[2].kind = 0x55;
                 }
                 let mut expected_race_data = (*race_data).clone();
                 let spline_start = EMPTY_RACE_EVENT_DATA.len();
