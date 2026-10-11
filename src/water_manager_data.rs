@@ -2,7 +2,7 @@ use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
     read_encoded_bool_array, read_encoded_byte_array, read_encoded_ushort_array,
-    write_encoded_byte_array, write_encoded_ushort_array,
+    write_encoded_bool_array, write_encoded_byte_array, write_encoded_ushort_array,
 };
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 
@@ -132,6 +132,9 @@ pub struct WaterManagerData {
     collect_water_pressure: Vec<u16>,
     collect_water_pressure_range: Option<(usize, usize)>,
     original_collect_water_pressure: Option<Vec<u16>>,
+    collect_water_pressure_selector: Option<Vec<bool>>,
+    collect_water_pressure_selector_range: Option<(usize, usize)>,
+    original_collect_water_pressure_selector: Option<Vec<bool>>,
     collect_sewage_pressure: Vec<u16>,
     collect_sewage_pressure_range: Option<(usize, usize)>,
     original_collect_sewage_pressure: Option<Vec<u16>>,
@@ -330,6 +333,9 @@ impl WaterManagerData {
         let mut collect_water_pressure = vec![0; NODE_COUNT];
         let mut collect_water_pressure_range = None;
         let mut original_collect_water_pressure = None;
+        let mut collect_water_pressure_selector = None;
+        let mut collect_water_pressure_selector_range = None;
+        let mut original_collect_water_pressure_selector = None;
         if format_version >= COLLECT_WATER_USHORT_VERSION {
             let start = reader.offset();
             let values = read_encoded_ushort_array(&mut reader, stored_node_count)?;
@@ -338,12 +344,17 @@ impl WaterManagerData {
             collect_water_pressure_range = Some((start, end));
             original_collect_water_pressure = Some(values);
         } else if format_version >= COLLECT_WATER_BOOL_VERSION {
+            let start = reader.offset();
             let collects = read_encoded_bool_array(&mut reader, stored_node_count)?;
-            for (index, collects_pressure) in collects.into_iter().enumerate() {
+            let end = reader.offset();
+            for (index, collects_pressure) in collects.iter().copied().enumerate() {
                 if collects_pressure {
                     collect_water_pressure[index] = water_node_pressure[index];
                 }
             }
+            collect_water_pressure_selector_range = Some((start, end));
+            original_collect_water_pressure_selector = Some(collects.clone());
+            collect_water_pressure_selector = Some(collects);
         }
         let mut collect_sewage_pressure = vec![0; NODE_COUNT];
         let mut collect_sewage_pressure_range = None;
@@ -448,6 +459,9 @@ impl WaterManagerData {
             collect_water_pressure,
             collect_water_pressure_range,
             original_collect_water_pressure,
+            collect_water_pressure_selector,
+            collect_water_pressure_selector_range,
+            original_collect_water_pressure_selector,
             collect_sewage_pressure,
             collect_sewage_pressure_range,
             original_collect_sewage_pressure,
@@ -776,7 +790,23 @@ impl WaterManagerData {
             node,
             pressure,
             "water",
-        )
+        )?;
+        if self
+            .collect_water_pressure_selector
+            .as_ref()
+            .and_then(|selectors| selectors.get(node))
+            .copied()
+            .unwrap_or(false)
+        {
+            let Some(collect_pressure) = self.collect_water_pressure.get_mut(node) else {
+                return Err(invalid_collect_pressure(
+                    node,
+                    "collect-water node index is outside the decoded grid",
+                ));
+            };
+            *collect_pressure = pressure;
+        }
+        Ok(())
     }
 
     /// Returns all 32,768 extra water node pressures.
@@ -949,6 +979,12 @@ impl WaterManagerData {
         &self.collect_water_pressure
     }
 
+    /// Returns the version-270 Bool selectors that derive collect-water
+    /// pressure from the current water-pressure grid.
+    pub fn collect_water_pressure_selector(&self) -> Option<&[bool]> {
+        self.collect_water_pressure_selector.as_deref()
+    }
+
     /// Returns the full collect-sewage pressure grid, including old defaults.
     pub fn collect_sewage_pressure(&self) -> &[u16] {
         &self.collect_sewage_pressure
@@ -984,6 +1020,57 @@ impl WaterManagerData {
             ));
         };
         *value = pressure;
+        Ok(())
+    }
+
+    /// Replaces one version-270 collect-water Bool selector. When enabled,
+    /// the in-memory collect-water pressure follows the current water pressure
+    /// for that node; setting it to false clears the derived pressure.
+    pub fn set_collect_water_pressure_selector(
+        &mut self,
+        node: usize,
+        selected: bool,
+    ) -> Result<(), CrpError> {
+        if self.collect_water_pressure_selector.is_none() {
+            return Err(invalid_collect_pressure(
+                self.scalar_fields_offset,
+                "collect-water Bool selectors are stored only at inner version 270",
+            ));
+        }
+        if node >= stored_node_count(self.format_version) {
+            return Err(invalid_collect_pressure(
+                node,
+                "collect-water node index is outside the stored prefix",
+            ));
+        }
+        let derived_pressure = if selected {
+            *self.water_node_pressure.get(node).ok_or_else(|| {
+                invalid_collect_pressure(
+                    node,
+                    "water node index is outside the decoded pressure grid",
+                )
+            })?
+        } else {
+            0
+        };
+        let selector = self
+            .collect_water_pressure_selector
+            .as_mut()
+            .and_then(|selectors| selectors.get_mut(node))
+            .ok_or_else(|| {
+                invalid_collect_pressure(
+                    node,
+                    "collect-water node index is outside the decoded selector grid",
+                )
+            })?;
+        let collect_pressure = self.collect_water_pressure.get_mut(node).ok_or_else(|| {
+            invalid_collect_pressure(
+                node,
+                "collect-water node index is outside the decoded pressure grid",
+            )
+        })?;
+        *selector = selected;
+        *collect_pressure = derived_pressure;
         Ok(())
     }
 
@@ -1069,9 +1156,10 @@ impl WaterManagerData {
     /// collect-pressure arrays, counters, and the continuation flag while
     /// preserving all unedited bytes, including conductivity grids, guide
     /// references, and the closing profiler reference. Changed UShort arrays
-    /// use the canonical UShort encoding; changed Byte arrays use literal
-    /// blocks. Either can change body length. Returns an error if a captured
-    /// field range is invalid.
+    /// use the canonical UShort encoding, changed Byte arrays use literal
+    /// blocks, and changed Bool arrays use bit-packed literal blocks. Any of
+    /// these can change body length. Returns an error if a captured field range
+    /// is invalid.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.original_body.clone();
         encode_pulse_groups(
@@ -1318,6 +1406,30 @@ impl WaterManagerData {
                 ));
             }
         }
+        match (
+            self.collect_water_pressure_selector_range,
+            self.collect_water_pressure_selector.as_deref(),
+            self.original_collect_water_pressure_selector.as_deref(),
+        ) {
+            (Some((start, end)), Some(values), Some(original)) => {
+                if let Some(encoded) = changed_bool_array(
+                    values,
+                    Some(original),
+                    stored_node_count,
+                    start,
+                    "collect-water Bool selectors",
+                )? {
+                    replacements.push((start, end, encoded));
+                }
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(invalid_collect_pressure(
+                    self.scalar_fields_offset,
+                    "collect-water Bool fields do not match the version gate",
+                ));
+            }
+        }
         if let Some((start, end)) = self.collect_water_pressure_range {
             if let Some(encoded) = changed_ushort_array(
                 &self.collect_water_pressure,
@@ -1491,6 +1603,33 @@ fn changed_byte_array(
     }
     let mut encoded = Vec::new();
     write_encoded_byte_array(&mut encoded, current);
+    Ok(Some(encoded))
+}
+
+fn changed_bool_array(
+    values: &[bool],
+    original_values: Option<&[bool]>,
+    count: usize,
+    offset: usize,
+    field: &str,
+) -> Result<Option<Vec<u8>>, CrpError> {
+    let current = values.get(..count).ok_or_else(|| {
+        invalid_collect_pressure(offset, &format!("{field} decoded prefix is truncated"))
+    })?;
+    let original = original_values.ok_or_else(|| {
+        invalid_collect_pressure(offset, &format!("{field} original values are missing"))
+    })?;
+    if original.len() != count {
+        return Err(invalid_collect_pressure(
+            offset,
+            &format!("{field} original prefix has an invalid length"),
+        ));
+    }
+    if current == original {
+        return Ok(None);
+    }
+    let mut encoded = Vec::new();
+    write_encoded_bool_array(&mut encoded, current);
     Ok(Some(encoded))
 }
 
@@ -2234,8 +2373,85 @@ mod tests {
         assert_eq!(data.collect_water_pressure()[0], 0x1234);
         assert_eq!(data.collect_water_pressure()[1], 0);
         assert_eq!(
+            data.collect_water_pressure_selector().unwrap()[..2],
+            [true, false]
+        );
+        assert_eq!(
             data.water_pulse_groups()[0].collect_pressure,
             Some(0x1516_1718)
+        );
+    }
+
+    #[test]
+    fn version_270_collect_water_selectors_edit_and_reencode_as_packed_bools() {
+        let body = active_body(270);
+        let mut data = WaterManagerData::decode(270, &body).unwrap();
+        let selector_range = data.collect_water_pressure_selector_range.unwrap();
+        let pressure_range = data.water_node_pressure_range;
+        data.set_collect_water_pressure_selector(0, true).unwrap();
+        assert_eq!(data.collect_water_pressure()[0], 0x1234);
+        data.set_water_node_pressure(0, 0x4321).unwrap();
+        data.set_water_node_pressure(1, 0x5678).unwrap();
+        data.set_collect_water_pressure_selector(1, true).unwrap();
+        assert_eq!(data.collect_water_pressure()[0], 0x4321);
+        assert_eq!(data.collect_water_pressure()[1], 0x5678);
+        data.set_collect_water_pressure_selector(0, false).unwrap();
+        assert_eq!(data.collect_water_pressure()[0], 0);
+        data.set_collect_water_pressure_selector(0, true).unwrap();
+
+        let mut expected_selectors = vec![false; NODE_COUNT];
+        expected_selectors[0] = true;
+        expected_selectors[1] = true;
+        let mut packed_selectors = vec![0; NODE_COUNT.div_ceil(8)];
+        for (node, selected) in expected_selectors.iter().copied().enumerate() {
+            if selected {
+                packed_selectors[node / 8] |= 1 << (node % 8);
+            }
+        }
+        let mut expected_selector_bytes = Vec::new();
+        for chunk in packed_selectors.chunks(128) {
+            expected_selector_bytes.push((chunk.len() - 1) as u8);
+            expected_selector_bytes.extend_from_slice(chunk);
+        }
+        let mut expected = body;
+        let mut replacements = vec![
+            (selector_range, expected_selector_bytes),
+            (
+                pressure_range,
+                expected_ushort_array_with_two_nonzero_values(NODE_COUNT, 0x4321, 0x5678),
+            ),
+        ];
+        replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in replacements.into_iter().rev() {
+            expected.splice(start..end, replacement);
+        }
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = WaterManagerData::decode(270, &encoded).unwrap();
+        assert_eq!(
+            decoded.collect_water_pressure_selector().unwrap()[..2],
+            [true, true]
+        );
+        assert_eq!(decoded.collect_water_pressure()[0], 0x4321);
+        assert_eq!(decoded.collect_water_pressure()[1], 0x5678);
+        assert!(data.set_collect_water_pressure(0, 1).is_err());
+        assert!(
+            data.set_collect_water_pressure_selector(NODE_COUNT, true)
+                .is_err()
+        );
+
+        let mut before_gate = WaterManagerData::decode(269, &empty_body(269)).unwrap();
+        assert!(
+            before_gate
+                .set_collect_water_pressure_selector(0, true)
+                .is_err()
+        );
+        let mut after_gate = WaterManagerData::decode(271, &empty_body(271)).unwrap();
+        assert!(
+            after_gate
+                .set_collect_water_pressure_selector(0, true)
+                .is_err()
         );
     }
 

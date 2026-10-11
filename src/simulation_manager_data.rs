@@ -13796,7 +13796,9 @@ mod manager_boundary_tests {
             append_zero_encoded_long_array(&mut graph, 32_768);
         }
         append_zero_encoded_long_array(&mut graph, 32_768); // Node pollution.
-        if format_version >= 271 {
+        if format_version == 270 {
+            append_zero_encoded_long_array(&mut graph, 32_768 / 8); // Bool collect-water selectors.
+        } else if format_version >= 271 {
             append_zero_encoded_long_array(&mut graph, 32_768); // Collect-water pressure.
         }
         if format_version >= 272 {
@@ -14453,6 +14455,43 @@ mod manager_boundary_tests {
         assert!(manager.replace_water_manager_data(&stale_editor).is_err());
         stale_editor.set_processed_cell_count(99);
         assert_eq!(manager.serialized_object_graph, replaced_graph);
+    }
+
+    #[test]
+    fn water_collect_selector_edit_preserves_following_manager_body() {
+        let mut manager = water_manager_with_next_version(
+            270,
+            "ZoneManager+Data, Assembly-CSharp",
+            "ZoneManager",
+        );
+        let original_graph = manager.serialized_object_graph.clone();
+        let mut edited = manager.decode_water_manager_data().unwrap();
+        edited.set_collect_water_pressure_selector(1, true).unwrap();
+        let expected_body = edited.encode().unwrap();
+        assert_ne!(expected_body.len(), edited.encode_unchanged().len());
+
+        let next_tag = profiler_tag("ZoneManager");
+        let old_next_start = original_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        manager.replace_water_manager_data(&edited).unwrap();
+        let new_next_start = manager
+            .serialized_object_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        let body_start = profiler_tag("WaterManager").len();
+        assert_eq!(
+            &manager.serialized_object_graph[body_start..new_next_start],
+            expected_body
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[new_next_start..],
+            &original_graph[old_next_start..]
+        );
+        let decoded = manager.decode_water_manager_data().unwrap();
+        assert_eq!(decoded.collect_water_pressure_selector().unwrap()[1], true);
     }
 
     #[test]
