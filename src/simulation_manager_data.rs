@@ -13800,7 +13800,10 @@ mod manager_boundary_tests {
         append_zero_encoded_long_array(&mut graph, 65_536); // Heating conductivity.
         append_zero_encoded_long_array(&mut graph, 65_536); // Closest water segment.
         append_zero_encoded_long_array(&mut graph, 65_536); // Closest heating segment.
-        graph.extend_from_slice(&[0; 12]); // Three empty pulse group/unit pairs.
+        graph.extend_from_slice(&1_u16.to_be_bytes()); // One water pulse group.
+        graph.extend_from_slice(&[0; 14]); // Fixed-width water pulse-group record.
+        graph.extend_from_slice(&0_u16.to_be_bytes()); // No water pulse units.
+        graph.extend_from_slice(&[0; 8]); // Empty sewage and heating group/unit pairs.
         for _ in 0..9 {
             append_zero_encoded_long_array(&mut graph, 32_768);
         }
@@ -14328,6 +14331,10 @@ mod manager_boundary_tests {
         edited.set_processed_cell_count(-17);
         edited.set_conductive_cell_count(23);
         edited.set_can_continue(false);
+        let mut pulse_group = edited.water_pulse_groups()[0];
+        pulse_group.current_pressure = 0x0102_0304;
+        pulse_group.merge_index = 0x1122;
+        edited.set_water_pulse_group(0, pulse_group).unwrap();
         let expected_body = edited.encode().unwrap();
 
         manager.replace_water_manager_data(&edited).unwrap();
@@ -14355,6 +14362,11 @@ mod manager_boundary_tests {
         assert_eq!(decoded.processed_cell_count(), -17);
         assert_eq!(decoded.conductive_cell_count(), 23);
         assert!(!decoded.can_continue());
+        assert_eq!(
+            decoded.water_pulse_groups()[0].current_pressure,
+            0x0102_0304
+        );
+        assert_eq!(decoded.water_pulse_groups()[0].merge_index, 0x1122);
 
         let replaced_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_water_manager_data(&stale_editor).is_err());
