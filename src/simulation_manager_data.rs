@@ -2507,9 +2507,10 @@ impl SimulationManagerData {
         WaterManagerData::decode(self.format_version, bytes)
     }
 
-    /// Replaces WaterManager's processed-cell counter, conductive-cell
-    /// counter, and continuation flag in place. Encoded network fields, guide
-    /// references, and the closing profiler reference remain byte-identical.
+    /// Replaces edited WaterManager counters, pulse records, and versioned
+    /// collect-pressure arrays. The body can change length when a collect-
+    /// pressure array is re-encoded; other manager bytes and the ZoneManager
+    /// boundary are retained and checked.
     pub fn replace_water_manager_data(
         &mut self,
         edited: &WaterManagerData,
@@ -2528,33 +2529,9 @@ impl SimulationManagerData {
             ));
         }
         let replacement = edited.encode()?;
-        if replacement.len() != edited.encode_unchanged().len() {
-            return Err(invalid(
-                16,
-                "WaterManager edits must preserve the decoded body length",
-            ));
-        }
         let field_range = self.water_manager_field_range()?;
-        let body_end = field_range
-            .start
-            .checked_add(replacement.len())
-            .ok_or(CrpError::ArithmeticOverflow("WaterManager replacement end"))?;
-        if body_end != field_range.end {
-            return Err(invalid(
-                body_end,
-                "WaterManager replacement no longer ends at the ZoneManager boundary",
-            ));
-        }
         let mut candidate_graph = self.serialized_object_graph.clone();
-        candidate_graph
-            .get_mut(field_range.start..body_end)
-            .ok_or_else(|| {
-                invalid(
-                    field_range.start,
-                    "WaterManager replacement range is invalid",
-                )
-            })?
-            .copy_from_slice(&replacement);
+        candidate_graph.splice(field_range.clone(), replacement.clone());
         let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
         let validation = self.decode_water_manager_data().and_then(|decoded| {
             if decoded.encode_unchanged() != replacement {
@@ -13794,7 +13771,14 @@ mod manager_boundary_tests {
     }
 
     fn water_manager_with_next(next_type: &str, next_tag_name: &str) -> SimulationManagerData {
-        const FORMAT_VERSION: u32 = 265;
+        water_manager_with_next_version(265, next_type, next_tag_name)
+    }
+
+    fn water_manager_with_next_version(
+        format_version: u32,
+        next_type: &str,
+        next_tag_name: &str,
+    ) -> SimulationManagerData {
         let mut graph = profiler_tag("WaterManager");
         append_zero_encoded_long_array(&mut graph, 65_536); // Water conductivity.
         append_zero_encoded_long_array(&mut graph, 65_536); // Heating conductivity.
@@ -13802,6 +13786,9 @@ mod manager_boundary_tests {
         append_zero_encoded_long_array(&mut graph, 65_536); // Closest heating segment.
         graph.extend_from_slice(&1_u16.to_be_bytes()); // One water pulse group.
         graph.extend_from_slice(&[0; 14]); // Fixed-width water pulse-group record.
+        if format_version >= 270 {
+            graph.extend_from_slice(&[0; 4]); // Version-270 collect pressure.
+        }
         graph.extend_from_slice(&1_u16.to_be_bytes()); // One water pulse unit.
         graph.extend_from_slice(&[0; 6]); // Fixed-width water pulse-unit record.
         graph.extend_from_slice(&[0; 8]); // Empty sewage and heating group/unit pairs.
@@ -13809,6 +13796,12 @@ mod manager_boundary_tests {
             append_zero_encoded_long_array(&mut graph, 32_768);
         }
         append_zero_encoded_long_array(&mut graph, 32_768); // Node pollution.
+        if format_version >= 271 {
+            append_zero_encoded_long_array(&mut graph, 32_768); // Collect-water pressure.
+        }
+        if format_version >= 272 {
+            append_zero_encoded_long_array(&mut graph, 32_768); // Collect-sewage pressure.
+        }
         graph.extend_from_slice(&[0; 8]); // Processed and conductive-cell counters.
         graph.push(1); // canContinue.
         graph.extend_from_slice(&[0xff, 0xff]); // Two null guide references.
@@ -13817,7 +13810,7 @@ mod manager_boundary_tests {
         graph.extend_from_slice(&[0xaa, 0xbb]);
 
         let mut manager = manager_with_graph(graph);
-        manager.format_version = FORMAT_VERSION;
+        manager.format_version = format_version;
         let mut references = vec![None; 14];
         references[12] = Some(ManagerObjectReference {
             object_id: 12,
@@ -14389,6 +14382,52 @@ mod manager_boundary_tests {
 
         manager.format_version += 1;
         assert!(manager.replace_water_manager_data(&edited).is_err());
+        assert_eq!(manager.serialized_object_graph, replaced_graph);
+    }
+
+    #[test]
+    fn water_collect_pressure_edits_resize_only_the_bounded_manager_body() {
+        let mut manager = water_manager_with_next_version(
+            272,
+            "ZoneManager+Data, Assembly-CSharp",
+            "ZoneManager",
+        );
+        let original_graph = manager.serialized_object_graph.clone();
+        let mut stale_editor = manager.decode_water_manager_data().unwrap();
+        let mut edited = manager.decode_water_manager_data().unwrap();
+        edited.set_collect_water_pressure(1, 0x1234).unwrap();
+        edited.set_collect_sewage_pressure(2, 0x5678).unwrap();
+        let expected_body = edited.encode().unwrap();
+        assert_ne!(expected_body.len(), edited.encode_unchanged().len());
+
+        let old_next_tag = profiler_tag("ZoneManager");
+        let old_next_start = original_graph
+            .windows(old_next_tag.len())
+            .position(|window| window == old_next_tag)
+            .unwrap();
+        manager.replace_water_manager_data(&edited).unwrap();
+
+        let new_next_start = manager
+            .serialized_object_graph
+            .windows(old_next_tag.len())
+            .position(|window| window == old_next_tag)
+            .unwrap();
+        let body_start = profiler_tag("WaterManager").len();
+        assert_eq!(
+            &manager.serialized_object_graph[body_start..new_next_start],
+            expected_body
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[new_next_start..],
+            &original_graph[old_next_start..]
+        );
+        let decoded = manager.decode_water_manager_data().unwrap();
+        assert_eq!(decoded.collect_water_pressure()[1], 0x1234);
+        assert_eq!(decoded.collect_sewage_pressure()[2], 0x5678);
+
+        let replaced_graph = manager.serialized_object_graph.clone();
+        assert!(manager.replace_water_manager_data(&stale_editor).is_err());
+        stale_editor.set_processed_cell_count(99);
         assert_eq!(manager.serialized_object_graph, replaced_graph);
     }
 
