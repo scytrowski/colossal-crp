@@ -14,6 +14,7 @@ const FIRST_EVENT_RECORD_VERSION: u32 = 210;
 const LAST_SUPPORTED_EVENT_RECORD_VERSION: u32 = 121_030;
 const CUSTOM_EVENT_SEED_FLAG: u32 = 1 << 10;
 const MAX_RACE_EVENT_ENTRIES: usize = 1_000_000;
+const MAX_EVENT_ROUTE_SCHEDULES: usize = 4;
 
 /// One decoded active event from the versioned EventManager record layout.
 ///
@@ -90,10 +91,11 @@ pub struct EventManagerTailData {
 /// Active event records in versions 210–121030 are decoded and retained.
 /// Race-event blocks are retained raw after their versioned structure is
 /// boundary-checked, including nonempty legacy route splines. Active event
-/// routes remain unsupported. Versions 121031 and newer are not supported for
-/// active event records. Reader, writer, and one corpus-observed counted-block
-/// candidate are boundary-checked. The counted block is retained as raw bytes
-/// because its meaning and type are unknown.
+/// routes from version 121005 are boundary-checked and retained raw. Versions
+/// 121031 and newer are not supported for active event records. Reader, writer,
+/// and one corpus-observed counted-block candidate are boundary-checked. The
+/// counted block is retained as raw bytes because its meaning and type are
+/// unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EventManagerReferenceData {
     format_version: u32,
@@ -101,6 +103,8 @@ pub(crate) struct EventManagerReferenceData {
     active_event_record_ranges: Vec<Range<usize>>,
     active_event_race_data_ranges: Vec<Option<Range<usize>>>,
     active_event_race_data_presence_bytes: Vec<Option<u8>>,
+    active_event_route_ranges: Vec<Range<usize>>,
+    route_schedule_prefab_scope_range: Option<Range<usize>>,
     pub(crate) object_headers: Vec<NetObjectHeader>,
     pub(crate) unidentified_counted_block: Option<UnidentifiedCountedBlock>,
     pub(crate) type_data: Vec<EventManagerTypeData>,
@@ -174,6 +178,7 @@ impl EventManagerReferenceData {
     pub(crate) fn equivalent_reference_layout(&self, other: &Self) -> bool {
         self.active_event_records == other.active_event_records
             && self.equivalent_race_event_data(other)
+            && self.equivalent_route_data(other)
             && self.object_headers == other.object_headers
             && self.unidentified_counted_block == other.unidentified_counted_block
             && self.type_data == other.type_data
@@ -205,6 +210,39 @@ impl EventManagerReferenceData {
                     }
                     _ => false,
                 })
+    }
+
+    fn equivalent_route_data(&self, other: &Self) -> bool {
+        self.active_event_route_ranges.len() == other.active_event_route_ranges.len()
+            && self
+                .active_event_route_ranges
+                .iter()
+                .zip(&other.active_event_route_ranges)
+                .all(|(left, right)| {
+                    match (
+                        self.serialized_body.get(left.clone()),
+                        other.serialized_body.get(right.clone()),
+                    ) {
+                        (Some(left), Some(right)) => left == right,
+                        _ => false,
+                    }
+                })
+            && match (
+                self.route_schedule_prefab_scope_range.as_ref(),
+                other.route_schedule_prefab_scope_range.as_ref(),
+            ) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    match (
+                        self.serialized_body.get(left.clone()),
+                        other.serialized_body.get(right.clone()),
+                    ) {
+                        (Some(left), Some(right)) => left == right,
+                        _ => false,
+                    }
+                }
+                _ => false,
+            }
     }
 
     pub(crate) fn into_type_data_editor(self) -> EventManagerTypeDataEditor {
@@ -300,11 +338,13 @@ impl EventManagerReferenceData {
             active_event_race_data_presence_bytes,
         ) = read_active_event_records(&mut reader, format_version, &event_flags)?;
 
-        if format_version >= 121_005 {
+        let (active_event_route_ranges, route_schedule_count) = if format_version >= 121_005 {
             let route_capacity = read_capacity(&mut reader, "event route")?;
-            let flags = read_encoded_uint_array(&mut reader, route_capacity - 1)?;
-            reject_active_flags(&reader, &flags, "event route")?;
-        }
+            let route_flags = read_encoded_uint_array(&mut reader, route_capacity - 1)?;
+            read_active_event_routes(&mut reader, format_version, &route_flags)?
+        } else {
+            (Vec::new(), 0)
+        };
 
         let milestone_count = usize::from(reader.read_u16_be()?);
         let type_data_count = if (108_002..109_000).contains(&format_version) {
@@ -327,9 +367,12 @@ impl EventManagerReferenceData {
         let type_data_has_ticket_price = type_data_ticket_price_present(format_version, false);
         let type_data_range = type_data_start..reader.offset();
 
-        if format_version >= 121_015 {
-            read_event_prefab_scope(&mut reader, 0, 0, 0)?;
-        }
+        let route_schedule_prefab_scope_range = if format_version >= 121_015 {
+            let scope = read_event_prefab_scope(&mut reader, 0, 0, route_schedule_count)?;
+            Some(scope.scope_range)
+        } else {
+            None
+        };
         let unidentified_counted_block = if counted_reference_block {
             let count = reader.read_u16_be()?;
             let block_start = reader.offset();
@@ -357,6 +400,8 @@ impl EventManagerReferenceData {
             active_event_record_ranges,
             active_event_race_data_ranges,
             active_event_race_data_presence_bytes,
+            active_event_route_ranges,
+            route_schedule_prefab_scope_range,
             object_headers,
             unidentified_counted_block,
             type_data,
@@ -397,7 +442,8 @@ impl EventManagerReferenceData {
         let type_data_range = type_data_start..reader.offset();
 
         // The current writer opens the schedule-prefab scope at every version.
-        read_event_prefab_scope(&mut reader, 0, 0, 0)?;
+        let route_schedule_prefab_scope_range =
+            read_event_prefab_scope(&mut reader, 0, 0, 0)?.scope_range;
         object_headers.push(read_net_object_header(&mut reader)?);
         object_headers.push(read_net_object_header(&mut reader)?);
         object_headers.push(read_net_object_header(&mut reader)?);
@@ -414,6 +460,8 @@ impl EventManagerReferenceData {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Some(route_schedule_prefab_scope_range),
             object_headers,
             None,
             type_data,
@@ -873,6 +921,69 @@ fn reject_active_flags(
         return Err(reader.invalid(format!("active {description} records are unsupported")));
     }
     Ok(())
+}
+
+fn read_active_event_routes(
+    reader: &mut Reader<'_>,
+    format_version: u32,
+    flags: &[u32],
+) -> Result<(Vec<Range<usize>>, usize), CrpError> {
+    let active_count = flags.iter().filter(|flag| **flag != 0).count();
+    let mut route_ranges = Vec::with_capacity(active_count);
+    let mut total_schedule_count = 0_usize;
+    for (slot, flags) in flags.iter().copied().enumerate() {
+        if flags == 0 {
+            continue;
+        }
+        let start = reader.offset();
+        if format_version >= 121_018 {
+            reader.read_u32_be()?; // Event policies.
+        }
+        for _ in 0..7 {
+            reader.read_u16_be()?; // Route and building/segment indexes.
+        }
+        if format_version >= 121_007 {
+            reader.read_u32_be()?; // Route version.
+            reader.read_u32_be()?; // Packed route color.
+            reader.read_u16_be()?; // Start node.
+            reader.read_u16_be()?; // End node.
+        }
+        if format_version >= 121_009 {
+            reader.read_u16_be()?; // Event prefab index.
+        }
+
+        let schedule_count = if format_version >= 121_015 {
+            usize::from(reader.read_u8()?)
+        } else {
+            0
+        };
+        if schedule_count > MAX_EVENT_ROUTE_SCHEDULES {
+            return Err(reader.invalid(format!(
+                "event route slot {} schedule count exceeds {MAX_EVENT_ROUTE_SCHEDULES}",
+                slot + 1
+            )));
+        }
+        total_schedule_count = total_schedule_count
+            .checked_add(schedule_count)
+            .ok_or_else(|| reader.invalid("event route schedule count overflowed"))?;
+        for _ in 0..schedule_count {
+            if format_version >= 121_027 {
+                reader.read_i32_be()?; // Schedule ID.
+            }
+            reader.read_u16_be()?; // Tier.
+            reader.read_u16_be()?; // Lap count.
+            reader.read_u16_be()?; // Ticket price.
+            reader.read_unique_string()?; // Schedule name.
+            if format_version >= 121_027 {
+                reader.read_u16_be()?; // Schedule flags.
+                reader.read_u8()?; // Frequency.
+                reader.read_u8()?; // Start day.
+                reader.read_u8()?; // Start month.
+            }
+        }
+        route_ranges.push(start..reader.offset());
+    }
+    Ok((route_ranges, total_schedule_count))
 }
 
 fn event_popularity_delta_present(format_version: u32) -> bool {
@@ -1399,6 +1510,8 @@ fn finish(
     active_event_record_ranges: Vec<Range<usize>>,
     active_event_race_data_ranges: Vec<Option<Range<usize>>>,
     active_event_race_data_presence_bytes: Vec<Option<u8>>,
+    active_event_route_ranges: Vec<Range<usize>>,
+    route_schedule_prefab_scope_range: Option<Range<usize>>,
     object_headers: Vec<NetObjectHeader>,
     unidentified_counted_block: Option<UnidentifiedCountedBlock>,
     type_data: Vec<EventManagerTypeData>,
@@ -1420,6 +1533,8 @@ fn finish(
             active_event_record_ranges,
             active_event_race_data_ranges,
             active_event_race_data_presence_bytes,
+            active_event_route_ranges,
+            route_schedule_prefab_scope_range,
             object_headers,
             unidentified_counted_block,
             type_data,
@@ -1856,6 +1971,72 @@ mod tests {
         bytes
     }
 
+    fn one_active_route_layout(version: u32, schedule_count: u8) -> (Vec<u8>, Vec<u8>) {
+        use crate::encoded_array::{write_encoded_uint_array, write_encoded_ushort_array};
+
+        let mut bytes = vec![
+            0x00, 0x00, // One event slot, no active event records.
+            0x00, 0x01, // Two route slots, including the reserved slot zero.
+        ];
+        write_encoded_uint_array(&mut bytes, &[0x1020_3040]); // One active route.
+
+        let mut route = Vec::new();
+        if version >= 121_018 {
+            route.extend_from_slice(&0x1122_3344_u32.to_be_bytes()); // Event policies.
+        }
+        for index in 1_u16..=7 {
+            route.extend_from_slice(&index.to_be_bytes()); // Route and building/segment indexes.
+        }
+        if version >= 121_007 {
+            route.extend_from_slice(&0x89ab_cdef_u32.to_be_bytes()); // Route version.
+            route.extend_from_slice(&0x1020_3040_u32.to_be_bytes()); // Packed color.
+            route.extend_from_slice(&8_u16.to_be_bytes()); // Start node.
+            route.extend_from_slice(&9_u16.to_be_bytes()); // End node.
+        }
+        if version >= 121_009 {
+            route.extend_from_slice(&10_u16.to_be_bytes()); // Event prefab index.
+        }
+        if version >= 121_015 {
+            route.push(schedule_count);
+            for _ in 0..schedule_count {
+                if version >= 121_027 {
+                    route.extend_from_slice(&(-11_i32).to_be_bytes()); // Schedule ID.
+                }
+                route.extend_from_slice(&12_u16.to_be_bytes()); // Tier.
+                route.extend_from_slice(&13_u16.to_be_bytes()); // Laps.
+                route.extend_from_slice(&14_u16.to_be_bytes()); // Ticket price.
+                route.push(0xff); // Null schedule name.
+                if version >= 121_027 {
+                    route.extend_from_slice(&15_u16.to_be_bytes()); // Schedule flags.
+                    route.extend_from_slice(&[16, 17, 18]); // Frequency, start day, start month.
+                }
+            }
+        }
+        bytes.extend_from_slice(&route);
+
+        bytes.extend_from_slice(&[0x00, 0x00]); // No unlock milestones.
+        bytes.extend_from_slice(&[0x00, 0x00]); // Empty event-prefab indexes and names.
+        if version >= 121_015 {
+            let schedule_indexes = vec![0x1234; usize::from(schedule_count)];
+            write_encoded_ushort_array(&mut bytes, &schedule_indexes);
+            bytes.extend_from_slice(&[0x00, 0x00]); // Empty schedule-prefab names.
+        }
+        if version >= 253 {
+            bytes.push(0xff); // Match-preparing reference.
+        }
+        if version >= 109_011 {
+            bytes.extend_from_slice(&[0xff, 0xff]); // Band references.
+        }
+        if version >= 109_003 {
+            bytes.extend_from_slice(&[0x34, 0x56]); // Band-popularity bonus.
+        }
+        if version >= 121_027 {
+            bytes.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // Event-schedule count.
+        }
+        bytes.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
+        (bytes, route)
+    }
+
     fn one_racer_race_event_data() -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1_i32.to_be_bytes()); // One racer.
@@ -1946,6 +2127,115 @@ mod tests {
             EventManagerReferenceData::decode_reader(version, &bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.object_headers, vec![NetObjectHeader::Null; 3]);
+    }
+
+    #[test]
+    fn active_event_routes_follow_version_gates_and_are_preserved_raw() {
+        for (version, schedule_count) in [
+            (121_005, 0),
+            (121_006, 0),
+            (121_007, 0),
+            (121_009, 0),
+            (121_014, 0),
+            (121_015, 1),
+            (121_026, 4),
+            (121_027, 2),
+            (121_030, 4),
+        ] {
+            let (bytes, expected_route_bytes) = one_active_route_layout(version, schedule_count);
+            let (decoded, consumed) = EventManagerReferenceData::decode_reader(version, &bytes)
+                .unwrap_or_else(|error| panic!("version {version}: {error}"));
+            assert_eq!(consumed, bytes.len(), "version {version}");
+            assert_eq!(
+                decoded.active_event_route_ranges.len(),
+                1,
+                "version {version}"
+            );
+            assert_eq!(
+                decoded
+                    .serialized_body
+                    .get(decoded.active_event_route_ranges[0].clone()),
+                Some(expected_route_bytes.as_slice()),
+                "version {version}"
+            );
+            assert_eq!(
+                decoded
+                    .clone()
+                    .into_event_records_editor()
+                    .encode()
+                    .unwrap(),
+                bytes,
+                "version {version}"
+            );
+            assert_eq!(
+                decoded.route_schedule_prefab_scope_range.is_some(),
+                version >= 121_015,
+                "schedule prefab scope at version {version}"
+            );
+        }
+
+        let (single_route_body, single_route) = one_active_route_layout(121_030, 1);
+        let schedule_count_offset = 4 + 7 * 2 + 4 + 4 + 4 + 2;
+        let mut second_route = single_route[..schedule_count_offset].to_vec();
+        second_route.push(2);
+        let schedule_record = &single_route[schedule_count_offset + 1..];
+        second_route.extend_from_slice(schedule_record);
+        second_route.extend_from_slice(schedule_record);
+
+        let first_route_start = 4 + 1 + 4; // Two capacity fields plus one literal flag.
+        let first_route_end = first_route_start + single_route.len();
+        let old_schedule_scope_start = first_route_end + 2 + 2;
+        let old_schedule_scope_end = old_schedule_scope_start + 5;
+        let mut two_route_body = single_route_body[..2].to_vec();
+        two_route_body.extend_from_slice(&2_u16.to_be_bytes()); // Three slots total.
+        crate::encoded_array::write_encoded_uint_array(&mut two_route_body, &[1, 2]);
+        two_route_body.extend_from_slice(&single_route);
+        two_route_body.extend_from_slice(&second_route);
+        two_route_body.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Empty milestones/scope.
+        crate::encoded_array::write_encoded_ushort_array(
+            &mut two_route_body,
+            &[0x1234, 0x1234, 0x1234],
+        );
+        two_route_body.extend_from_slice(&[0x00, 0x00]); // Empty schedule-prefab names.
+        two_route_body.extend_from_slice(&single_route_body[old_schedule_scope_end..]);
+        let (decoded_two_routes, consumed_two_routes) =
+            EventManagerReferenceData::decode_reader(121_030, &two_route_body).unwrap();
+        assert_eq!(consumed_two_routes, two_route_body.len());
+        assert_eq!(decoded_two_routes.active_event_route_ranges.len(), 2);
+        assert_eq!(
+            decoded_two_routes
+                .clone()
+                .into_event_records_editor()
+                .encode()
+                .unwrap(),
+            two_route_body
+        );
+
+        let (bytes, _) = one_active_route_layout(121_030, 5);
+        assert!(EventManagerReferenceData::decode_reader(121_030, &bytes).is_err());
+
+        let (mut invalid_string, route) = one_active_route_layout(121_015, 1);
+        let route_start = invalid_string
+            .windows(route.len())
+            .position(|window| window == route)
+            .expect("active route fixture occurs in the manager body");
+        let name_offset = route
+            .iter()
+            .position(|byte| *byte == 0xff)
+            .expect("schedule name null marker occurs in the route");
+        invalid_string.splice(
+            route_start + name_offset..route_start + name_offset + 1,
+            [0x00, 0x00, 0x01, 0xd7, 0x80], // One unpaired UTF-16 high surrogate.
+        );
+        assert!(EventManagerReferenceData::decode_reader(121_015, &invalid_string).is_err());
+
+        let (bytes, _) = one_active_route_layout(121_030, 1);
+        for end in 0..bytes.len() {
+            assert!(
+                EventManagerReferenceData::decode_reader(121_030, &bytes[..end]).is_err(),
+                "truncated active route body at {end}"
+            );
+        }
     }
 
     #[test]

@@ -2161,9 +2161,9 @@ impl SimulationManagerData {
     /// This table is available only when the bounded EventManager body matches
     /// one unambiguous supported reader/writer candidate. Legacy active-event
     /// records from inner versions 210 through 121030 are preserved unchanged;
-    /// nested race-event blocks, including legacy nonempty route splines, are
-    /// boundary-checked and retained raw. Active routes and versions 121031 and
-    /// newer remain unsupported.
+    /// nested race-event blocks and active event routes are boundary-checked
+    /// and retained raw. Versions 121031 and newer remain unsupported for
+    /// active event records.
     pub fn decode_event_manager_type_data(&self) -> Result<EventManagerTypeDataEditor, CrpError> {
         let managers = self
             .manager_objects
@@ -2182,8 +2182,8 @@ impl SimulationManagerData {
     /// values are exposed when present. From version 120004 through 121005,
     /// nested race-event data follows unconditionally. From version 121006,
     /// the source bool and optional nested data are preserved. Legacy route
-    /// splines are boundary-checked and retained raw. Active event routes and
-    /// active records from version 121031 onward are rejected. The bounded
+    /// splines and active event routes are boundary-checked and retained raw.
+    /// Active records from version 121031 onward are rejected. The bounded
     /// manager body must match one unambiguous reader/writer candidate.
     pub fn decode_event_manager_event_records(
         &self,
@@ -2427,8 +2427,8 @@ impl SimulationManagerData {
 
     /// Decodes the shared EventManager event, milestone, and type-data prefab indexes.
     ///
-    /// The three groups occupy one encoded UShort array. Active routes remain
-    /// unsupported; their schedule scope is retained as source bytes.
+    /// The three groups occupy one encoded UShort array. Active route records
+    /// and their separate schedule-prefab scope are preserved as source bytes.
     pub fn decode_event_manager_prefab_indices(
         &self,
     ) -> Result<EventManagerPrefabIndicesEditor, CrpError> {
@@ -14419,6 +14419,66 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph(), expected_graph);
+    }
+
+    #[test]
+    fn event_manager_route_records_survive_event_record_replacement() {
+        let version = 121_030;
+        let mut body = vec![
+            0x00, 0x00, // One event slot, no active events.
+            0x00, 0x01, // Two route slots, including reserved slot zero.
+        ];
+        write_encoded_uint_array(&mut body, &[1]); // One active route.
+        let route_start = body.len();
+        body.extend_from_slice(&0x1122_3344_u32.to_be_bytes()); // Event policies.
+        for value in 1_u16..=7 {
+            body.extend_from_slice(&value.to_be_bytes()); // Route and building/segment indexes.
+        }
+        body.extend_from_slice(&0x5566_7788_u32.to_be_bytes()); // Route version.
+        body.extend_from_slice(&0x99aa_bbcc_u32.to_be_bytes()); // Packed color.
+        body.extend_from_slice(&8_u16.to_be_bytes()); // Start node.
+        body.extend_from_slice(&9_u16.to_be_bytes()); // End node.
+        body.extend_from_slice(&10_u16.to_be_bytes()); // Event prefab index.
+        body.push(1); // One route schedule.
+        body.extend_from_slice(&(-11_i32).to_be_bytes()); // Schedule ID.
+        body.extend_from_slice(&12_u16.to_be_bytes()); // Tier.
+        body.extend_from_slice(&13_u16.to_be_bytes()); // Laps.
+        body.extend_from_slice(&14_u16.to_be_bytes()); // Ticket price.
+        body.push(0xff); // Null schedule name.
+        body.extend_from_slice(&15_u16.to_be_bytes()); // Schedule flags.
+        body.extend_from_slice(&[16, 17, 18]); // Frequency, start day, start month.
+        let route_end = body.len();
+
+        body.extend_from_slice(&[0x00, 0x00]); // No unlock milestones.
+        body.extend_from_slice(&[0x00, 0x00]); // Empty event-prefab scope.
+        write_encoded_ushort_array(&mut body, &[0x1234]); // Route schedule prefab index.
+        body.extend_from_slice(&[0x00, 0x00]); // Empty schedule-prefab name table.
+        body.push(0xff); // Match-preparing reference.
+        body.extend_from_slice(&[0xff, 0xff]); // Band references.
+        body.extend_from_slice(&[0x22, 0x33]); // Band-popularity bonus.
+        body.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // Event-schedule count.
+        body.extend_from_slice(&[0x44, 0x55]); // End-profiler index.
+
+        let (mut manager, body_start) = manager_with_event_manager_body(version, &body);
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let mut editor = manager.decode_event_manager_event_records().unwrap();
+        assert!(editor.records().is_empty());
+        assert_eq!(editor.original_body_bytes(), body);
+        assert_eq!(
+            &body[route_start..route_end],
+            &manager.serialized_object_graph()[body_start + route_start..body_start + route_end]
+        );
+
+        manager
+            .replace_event_manager_event_records(&editor)
+            .unwrap();
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start..body_start + body.len()],
+            body
+        );
+        assert_eq!(manager.serialized_object_graph(), original_graph);
+        editor = manager.decode_event_manager_event_records().unwrap();
+        assert_eq!(editor.original_body_bytes(), body);
     }
 
     #[test]
