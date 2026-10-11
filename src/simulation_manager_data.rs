@@ -2162,7 +2162,7 @@ impl SimulationManagerData {
     /// one unambiguous supported reader/writer candidate. Legacy active-event
     /// records from inner versions 210 through 121034 are preserved unchanged;
     /// nested race-event blocks are decoded through version 121034 and active
-    /// routes are supported through version 121030.
+    /// routes are supported through version 121034.
     pub fn decode_event_manager_type_data(&self) -> Result<EventManagerTypeDataEditor, CrpError> {
         let managers = self
             .manager_objects
@@ -2280,13 +2280,13 @@ impl SimulationManagerData {
     /// Decodes active EventManager routes and their schedules.
     ///
     /// Route fields are read from the versioned reader layout for inner
-    /// versions 121005–121030 according to their individual gates. This does
+    /// versions 121005–121034 according to their individual gates. This does
     /// not establish compatibility with the supplied writer's unconditional
     /// layout. Schedule prefab indexes remain raw and are not exposed here.
     pub fn decode_event_manager_route_records(
         &self,
     ) -> Result<EventManagerRouteRecordsEditor, CrpError> {
-        if !(121_005..=121_030).contains(&self.format_version) {
+        if !(121_005..=121_034).contains(&self.format_version) {
             return Err(invalid(
                 0,
                 format!(
@@ -14450,7 +14450,7 @@ mod manager_boundary_tests {
 
     #[test]
     fn event_manager_prefab_editor_updates_route_schedule_scope_and_resizes_body() {
-        let version = 121_030;
+        let version = 121_034;
         let mut body = vec![
             0x00, 0x00, // One event slot, no active events.
             0x00, 0x01, // Two route slots, including reserved slot zero.
@@ -14824,7 +14824,7 @@ mod manager_boundary_tests {
 
     #[test]
     fn event_manager_route_editor_changes_values_resizes_names_and_preserves_scope() {
-        let version = 121_030;
+        let version = 121_034;
         let mut body = vec![
             0x00, 0x00, // One event slot, no active events.
             0x00, 0x01, // Two route slots, including reserved slot zero.
@@ -15018,7 +15018,7 @@ mod manager_boundary_tests {
                 .name,
             None
         );
-        manager.format_version = 121_031;
+        manager.format_version = 121_035;
         assert!(manager.decode_event_manager_route_records().is_err());
     }
 

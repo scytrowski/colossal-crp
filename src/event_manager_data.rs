@@ -11,7 +11,7 @@ use std::ops::Range;
 const MAX_EVENT_SLOTS: usize = u16::MAX as usize + 1;
 const FIRST_EVENT_RECORD_VERSION: u32 = 210;
 const LAST_SUPPORTED_EVENT_RECORD_VERSION: u32 = 121_034;
-const LAST_SUPPORTED_EVENT_ROUTE_VERSION: u32 = 121_030;
+const LAST_SUPPORTED_EVENT_ROUTE_VERSION: u32 = 121_034;
 const CUSTOM_EVENT_SEED_FLAG: u32 = 1 << 10;
 const MAX_RACE_EVENT_ENTRIES: usize = 1_000_000;
 const MAX_EVENT_ROUTE_SCHEDULES: usize = 4;
@@ -286,7 +286,7 @@ pub struct EventManagerTailData {
 /// Race-event blocks are boundary-checked and retained raw, with selected
 /// fixed-width scalar fields exposed for editing, including nonempty legacy
 /// route splines. Active event routes from version 121005 are boundary-checked
-/// through version 121030 and their known values are exposed for edits. The
+/// through version 121034 and their known values are exposed for edits. The
 /// legacy counted UShort block in race-event data is retained raw because its
 /// meaning is unknown. Reader, writer, and one corpus-observed counted block
 /// candidate are boundary-checked.
@@ -350,7 +350,7 @@ pub struct EventManagerEventRecordsEditor {
 /// Editor for existing EventManager routes and their schedules.
 ///
 /// It edits route scalar values and schedule names for inner versions
-/// 121005–121030. Route count, slot indexes, flags, and schedule counts are
+/// 121005–121034. Route count, slot indexes, flags, and schedule counts are
 /// fixed. Schedule names keep their source compact or wide encoding when
 /// possible and can resize the manager body. Schedule prefab indexes and other
 /// body bytes are preserved raw.
@@ -3850,6 +3850,10 @@ mod tests {
             (121_026, 4),
             (121_027, 2),
             (121_030, 4),
+            (121_031, 2),
+            (121_032, 2),
+            (121_033, 2),
+            (121_034, 4),
         ] {
             let (bytes, expected_route_bytes) = one_active_route_layout(version, schedule_count);
             let (decoded, consumed) = EventManagerReferenceData::decode_reader(version, &bytes)
@@ -4357,8 +4361,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x01, // One active route flag.
         ];
         assert!(EventManagerReferenceData::decode_reader(121_005, &active_route).is_err());
-        let (version_121031_route, _) = one_active_route_layout(121_031, 1);
-        assert!(EventManagerReferenceData::decode_reader(121_031, &version_121031_route).is_err());
+        let (version_121035_route, _) = one_active_route_layout(121_035, 1);
+        assert!(EventManagerReferenceData::decode_reader(121_035, &version_121035_route).is_err());
 
         let bytes = empty_reader_layout(109_011);
         for end in 0..bytes.len() {
