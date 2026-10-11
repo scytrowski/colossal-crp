@@ -1471,21 +1471,25 @@ impl TransportManagerActiveLineEditor<'_> {
     }
 }
 
-/// Decoded TransportManager line-number and passenger tables with active lines.
+/// Decoded TransportManager active-line prefab assignments, line-number and
+/// passenger tables, and active lines.
 ///
 /// Fields are exposed only where their inner DataSerializer version gates
 /// apply. Original bytes are retained for unchanged writing; semantic edits
-/// support version-gated active-line fields, shared line numbers, and passenger
-/// counters.
+/// support active-line prefab indexes, version-gated active-line fields, shared
+/// line numbers, and passenger counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerLineData {
     format_version: u32,
+    active_line_prefab_indices: Vec<u16>,
     line_numbers: Option<Vec<u16>>,
     active_lines: Vec<TransportManagerLineRecord>,
     global_passengers: Option<Vec<TransportPassengerRecord>>,
     serialized_line_numbers: Vec<u8>,
     serialized_global_passengers: Vec<u8>,
     serialized_body: Vec<u8>,
+    original_prefab_indices: Vec<u16>,
+    prefab_index_range: Range<usize>,
     line_number_range: Option<Range<usize>>,
     global_passenger_range: Option<Range<usize>>,
 }
@@ -1499,6 +1503,11 @@ impl TransportManagerLineData {
     /// Returns the version-gated shared line-number table.
     pub fn line_numbers(&self) -> Option<&[u16]> {
         self.line_numbers.as_deref()
+    }
+
+    /// Returns prefab indexes assigned to active lines in active-flag order.
+    pub fn active_line_prefab_indices(&self) -> &[u16] {
+        &self.active_line_prefab_indices
     }
 
     /// Returns active line records in flag order.
@@ -1525,32 +1534,39 @@ impl TransportManagerLineData {
     pub fn into_editor(self) -> TransportManagerLineDataEditor {
         TransportManagerLineDataEditor {
             format_version: self.format_version,
+            active_line_prefab_indices: self.active_line_prefab_indices,
             line_numbers: self.line_numbers.clone(),
             original_line_numbers: self.line_numbers,
             active_lines: self.active_lines,
             global_passengers: self.global_passengers.clone(),
             original_global_passengers: self.global_passengers,
             original_body: self.serialized_body,
+            original_prefab_indices: self.original_prefab_indices,
+            prefab_index_range: self.prefab_index_range,
             line_number_range: self.line_number_range,
             global_passenger_range: self.global_passenger_range,
         }
     }
 }
 
-/// Editor for TransportManager line and passenger data.
+/// Editor for TransportManager active-line prefab, line, and passenger data.
 ///
-/// This retains the original bounded manager body. Legacy vehicle names may
-/// resize active-line records; line and passenger table counts remain fixed.
-/// Passenger counts must fit in the serialized 24-bit fields.
+/// This retains the original bounded manager body. Prefab-index edits and
+/// legacy vehicle names may resize serialized sections; line and passenger
+/// table counts remain fixed. Passenger counts must fit in the serialized
+/// 24-bit fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerLineDataEditor {
     format_version: u32,
+    active_line_prefab_indices: Vec<u16>,
     line_numbers: Option<Vec<u16>>,
     original_line_numbers: Option<Vec<u16>>,
     active_lines: Vec<TransportManagerLineRecord>,
     global_passengers: Option<Vec<TransportPassengerRecord>>,
     original_global_passengers: Option<Vec<TransportPassengerRecord>>,
     original_body: Vec<u8>,
+    original_prefab_indices: Vec<u16>,
+    prefab_index_range: Range<usize>,
     line_number_range: Option<Range<usize>>,
     global_passenger_range: Option<Range<usize>>,
 }
@@ -1564,6 +1580,30 @@ impl TransportManagerLineDataEditor {
     /// Returns the shared line numbers.
     pub fn line_numbers(&self) -> Option<&[u16]> {
         self.line_numbers.as_deref()
+    }
+
+    /// Returns prefab indexes assigned to active lines in active-flag order.
+    pub fn active_line_prefab_indices(&self) -> &[u16] {
+        &self.active_line_prefab_indices
+    }
+
+    /// Changes the prefab index assigned to an active line.
+    pub fn set_active_line_prefab_index(
+        &mut self,
+        active_line_index: usize,
+        prefab_index: u16,
+    ) -> Result<(), CrpError> {
+        let index = self
+            .active_line_prefab_indices
+            .get_mut(active_line_index)
+            .ok_or_else(|| {
+                invalid(
+                    active_line_index,
+                    "TransportManager active-line prefab index is out of bounds",
+                )
+            })?;
+        *index = prefab_index;
+        Ok(())
     }
 
     /// Returns the shared line numbers for in-place editing.
@@ -1608,13 +1648,24 @@ impl TransportManagerLineDataEditor {
         self.global_passengers.as_deref_mut()
     }
 
-    /// Writes the original bounded body with edited line records, line-number
-    /// values, and passenger counters. Resized legacy vehicle names shift the
+    /// Writes the original bounded body with edited prefab indexes, line
+    /// records, line-number values, and passenger counters. Resized encoded
+    /// scopes and legacy vehicle names shift the
     /// following bytes while preserving their contents, including the closing
     /// profiler reference. Returns an error if an edit changes a table's
     /// length, changes passenger group counts, exceeds the 24-bit passenger
     /// limit, or would exceed the captured source ranges.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.active_line_prefab_indices.len() != self.active_lines.len()
+            || self.original_prefab_indices.len() < self.active_line_prefab_indices.len()
+            || self.prefab_index_range.start > self.prefab_index_range.end
+            || self.prefab_index_range.end > self.original_body.len()
+        {
+            return Err(invalid(
+                0,
+                "TransportManager active-line prefab indexes have inconsistent source counts or range",
+            ));
+        }
         let mut body = self.original_body.clone();
         let mut line_growth = 0_usize;
         let mut line_shrinkage = 0_usize;
@@ -1785,6 +1836,15 @@ impl TransportManagerLineDataEditor {
                     }
                 }
             }
+        }
+
+        let mut prefab_indices = self.original_prefab_indices.clone();
+        prefab_indices[..self.active_line_prefab_indices.len()]
+            .copy_from_slice(&self.active_line_prefab_indices);
+        if prefab_indices != self.original_prefab_indices {
+            let mut encoded_prefab_indices = Vec::new();
+            write_encoded_ushort_array(&mut encoded_prefab_indices, &prefab_indices);
+            body.splice(self.prefab_index_range.clone(), encoded_prefab_indices);
         }
 
         Ok(body)
@@ -10908,8 +10968,8 @@ impl SimulationManagerData {
         Ok(self.decode_transport_manager_line_data()?.active_lines)
     }
 
-    /// Decodes the TransportManager line-number, active-line, and global
-    /// passenger data.
+    /// Decodes active-line prefab indexes, line numbers, active-line records,
+    /// and global passenger data.
     ///
     /// The bounded manager body, including its reference tail and closing
     /// profiler tag, is checked before returning. Object headers and the
@@ -10920,8 +10980,13 @@ impl SimulationManagerData {
             .serialized_object_graph
             .get(body_range.clone())
             .ok_or_else(|| invalid(0, "TransportManager body range exceeds manager graph"))?;
-        let fields =
-            decode_transport_manager_reference_body(self.format_version, body, None, None)?;
+        let fields = decode_transport_manager_reference_body_with_milestones(
+            self.format_version,
+            body,
+            None,
+            None,
+            true,
+        )?;
         let bounded_body_end = body_range
             .end
             .checked_add(LOADING_PROFILER_END_TAG_BYTES)
@@ -10935,23 +11000,41 @@ impl SimulationManagerData {
             .to_vec();
         Ok(TransportManagerLineData {
             format_version: self.format_version,
+            active_line_prefab_indices: fields
+                .all_prefab_indices
+                .get(..fields.line_records.len())
+                .ok_or_else(|| {
+                    invalid(
+                        body_range.start,
+                        "TransportManager active-line prefab count is invalid",
+                    )
+                })?
+                .to_vec(),
             line_numbers: fields.line_numbers,
             active_lines: fields.line_records,
             global_passengers: fields.global_passengers,
             serialized_line_numbers: fields.serialized_line_numbers,
             serialized_global_passengers: fields.serialized_global_passengers,
             serialized_body,
+            original_prefab_indices: fields.all_prefab_indices,
+            prefab_index_range: fields.prefab_index_range.ok_or_else(|| {
+                invalid(
+                    body_range.start,
+                    "TransportManager prefab-index range was not captured",
+                )
+            })?,
             line_number_range: fields.line_number_range,
             global_passenger_range: fields.global_passenger_range,
         })
     }
 
-    /// Replaces TransportManager line records, line numbers, and passenger tables.
+    /// Replaces TransportManager active-line prefab indexes, line records, line
+    /// numbers, and passenger tables.
     ///
     /// The editor must come from this manager's current bytes and version.
-    /// Legacy vehicle-name edits may resize the bounded manager body and graph;
-    /// all other manager bytes are preserved. Values that do not fit the
-    /// format's 24-bit passenger fields return an error.
+    /// Prefab-index and legacy vehicle-name edits may resize the bounded manager
+    /// body and graph; all other manager bytes are preserved. Values that do not
+    /// fit the format's 24-bit passenger fields return an error.
     pub fn replace_transport_manager_line_data(
         &mut self,
         edited: &TransportManagerLineDataEditor,
@@ -10998,6 +11081,7 @@ impl SimulationManagerData {
                 )?;
                 let (validated_body_range, _) = self.transport_manager_body_range()?;
                 if decoded.line_numbers != edited.line_numbers
+                    || decoded.active_line_prefab_indices != edited.active_line_prefab_indices
                     || decoded.global_passengers != edited.global_passengers
                     || validated_body_range.start != body_range.start
                     || validated_body_range.end != expected_body_end
@@ -20759,6 +20843,69 @@ mod manager_boundary_tests {
                 Some(&mut Vec::new()),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn transport_manager_active_line_prefab_edit_resizes_combined_scope() {
+        let (mut body, _) = active_transport_manager_reference_body(112_004, 14, 4, 7);
+        let fields = decode_transport_manager_reference_body_with_milestones(
+            112_004, &body, None, None, true,
+        )
+        .unwrap();
+        let prefab_range = fields.prefab_index_range.clone().unwrap();
+        assert_eq!(fields.all_prefab_indices, [7, 8, 9, 10, 11]);
+        body[prefab_range.start + 1..prefab_range.start + 3].copy_from_slice(&0_u16.to_be_bytes());
+        assert_eq!(
+            decode_transport_manager_reference_body_with_milestones(
+                112_004, &body, None, None, true
+            )
+            .unwrap()
+            .all_prefab_indices,
+            [0, 8, 9, 10, 11]
+        );
+
+        let (mut manager, body_start) = manager_with_transport_body(112_004, &body);
+        let line_data = manager.decode_transport_manager_line_data().unwrap();
+        assert_eq!(line_data.active_line_prefab_indices(), [0]);
+        let mut editor = line_data.into_editor();
+        assert!(editor.set_active_line_prefab_index(1, 7).is_err());
+        editor.set_active_line_prefab_index(0, 7).unwrap();
+        assert_eq!(editor.active_line_prefab_indices(), [7]);
+
+        let mut expected_body = body.clone();
+        expected_body.splice(prefab_range.clone(), [0x01, 0x00, 0x07, 0x00, 0x08, 0x82]);
+        let mut expected_graph = manager.serialized_object_graph().to_vec();
+        expected_graph.splice(
+            body_start..body_start + body.len(),
+            expected_body.iter().copied(),
+        );
+        manager
+            .replace_transport_manager_line_data(&editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+
+        let rewritten_body = manager
+            .serialized_object_graph()
+            .get(body_start..body_start + expected_body.len())
+            .unwrap();
+        let decoded = decode_transport_manager_reference_body_with_milestones(
+            112_004,
+            rewritten_body,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(decoded.all_prefab_indices, [7, 8, 9, 10, 11]);
+        assert_eq!(decoded.milestone_object_headers.len(), 4);
+        assert_eq!(decoded.object_headers, vec![NetObjectHeader::Null; 7]);
+        assert_eq!(
+            manager
+                .decode_transport_manager_line_data()
+                .unwrap()
+                .active_line_prefab_indices(),
+            [7]
         );
     }
 
