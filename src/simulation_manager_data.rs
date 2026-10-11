@@ -742,7 +742,7 @@ pub enum TransportManagerSharedStringValue {
     },
 }
 
-/// DataSerializer encoding mode for a TransportManager selection string.
+/// DataSerializer encoding mode for a TransportManager unique string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportManagerStringEncoding {
     /// Store one byte per character; supported characters must be below U+0100.
@@ -845,6 +845,7 @@ pub struct TransportManagerLineRecord {
     passengers: Option<TransportPassengerRecord>,
     legacy_vehicle_selection: Option<TransportLineVehicleSelection>,
     legacy_vehicle_selection_range: Option<Range<usize>>,
+    legacy_vehicle_selection_encoding_override: Option<TransportManagerStringEncoding>,
     serialized_bytes: Vec<u8>,
     serialized_range: Range<usize>,
     passengers_range: Option<Range<usize>>,
@@ -1039,7 +1040,11 @@ impl TransportManagerLineRecord {
                         "legacy vehicle-selection range exceeds active line",
                     )
                 })?;
-                let encoded = encode_legacy_vehicle_selection(selection, original)?;
+                let encoded = encode_legacy_vehicle_selection(
+                    selection,
+                    original,
+                    self.legacy_vehicle_selection_encoding_override,
+                )?;
                 bytes.splice(range.clone(), encoded);
             }
             (None, None) => {}
@@ -1057,6 +1062,7 @@ impl TransportManagerLineRecord {
 fn encode_legacy_vehicle_selection(
     selection: &TransportLineVehicleSelection,
     original: &[u8],
+    encoding_override: Option<TransportManagerStringEncoding>,
 ) -> Result<Vec<u8>, CrpError> {
     match selection {
         TransportLineVehicleSelection::Index(index) => {
@@ -1079,8 +1085,8 @@ fn encode_legacy_vehicle_selection(
         }
         TransportLineVehicleSelection::Name(Some(name)) => {
             let mut encoded = Vec::new();
-            if original == [0xff] {
-                write_unique_string(&mut encoded, name)?;
+            let source_compact = if original == [0xff] {
+                None
             } else {
                 if original.len() < 3 || original[0] == 0xff {
                     return Err(invalid(
@@ -1091,16 +1097,18 @@ fn encode_legacy_vehicle_selection(
                 let encoded_length = (u32::from(original[0]) << 16)
                     | (u32::from(original[1]) << 8)
                     | u32::from(original[2]);
-                let compact = encoded_length & COMPACT_STRING_FLAG != 0;
-                let replacement_is_compact =
-                    name.chars().all(|character| u32::from(character) < 256);
-                match (compact, replacement_is_compact) {
-                    (true, true) => write_unique_string_with_mode(&mut encoded, name, true)?,
-                    (true, false) | (false, _) => {
-                        write_unique_string_with_mode(&mut encoded, name, false)?
-                    }
-                }
-            }
+                Some(encoded_length & COMPACT_STRING_FLAG != 0)
+            };
+            let compact = match encoding_override {
+                Some(TransportManagerStringEncoding::Compact) => true,
+                Some(TransportManagerStringEncoding::Wide) => false,
+                None => match source_compact {
+                    Some(true) => name.chars().all(|character| u32::from(character) < 256),
+                    Some(false) => false,
+                    None => name.chars().all(|character| u32::from(character) < 256),
+                },
+            };
+            write_unique_string_with_mode(&mut encoded, name, compact)?;
             Ok(encoded)
         }
     }
@@ -1185,10 +1193,31 @@ impl TransportManagerActiveLineEditor<'_> {
     /// A replacement may change the serialized length. Existing compact or
     /// wide encoding is retained when possible; compact strings that cannot
     /// represent the replacement are written wide. A null source uses the
-    /// default string encoding. The source version determines whether the
-    /// value is a numeric index or a nullable name.
+    /// default string encoding. Use [`Self::set_legacy_vehicle_selection_encoding`]
+    /// to request a specific encoding. The source version determines whether
+    /// the value is a numeric index or a nullable name.
     pub fn legacy_vehicle_selection_mut(&mut self) -> Option<&mut TransportLineVehicleSelection> {
         self.record.legacy_vehicle_selection.as_mut()
+    }
+
+    /// Selects an explicit compact or wide encoding for this line's nullable
+    /// vehicle name. Pass `None` to return to the source-preserving default;
+    /// compact mode rejects characters above U+00FF when the editor is encoded.
+    pub fn set_legacy_vehicle_selection_encoding(
+        &mut self,
+        encoding: Option<TransportManagerStringEncoding>,
+    ) -> Result<(), CrpError> {
+        if !matches!(
+            self.record.legacy_vehicle_selection.as_ref(),
+            Some(TransportLineVehicleSelection::Name(_))
+        ) {
+            return Err(invalid(
+                0,
+                "legacy vehicle-selection encoding applies only to nullable name fields",
+            ));
+        }
+        self.record.legacy_vehicle_selection_encoding_override = encoding;
+        Ok(())
     }
 }
 
@@ -13847,6 +13876,7 @@ fn decode_transport_manager_line_record(
         passengers,
         legacy_vehicle_selection,
         legacy_vehicle_selection_range,
+        legacy_vehicle_selection_encoding_override: None,
         serialized_bytes,
         serialized_range: start..end,
         passengers_range: (format_version >= 122)
@@ -19624,6 +19654,83 @@ mod manager_boundary_tests {
                 .legacy_vehicle_selection(),
             Some(&TransportLineVehicleSelection::Name(Some("Bus".to_owned())))
         );
+    }
+
+    #[test]
+    fn transport_manager_legacy_vehicle_selection_encoding_can_be_explicit() {
+        let (source_body, _) = active_transport_manager_reference_body(112_022, 14, 0, 7);
+        let (mut manager, body_start) = manager_with_transport_body(112_022, &source_body);
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let source_data = manager.decode_transport_manager_line_data().unwrap();
+        let source_line = &source_data.active_lines()[0];
+        let source_range = source_line.legacy_vehicle_selection_range.as_ref().unwrap();
+        let absolute_start = body_start + source_line.serialized_range.start + source_range.start;
+        let absolute_end = body_start + source_line.serialized_range.start + source_range.end;
+        let mut wide_editor = source_data.into_editor();
+        {
+            let mut line = wide_editor.active_line_mut(0).unwrap();
+            line.set_legacy_vehicle_selection_encoding(Some(TransportManagerStringEncoding::Wide))
+                .unwrap();
+            *line.legacy_vehicle_selection_mut().unwrap() =
+                TransportLineVehicleSelection::Name(Some("Bus".to_owned()));
+        }
+        let wide_bus = [0x00, 0x00, 0x03, 0xff, 0xc2, 0x00, 0x33, 0xff, 0xfe];
+        let mut expected_wide = original_graph.clone();
+        expected_wide.splice(absolute_start..absolute_end, wide_bus);
+        manager
+            .replace_transport_manager_line_data(&wide_editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_wide);
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            original_graph.len() - 5
+        );
+
+        let source_data = manager.decode_transport_manager_line_data().unwrap();
+        let source_line = &source_data.active_lines()[0];
+        let source_range = source_line.legacy_vehicle_selection_range.as_ref().unwrap();
+        let absolute_start = body_start + source_line.serialized_range.start + source_range.start;
+        let absolute_end = body_start + source_line.serialized_range.start + source_range.end;
+        let mut compact_editor = source_data.into_editor();
+        compact_editor
+            .active_line_mut(0)
+            .unwrap()
+            .set_legacy_vehicle_selection_encoding(Some(TransportManagerStringEncoding::Compact))
+            .unwrap();
+        let mut expected_compact = manager.serialized_object_graph().to_vec();
+        expected_compact.splice(
+            absolute_start..absolute_end,
+            [0x80, 0x00, 0x03, 0xc2, 0x33, 0xfe],
+        );
+        manager
+            .replace_transport_manager_line_data(&compact_editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_compact);
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            original_graph.len() - 8
+        );
+
+        let mut invalid_compact_editor = manager
+            .decode_transport_manager_line_data()
+            .unwrap()
+            .into_editor();
+        {
+            let mut line = invalid_compact_editor.active_line_mut(0).unwrap();
+            line.set_legacy_vehicle_selection_encoding(Some(
+                TransportManagerStringEncoding::Compact,
+            ))
+            .unwrap();
+            *line.legacy_vehicle_selection_mut().unwrap() =
+                TransportLineVehicleSelection::Name(Some("☃".to_owned()));
+        }
+        let before_rejection = manager.serialized_object_graph().to_vec();
+        assert!(
+            manager
+                .replace_transport_manager_line_data(&invalid_compact_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), before_rejection);
     }
 
     #[test]
