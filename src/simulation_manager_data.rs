@@ -12,6 +12,7 @@ use crate::TerrainManagerData;
 use crate::TerrainManagerEditor;
 use crate::TreeManagerDataPrefix;
 use crate::TreeManagerEditor;
+use crate::VehicleInstanceFieldsEditor;
 use crate::VehicleInstanceFieldsPrefix;
 use crate::VehicleLastFrameDataPrefix;
 use crate::VehicleLastFrameEditor;
@@ -6313,6 +6314,106 @@ impl SimulationManagerData {
                 "VehicleManager scalar-field prefix end",
             ))?;
         Ok((fields, graph_end))
+    }
+
+    /// Decodes active-vehicle scalar and reference fields into a fixed-width editor.
+    pub fn decode_vehicle_manager_instance_fields_editor(
+        &self,
+    ) -> Result<VehicleInstanceFieldsEditor, CrpError> {
+        let (fields, _) = self.decode_vehicle_manager_instance_fields_prefix()?;
+        Ok(fields.into_editor())
+    }
+
+    /// Replaces fixed-width active-vehicle scalar and reference fields.
+    ///
+    /// The editor must come from this VehicleManager body and inner version.
+    /// Record counts and the encoded width remain fixed; the complete
+    /// VehicleManager body and following TransportManager bytes are validated
+    /// after the replacement.
+    pub fn replace_vehicle_manager_instance_fields(
+        &mut self,
+        edited: &VehicleInstanceFieldsEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                17,
+                "edited vehicle instance-field version does not match this stream",
+            ));
+        }
+        let (vehicle_data, original_manager_end) = self.decode_vehicle_manager_data()?;
+        let (current, original_fields_end) =
+            self.decode_vehicle_manager_instance_fields_prefix()?;
+        if current.encode().as_slice() != edited.original_bytes()
+            || vehicle_data.instance_fields().encode() != current.encode()
+        {
+            return Err(invalid(
+                17,
+                "vehicle instance-field bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode();
+        let original_fields = current.encode();
+        if replacement.len() != original_fields.len() {
+            return Err(invalid(
+                17,
+                "vehicle instance-field edit changed the serialized record width",
+            ));
+        }
+
+        let (_, fields_start) = self.decode_vehicle_manager_last_frame_prefix()?;
+        let fields_end =
+            fields_start
+                .checked_add(original_fields.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "VehicleManager instance-field end",
+                ))?;
+        if fields_end != original_fields_end {
+            return Err(invalid(
+                fields_start,
+                "vehicle instance fields do not end at their decoded boundary",
+            ));
+        }
+        if self.serialized_object_graph.get(fields_start..fields_end)
+            != Some(original_fields.as_slice())
+        {
+            return Err(invalid(
+                fields_start,
+                "vehicle instance-field range differs from its decoded source bytes",
+            ));
+        }
+
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate
+            .get_mut(fields_start..fields_end)
+            .ok_or_else(|| {
+                invalid(
+                    fields_start,
+                    "vehicle instance-field range exceeds manager graph",
+                )
+            })?
+            .copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        let validation =
+            self.decode_vehicle_manager_data()
+                .and_then(|(data, updated_manager_end)| {
+                    if updated_manager_end != original_manager_end
+                        || data.instance_fields().encode() != replacement
+                    {
+                        return Err(invalid(
+                            fields_start,
+                            "edited vehicle instance fields changed the manager boundary",
+                        ));
+                    }
+                    Ok(())
+                });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                fields_start,
+                format!("edited vehicle instance fields failed boundary validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes active parked-vehicle records after the active vehicle fields.
@@ -19943,6 +20044,47 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph(), expected);
+
+        let mut fields_editor = manager
+            .decode_vehicle_manager_instance_fields_editor()
+            .unwrap();
+        assert_eq!(fields_editor.records()[0].source_building(), 0x0102);
+        fields_editor.set_source_building(0, 0xaabb).unwrap();
+        fields_editor.set_target_building(0, 0xccdd).unwrap();
+        fields_editor.set_transfer_size(0, 0x1234).unwrap();
+        fields_editor.set_transfer_type(0, 0x56).unwrap();
+        fields_editor.set_wait_counter(0, 0x78).unwrap();
+        let mut expected_fields = expected.clone();
+        let fields_start = last_frame_start + 12;
+        expected_fields[fields_start..fields_start + 8]
+            .copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0x12, 0x34, 0x56, 0x78]);
+        manager
+            .replace_vehicle_manager_instance_fields(&fields_editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_fields);
+        assert_eq!(manager.serialized_object_graph().len(), graph_len);
+        let (updated, manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(
+            updated.instance_fields().records()[0].source_building(),
+            0xaabb
+        );
+        assert_eq!(
+            updated.instance_fields().records()[0].target_building(),
+            0xccdd
+        );
+        assert_eq!(
+            updated.instance_fields().records()[0].transfer_size(),
+            0x1234
+        );
+        assert_eq!(updated.instance_fields().records()[0].transfer_type(), 0x56);
+        assert_eq!(updated.instance_fields().records()[0].wait_counter(), 0x78);
+        assert_eq!(updated.encode(), expected_fields[body_start..manager_end]);
+        assert!(
+            manager
+                .replace_vehicle_manager_instance_fields(&fields_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), expected_fields);
     }
 
     #[test]

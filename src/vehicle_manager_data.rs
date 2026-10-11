@@ -787,6 +787,16 @@ pub struct VehicleInstanceFieldsPrefix {
     serialized_prefix: Vec<u8>,
 }
 
+/// Editor for fixed-width active-vehicle scalar and reference fields.
+///
+/// The record count and version-gated fields remain fixed. Citizen-unit
+/// references are checked against their serialized 24-bit width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleInstanceFieldsEditor {
+    original: VehicleInstanceFieldsPrefix,
+    records: Vec<VehicleInstanceFields>,
+}
+
 impl VehicleInstanceFieldsPrefix {
     /// Returns the inner DataSerializer version.
     pub fn format_version(&self) -> u32 {
@@ -801,6 +811,14 @@ impl VehicleInstanceFieldsPrefix {
     /// Writes the original scalar/reference bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Creates an editor for the existing active-vehicle scalar fields.
+    pub fn into_editor(self) -> VehicleInstanceFieldsEditor {
+        VehicleInstanceFieldsEditor {
+            records: self.records.clone(),
+            original: self,
+        }
     }
 
     /// Decodes serialized parked-vehicle records after the active vehicles.
@@ -836,6 +854,204 @@ impl VehicleInstanceFieldsPrefix {
             },
             consumed,
         ))
+    }
+}
+
+impl VehicleInstanceFieldsEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns the current fields, in active-vehicle order.
+    pub fn records(&self) -> &[VehicleInstanceFields] {
+        &self.records
+    }
+
+    /// Changes the source-building index.
+    pub fn set_source_building(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        self.record_mut(index)?.source_building = value;
+        Ok(())
+    }
+
+    /// Changes the target-building index.
+    pub fn set_target_building(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        self.record_mut(index)?.target_building = value;
+        Ok(())
+    }
+
+    /// Changes the transport-line index from version 52.
+    pub fn set_transport_line(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let field = record.transport_line.as_mut().ok_or_else(|| {
+            invalid(
+                index,
+                "transport-line field is not serialized before version 52",
+            )
+        })?;
+        *field = value;
+        Ok(())
+    }
+
+    /// Changes the transfer size.
+    pub fn set_transfer_size(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        self.record_mut(index)?.transfer_size = value;
+        Ok(())
+    }
+
+    /// Changes the transfer-type byte.
+    pub fn set_transfer_type(&mut self, index: usize, value: u8) -> Result<(), CrpError> {
+        self.record_mut(index)?.transfer_type = value;
+        Ok(())
+    }
+
+    /// Changes the wait-counter byte.
+    pub fn set_wait_counter(&mut self, index: usize, value: u8) -> Result<(), CrpError> {
+        self.record_mut(index)?.wait_counter = value;
+        Ok(())
+    }
+
+    /// Changes the block-counter byte from version 99.
+    pub fn set_block_counter(&mut self, index: usize, value: u8) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let field = record
+            .block_counter
+            .as_mut()
+            .ok_or_else(|| invalid(index, "block counter is not serialized before version 99"))?;
+        *field = value;
+        Ok(())
+    }
+
+    /// Changes the 24-bit citizen-unit reference from version 32.
+    pub fn set_citizen_unit(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        if value > 0x00ff_ffff {
+            return Err(invalid(
+                index,
+                "vehicle citizen-unit reference does not fit u24",
+            ));
+        }
+        let record = self.record_mut(index)?;
+        let field = record.citizen_unit.as_mut().ok_or_else(|| {
+            invalid(
+                index,
+                "citizen-unit reference is not serialized before version 32",
+            )
+        })?;
+        *field = value;
+        Ok(())
+    }
+
+    /// Changes the path-unit reference from version 47.
+    pub fn set_path_unit(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let field = record.path_unit.as_mut().ok_or_else(|| {
+            invalid(
+                index,
+                "path-unit reference is not serialized before version 47",
+            )
+        })?;
+        *field = value;
+        Ok(())
+    }
+
+    /// Changes both path-position bytes from version 47.
+    pub fn set_path_position(&mut self, index: usize, value: [u8; 2]) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let field = record
+            .path_position
+            .as_mut()
+            .ok_or_else(|| invalid(index, "path position is not serialized before version 47"))?;
+        *field = value;
+        Ok(())
+    }
+
+    /// Changes the trailing-vehicle index from version 58.
+    pub fn set_trailing_vehicle(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let field = record.trailing_vehicle.as_mut().ok_or_else(|| {
+            invalid(
+                index,
+                "trailing-vehicle field is not serialized before version 58",
+            )
+        })?;
+        *field = value;
+        Ok(())
+    }
+
+    /// Changes the cargo-parent index from version 104.
+    pub fn set_cargo_parent(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let field = record.cargo_parent.as_mut().ok_or_else(|| {
+            invalid(
+                index,
+                "cargo-parent field is not serialized before version 104",
+            )
+        })?;
+        *field = value;
+        Ok(())
+    }
+
+    /// Changes the custom value from version 113012.
+    pub fn set_custom_value(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        let field = record.custom_value.as_mut().ok_or_else(|| {
+            invalid(
+                index,
+                "custom value is not serialized before version 113012",
+            )
+        })?;
+        *field = value;
+        Ok(())
+    }
+
+    /// Writes the same fixed-width record count and version-gated field layout.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.original.serialized_prefix.len());
+        for record in &self.records {
+            bytes.extend_from_slice(&record.source_building.to_be_bytes());
+            bytes.extend_from_slice(&record.target_building.to_be_bytes());
+            if let Some(value) = record.transport_line {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            bytes.extend_from_slice(&record.transfer_size.to_be_bytes());
+            bytes.push(record.transfer_type);
+            bytes.push(record.wait_counter);
+            if let Some(value) = record.block_counter {
+                bytes.push(value);
+            }
+            if let Some(value) = record.citizen_unit {
+                bytes.push((value >> 16) as u8);
+                bytes.push((value >> 8) as u8);
+                bytes.push(value as u8);
+            }
+            if let Some(value) = record.path_unit {
+                bytes.extend_from_slice(&value.to_be_bytes());
+                bytes.extend_from_slice(&record.path_position.unwrap_or_default());
+            }
+            if let Some(value) = record.trailing_vehicle {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            if let Some(value) = record.cargo_parent {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            if let Some(value) = record.custom_value {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        bytes
+    }
+
+    pub(crate) fn original_bytes(&self) -> &[u8] {
+        &self.original.serialized_prefix
+    }
+
+    fn record_mut(&mut self, index: usize) -> Result<&mut VehicleInstanceFields, CrpError> {
+        self.records.get_mut(index).ok_or_else(|| {
+            invalid(
+                index,
+                format!("vehicle record index {index} is out of range"),
+            )
+        })
     }
 }
 
@@ -1834,6 +2050,69 @@ mod tests {
         assert_eq!(decoded.records()[0].custom_value(), Some(0x1718));
         assert_eq!(decoded.records()[1].source_building(), 0x2122);
         assert_eq!(decoded.encode(), bytes);
+    }
+
+    #[test]
+    fn vehicle_instance_fields_editor_writes_exact_versioned_bytes() {
+        let source = scalar_record_for_version(113_012);
+        let frames = last_frame_prefix_with_count(113_012, 1);
+        let (decoded, consumed) = frames.decode_scalar_fields(&source).unwrap();
+        assert_eq!(consumed, 24);
+        let mut editor = decoded.into_editor();
+        assert_eq!(editor.encode(), source);
+        editor.set_source_building(0, 0xaabb).unwrap();
+        editor.set_target_building(0, 0xccdd).unwrap();
+        editor.set_transport_line(0, 0x1122).unwrap();
+        editor.set_transfer_size(0, 0x3344).unwrap();
+        editor.set_transfer_type(0, 0x55).unwrap();
+        editor.set_wait_counter(0, 0x66).unwrap();
+        editor.set_block_counter(0, 0x77).unwrap();
+        editor.set_citizen_unit(0, 0x8899aa).unwrap();
+        editor.set_path_unit(0, 0xbbcc).unwrap();
+        editor.set_path_position(0, [0xdd, 0xee]).unwrap();
+        editor.set_trailing_vehicle(0, 0x1234).unwrap();
+        editor.set_cargo_parent(0, 0x5678).unwrap();
+        editor.set_custom_value(0, 0x9abc).unwrap();
+
+        let expected = [
+            0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+            0xbb, 0xcc, 0xdd, 0xee, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+        ];
+        assert_eq!(editor.encode(), expected);
+        assert_eq!(editor.encode().len(), source.len());
+        assert!(editor.set_citizen_unit(0, 0x0100_0000).is_err());
+        assert!(editor.set_source_building(1, 0).is_err());
+        assert_eq!(editor.encode(), expected);
+
+        let (decoded, consumed) = frames.decode_scalar_fields(&expected).unwrap();
+        assert_eq!(consumed, expected.len());
+        assert_eq!(decoded.records()[0].source_building(), 0xaabb);
+        assert_eq!(decoded.records()[0].transport_line(), Some(0x1122));
+        assert_eq!(decoded.records()[0].citizen_unit(), Some(0x8899aa));
+        assert_eq!(decoded.records()[0].path_position(), Some([0xdd, 0xee]));
+        assert_eq!(decoded.records()[0].custom_value(), Some(0x9abc));
+    }
+
+    #[test]
+    fn vehicle_instance_fields_editor_rejects_fields_before_their_gates() {
+        let source = scalar_record_for_version(31);
+        let frames = last_frame_prefix_with_count(31, 1);
+        let (decoded, consumed) = frames.decode_scalar_fields(&source).unwrap();
+        assert_eq!(consumed, source.len());
+        let mut editor = decoded.into_editor();
+        assert!(editor.set_transport_line(0, 1).is_err());
+        assert!(editor.set_citizen_unit(0, 1).is_err());
+        assert!(editor.set_path_unit(0, 1).is_err());
+        assert!(editor.set_path_position(0, [1, 2]).is_err());
+        assert!(editor.set_trailing_vehicle(0, 1).is_err());
+        assert!(editor.set_block_counter(0, 1).is_err());
+        assert!(editor.set_cargo_parent(0, 1).is_err());
+        assert!(editor.set_custom_value(0, 1).is_err());
+        editor.set_source_building(0, 0x1234).unwrap();
+        assert_eq!(
+            editor.encode(),
+            [0x12, 0x34, 0x03, 0x04, 0x07, 0x08, 0x09, 0x0a]
+        );
     }
 
     #[test]

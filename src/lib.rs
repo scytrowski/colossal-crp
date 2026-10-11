@@ -138,10 +138,11 @@ pub use unlock_manager_data::{
     UnlockManagerMilestoneArray, UnlockManagerMilestoneKind, UnlockManagerReferences,
 };
 pub use vehicle_manager_data::{
-    VehicleInstanceFields, VehicleInstanceFieldsPrefix, VehicleLastFrameDataPrefix,
-    VehicleLastFrameEditor, VehicleLastFrameRecord, VehicleManagerData, VehicleManagerDataPrefix,
-    VehicleManagerSparseFieldsPrefix, VehicleManagerTailDataPrefix, VehicleParkedInstanceRecord,
-    VehicleParkedRecordsEditor, VehicleParkedRecordsPrefix, VehicleTargetPosition0,
+    VehicleInstanceFields, VehicleInstanceFieldsEditor, VehicleInstanceFieldsPrefix,
+    VehicleLastFrameDataPrefix, VehicleLastFrameEditor, VehicleLastFrameRecord, VehicleManagerData,
+    VehicleManagerDataPrefix, VehicleManagerSparseFieldsPrefix, VehicleManagerTailDataPrefix,
+    VehicleParkedInstanceRecord, VehicleParkedRecordsEditor, VehicleParkedRecordsPrefix,
+    VehicleTargetPosition0,
 };
 pub use water_manager_data::{
     HeatingConductiveCellData, WaterConductiveCellData, WaterManagerData, WaterPulseGroup,
