@@ -1519,7 +1519,8 @@ impl TransportManagerSelectionPrefix {
             format_version: self.format_version,
             keys,
             values,
-            original_prefix: self.serialized_prefix,
+            original_prefix: self.serialized_prefix.clone(),
+            working_prefix: self.serialized_prefix,
             key_ranges: self.key_ranges,
             new_string_ranges: self.new_string_ranges,
             new_string_indexes: self.new_string_indexes,
@@ -1533,15 +1534,17 @@ impl TransportManagerSelectionPrefix {
 /// Editor for signed keys in the TransportManager vehicle-selection table.
 ///
 /// The table is rewritten in the manager graph. String markers and compact or
-/// wide encoding modes are retained. Entries cannot be added or removed.
-/// Newly declared strings can change serialized width, and existing entries
-/// can redirect only to prior indexes.
+/// wide encoding modes are retained. Entries can be appended when they use an
+/// already declared shared string, and the last entry can be removed when it
+/// only references an existing string. Newly declared strings can change
+/// serialized width, and existing entries can redirect only to prior indexes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerSelectionEditor {
     format_version: u32,
     keys: Vec<i16>,
     values: Vec<TransportManagerSharedStringValue>,
     original_prefix: Vec<u8>,
+    working_prefix: Vec<u8>,
     key_ranges: Vec<Range<usize>>,
     new_string_ranges: Vec<Option<Range<usize>>>,
     new_string_indexes: Vec<Option<u16>>,
@@ -1564,6 +1567,142 @@ impl TransportManagerSelectionEditor {
     /// Returns mutable access to existing signed selection keys.
     pub fn keys_mut(&mut self) -> &mut [i16] {
         &mut self.keys
+    }
+
+    /// Appends a selection entry that points to an already declared string.
+    ///
+    /// This does not add a shared string, so indexes in the table and later
+    /// manager fields keep their original meanings. The entry count is limited
+    /// to the largest nonnegative signed 16-bit value stored by the format.
+    pub fn push_existing_string_reference(
+        &mut self,
+        key: i16,
+        string_index: u16,
+    ) -> Result<(), CrpError> {
+        if self.format_version < 114_001 {
+            return Err(invalid(
+                0,
+                "TransportManager selection table is unavailable before version 114001",
+            ));
+        }
+        if self.keys.len() >= i16::MAX as usize {
+            return Err(invalid(
+                0,
+                "TransportManager selection count exceeds the signed 16-bit limit",
+            ));
+        }
+        if self.working_prefix.get(..2).is_none() {
+            return Err(invalid(
+                0,
+                "TransportManager selection table is missing its count field",
+            ));
+        }
+        let shared_string = self
+            .shared_string_values
+            .get(usize::from(string_index))
+            .cloned()
+            .ok_or_else(|| {
+                invalid(
+                    self.working_prefix.len(),
+                    "TransportManager appended entry references an unavailable shared string",
+                )
+            })?;
+        let entry_start = self.working_prefix.len();
+        let key_end = entry_start
+            .checked_add(2)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager appended selection key end",
+            ))?;
+        let entry_end = key_end.checked_add(2).ok_or(CrpError::ArithmeticOverflow(
+            "TransportManager appended selection end",
+        ))?;
+
+        self.working_prefix.extend_from_slice(&key.to_be_bytes());
+        self.working_prefix
+            .extend_from_slice(&string_index.to_be_bytes());
+        self.keys.push(key);
+        self.values
+            .push(TransportManagerSharedStringValue::Existing {
+                index: string_index,
+                value: shared_string,
+            });
+        self.key_ranges.push(entry_start..key_end);
+        self.new_string_ranges.push(None);
+        self.new_string_indexes.push(None);
+        self.existing_index_ranges.push(Some(key_end..entry_end));
+        self.available_shared_string_counts
+            .push(self.shared_string_values.len());
+        self.write_entry_count()
+    }
+
+    /// Removes and returns the last entry when it references an existing string.
+    ///
+    /// A last entry that declares a new shared string cannot be removed because
+    /// other serialized fields may refer to that shared-string index.
+    pub fn remove_last_existing_entry(&mut self) -> Result<TransportManagerSelection, CrpError> {
+        let entry_index = self
+            .keys
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| invalid(0, "TransportManager selection table is empty"))?;
+        let key_range = self
+            .key_ranges
+            .get(entry_index)
+            .ok_or_else(|| invalid(0, "TransportManager selection key ranges are inconsistent"))?;
+        let index_range = self
+            .existing_index_ranges
+            .get(entry_index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                invalid(
+                    key_range.start,
+                    "last TransportManager selection entry declares a shared string",
+                )
+            })?;
+        if self
+            .new_string_ranges
+            .get(entry_index)
+            .is_none_or(Option::is_some)
+            || key_range.len() != 2
+            || index_range.len() != 2
+            || index_range.end != self.working_prefix.len()
+        {
+            return Err(invalid(
+                key_range.start,
+                "last TransportManager selection entry has an invalid source range",
+            ));
+        }
+        let key = *self
+            .keys
+            .get(entry_index)
+            .ok_or_else(|| invalid(key_range.start, "last selection key is missing"))?;
+        let value = self
+            .values
+            .get(entry_index)
+            .cloned()
+            .ok_or_else(|| invalid(key_range.start, "last selection value is missing"))?;
+        let removed = TransportManagerSelection { key, value };
+
+        self.working_prefix.truncate(key_range.start);
+        self.keys.pop();
+        self.values.pop();
+        self.key_ranges.pop();
+        self.new_string_ranges.pop();
+        self.new_string_indexes.pop();
+        self.existing_index_ranges.pop();
+        self.available_shared_string_counts.pop();
+        self.write_entry_count()?;
+        Ok(removed)
+    }
+
+    fn write_entry_count(&mut self) -> Result<(), CrpError> {
+        let count = i16::try_from(self.keys.len())
+            .map_err(|_| invalid(0, "TransportManager selection count exceeds i16"))?;
+        self.working_prefix
+            .get_mut(..2)
+            .ok_or_else(|| invalid(0, "TransportManager selection table is missing its count"))?
+            .copy_from_slice(&count.to_be_bytes());
+        Ok(())
     }
 
     /// Returns current decoded shared-string values in entry order.
@@ -1714,7 +1853,13 @@ impl TransportManagerSelectionEditor {
                 "TransportManager selection editor has inconsistent version or entry counts",
             ));
         }
-        let mut bytes = self.original_prefix.clone();
+        if self.working_prefix.len() < 2 {
+            return Err(invalid(
+                0,
+                "TransportManager selection table is missing its count field",
+            ));
+        }
+        let mut bytes = self.working_prefix.clone();
         let mut new_string_edits = Vec::new();
         for (key, range) in self.keys.iter().zip(&self.key_ranges) {
             if range.len() != 2 {
@@ -17999,7 +18144,7 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn transport_manager_selection_editor_replaces_fixed_width_fields() {
+    fn transport_manager_selection_editor_resizes_values_and_reference_entries() {
         let mut body = active_transport_manager_reference_body(
             114_001,
             transport_manager_line_number_count(114_001),
@@ -18208,6 +18353,136 @@ mod manager_boundary_tests {
             .replace_transport_manager_selection_prefix(&shrink_editor)
             .unwrap();
         assert_eq!(manager.serialized_object_graph(), expected_graph);
+
+        let (body_range, _) = manager.transport_manager_body_range().unwrap();
+        let body = manager
+            .serialized_object_graph()
+            .get(body_range.clone())
+            .unwrap();
+        let fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let table_range = fields.selection_range.unwrap();
+        let mut append_editor = fields.selection_prefix.unwrap().into_editor();
+        assert!(
+            append_editor
+                .push_existing_string_reference(9, u16::MAX)
+                .is_err()
+        );
+        append_editor.push_existing_string_reference(9, 1).unwrap();
+        let appended_table = [
+            0x00, 0x03, 0x12, 0x34, 0xfe, 0x80, 0x00, 0x03, 0xc3, 0x1e, 0x11, 0x00, 0x08, 0x00,
+            0x01, 0x00, 0x09, 0x00, 0x01,
+        ];
+        assert_eq!(append_editor.encode().unwrap(), appended_table);
+        let selection_start = body_range.start.checked_add(table_range.start).unwrap();
+        let selection_end = body_range.start.checked_add(table_range.end).unwrap();
+        let mut expected_appended_graph = expected_graph.clone();
+        expected_appended_graph.splice(
+            selection_start..selection_end,
+            appended_table.iter().copied(),
+        );
+        manager
+            .replace_transport_manager_selection_prefix(&append_editor)
+            .unwrap();
+        assert_eq!(
+            manager.serialized_object_graph(),
+            expected_appended_graph.as_slice()
+        );
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            expected_graph.len() + 4
+        );
+
+        let (body_range, _) = manager.transport_manager_body_range().unwrap();
+        let body = manager
+            .serialized_object_graph()
+            .get(body_range.clone())
+            .unwrap();
+        let fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let appended_selection = fields.selection_prefix.unwrap();
+        assert_eq!(appended_selection.selections().len(), 3);
+        assert_eq!(
+            appended_selection.selections()[2],
+            TransportManagerSelection {
+                key: 9,
+                value: TransportManagerSharedStringValue::Existing {
+                    index: 1,
+                    value: Some("Car".to_owned()),
+                },
+            }
+        );
+        let mut remove_editor = appended_selection.into_editor();
+        assert_eq!(
+            remove_editor.remove_last_existing_entry().unwrap(),
+            TransportManagerSelection {
+                key: 9,
+                value: TransportManagerSharedStringValue::Existing {
+                    index: 1,
+                    value: Some("Car".to_owned()),
+                },
+            }
+        );
+        let original_table_end = body_range.start.checked_add(table_range.end).unwrap();
+        let original_table = expected_graph
+            .get(selection_start..original_table_end)
+            .unwrap();
+        assert_eq!(remove_editor.encode().unwrap(), original_table);
+        manager
+            .replace_transport_manager_selection_prefix(&remove_editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+    }
+
+    #[test]
+    fn transport_manager_selection_removes_only_existing_string_entries() {
+        let mut body = active_transport_manager_reference_body(
+            114_001,
+            transport_manager_line_number_count(114_001),
+            0,
+            transport_manager_object_header_count(114_001),
+        )
+        .0;
+        body.truncate(body.len() - 2);
+        body.extend_from_slice(&1_i16.to_be_bytes());
+        body.extend_from_slice(&7_i16.to_be_bytes());
+        body.push(0xfe);
+        write_unique_string(&mut body, "Bus").unwrap();
+        let fields = decode_transport_manager_reference_body(
+            114_001,
+            &body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let table_range = fields.selection_range.unwrap();
+        let prefix = fields.selection_prefix.unwrap();
+        let source_table = prefix.encode_unchanged();
+        let mut editor = prefix.into_editor();
+        assert!(editor.remove_last_existing_entry().is_err());
+        editor.push_existing_string_reference(8, 1).unwrap();
+        assert_eq!(
+            editor.remove_last_existing_entry().unwrap(),
+            TransportManagerSelection {
+                key: 8,
+                value: TransportManagerSharedStringValue::Existing {
+                    index: 1,
+                    value: Some("Bus".to_owned()),
+                },
+            }
+        );
+        assert_eq!(editor.encode().unwrap(), source_table);
+        assert_eq!(table_range.end - table_range.start, source_table.len());
     }
 
     #[test]
