@@ -24,6 +24,7 @@ pub struct GameAreaManagerData {
     start_tile_range: Option<Range<usize>>,
     area_grid_range: Range<usize>,
     buildable_area_range: Option<Range<usize>>,
+    saved_camera_view_range: Option<Range<usize>>,
     serialized_body: Vec<u8>,
 }
 
@@ -36,6 +37,7 @@ pub struct GameAreaManagerEditor {
     start_tile: u8,
     area_grid: Vec<u8>,
     buildable_area: [f32; 4],
+    saved_camera_view: SavedCameraView,
 }
 
 /// Camera state serialized inline by `GameAreaManager+Data`.
@@ -88,8 +90,9 @@ impl GameAreaManagerData {
         } else {
             ([-1.0; 4], None)
         };
-        let saved_camera_view = if version >= SAVED_CAMERA_VIEW_VERSION {
-            SavedCameraView {
+        let (saved_camera_view, saved_camera_view_range) = if version >= SAVED_CAMERA_VIEW_VERSION {
+            let start = reader.offset();
+            let view = SavedCameraView {
                 mode: reader.read_i16_be()?,
                 position: [
                     reader.read_f32_be()?,
@@ -99,15 +102,19 @@ impl GameAreaManagerData {
                 size: reader.read_f32_be()?,
                 angle: [reader.read_f32_be()?, reader.read_f32_be()?],
                 height: reader.read_f32_be()?,
-            }
+            };
+            (view, Some(start..reader.offset()))
         } else {
-            SavedCameraView {
-                mode: -1,
-                position: [0.0; 3],
-                size: 0.0,
-                angle: [0.0; 2],
-                height: 0.0,
-            }
+            (
+                SavedCameraView {
+                    mode: -1,
+                    position: [0.0; 3],
+                    size: 0.0,
+                    angle: [0.0; 2],
+                    height: 0.0,
+                },
+                None,
+            )
         };
         let consumed = reader.offset();
         Ok((
@@ -122,6 +129,7 @@ impl GameAreaManagerData {
                 start_tile_range,
                 area_grid_range,
                 buildable_area_range,
+                saved_camera_view_range,
                 serialized_body: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -166,6 +174,7 @@ impl GameAreaManagerData {
             start_tile: self.start_tile,
             area_grid: self.area_grid.clone(),
             buildable_area: self.buildable_area,
+            saved_camera_view: self.saved_camera_view,
             original: self,
         }
     }
@@ -203,6 +212,12 @@ impl GameAreaManagerEditor {
     pub fn buildable_area_mut(&mut self) -> Option<&mut [f32; 4]> {
         self.original.buildable_area_range.as_ref()?;
         Some(&mut self.buildable_area)
+    }
+
+    /// Returns mutable saved-camera fields from inner version 112032 onward.
+    pub fn saved_camera_view_mut(&mut self) -> Option<&mut SavedCameraView> {
+        self.original.saved_camera_view_range.as_ref()?;
+        Some(&mut self.saved_camera_view)
     }
 
     /// Writes changed values using the known field layout while preserving
@@ -248,6 +263,32 @@ impl GameAreaManagerEditor {
             }
             replacements.push((range.clone(), encoded));
         }
+        if !saved_camera_view_bits_equal(self.saved_camera_view, self.original.saved_camera_view) {
+            let range = self
+                .original
+                .saved_camera_view_range
+                .as_ref()
+                .ok_or_else(|| {
+                    invalid_game_area(
+                        0,
+                        "saved camera view is unavailable before inner version 112032",
+                    )
+                })?;
+            let mut encoded = Vec::with_capacity(30);
+            encoded.extend_from_slice(&self.saved_camera_view.mode.to_be_bytes());
+            for value in [
+                self.saved_camera_view.position[0],
+                self.saved_camera_view.position[1],
+                self.saved_camera_view.position[2],
+                self.saved_camera_view.size,
+                self.saved_camera_view.angle[0],
+                self.saved_camera_view.angle[1],
+                self.saved_camera_view.height,
+            ] {
+                encoded.extend_from_slice(&value.to_bits().to_be_bytes());
+            }
+            replacements.push((range.clone(), encoded));
+        }
 
         replacements.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
         for (range, replacement) in replacements {
@@ -273,6 +314,22 @@ fn invalid_game_area(offset: usize, reason: impl Into<String>) -> CrpError {
         offset,
         reason: reason.into(),
     }
+}
+
+fn saved_camera_view_bits_equal(left: SavedCameraView, right: SavedCameraView) -> bool {
+    left.mode == right.mode
+        && left
+            .position
+            .iter()
+            .zip(right.position)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+        && left.size.to_bits() == right.size.to_bits()
+        && left
+            .angle
+            .iter()
+            .zip(right.angle)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+        && left.height.to_bits() == right.height.to_bits()
 }
 
 fn skip_object_reference(reader: &mut Reader<'_>) -> Result<(), CrpError> {
@@ -377,6 +434,39 @@ mod tests {
     }
 
     #[test]
+    fn editor_writes_saved_camera_fields_in_expected_big_endian_order() {
+        let mut source = vec![5, 7, 0x98, 0xff];
+        source.extend([0; 16]);
+        let camera_start = source.len();
+        source.extend_from_slice(&0x0102_i16.to_be_bytes());
+        for value in [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0] {
+            source.extend_from_slice(&value.to_bits().to_be_bytes());
+        }
+        let (data, _) = GameAreaManagerData::decode_prefix(112_032, &source).unwrap();
+        let mut editor = data.into_editor();
+        let camera = editor.saved_camera_view_mut().unwrap();
+        camera.mode = -2;
+        camera.position = [8.5, -9.25, 1.5];
+        camera.size = 2.5;
+        camera.angle = [0.5, -0.75];
+        camera.height = 100.0;
+
+        let encoded = editor.encode().unwrap();
+        let mut expected = source[..camera_start].to_vec();
+        expected.extend_from_slice(&(-2_i16).to_be_bytes());
+        for value in [8.5_f32, -9.25, 1.5, 2.5, 0.5, -0.75, 100.0] {
+            expected.extend_from_slice(&value.to_bits().to_be_bytes());
+        }
+        assert_eq!(encoded, expected);
+        let (decoded, _) = GameAreaManagerData::decode_prefix(112_032, &encoded).unwrap();
+        assert_eq!(decoded.saved_camera_view().mode, -2);
+        assert_eq!(decoded.saved_camera_view().position, [8.5, -9.25, 1.5]);
+        assert_eq!(decoded.saved_camera_view().size, 2.5);
+        assert_eq!(decoded.saved_camera_view().angle, [0.5, -0.75]);
+        assert_eq!(decoded.saved_camera_view().height, 100.0);
+    }
+
+    #[test]
     fn editor_keeps_legacy_fields_absent() {
         let mut source = vec![7, 24];
         source.extend([0; 25]);
@@ -384,6 +474,7 @@ mod tests {
         let mut editor = data.into_editor();
         assert!(editor.start_tile_mut().is_none());
         assert!(editor.buildable_area_mut().is_none());
+        assert!(editor.saved_camera_view_mut().is_none());
         editor.set_area_count(8);
         let mut expected = source;
         expected[0] = 8;
