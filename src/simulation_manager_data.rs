@@ -5333,6 +5333,79 @@ impl SimulationManagerData {
         Ok((data, manager_end))
     }
 
+    /// Replaces the versioned citizen-column prefix at slot 7, allowing its
+    /// encoded columns and the complete manager body to change length.
+    ///
+    /// The edited value must come from this stream's inner version and have
+    /// unchanged citizen flags, legacy columns, and body bytes after the
+    /// prefix. The manager graph is resized at the validated TransferManager
+    /// boundary, preserving all following graph data.
+    pub fn replace_citizen_manager_prefix(
+        &mut self,
+        edited: &CitizenManagerData,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited CitizenManager prefix version does not match this stream",
+            ));
+        }
+        expect_manager_type(self.manager_objects.as_deref(), 7, "CitizenManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
+
+        let (current, manager_end) = self.decode_citizen_manager_data()?;
+        if edited.citizens().citizen_flags() != current.citizens().citizen_flags()
+            || edited.citizens().legacy_columns() != current.citizens().legacy_columns()
+        {
+            return Err(invalid(
+                0,
+                "edited CitizenManager citizen layout does not match this stream",
+            ));
+        }
+
+        let edited_prefix_len = edited.citizens().original_prefix().len();
+        let current_prefix_len = current.citizens().original_prefix().len();
+        let edited_body = edited.original_body_bytes();
+        let current_body = current.original_body_bytes();
+        if edited_body.get(..edited_prefix_len) != Some(edited.citizens().original_prefix())
+            || edited_body.get(edited_prefix_len..) != current_body.get(current_prefix_len..)
+        {
+            return Err(invalid(
+                0,
+                "edited CitizenManager data does not match this stream outside citizen columns",
+            ));
+        }
+
+        let (body_start, boundary_end) = self.manager_body_boundary(7)?;
+        if boundary_end != manager_end
+            || self.serialized_object_graph.get(body_start..manager_end) != Some(current_body)
+        {
+            return Err(invalid(
+                body_start,
+                "CitizenManager body boundary changed during prefix replacement",
+            ));
+        }
+        let retained_len = self
+            .serialized_object_graph
+            .len()
+            .checked_sub(manager_end - body_start)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "CitizenManager graph replacement",
+            ))?;
+        let graph_len =
+            retained_len
+                .checked_add(edited_body.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager graph replacement",
+                ))?;
+        let mut graph = Vec::with_capacity(graph_len);
+        graph.extend_from_slice(&self.serialized_object_graph[..body_start]);
+        graph.extend_from_slice(edited_body);
+        graph.extend_from_slice(&self.serialized_object_graph[manager_end..]);
+        self.serialized_object_graph = graph;
+        Ok(())
+    }
+
     /// Replaces the version 69+ CitizenUnit fields at slot 7 while preserving
     /// the rest of the CitizenManager body byte-for-byte.
     ///
@@ -18641,6 +18714,90 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(wrong_version.serialized_object_graph, stable_graph);
+    }
+
+    #[test]
+    fn citizen_manager_prefix_replacement_resizes_graph_at_transfer_boundary() {
+        let mut citizen_flags = vec![63]; // 64 literal active citizen flags
+        for _ in 0..64 {
+            citizen_flags.extend_from_slice(&1_u32.to_be_bytes());
+        }
+        citizen_flags.push(1); // two literal zero values reset the UInt delta
+        citizen_flags.extend_from_slice(&[0; 8]);
+        let mut remaining_flags = 1_048_575 - 66;
+        while remaining_flags > 0 {
+            let run = remaining_flags.min(128);
+            citizen_flags.push((0x7f + run) as u8);
+            remaining_flags -= run;
+        }
+
+        let mut body = citizen_flags.clone();
+        body.extend_from_slice(&[0xbf, 0xbf]); // 64 zero health and wellbeing values
+        let mut remaining_units = 524_287;
+        while remaining_units > 0 {
+            let run = remaining_units.min(128);
+            body.push((0x7f + run) as u8);
+            remaining_units -= run;
+        }
+        let mut remaining_instances = 32_767;
+        while remaining_instances > 0 {
+            let run = remaining_instances.min(128);
+            body.push((0x7f + run) as u8);
+            remaining_instances -= run;
+        }
+        body.extend_from_slice(&[0, 0]); // empty BuildingInfo name table
+        body.extend_from_slice(&[0x12, 0x34]);
+        crate::CitizenManagerData::decode(69, &body).expect("synthetic CitizenManager body");
+
+        let citizen_tag = profiler_tag("CitizenManager");
+        let transfer_tag = profiler_tag("TransferManager");
+        let mut graph = citizen_tag.clone();
+        graph.extend_from_slice(&body);
+        graph.extend_from_slice(&transfer_tag);
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 69;
+        let mut manager_objects = vec![None; 9];
+        manager_objects[7] = Some(ManagerObjectReference {
+            object_id: 7,
+            type_name: "CitizenManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[8] = Some(ManagerObjectReference {
+            object_id: 8,
+            type_name: "TransferManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (mut edited, original_end) = manager.decode_citizen_manager_data().unwrap();
+        let original_prefix_len = edited.citizens().original_prefix().len();
+        assert_eq!(edited.citizens().health(), Some([0; 64].as_slice()));
+        edited.set_citizen_health(0, 0x21).unwrap();
+        edited.set_citizen_wellbeing(63, 0x32).unwrap();
+
+        let mut expected_prefix = citizen_flags;
+        expected_prefix.push(63);
+        expected_prefix.push(0x21);
+        expected_prefix.extend_from_slice(&[0; 63]);
+        expected_prefix.push(63);
+        expected_prefix.extend_from_slice(&[0; 63]);
+        expected_prefix.push(0x32);
+        let mut expected_body = expected_prefix;
+        expected_body.extend_from_slice(&body[original_prefix_len..]);
+        assert_eq!(edited.encode(), expected_body);
+        assert_eq!(expected_body.len(), body.len() + 128);
+
+        manager
+            .replace_citizen_manager_prefix(&edited)
+            .expect("resize CitizenManager body");
+        let (updated, updated_end) = manager.decode_citizen_manager_data().unwrap();
+        assert_eq!(updated_end, original_end + 128);
+        assert_eq!(updated.encode(), expected_body);
+        assert_eq!(updated.citizens().health().unwrap()[0], 0x21);
+        assert_eq!(updated.citizens().wellbeing().unwrap()[63], 0x32);
+        assert!(manager.serialized_object_graph()[updated_end..].starts_with(&transfer_tag));
+        assert_eq!(
+            manager.serialized_object_graph()[citizen_tag.len()..updated_end],
+            expected_body
+        );
     }
 
     #[test]

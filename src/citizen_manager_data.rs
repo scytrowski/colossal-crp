@@ -4,7 +4,7 @@ use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
     EncodedUIntArrayReader, read_encoded_byte_array, read_encoded_uint_array,
-    read_encoded_ushort_array,
+    read_encoded_ushort_array, write_encoded_byte_array, write_encoded_ushort_array,
 };
 
 const CITIZEN_FLAG_COUNT: usize = 1_048_575;
@@ -40,10 +40,11 @@ const CITIZEN_INSTANCE_COLOR_FLAG: u32 = 1 << 24;
 ///
 /// The prefix ends before the fixed-capacity citizen-unit and citizen-instance
 /// arrays. Those later fields remain in the serialized manager graph and are
-/// not decoded here. The exact consumed source bytes are retained for unchanged
-/// writing. Reader gates come from `CitizenManager+Data.Deserialize` in the
-/// supplied Assembly-CSharp.dll; the local map corpus has no active citizens,
-/// so nonzero values have synthetic test coverage only.
+/// not decoded here. Unedited columns retain their exact source bytes; an
+/// edited sparse column is re-encoded and may change the prefix length. Reader
+/// gates come from `CitizenManager+Data.Deserialize` in the supplied
+/// Assembly-CSharp.dll; the local map corpus has no active citizens, so
+/// nonzero values have synthetic test coverage only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CitizenManagerDataPrefix {
     format_version: u32,
@@ -55,6 +56,13 @@ pub struct CitizenManagerDataPrefix {
     family: Option<Vec<u8>>,
     job_title: Option<Vec<u8>>,
     tourist_type: Option<Vec<u8>>,
+    column_ranges: Vec<Range<usize>>,
+    health_column: Option<usize>,
+    wellbeing_column: Option<usize>,
+    age_column: Option<usize>,
+    family_column: Option<usize>,
+    job_title_column: Option<usize>,
+    tourist_type_column: Option<usize>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -84,51 +92,86 @@ impl CitizenManagerDataPrefix {
             EncodedUIntArrayReader::default().read_array(&mut reader, flag_count)?
         };
         let active_count = citizen_flags.iter().filter(|flags| **flags != 0).count();
+        let mut column_ranges = Vec::new();
 
         let legacy_columns = if format_version < LEGACY_CITIZEN_COLUMNS_VERSION {
-            Some(vec![read_encoded_byte_array(&mut reader, active_count)?])
+            let start = reader.offset();
+            let values = read_encoded_byte_array(&mut reader, active_count)?;
+            column_ranges.push(start..reader.offset());
+            Some(vec![values])
         } else if format_version < BYTE_CITIZEN_FLAGS_VERSION {
             let mut columns = Vec::with_capacity(4);
             for _ in 0..4 {
+                let start = reader.offset();
                 columns.push(read_encoded_byte_array(&mut reader, active_count)?);
+                column_ranges.push(start..reader.offset());
             }
             Some(columns)
         } else {
             None
         };
 
+        let mut health_column = None;
+        let mut wellbeing_column = None;
         let (health, wellbeing) = if format_version >= CITIZEN_HEALTH_VERSION {
-            (
-                Some(read_encoded_byte_array(&mut reader, active_count)?),
-                Some(read_encoded_byte_array(&mut reader, active_count)?),
-            )
+            health_column = Some(column_ranges.len());
+            let start = reader.offset();
+            let health = read_encoded_byte_array(&mut reader, active_count)?;
+            column_ranges.push(start..reader.offset());
+            wellbeing_column = Some(column_ranges.len());
+            let start = reader.offset();
+            let wellbeing = read_encoded_byte_array(&mut reader, active_count)?;
+            column_ranges.push(start..reader.offset());
+            (Some(health), Some(wellbeing))
         } else {
             (None, None)
         };
+        let mut age_column = None;
         let age = if format_version >= CITIZEN_AGE_USHORT_VERSION {
-            Some(read_encoded_ushort_array(&mut reader, active_count)?)
+            age_column = Some(column_ranges.len());
+            let start = reader.offset();
+            let age = read_encoded_ushort_array(&mut reader, active_count)?;
+            column_ranges.push(start..reader.offset());
+            Some(age)
         } else if format_version >= CITIZEN_AGE_VERSION {
-            Some(
-                read_encoded_byte_array(&mut reader, active_count)?
-                    .into_iter()
-                    .map(u16::from)
-                    .collect(),
-            )
+            age_column = Some(column_ranges.len());
+            let start = reader.offset();
+            let age = read_encoded_byte_array(&mut reader, active_count)?
+                .into_iter()
+                .map(u16::from)
+                .collect();
+            column_ranges.push(start..reader.offset());
+            Some(age)
         } else {
             None
         };
+        let mut family_column = None;
         let family = if format_version >= CITIZEN_FAMILY_VERSION {
-            Some(read_encoded_byte_array(&mut reader, active_count)?)
+            family_column = Some(column_ranges.len());
+            let start = reader.offset();
+            let family = read_encoded_byte_array(&mut reader, active_count)?;
+            column_ranges.push(start..reader.offset());
+            Some(family)
         } else {
             None
         };
+        let mut job_title_column = None;
         let job_title = if format_version >= CITIZEN_JOB_TITLE_VERSION {
-            Some(read_encoded_byte_array(&mut reader, active_count)?)
+            job_title_column = Some(column_ranges.len());
+            let start = reader.offset();
+            let job_title = read_encoded_byte_array(&mut reader, active_count)?;
+            column_ranges.push(start..reader.offset());
+            Some(job_title)
         } else {
             None
         };
+        let mut tourist_type_column = None;
         let tourist_type = if format_version >= CITIZEN_TOURIST_TYPE_VERSION {
-            Some(read_encoded_byte_array(&mut reader, active_count)?)
+            tourist_type_column = Some(column_ranges.len());
+            let start = reader.offset();
+            let tourist_type = read_encoded_byte_array(&mut reader, active_count)?;
+            column_ranges.push(start..reader.offset());
+            Some(tourist_type)
         } else {
             None
         };
@@ -145,6 +188,13 @@ impl CitizenManagerDataPrefix {
                 family,
                 job_title,
                 tourist_type,
+                column_ranges,
+                health_column,
+                wellbeing_column,
+                age_column,
+                family_column,
+                job_title_column,
+                tourist_type_column,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -171,34 +221,174 @@ impl CitizenManagerDataPrefix {
     }
 
     /// Returns the sparse health values from version 65.
+    ///
+    /// Values are ordered by the ascending citizen slot among nonzero flags.
     pub fn health(&self) -> Option<&[u8]> {
         self.health.as_deref()
     }
 
     /// Returns the sparse wellbeing values from version 65.
+    ///
+    /// Values are ordered by the ascending citizen slot among nonzero flags.
     pub fn wellbeing(&self) -> Option<&[u8]> {
         self.wellbeing.as_deref()
     }
 
     /// Returns sparse age values from version 157, widened to `u16` for a
     /// consistent API. The serialized width changes at version 113007.
+    /// Values are ordered by the ascending citizen slot among nonzero flags.
     pub fn age(&self) -> Option<&[u16]> {
         self.age.as_deref()
     }
 
     /// Returns the sparse family values from version 190.
+    ///
+    /// Values are ordered by the ascending citizen slot among nonzero flags.
     pub fn family(&self) -> Option<&[u8]> {
         self.family.as_deref()
     }
 
     /// Returns sparse job-title indices from version 112007.
+    ///
+    /// Values are ordered by the ascending citizen slot among nonzero flags.
     pub fn job_title(&self) -> Option<&[u8]> {
         self.job_title.as_deref()
     }
 
     /// Returns sparse tourist types from version 117002.
+    ///
+    /// Values are ordered by the ascending citizen slot among nonzero flags.
     pub fn tourist_type(&self) -> Option<&[u8]> {
         self.tourist_type.as_deref()
+    }
+
+    /// Replaces one health value from version 65 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags, ordered
+    /// by ascending citizen slot. Only the health column is re-encoded.
+    pub fn set_health_value(&mut self, sparse_index: usize, value: u8) -> Result<(), CrpError> {
+        let mut values = self
+            .health
+            .clone()
+            .ok_or_else(|| invalid(0, "citizen health is not serialized before version 65"))?;
+        set_sparse_value(&mut values, sparse_index, value, "citizen health")?;
+        self.replace_byte_column(self.health_column, &values, "citizen health")?;
+        self.health = Some(values);
+        Ok(())
+    }
+
+    /// Replaces one wellbeing value from version 65 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags, ordered
+    /// by ascending citizen slot. Only the wellbeing column is re-encoded.
+    pub fn set_wellbeing_value(&mut self, sparse_index: usize, value: u8) -> Result<(), CrpError> {
+        let mut values = self
+            .wellbeing
+            .clone()
+            .ok_or_else(|| invalid(0, "citizen wellbeing is not serialized before version 65"))?;
+        set_sparse_value(&mut values, sparse_index, value, "citizen wellbeing")?;
+        self.replace_byte_column(self.wellbeing_column, &values, "citizen wellbeing")?;
+        self.wellbeing = Some(values);
+        Ok(())
+    }
+
+    /// Replaces one age value from version 157 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags, ordered
+    /// by ascending citizen slot. Versions 157–113006 store a byte and reject
+    /// values above 255; version 113007 onward stores a `u16`. Only the age
+    /// column is re-encoded.
+    pub fn set_age_value(&mut self, sparse_index: usize, value: u16) -> Result<(), CrpError> {
+        let mut values = self
+            .age
+            .clone()
+            .ok_or_else(|| invalid(0, "citizen age is not serialized before version 157"))?;
+        let current = values
+            .get_mut(sparse_index)
+            .ok_or_else(|| invalid(sparse_index, "citizen age sparse index is out of range"))?;
+        if self.format_version < CITIZEN_AGE_USHORT_VERSION && value > u8::MAX.into() {
+            return Err(invalid(
+                sparse_index,
+                "citizen age exceeds byte storage before version 113007",
+            ));
+        }
+        *current = value;
+        let column = self
+            .age_column
+            .ok_or_else(|| invalid(0, "citizen age column has no serialized byte range"))?;
+        let mut encoded = Vec::new();
+        if self.format_version >= CITIZEN_AGE_USHORT_VERSION {
+            write_encoded_ushort_array(&mut encoded, &values);
+        } else {
+            let byte_values: Vec<u8> = values
+                .iter()
+                .map(|age| {
+                    u8::try_from(*age).map_err(|_| {
+                        invalid(
+                            sparse_index,
+                            "citizen age exceeds byte storage before version 113007",
+                        )
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            write_encoded_byte_array(&mut encoded, &byte_values);
+        }
+        self.replace_encoded_column(column, &encoded, "citizen age")?;
+        self.age = Some(values);
+        Ok(())
+    }
+
+    /// Replaces one family value from version 190 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags, ordered
+    /// by ascending citizen slot. Only the family column is re-encoded.
+    pub fn set_family_value(&mut self, sparse_index: usize, value: u8) -> Result<(), CrpError> {
+        let mut values = self
+            .family
+            .clone()
+            .ok_or_else(|| invalid(0, "citizen family is not serialized before version 190"))?;
+        set_sparse_value(&mut values, sparse_index, value, "citizen family")?;
+        self.replace_byte_column(self.family_column, &values, "citizen family")?;
+        self.family = Some(values);
+        Ok(())
+    }
+
+    /// Replaces one job-title index from version 112007 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags, ordered
+    /// by ascending citizen slot. Only the job-title column is re-encoded.
+    pub fn set_job_title_value(&mut self, sparse_index: usize, value: u8) -> Result<(), CrpError> {
+        let mut values = self.job_title.clone().ok_or_else(|| {
+            invalid(
+                0,
+                "citizen job title is not serialized before version 112007",
+            )
+        })?;
+        set_sparse_value(&mut values, sparse_index, value, "citizen job title")?;
+        self.replace_byte_column(self.job_title_column, &values, "citizen job title")?;
+        self.job_title = Some(values);
+        Ok(())
+    }
+
+    /// Replaces one tourist type from version 117002 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags, ordered
+    /// by ascending citizen slot. Only the tourist-type column is re-encoded.
+    pub fn set_tourist_type_value(
+        &mut self,
+        sparse_index: usize,
+        value: u8,
+    ) -> Result<(), CrpError> {
+        let mut values = self.tourist_type.clone().ok_or_else(|| {
+            invalid(
+                0,
+                "citizen tourist type is not serialized before version 117002",
+            )
+        })?;
+        set_sparse_value(&mut values, sparse_index, value, "citizen tourist type")?;
+        self.replace_byte_column(self.tourist_type_column, &values, "citizen tourist type")?;
+        self.tourist_type = Some(values);
+        Ok(())
     }
 
     /// Returns the exact source bytes consumed by this prefix decoder.
@@ -206,10 +396,164 @@ impl CitizenManagerDataPrefix {
         &self.serialized_prefix
     }
 
-    /// Reproduces this prefix unchanged. Sparse values are not editable yet.
+    /// Reproduces this prefix, retaining unedited columns exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
+
+    fn replace_byte_column(
+        &mut self,
+        column: Option<usize>,
+        values: &[u8],
+        name: &str,
+    ) -> Result<(), CrpError> {
+        let column = column
+            .ok_or_else(|| invalid(0, format!("{name} column has no serialized byte range")))?;
+        let mut encoded = Vec::new();
+        write_encoded_byte_array(&mut encoded, values);
+        self.replace_encoded_column(column, &encoded, name)
+    }
+
+    fn replace_encoded_column(
+        &mut self,
+        column: usize,
+        encoded: &[u8],
+        name: &str,
+    ) -> Result<(), CrpError> {
+        let range = self
+            .column_ranges
+            .get(column)
+            .cloned()
+            .ok_or_else(|| invalid(0, format!("{name} column byte range is unavailable")))?;
+        if range.start > range.end || range.end > self.serialized_prefix.len() {
+            return Err(invalid(
+                range.start,
+                format!("{name} column byte range is invalid"),
+            ));
+        }
+        let retained_len = self
+            .serialized_prefix
+            .len()
+            .checked_sub(range.end - range.start)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "CitizenManager column replacement",
+            ))?;
+        let new_len =
+            retained_len
+                .checked_add(encoded.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager column replacement",
+                ))?;
+        let column_end = range
+            .start
+            .checked_add(encoded.len())
+            .ok_or(CrpError::ArithmeticOverflow("CitizenManager column end"))?;
+        let mut replacement = Vec::with_capacity(new_len);
+        replacement.extend_from_slice(&self.serialized_prefix[..range.start]);
+        replacement.extend_from_slice(encoded);
+        replacement.extend_from_slice(&self.serialized_prefix[range.end..]);
+
+        let old_column_len = range.end - range.start;
+        let mut updated_ranges = self.column_ranges.clone();
+        for (index, column_range) in updated_ranges.iter_mut().enumerate() {
+            if index == column {
+                *column_range = range.start..column_end;
+            } else if index > column {
+                column_range.start = shift_offset(
+                    column_range.start,
+                    old_column_len,
+                    encoded.len(),
+                    range.end,
+                    name,
+                )?;
+                column_range.end = shift_offset(
+                    column_range.end,
+                    old_column_len,
+                    encoded.len(),
+                    range.end,
+                    name,
+                )?;
+            }
+        }
+        self.serialized_prefix = replacement;
+        self.column_ranges = updated_ranges;
+        Ok(())
+    }
+}
+
+fn set_sparse_value(
+    values: &mut [u8],
+    sparse_index: usize,
+    value: u8,
+    name: &str,
+) -> Result<(), CrpError> {
+    let slot = values
+        .get_mut(sparse_index)
+        .ok_or_else(|| invalid(sparse_index, format!("{name} sparse index is out of range")))?;
+    *slot = value;
+    Ok(())
+}
+
+fn shift_offset(
+    value: usize,
+    old_len: usize,
+    new_len: usize,
+    threshold: usize,
+    name: &str,
+) -> Result<usize, CrpError> {
+    if value < threshold {
+        return Ok(value);
+    }
+    if new_len >= old_len {
+        value
+            .checked_add(new_len - old_len)
+            .ok_or(CrpError::ArithmeticOverflow("CitizenManager column offset"))
+    } else {
+        value
+            .checked_sub(old_len - new_len)
+            .ok_or_else(|| invalid(value, format!("{name} column offset underflow")))
+    }
+}
+
+fn shift_manager_offset(
+    value: usize,
+    old_prefix_len: usize,
+    new_prefix_len: usize,
+    name: &str,
+) -> Result<usize, CrpError> {
+    if value < old_prefix_len {
+        return Err(invalid(
+            value,
+            format!("{name} precedes the citizen prefix"),
+        ));
+    }
+    shift_offset(value, old_prefix_len, new_prefix_len, old_prefix_len, name)
+}
+
+fn shift_manager_range(
+    range: &Range<usize>,
+    old_prefix_len: usize,
+    new_prefix_len: usize,
+    name: &str,
+) -> Result<Range<usize>, CrpError> {
+    if range.start > range.end {
+        return Err(invalid(range.start, format!("{name} range is invalid")));
+    }
+    let start = shift_manager_offset(range.start, old_prefix_len, new_prefix_len, name)?;
+    let end = shift_manager_offset(range.end, old_prefix_len, new_prefix_len, name)?;
+    Ok(start..end)
+}
+
+fn shift_optional_manager_offset(
+    value: &mut Option<usize>,
+    old_prefix_len: usize,
+    new_prefix_len: usize,
+    name: &str,
+) -> Result<(), CrpError> {
+    if let Some(offset) = value {
+        *offset = shift_manager_offset(*offset, old_prefix_len, new_prefix_len, name)?;
+    }
+    Ok(())
 }
 
 /// One active `CitizenUnit` and its six optional 24-bit references.
@@ -765,9 +1109,10 @@ const FULLY_EDUCATED_RESIDENTS_VERSION: u32 = 179;
 ///
 /// Citizen flags and sparse columns, version 69+ unit records, and the
 /// versioned instance flags/prefab scope and active records are decoded.
-/// Existing masked unit references and known active-instance fields can be
-/// edited in place. The full body, two-byte profiler reference, and counters
-/// are retained for rewriting.
+/// Sparse citizen columns, existing masked unit references, and known active-
+/// instance fields can be edited. Resizing a citizen column shifts subsequent
+/// body offsets while retaining the remaining bytes. The full body, two-byte
+/// profiler reference, and counters are retained for rewriting.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CitizenManagerData {
     format_version: u32,
@@ -1050,6 +1395,226 @@ impl CitizenManagerData {
     /// Returns decoded citizen flags and sparse columns.
     pub fn citizens(&self) -> &CitizenManagerDataPrefix {
         &self.citizen_prefix
+    }
+
+    /// Replaces one health value from version 65 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags, ordered
+    /// by ascending citizen slot. The edited column may change the prefix
+    /// length; following manager bytes are retained and their editor offsets
+    /// are updated.
+    pub fn set_citizen_health(&mut self, sparse_index: usize, value: u8) -> Result<(), CrpError> {
+        self.edit_citizen_prefix(|prefix| prefix.set_health_value(sparse_index, value))
+    }
+
+    /// Replaces one wellbeing value from version 65 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags, ordered
+    /// by ascending citizen slot. The edited column may change the prefix
+    /// length; following manager bytes are retained and their editor offsets
+    /// are updated.
+    pub fn set_citizen_wellbeing(
+        &mut self,
+        sparse_index: usize,
+        value: u8,
+    ) -> Result<(), CrpError> {
+        self.edit_citizen_prefix(|prefix| prefix.set_wellbeing_value(sparse_index, value))
+    }
+
+    /// Replaces one age value from version 157 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags. Values
+    /// above 255 are rejected before version 113007.
+    pub fn set_citizen_age(&mut self, sparse_index: usize, value: u16) -> Result<(), CrpError> {
+        self.edit_citizen_prefix(|prefix| prefix.set_age_value(sparse_index, value))
+    }
+
+    /// Replaces one family value from version 190 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags.
+    pub fn set_citizen_family(&mut self, sparse_index: usize, value: u8) -> Result<(), CrpError> {
+        self.edit_citizen_prefix(|prefix| prefix.set_family_value(sparse_index, value))
+    }
+
+    /// Replaces one job-title index from version 112007 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags.
+    pub fn set_citizen_job_title(
+        &mut self,
+        sparse_index: usize,
+        value: u8,
+    ) -> Result<(), CrpError> {
+        self.edit_citizen_prefix(|prefix| prefix.set_job_title_value(sparse_index, value))
+    }
+
+    /// Replaces one tourist type from version 117002 onward.
+    ///
+    /// `sparse_index` is zero-based among citizens with nonzero flags.
+    pub fn set_citizen_tourist_type(
+        &mut self,
+        sparse_index: usize,
+        value: u8,
+    ) -> Result<(), CrpError> {
+        self.edit_citizen_prefix(|prefix| prefix.set_tourist_type_value(sparse_index, value))
+    }
+
+    fn edit_citizen_prefix(
+        &mut self,
+        edit: impl FnOnce(&mut CitizenManagerDataPrefix) -> Result<(), CrpError>,
+    ) -> Result<(), CrpError> {
+        let mut prefix = self.citizen_prefix.clone();
+        edit(&mut prefix)?;
+        self.replace_citizen_prefix(prefix)
+    }
+
+    fn replace_citizen_prefix(&mut self, prefix: CitizenManagerDataPrefix) -> Result<(), CrpError> {
+        if prefix.format_version != self.format_version
+            || prefix.citizen_flags != self.citizen_prefix.citizen_flags
+            || prefix.legacy_columns != self.citizen_prefix.legacy_columns
+        {
+            return Err(invalid(
+                0,
+                "edited CitizenManager citizen layout does not match this body",
+            ));
+        }
+        let old_prefix_len = self.citizen_prefix.serialized_prefix.len();
+        let new_prefix = prefix.encode();
+        if self.original_body.get(..old_prefix_len)
+            != Some(self.citizen_prefix.serialized_prefix.as_slice())
+        {
+            return Err(invalid(
+                0,
+                "CitizenManager body does not match its retained citizen prefix",
+            ));
+        }
+        let body_suffix = self
+            .original_body
+            .get(old_prefix_len..)
+            .ok_or_else(|| invalid(old_prefix_len, "CitizenManager citizen prefix exceeds body"))?;
+        let new_body_len =
+            new_prefix
+                .len()
+                .checked_add(body_suffix.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager resized body length",
+                ))?;
+        let mut new_body = Vec::with_capacity(new_body_len);
+        new_body.extend_from_slice(&new_prefix);
+        new_body.extend_from_slice(body_suffix);
+
+        let unit_fields = shift_manager_range(
+            &self.unit_fields,
+            old_prefix_len,
+            new_prefix.len(),
+            "CitizenManager unit fields",
+        )?;
+        let instance_fields = shift_manager_range(
+            &self.instance_fields,
+            old_prefix_len,
+            new_prefix.len(),
+            "CitizenManager instance fields",
+        )?;
+        let instance_field_suffix = shift_manager_range(
+            &self.instance_field_suffix,
+            old_prefix_len,
+            new_prefix.len(),
+            "CitizenManager instance suffix",
+        )?;
+        let mut active_instances = self.active_instances.clone();
+        for record in &mut active_instances {
+            record.original_record_start = shift_manager_offset(
+                record.original_record_start,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance record start",
+            )?;
+            record.original_record_end = shift_manager_offset(
+                record.original_record_end,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance record end",
+            )?;
+            record.citizen_offset = shift_manager_offset(
+                record.citizen_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance citizen offset",
+            )?;
+            record.target_building_offset = shift_manager_offset(
+                record.target_building_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance target-building offset",
+            )?;
+            record.position_offset = shift_manager_offset(
+                record.position_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance position offset",
+            )?;
+            shift_optional_manager_offset(
+                &mut record.path_fields_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance path fields",
+            )?;
+            shift_optional_manager_offset(
+                &mut record.wait_counter_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance wait counter",
+            )?;
+            shift_optional_manager_offset(
+                &mut record.target_seed_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance target seed",
+            )?;
+            shift_optional_manager_offset(
+                &mut record.performance_indices_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance performance indices",
+            )?;
+            shift_optional_manager_offset(
+                &mut record.source_building_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance source-building offset",
+            )?;
+            shift_optional_manager_offset(
+                &mut record.velocity_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance velocity offset",
+            )?;
+            shift_optional_manager_offset(
+                &mut record.target_position_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance target-position offset",
+            )?;
+            shift_optional_manager_offset(
+                &mut record.target_direction_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance target-direction offset",
+            )?;
+            shift_optional_manager_offset(
+                &mut record.color_rgb_offset,
+                old_prefix_len,
+                new_prefix.len(),
+                "CitizenManager instance RGB offset",
+            )?;
+        }
+
+        self.citizen_prefix = prefix;
+        self.original_body = new_body;
+        self.unit_fields = unit_fields;
+        self.instance_fields = instance_fields;
+        self.instance_field_suffix = instance_field_suffix;
+        self.active_instances = active_instances;
+        Ok(())
     }
 
     /// Returns decoded version 69+ citizen-unit data.
@@ -1983,6 +2548,141 @@ mod tests {
             assert_eq!(decoded.encode(), bytes[..consumed]);
             assert_eq!(bytes[consumed..], [0xfe, 0xed]);
         }
+    }
+
+    #[test]
+    fn edits_sparse_citizen_columns_and_reencodes_only_selected_columns() {
+        let mut original = uint_array(&[1, 0, 1]);
+        original.extend_from_slice(&byte_array(&[0x11, 0x22])); // health
+        original.extend_from_slice(&byte_array(&[0x33, 0x44])); // wellbeing
+        original.extend_from_slice(&ushort_array(&[0x0010, 0x0020])); // age
+        original.extend_from_slice(&byte_array(&[0x55, 0x66])); // family
+        original.extend_from_slice(&byte_array(&[0x77, 0x88])); // job title
+        original.extend_from_slice(&byte_array(&[0x99, 0xaa])); // tourist type
+        original.extend_from_slice(&[0xfe, 0xed]); // next manager bytes
+
+        let (mut decoded, consumed) =
+            CitizenManagerDataPrefix::decode_prefix_with_count(117_002, 3, &original)
+                .expect("valid active citizen columns");
+        assert_eq!(consumed, original.len() - 2);
+        assert_eq!(decoded.citizen_flags(), [1, 0, 1]);
+        decoded.set_health_value(1, 0x23).expect("health edit");
+        decoded
+            .set_wellbeing_value(1, 0x45)
+            .expect("wellbeing edit");
+        decoded.set_age_value(1, 0x0040).expect("age edit");
+        decoded.set_family_value(1, 0x67).expect("family edit");
+        decoded
+            .set_job_title_value(1, 0x89)
+            .expect("job title edit");
+        decoded
+            .set_tourist_type_value(1, 0xab)
+            .expect("tourist type edit");
+
+        let mut expected = uint_array(&[1, 0, 1]);
+        expected.extend_from_slice(&byte_array(&[0x11, 0x23]));
+        expected.extend_from_slice(&byte_array(&[0x33, 0x45]));
+        expected.extend_from_slice(&[1, 0, 0x10, 0, 0x40]);
+        expected.extend_from_slice(&byte_array(&[0x55, 0x67]));
+        expected.extend_from_slice(&byte_array(&[0x77, 0x89]));
+        expected.extend_from_slice(&byte_array(&[0x99, 0xab]));
+        assert_eq!(decoded.health(), Some([0x11, 0x23].as_slice()));
+        assert_eq!(decoded.wellbeing(), Some([0x33, 0x45].as_slice()));
+        assert_eq!(decoded.age(), Some([0x0010, 0x0040].as_slice()));
+        assert_eq!(decoded.family(), Some([0x55, 0x67].as_slice()));
+        assert_eq!(decoded.job_title(), Some([0x77, 0x89].as_slice()));
+        assert_eq!(decoded.tourist_type(), Some([0x99, 0xab].as_slice()));
+        assert_eq!(decoded.encode(), expected);
+
+        let mut age_byte_version = uint_array(&[1]);
+        age_byte_version.extend_from_slice(&byte_array(&[0x21]));
+        age_byte_version.extend_from_slice(&byte_array(&[0x32]));
+        age_byte_version.extend_from_slice(&byte_array(&[0x7f]));
+        age_byte_version.extend_from_slice(&byte_array(&[0x35])); // family
+        age_byte_version.extend_from_slice(&byte_array(&[0x43])); // job title
+        let (mut age_byte, _) =
+            CitizenManagerDataPrefix::decode_prefix_with_count(113_006, 1, &age_byte_version)
+                .expect("valid byte age column");
+        let original_age_prefix = age_byte.encode();
+        assert!(age_byte.set_age_value(0, 256).is_err());
+        assert_eq!(age_byte.encode(), original_age_prefix);
+        assert!(age_byte.set_age_value(1, 1).is_err());
+        assert_eq!(age_byte.encode(), original_age_prefix);
+
+        let (mut old_version, _) =
+            CitizenManagerDataPrefix::decode_prefix_with_count(64, 1, &uint_array(&[1]))
+                .expect("valid pre-column citizen flags");
+        let original_old_prefix = old_version.encode();
+        assert!(old_version.set_health_value(0, 1).is_err());
+        assert!(old_version.set_wellbeing_value(0, 1).is_err());
+        assert!(old_version.set_age_value(0, 1).is_err());
+        assert!(old_version.set_family_value(0, 1).is_err());
+        assert!(old_version.set_job_title_value(0, 1).is_err());
+        assert!(old_version.set_tourist_type_value(0, 1).is_err());
+        assert_eq!(old_version.encode(), original_old_prefix);
+    }
+
+    #[test]
+    fn resizes_citizen_prefix_and_keeps_later_edit_offsets_valid() {
+        let base = single_active_instance_body_194();
+        let mut body = Vec::new();
+
+        body.push(63); // 64 literal citizen flags
+        for _ in 0..64 {
+            body.extend_from_slice(&1_u32.to_be_bytes());
+        }
+        body.push(1); // two literal zero flags reset the UInt delta
+        body.extend_from_slice(&[0; 8]);
+        append_zero_uint_array(&mut body, 1_048_575 - 66);
+        body.extend_from_slice(&[0xbf; 4]); // health, wellbeing, age, and family
+
+        let mut unit_flags = vec![0_u16; 64];
+        unit_flags[0] = 1;
+        body.extend_from_slice(&ushort_array(&unit_flags));
+        append_zero_ushort_array(&mut body, 524_287 - 64);
+        body.extend_from_slice(&[1, 0x12, 0x34, 0x56]); // one masked citizen reference
+        body.extend_from_slice(&ushort_array(&[0x7777])); // one unit goods value
+
+        let old_citizen_flags_len = 1_048_575_usize.div_ceil(128);
+        let old_unit_flags_len = 524_287_usize.div_ceil(128);
+        body.extend_from_slice(&base[old_citizen_flags_len + old_unit_flags_len..]);
+
+        let (_, citizen_len) =
+            CitizenManagerDataPrefix::decode_prefix(194, &body).expect("citizen columns");
+        let (_, unit_len) =
+            CitizenUnitDataPrefix::decode_prefix(194, &body[citizen_len..]).expect("unit columns");
+        CitizenInstanceDataPrefix::decode_prefix(194, &body[citizen_len + unit_len..])
+            .expect("instance columns");
+        let mut decoded = CitizenManagerData::decode(194, &body).expect("valid active manager");
+        assert_eq!(decoded.citizens().health().unwrap().len(), 64);
+        assert_eq!(decoded.units().active_units().len(), 1);
+        assert_eq!(decoded.active_instances().len(), 1);
+        assert_eq!(decoded.units().active_units()[0].goods(), 0x7777);
+
+        decoded
+            .set_citizen_health(0, 0x21)
+            .expect("resize health column");
+        decoded
+            .set_citizen_wellbeing(63, 0x32)
+            .expect("resize wellbeing column");
+        decoded
+            .set_unit_citizen_reference(0, 0, 0x00ab_cdef)
+            .expect("write shifted unit reference");
+        decoded
+            .set_instance_position(0, [21.0, 22.0, 23.0])
+            .expect("write shifted instance position");
+
+        let rewritten = decoded.encode();
+        let reread = CitizenManagerData::decode(194, &rewritten)
+            .expect("edited manager remains structurally readable");
+        assert_eq!(
+            reread.units().active_units()[0].citizens()[0],
+            Some(0x00ab_cdef)
+        );
+        assert_eq!(reread.units().active_units()[0].goods(), 0x7777);
+        assert_eq!(reread.active_instances()[0].position(), [21.0, 22.0, 23.0]);
+        assert_eq!(reread.end_profiler_reference(), [0x12, 0x34]);
+        assert_eq!(reread.oldest_original_residents(), Some([0, 0]));
     }
 
     #[test]
