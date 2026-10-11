@@ -5510,6 +5510,99 @@ impl SimulationManagerData {
         Ok(())
     }
 
+    /// Replaces the complete version 69+ CitizenUnit section at slot 7.
+    ///
+    /// This accepts same-width reference edits and goods-column edits that
+    /// resize the encoded section. Unit flags and reference masks must match
+    /// the destination; citizen and instance bytes outside the unit section
+    /// must remain unchanged.
+    pub fn replace_citizen_manager_units(
+        &mut self,
+        edited: &CitizenManagerData,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited CitizenManager unit version does not match this stream",
+            ));
+        }
+        expect_manager_type(self.manager_objects.as_deref(), 7, "CitizenManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
+
+        let (current, manager_end) = self.decode_citizen_manager_data()?;
+        let same_unit_layout = edited.units().unit_flags() == current.units().unit_flags()
+            && edited.units().active_units().len() == current.units().active_units().len()
+            && edited
+                .units()
+                .active_units()
+                .iter()
+                .zip(current.units().active_units())
+                .all(|(edited, current)| {
+                    edited.index() == current.index()
+                        && edited.flags() == current.flags()
+                        && edited.reference_mask() == current.reference_mask()
+                });
+        if !same_unit_layout {
+            return Err(invalid(
+                0,
+                "edited CitizenManager unit layout does not match this stream",
+            ));
+        }
+
+        let edited_range = edited.unit_fields_range();
+        let current_range = current.unit_fields_range();
+        let edited_body = edited.original_body_bytes();
+        let current_body = current.original_body_bytes();
+        if edited_range.start != current_range.start
+            || edited_range.start > edited_range.end
+            || current_range.start > current_range.end
+            || edited_body.get(..edited_range.start) != current_body.get(..current_range.start)
+            || edited_body.get(edited_range.end..) != current_body.get(current_range.end..)
+            || edited_body.get(edited_range.clone()) != Some(edited.units().original_prefix())
+            || current_body.get(current_range.clone()) != Some(current.units().original_prefix())
+        {
+            return Err(invalid(
+                0,
+                "edited CitizenManager data does not match this stream outside unit fields",
+            ));
+        }
+
+        let (body_start, boundary_end) = self.manager_body_boundary(7)?;
+        if boundary_end != manager_end
+            || self.serialized_object_graph.get(body_start..manager_end) != Some(current_body)
+        {
+            return Err(invalid(
+                body_start,
+                "CitizenManager body boundary changed during unit replacement",
+            ));
+        }
+        let old_body_len =
+            manager_end
+                .checked_sub(body_start)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager body replacement",
+                ))?;
+        let retained_len = self
+            .serialized_object_graph
+            .len()
+            .checked_sub(old_body_len)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "CitizenManager graph replacement",
+            ))?;
+        let graph_len =
+            retained_len
+                .checked_add(edited_body.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager graph replacement",
+                ))?;
+        let mut graph = Vec::with_capacity(graph_len);
+        graph.extend_from_slice(&self.serialized_object_graph[..body_start]);
+        graph.extend_from_slice(edited_body);
+        graph.extend_from_slice(&self.serialized_object_graph[manager_end..]);
+        self.serialized_object_graph = graph;
+        Ok(())
+    }
+
     /// Replaces the active CitizenInstance field section at slot 7 while
     /// preserving the rest of the current CitizenManager body byte-for-byte.
     ///
@@ -18798,6 +18891,76 @@ mod manager_boundary_tests {
             manager.serialized_object_graph()[citizen_tag.len()..updated_end],
             expected_body
         );
+    }
+
+    #[test]
+    fn citizen_manager_units_replacement_resizes_goods_column_at_boundary() {
+        let mut body = Vec::new();
+        let mut remaining_citizens = 1_048_575;
+        while remaining_citizens > 0 {
+            let run = remaining_citizens.min(128);
+            body.push((0x7f + run) as u8);
+            remaining_citizens -= run;
+        }
+
+        let mut unit_flags = vec![63]; // first 64 literal unit flags
+        unit_flags.extend_from_slice(&1_u16.to_be_bytes());
+        unit_flags.extend_from_slice(&[0; 63 * 2]);
+        let mut remaining_units = 524_287 - 64;
+        while remaining_units > 0 {
+            let run = remaining_units.min(128);
+            unit_flags.push((0x7f + run) as u8);
+            remaining_units -= run;
+        }
+        body.extend_from_slice(&unit_flags);
+        body.push(0); // one active unit with no masked references
+        body.push(0x80); // one zero-valued goods entry
+
+        let mut remaining_instances = 32_767;
+        while remaining_instances > 0 {
+            let run = remaining_instances.min(128);
+            body.push((0x7f + run) as u8);
+            remaining_instances -= run;
+        }
+        body.extend_from_slice(&[0, 0]); // empty BuildingInfo name table
+        body.extend_from_slice(&[0x12, 0x34]);
+
+        let citizen_tag = profiler_tag("CitizenManager");
+        let transfer_tag = profiler_tag("TransferManager");
+        let mut graph = citizen_tag.clone();
+        graph.extend_from_slice(&body);
+        graph.extend_from_slice(&transfer_tag);
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 69;
+        let mut manager_objects = vec![None; 9];
+        manager_objects[7] = Some(ManagerObjectReference {
+            object_id: 7,
+            type_name: "CitizenManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[8] = Some(ManagerObjectReference {
+            object_id: 8,
+            type_name: "TransferManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (mut edited, original_end) = manager.decode_citizen_manager_data().unwrap();
+        assert_eq!(edited.units().active_units()[0].goods(), 0);
+        edited.set_unit_goods(0, 0x1234).unwrap();
+
+        let mut expected_body = body.clone();
+        let goods_start = 1_048_575_usize.div_ceil(128) + unit_flags.len() + 1;
+        expected_body.splice(goods_start..goods_start + 1, [0, 0x12, 0x34]);
+        assert_eq!(edited.encode(), expected_body);
+        assert_eq!(expected_body.len(), body.len() + 2);
+
+        manager
+            .replace_citizen_manager_units(&edited)
+            .expect("replace resized CitizenUnit section");
+        let (updated, updated_end) = manager.decode_citizen_manager_data().unwrap();
+        assert_eq!(updated.units().active_units()[0].goods(), 0x1234);
+        assert_eq!(updated_end, original_end + 2);
+        assert_eq!(updated.encode(), expected_body);
+        assert!(manager.serialized_object_graph()[updated_end..].starts_with(&transfer_tag));
     }
 
     #[test]

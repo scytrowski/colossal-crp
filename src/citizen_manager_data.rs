@@ -524,7 +524,7 @@ fn shift_manager_offset(
     if value < old_prefix_len {
         return Err(invalid(
             value,
-            format!("{name} precedes the citizen prefix"),
+            format!("{name} precedes the replaced manager section"),
         ));
     }
     shift_offset(value, old_prefix_len, new_prefix_len, old_prefix_len, name)
@@ -552,6 +552,100 @@ fn shift_optional_manager_offset(
 ) -> Result<(), CrpError> {
     if let Some(offset) = value {
         *offset = shift_manager_offset(*offset, old_prefix_len, new_prefix_len, name)?;
+    }
+    Ok(())
+}
+
+fn shift_active_instance_offsets(
+    records: &mut [CitizenInstanceRecord],
+    old_boundary: usize,
+    new_boundary: usize,
+) -> Result<(), CrpError> {
+    for record in records {
+        record.original_record_start = shift_manager_offset(
+            record.original_record_start,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance record start",
+        )?;
+        record.original_record_end = shift_manager_offset(
+            record.original_record_end,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance record end",
+        )?;
+        record.citizen_offset = shift_manager_offset(
+            record.citizen_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance citizen offset",
+        )?;
+        record.target_building_offset = shift_manager_offset(
+            record.target_building_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance target-building offset",
+        )?;
+        record.position_offset = shift_manager_offset(
+            record.position_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance position offset",
+        )?;
+        shift_optional_manager_offset(
+            &mut record.path_fields_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance path fields",
+        )?;
+        shift_optional_manager_offset(
+            &mut record.wait_counter_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance wait counter",
+        )?;
+        shift_optional_manager_offset(
+            &mut record.target_seed_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance target seed",
+        )?;
+        shift_optional_manager_offset(
+            &mut record.performance_indices_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance performance indices",
+        )?;
+        shift_optional_manager_offset(
+            &mut record.source_building_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance source-building offset",
+        )?;
+        shift_optional_manager_offset(
+            &mut record.velocity_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance velocity offset",
+        )?;
+        shift_optional_manager_offset(
+            &mut record.target_position_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance target-position offset",
+        )?;
+        shift_optional_manager_offset(
+            &mut record.target_direction_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance target-direction offset",
+        )?;
+        shift_optional_manager_offset(
+            &mut record.color_rgb_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance RGB offset",
+        )?;
     }
     Ok(())
 }
@@ -631,12 +725,14 @@ impl CitizenUnitRecord {
 /// map corpus contains no active units; nonzero records have synthetic
 /// expected-byte tests only. Pre-69 reference selection from the flag bits is
 /// not exposed by this reader. Existing references selected by the mask can
-/// be edited without changing the mask, goods column, or record widths.
+/// be edited without changing the mask, goods column, or record widths. The
+/// sparse goods values can also be edited by re-encoding only their column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CitizenUnitDataPrefix {
     format_version: u32,
     unit_flags: Vec<u16>,
     active_units: Vec<CitizenUnitRecord>,
+    goods_range: Range<usize>,
     serialized_prefix: Vec<u8>,
 }
 
@@ -706,7 +802,9 @@ impl CitizenUnitDataPrefix {
             });
         }
 
+        let goods_start = reader.offset();
         let goods = read_encoded_ushort_array(&mut reader, active_units.len())?;
+        let goods_range = goods_start..reader.offset();
         for (unit, goods) in active_units.iter_mut().zip(goods) {
             unit.goods = goods;
         }
@@ -717,6 +815,7 @@ impl CitizenUnitDataPrefix {
                 format_version,
                 unit_flags,
                 active_units,
+                goods_range,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -788,6 +887,55 @@ impl CitizenUnitDataPrefix {
             "CitizenUnit next-unit reference exceeds 24-bit storage",
         )?;
         self.active_units[unit_index].next_unit = Some(next_unit);
+        Ok(())
+    }
+
+    /// Replaces one active unit's goods value.
+    ///
+    /// `unit_index` is zero-based among active units in ascending unit-slot
+    /// order. The goods column is re-encoded and can change this prefix's
+    /// length; unit flags, reference masks, and reference bytes are retained.
+    pub fn set_goods(&mut self, unit_index: usize, goods: u16) -> Result<(), CrpError> {
+        if unit_index >= self.active_units.len() {
+            return Err(invalid(0, "CitizenUnit record index is out of range"));
+        }
+        let mut values: Vec<u16> = self.active_units.iter().map(|unit| unit.goods).collect();
+        values[unit_index] = goods;
+
+        let range = self.goods_range.clone();
+        if range.start > range.end || range.end > self.serialized_prefix.len() {
+            return Err(invalid(
+                range.start,
+                "CitizenUnit goods byte range is invalid",
+            ));
+        }
+        let mut encoded = Vec::new();
+        write_encoded_ushort_array(&mut encoded, &values);
+        let retained_len = self
+            .serialized_prefix
+            .len()
+            .checked_sub(range.end - range.start)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "CitizenUnit goods replacement",
+            ))?;
+        let new_len =
+            retained_len
+                .checked_add(encoded.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenUnit goods replacement",
+                ))?;
+        let range_end = range
+            .start
+            .checked_add(encoded.len())
+            .ok_or(CrpError::ArithmeticOverflow("CitizenUnit goods column end"))?;
+        let mut replacement = Vec::with_capacity(new_len);
+        replacement.extend_from_slice(&self.serialized_prefix[..range.start]);
+        replacement.extend_from_slice(&encoded);
+        replacement.extend_from_slice(&self.serialized_prefix[range.end..]);
+
+        self.serialized_prefix = replacement;
+        self.goods_range = range.start..range_end;
+        self.active_units[unit_index].goods = goods;
         Ok(())
     }
 
@@ -1109,10 +1257,11 @@ const FULLY_EDUCATED_RESIDENTS_VERSION: u32 = 179;
 ///
 /// Citizen flags and sparse columns, version 69+ unit records, and the
 /// versioned instance flags/prefab scope and active records are decoded.
-/// Sparse citizen columns, existing masked unit references, and known active-
-/// instance fields can be edited. Resizing a citizen column shifts subsequent
-/// body offsets while retaining the remaining bytes. The full body, two-byte
-/// profiler reference, and counters are retained for rewriting.
+/// Sparse citizen columns, existing masked unit references and goods values,
+/// and known active-instance fields can be edited. Resizing a citizen or unit
+/// column shifts subsequent body offsets while retaining the remaining bytes.
+/// The full body, two-byte profiler reference, and counters are retained for
+/// rewriting.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CitizenManagerData {
     format_version: u32,
@@ -1521,92 +1670,7 @@ impl CitizenManagerData {
             "CitizenManager instance suffix",
         )?;
         let mut active_instances = self.active_instances.clone();
-        for record in &mut active_instances {
-            record.original_record_start = shift_manager_offset(
-                record.original_record_start,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance record start",
-            )?;
-            record.original_record_end = shift_manager_offset(
-                record.original_record_end,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance record end",
-            )?;
-            record.citizen_offset = shift_manager_offset(
-                record.citizen_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance citizen offset",
-            )?;
-            record.target_building_offset = shift_manager_offset(
-                record.target_building_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance target-building offset",
-            )?;
-            record.position_offset = shift_manager_offset(
-                record.position_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance position offset",
-            )?;
-            shift_optional_manager_offset(
-                &mut record.path_fields_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance path fields",
-            )?;
-            shift_optional_manager_offset(
-                &mut record.wait_counter_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance wait counter",
-            )?;
-            shift_optional_manager_offset(
-                &mut record.target_seed_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance target seed",
-            )?;
-            shift_optional_manager_offset(
-                &mut record.performance_indices_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance performance indices",
-            )?;
-            shift_optional_manager_offset(
-                &mut record.source_building_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance source-building offset",
-            )?;
-            shift_optional_manager_offset(
-                &mut record.velocity_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance velocity offset",
-            )?;
-            shift_optional_manager_offset(
-                &mut record.target_position_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance target-position offset",
-            )?;
-            shift_optional_manager_offset(
-                &mut record.target_direction_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance target-direction offset",
-            )?;
-            shift_optional_manager_offset(
-                &mut record.color_rgb_offset,
-                old_prefix_len,
-                new_prefix.len(),
-                "CitizenManager instance RGB offset",
-            )?;
-        }
+        shift_active_instance_offsets(&mut active_instances, old_prefix_len, new_prefix.len())?;
 
         self.citizen_prefix = prefix;
         self.original_body = new_body;
@@ -1729,6 +1793,97 @@ impl CitizenManagerData {
             next_unit,
             "CitizenUnit next-unit reference exceeds 24-bit storage",
         )
+    }
+
+    /// Replaces one active CitizenUnit goods value.
+    ///
+    /// `unit_index` is zero-based among active units. Re-encoding the goods
+    /// column can change the unit section length; following instance offsets
+    /// are adjusted while all other unit bytes are retained.
+    pub fn set_unit_goods(&mut self, unit_index: usize, goods: u16) -> Result<(), CrpError> {
+        let mut prefix = self.unit_prefix.clone();
+        prefix.set_goods(unit_index, goods)?;
+        self.replace_unit_prefix(prefix)
+    }
+
+    fn replace_unit_prefix(&mut self, prefix: CitizenUnitDataPrefix) -> Result<(), CrpError> {
+        if prefix.format_version != self.format_version
+            || prefix.unit_flags != self.unit_prefix.unit_flags
+            || prefix.active_units.len() != self.unit_prefix.active_units.len()
+            || !prefix
+                .active_units
+                .iter()
+                .zip(&self.unit_prefix.active_units)
+                .all(|(edited, current)| {
+                    edited.index == current.index
+                        && edited.flags == current.flags
+                        && edited.reference_mask == current.reference_mask
+                })
+        {
+            return Err(invalid(
+                0,
+                "edited CitizenManager unit layout does not match this body",
+            ));
+        }
+        let old_range = self.unit_fields.clone();
+        let old_bytes = self
+            .original_body
+            .get(old_range.clone())
+            .ok_or_else(|| invalid(old_range.start, "CitizenManager unit range is invalid"))?;
+        if old_bytes != self.unit_prefix.serialized_prefix {
+            return Err(invalid(
+                old_range.start,
+                "CitizenManager body does not match its retained unit section",
+            ));
+        }
+        let new_bytes = prefix.encode();
+        let new_end =
+            old_range
+                .start
+                .checked_add(new_bytes.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager unit section end",
+                ))?;
+        let retained_len = self
+            .original_body
+            .len()
+            .checked_sub(old_range.end - old_range.start)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "CitizenManager resized body length",
+            ))?;
+        let new_body_len =
+            retained_len
+                .checked_add(new_bytes.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager resized body length",
+                ))?;
+        let mut new_body = Vec::with_capacity(new_body_len);
+        new_body.extend_from_slice(&self.original_body[..old_range.start]);
+        new_body.extend_from_slice(&new_bytes);
+        new_body.extend_from_slice(&self.original_body[old_range.end..]);
+
+        let instance_fields = shift_manager_range(
+            &self.instance_fields,
+            old_range.end,
+            new_end,
+            "CitizenManager instance fields",
+        )?;
+        let instance_field_suffix = shift_manager_range(
+            &self.instance_field_suffix,
+            old_range.end,
+            new_end,
+            "CitizenManager instance suffix",
+        )?;
+        let mut active_instances = self.active_instances.clone();
+        shift_active_instance_offsets(&mut active_instances, old_range.end, new_end)?;
+
+        self.unit_prefix = prefix;
+        self.original_body = new_body;
+        self.unit_fields = old_range.start..new_end;
+        self.instance_fields = instance_fields;
+        self.instance_field_suffix = instance_field_suffix;
+        self.active_instances = active_instances;
+        Ok(())
     }
 
     /// Replaces one active instance's serialized position without changing
@@ -2641,7 +2796,7 @@ mod tests {
         body.extend_from_slice(&ushort_array(&unit_flags));
         append_zero_ushort_array(&mut body, 524_287 - 64);
         body.extend_from_slice(&[1, 0x12, 0x34, 0x56]); // one masked citizen reference
-        body.extend_from_slice(&ushort_array(&[0x7777])); // one unit goods value
+        body.push(0x80); // one zero-valued unit goods entry
 
         let old_citizen_flags_len = 1_048_575_usize.div_ceil(128);
         let old_unit_flags_len = 524_287_usize.div_ceil(128);
@@ -2657,7 +2812,7 @@ mod tests {
         assert_eq!(decoded.citizens().health().unwrap().len(), 64);
         assert_eq!(decoded.units().active_units().len(), 1);
         assert_eq!(decoded.active_instances().len(), 1);
-        assert_eq!(decoded.units().active_units()[0].goods(), 0x7777);
+        assert_eq!(decoded.units().active_units()[0].goods(), 0);
 
         decoded
             .set_citizen_health(0, 0x21)
@@ -2665,6 +2820,9 @@ mod tests {
         decoded
             .set_citizen_wellbeing(63, 0x32)
             .expect("resize wellbeing column");
+        decoded
+            .set_unit_goods(0, 0x7777)
+            .expect("resize unit goods column");
         decoded
             .set_unit_citizen_reference(0, 0, 0x00ab_cdef)
             .expect("write shifted unit reference");
@@ -2799,6 +2957,39 @@ mod tests {
         assert!(edited.set_next_unit_reference(1, 9).is_err());
         assert!(edited.set_next_unit_reference(0, 0x0100_0000).is_err());
         assert_eq!(edited.encode(), expected);
+    }
+
+    #[test]
+    fn edits_goods_column_and_preserves_unit_flags_and_masks() {
+        let mut original = ushort_array(&[1, 1]);
+        original.extend_from_slice(&[1, 0, 0, 0, 0]); // literal zeros reset the UShort delta
+        append_zero_ushort_array(&mut original, 524_287 - 4);
+        original.extend_from_slice(&[0, 0]); // two active units with empty masks
+        original.push(0x81); // two repeated zero goods values
+
+        let (mut decoded, consumed) =
+            CitizenUnitDataPrefix::decode_prefix(69, &original).expect("valid unit prefix");
+        assert_eq!(consumed, original.len());
+        assert_eq!(decoded.active_units().len(), 2);
+        assert_eq!(decoded.active_units()[0].goods(), 0);
+        assert_eq!(decoded.active_units()[1].goods(), 0);
+
+        decoded.set_goods(0, 1).expect("edit first goods value");
+        let mut expected = ushort_array(&[1, 1]);
+        expected.extend_from_slice(&[1, 0, 0, 0, 0]);
+        append_zero_ushort_array(&mut expected, 524_287 - 4);
+        expected.extend_from_slice(&[0, 0]);
+        expected.extend_from_slice(&[1, 0, 1, 0, 0]); // literal UShort values [1, 0]
+        assert_eq!(decoded.active_units()[0].goods(), 1);
+        assert_eq!(decoded.active_units()[1].goods(), 0);
+        assert_eq!(decoded.encode(), expected);
+        assert_eq!(decoded.encode().len(), original.len() + 4);
+
+        let unchanged = decoded.encode();
+        assert!(decoded.set_goods(2, 7).is_err());
+        assert_eq!(decoded.encode(), unchanged);
+        assert_eq!(decoded.active_units()[0].reference_mask(), 0);
+        assert_eq!(decoded.active_units()[1].reference_mask(), 0);
     }
 
     #[test]
