@@ -14615,6 +14615,7 @@ mod manager_boundary_tests {
         assert_eq!(
             editor.race_event_data(),
             [Some(crate::EventManagerRaceEventData {
+                racers: Vec::new(),
                 schedule_id: 0x090a_0b0c,
                 lap_count: 0x0d0e_0f10,
                 state: 0x1112_1314,

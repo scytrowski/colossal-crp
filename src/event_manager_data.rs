@@ -65,13 +65,16 @@ pub struct EventManagerEventRecord {
     pub custom_seed: Option<u64>,
 }
 
-/// Known fixed-width values decoded from an active nested `RaceEventData` block.
+/// Known values decoded from an active nested `RaceEventData` block.
 ///
-/// Only these scalar fields are editable. Racer collections, track points,
-/// teams, spline bytes, and other nested values remain preserved as raw source
-/// bytes. The fields are available for EventManager inner versions 120004–121030.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Fixed-width scalar fields and racer values are editable. Track points, teams,
+/// spline bytes, and other nested values remain preserved as raw source bytes.
+/// The fields are available for EventManager inner versions 120004–121030.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerRaceEventData {
+    /// Existing racers in serialized order. The count and optional-reference
+    /// presence are fixed; changing racer names is rejected by the editor.
+    pub racers: Vec<EventManagerRaceRacer>,
     /// Schedule identifier.
     pub schedule_id: i32,
     /// Number of race laps.
@@ -86,6 +89,38 @@ pub struct EventManagerRaceEventData {
     pub event_end_frame: u32,
     /// Frames remaining until the next overtake.
     pub frames_to_next_overtake: i32,
+}
+
+/// Known values from one racer entry in `RaceEventData`.
+///
+/// All fixed-width values and performer IDs can be edited while keeping the
+/// existing counts. `name` is decoded for inspection but must remain unchanged
+/// so its original string encoding can be preserved exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventManagerRaceRacer {
+    /// Racer identifier.
+    pub racer_id: u16,
+    /// Raw racer-type value.
+    pub racer_type: u16,
+    /// Frame when this racer spawns.
+    pub spawn_frame: u32,
+    /// Parade-float identifier.
+    pub parade_float: u16,
+    /// Existing performer identifiers in serialized order.
+    pub performer_ids: Vec<u16>,
+    /// First path choice.
+    pub first_path: u16,
+    /// Second path choice.
+    pub second_path: u16,
+    /// Original DataSerializer bool byte for the paths-assigned flag.
+    /// Only `1` is interpreted as true; other byte values are preserved raw.
+    pub paths_assigned_raw: u8,
+    /// Optional race-team reference index.
+    pub race_team_index: Option<u16>,
+    /// Decoded racer name, retained with its original string encoding.
+    pub name: Option<String>,
+    /// Optional parade-group reference index.
+    pub parade_group_index: Option<u16>,
 }
 
 /// One versioned popularity and ticket-price override for an event type.
@@ -436,6 +471,7 @@ struct EventPrefabScope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EventManagerRaceEventDataFieldRanges {
+    racers: Vec<EventManagerRaceRacerFieldRanges>,
     schedule_id: Range<usize>,
     lap_count: Range<usize>,
     state: Range<usize>,
@@ -443,6 +479,20 @@ struct EventManagerRaceEventDataFieldRanges {
     race_marshal_id: Range<usize>,
     event_end_frame: Range<usize>,
     frames_to_next_overtake: Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventManagerRaceRacerFieldRanges {
+    racer_id: Range<usize>,
+    racer_type: Range<usize>,
+    spawn_frame: Range<usize>,
+    parade_float: Range<usize>,
+    performer_ids: Vec<Range<usize>>,
+    first_path: Range<usize>,
+    second_path: Range<usize>,
+    paths_assigned_raw: Range<usize>,
+    race_team_index: Option<Range<usize>>,
+    parade_group_index: Option<Range<usize>>,
 }
 
 impl EventManagerReferenceData {
@@ -806,6 +856,140 @@ impl EventManagerEventRecordsEditor {
         {
             match (edited, race_range, field_ranges) {
                 (Some(data), Some(_), Some(ranges)) => {
+                    let original_data = self
+                        .original
+                        .active_event_race_data
+                        .get(record_index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            invalid_event_record(
+                                ranges.schedule_id.start,
+                                "race-event decoded values are missing from the source layout",
+                            )
+                        })?;
+                    if data.racers.len() != ranges.racers.len()
+                        || data.racers.len() != original_data.racers.len()
+                    {
+                        return Err(invalid_event_record(
+                            ranges.schedule_id.start,
+                            "race-event racer count cannot change in this editor",
+                        ));
+                    }
+                    for (racer_index, ((racer, original_racer), racer_ranges)) in data
+                        .racers
+                        .iter()
+                        .zip(&original_data.racers)
+                        .zip(&ranges.racers)
+                        .enumerate()
+                    {
+                        if racer.performer_ids.len() != racer_ranges.performer_ids.len()
+                            || racer.performer_ids.len() != original_racer.performer_ids.len()
+                        {
+                            return Err(invalid_event_record(
+                                racer_ranges.racer_id.start,
+                                format!(
+                                    "race-event racer {racer_index} performer count cannot change"
+                                ),
+                            ));
+                        }
+                        if racer.name != original_racer.name {
+                            return Err(invalid_event_record(
+                                racer_ranges.racer_id.start,
+                                format!(
+                                    "race-event racer {racer_index} name cannot change in this editor"
+                                ),
+                            ));
+                        }
+                        patch_race_event_field(
+                            &mut output,
+                            &racer_ranges.racer_id,
+                            &racer.racer_id.to_be_bytes(),
+                            "racer ID",
+                        )?;
+                        patch_race_event_field(
+                            &mut output,
+                            &racer_ranges.racer_type,
+                            &racer.racer_type.to_be_bytes(),
+                            "racer type",
+                        )?;
+                        patch_race_event_field(
+                            &mut output,
+                            &racer_ranges.spawn_frame,
+                            &racer.spawn_frame.to_be_bytes(),
+                            "racer spawn frame",
+                        )?;
+                        patch_race_event_field(
+                            &mut output,
+                            &racer_ranges.parade_float,
+                            &racer.parade_float.to_be_bytes(),
+                            "racer parade float",
+                        )?;
+                        for (performer_id, performer_range) in
+                            racer.performer_ids.iter().zip(&racer_ranges.performer_ids)
+                        {
+                            patch_race_event_field(
+                                &mut output,
+                                performer_range,
+                                &performer_id.to_be_bytes(),
+                                "performer ID",
+                            )?;
+                        }
+                        patch_race_event_field(
+                            &mut output,
+                            &racer_ranges.first_path,
+                            &racer.first_path.to_be_bytes(),
+                            "racer first path",
+                        )?;
+                        patch_race_event_field(
+                            &mut output,
+                            &racer_ranges.second_path,
+                            &racer.second_path.to_be_bytes(),
+                            "racer second path",
+                        )?;
+                        patch_race_event_field(
+                            &mut output,
+                            &racer_ranges.paths_assigned_raw,
+                            &[racer.paths_assigned_raw],
+                            "racer paths-assigned flag",
+                        )?;
+                        match (racer.race_team_index, racer_ranges.race_team_index.as_ref()) {
+                            (Some(index), Some(range)) => patch_race_event_field(
+                                &mut output,
+                                range,
+                                &index.to_be_bytes(),
+                                "racer race-team index",
+                            )?,
+                            (None, None) => {}
+                            _ => {
+                                return Err(invalid_event_record(
+                                    racer_ranges.racer_id.start,
+                                    format!(
+                                        "race-event racer {racer_index} race-team reference presence cannot change"
+                                    ),
+                                ));
+                            }
+                        }
+                        match (
+                            racer.parade_group_index,
+                            racer_ranges.parade_group_index.as_ref(),
+                        ) {
+                            (Some(index), Some(range)) => patch_race_event_field(
+                                &mut output,
+                                range,
+                                &index.to_be_bytes(),
+                                "racer parade-group index",
+                            )?,
+                            (None, None) => {}
+                            _ => {
+                                return Err(invalid_event_record(
+                                    racer_ranges.racer_id.start,
+                                    format!(
+                                        "race-event racer {racer_index} parade-group reference presence cannot change"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                     patch_race_event_field(
                         &mut output,
                         &ranges.schedule_id,
@@ -1873,25 +2057,84 @@ fn skip_race_event_data(
     let racer_count = read_race_event_count(reader, "racer", 20)?;
     let mut race_team_reference_count = 0;
     let mut parade_group_reference_count = 0;
+    let mut racers = Vec::with_capacity(racer_count);
+    let mut racer_field_ranges = Vec::with_capacity(racer_count);
     for _ in 0..racer_count {
-        reader.read_u16_be()?; // Racer ID.
-        reader.read_u16_be()?; // Racer type.
-        reader.read_u32_be()?; // Spawn frame.
-        reader.read_u16_be()?; // Parade float.
+        let racer_id_start = reader.offset();
+        let racer_id = reader.read_u16_be()?;
+        let racer_id_range = racer_id_start..reader.offset();
+        let racer_type_start = reader.offset();
+        let racer_type = reader.read_u16_be()?;
+        let racer_type_range = racer_type_start..reader.offset();
+        let spawn_frame_start = reader.offset();
+        let spawn_frame = reader.read_u32_be()?;
+        let spawn_frame_range = spawn_frame_start..reader.offset();
+        let parade_float_start = reader.offset();
+        let parade_float = reader.read_u16_be()?;
+        let parade_float_range = parade_float_start..reader.offset();
         let performer_count = usize::from(reader.read_u16_be()?);
-        skip_race_event_values(reader, performer_count, 2, "performer")?;
-        reader.read_u16_be()?; // First path.
-        reader.read_u16_be()?; // Second path.
-        reader.read_u8()?; // Paths assigned.
-        if data_serializer_bool_is_true(reader.read_u8()?) {
-            reader.read_u16_be()?;
-            race_team_reference_count += 1;
+        let mut performer_ids = Vec::with_capacity(performer_count);
+        let mut performer_ranges = Vec::with_capacity(performer_count);
+        for _ in 0..performer_count {
+            let performer_start = reader.offset();
+            performer_ids.push(reader.read_u16_be()?);
+            performer_ranges.push(performer_start..reader.offset());
         }
-        reader.read_unique_string()?;
-        if data_serializer_bool_is_true(reader.read_u8()?) {
-            reader.read_u16_be()?;
-            parade_group_reference_count += 1;
-        }
+        let first_path_start = reader.offset();
+        let first_path = reader.read_u16_be()?;
+        let first_path_range = first_path_start..reader.offset();
+        let second_path_start = reader.offset();
+        let second_path = reader.read_u16_be()?;
+        let second_path_range = second_path_start..reader.offset();
+        let paths_assigned_start = reader.offset();
+        let paths_assigned_raw = reader.read_u8()?;
+        let paths_assigned_range = paths_assigned_start..reader.offset();
+        let race_team_presence = reader.read_u8()?;
+        let (race_team_index, race_team_index_range) =
+            if data_serializer_bool_is_true(race_team_presence) {
+                let index_start = reader.offset();
+                let index = reader.read_u16_be()?;
+                race_team_reference_count += 1;
+                (Some(index), Some(index_start..reader.offset()))
+            } else {
+                (None, None)
+            };
+        let name = reader.read_unique_string()?;
+        let parade_group_presence = reader.read_u8()?;
+        let (parade_group_index, parade_group_index_range) =
+            if data_serializer_bool_is_true(parade_group_presence) {
+                let index_start = reader.offset();
+                let index = reader.read_u16_be()?;
+                parade_group_reference_count += 1;
+                (Some(index), Some(index_start..reader.offset()))
+            } else {
+                (None, None)
+            };
+        racers.push(EventManagerRaceRacer {
+            racer_id,
+            racer_type,
+            spawn_frame,
+            parade_float,
+            performer_ids,
+            first_path,
+            second_path,
+            paths_assigned_raw,
+            race_team_index,
+            name,
+            parade_group_index,
+        });
+        racer_field_ranges.push(EventManagerRaceRacerFieldRanges {
+            racer_id: racer_id_range,
+            racer_type: racer_type_range,
+            spawn_frame: spawn_frame_range,
+            parade_float: parade_float_range,
+            performer_ids: performer_ranges,
+            first_path: first_path_range,
+            second_path: second_path_range,
+            paths_assigned_raw: paths_assigned_range,
+            race_team_index: race_team_index_range,
+            parade_group_index: parade_group_index_range,
+        });
     }
 
     skip_event_prefab_scope(reader, race_team_reference_count)?;
@@ -1943,6 +2186,7 @@ fn skip_race_event_data(
     }
     Ok((
         EventManagerRaceEventData {
+            racers,
             schedule_id,
             lap_count,
             state,
@@ -1952,6 +2196,7 @@ fn skip_race_event_data(
             frames_to_next_overtake,
         },
         EventManagerRaceEventDataFieldRanges {
+            racers: racer_field_ranges,
             schedule_id: schedule_id_range,
             lap_count: lap_count_range,
             state: state_range,
@@ -3902,6 +4147,7 @@ mod tests {
         assert_eq!(
             decoded.active_event_race_data[0],
             Some(EventManagerRaceEventData {
+                racers: Vec::new(),
                 schedule_id: 0x090a_0b0c,
                 lap_count: 0x0d0e_0f10,
                 state: 0x1112_1314,
@@ -3971,6 +4217,7 @@ mod tests {
         );
         let mut invalid_editor = decoded_noncanonical.into_event_records_editor();
         invalid_editor.race_event_data_mut()[0] = Some(EventManagerRaceEventData {
+            racers: Vec::new(),
             schedule_id: 1,
             lap_count: 1,
             state: 1,
@@ -4009,6 +4256,19 @@ mod tests {
         assert_eq!(
             decoded_racer.active_event_race_data[0],
             Some(EventManagerRaceEventData {
+                racers: vec![super::EventManagerRaceRacer {
+                    racer_id: 1,
+                    racer_type: 2,
+                    spawn_frame: 3,
+                    parade_float: 4,
+                    performer_ids: vec![5],
+                    first_path: 6,
+                    second_path: 7,
+                    paths_assigned_raw: 1,
+                    race_team_index: Some(8),
+                    name: None,
+                    parade_group_index: Some(9),
+                }],
                 schedule_id: 0x1112_1314,
                 lap_count: 0x1516_1718,
                 state: 0x1920_2122,
@@ -4033,17 +4293,38 @@ mod tests {
         );
 
         let mut editor = decoded_racer.clone().into_event_records_editor();
-        editor.race_event_data_mut()[0] = Some(EventManagerRaceEventData {
-            schedule_id: -101,
-            lap_count: 202,
-            state: -303,
-            frames_in_state: 404,
-            race_marshal_id: 0xabcd,
-            event_end_frame: 0xdead_beef,
-            frames_to_next_overtake: -505,
-        });
+        let data = editor.race_event_data_mut()[0]
+            .as_mut()
+            .expect("race-event data is present");
+        data.racers[0].racer_id = 0xabcd;
+        data.racers[0].racer_type = 0x1234;
+        data.racers[0].spawn_frame = 0xcafe_babe;
+        data.racers[0].parade_float = 0x2345;
+        data.racers[0].performer_ids[0] = 0x6789;
+        data.racers[0].first_path = 0x4567;
+        data.racers[0].second_path = 0x89ab;
+        data.racers[0].paths_assigned_raw = 2;
+        data.racers[0].race_team_index = Some(0xbeef);
+        data.racers[0].parade_group_index = Some(0xcafe);
+        data.schedule_id = -101;
+        data.lap_count = 202;
+        data.state = -303;
+        data.frames_in_state = 404;
+        data.race_marshal_id = 0xabcd;
+        data.event_end_frame = 0xdead_beef;
+        data.frames_to_next_overtake = -505;
         let mut expected = one_racer_bytes.clone();
         for (offset, value) in [
+            (4, 0xabcd_u16.to_be_bytes().to_vec()),
+            (6, 0x1234_u16.to_be_bytes().to_vec()),
+            (8, 0xcafe_babe_u32.to_be_bytes().to_vec()),
+            (12, 0x2345_u16.to_be_bytes().to_vec()),
+            (16, 0x6789_u16.to_be_bytes().to_vec()),
+            (18, 0x4567_u16.to_be_bytes().to_vec()),
+            (20, 0x89ab_u16.to_be_bytes().to_vec()),
+            (22, vec![2]),
+            (24, 0xbeef_u16.to_be_bytes().to_vec()),
+            (28, 0xcafe_u16.to_be_bytes().to_vec()),
             (72, (-101_i32).to_be_bytes().to_vec()),
             (76, 202_i32.to_be_bytes().to_vec()),
             (80, (-303_i32).to_be_bytes().to_vec()),
@@ -4060,6 +4341,39 @@ mod tests {
         let mut invalid_editor = decoded_racer.clone().into_event_records_editor();
         invalid_editor.race_event_data_mut()[0] = None;
         assert!(invalid_editor.encode().is_err());
+
+        let mut invalid_name_editor = decoded_racer.clone().into_event_records_editor();
+        invalid_name_editor.race_event_data_mut()[0]
+            .as_mut()
+            .unwrap()
+            .racers[0]
+            .name = Some("new name".to_owned());
+        assert!(invalid_name_editor.encode().is_err());
+
+        let mut invalid_reference_editor = decoded_racer.clone().into_event_records_editor();
+        invalid_reference_editor.race_event_data_mut()[0]
+            .as_mut()
+            .unwrap()
+            .racers[0]
+            .race_team_index = None;
+        assert!(invalid_reference_editor.encode().is_err());
+
+        let mut invalid_count_editor = decoded_racer.clone().into_event_records_editor();
+        invalid_count_editor.race_event_data_mut()[0]
+            .as_mut()
+            .unwrap()
+            .racers[0]
+            .performer_ids
+            .clear();
+        assert!(invalid_count_editor.encode().is_err());
+
+        let mut invalid_racer_count_editor = decoded_racer.clone().into_event_records_editor();
+        invalid_racer_count_editor.race_event_data_mut()[0]
+            .as_mut()
+            .unwrap()
+            .racers
+            .clear();
+        assert!(invalid_racer_count_editor.encode().is_err());
         assert_eq!(
             decoded_racer.into_event_records_editor().encode().unwrap(),
             one_racer_bytes
