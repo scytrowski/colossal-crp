@@ -45,6 +45,37 @@ pub(crate) fn write_encoded_byte_array(output: &mut Vec<u8>, values: &[u8]) {
     }
 }
 
+/// Writes unsigned byte values with the repeat-delta controls accepted by
+/// `EncodedArray.Byte.Read`.
+pub(crate) fn write_encoded_byte_array_runs(output: &mut Vec<u8>, values: &[u8]) {
+    let mut previous_value = 0_u8;
+    let mut previous_delta = 0_i8;
+    let mut index = 0;
+    while index < values.len() {
+        let mut repeated_value = previous_value;
+        let mut repeat_count = 0;
+        while repeat_count < 128 && index + repeat_count < values.len() {
+            repeated_value = repeated_value.wrapping_add(previous_delta as u8);
+            if values[index + repeat_count] != repeated_value {
+                break;
+            }
+            repeat_count += 1;
+        }
+        if repeat_count > 0 {
+            output.push(0x7f + repeat_count as u8);
+            previous_value = repeated_value;
+            index += repeat_count;
+        } else {
+            let value = values[index];
+            output.push(0);
+            output.push(value);
+            previous_delta = value.wrapping_sub(previous_value) as i8;
+            previous_value = value;
+            index += 1;
+        }
+    }
+}
+
 pub(crate) fn read_encoded_bool_array(
     reader: &mut Reader<'_>,
     count: usize,
@@ -481,8 +512,8 @@ mod tests {
         EncodedLongArrayReader, EncodedUIntArrayReader, read_encoded_bool_array,
         read_encoded_byte_array, read_encoded_float_array, read_encoded_long_array,
         read_encoded_uint_array, read_encoded_ulong_array, read_encoded_ushort_array,
-        skip_encoded_ushort_array, write_encoded_bool_array, write_encoded_float_array,
-        write_encoded_long_array, write_encoded_uint_array_runs,
+        skip_encoded_ushort_array, write_encoded_bool_array, write_encoded_byte_array_runs,
+        write_encoded_float_array, write_encoded_long_array, write_encoded_uint_array_runs,
     };
     use crate::data_serializer::Reader;
 
@@ -576,6 +607,32 @@ mod tests {
             values
         );
         assert_eq!(reader.offset(), bytes.len());
+    }
+
+    #[test]
+    fn byte_repeat_writer_emits_exact_delta_runs_and_keeps_zero_arrays_compact() {
+        let values = [0, 0, 3, 6, 9, 12, 12];
+        let mut bytes = Vec::new();
+        write_encoded_byte_array_runs(&mut bytes, &values);
+        assert_eq!(bytes, [0x81, 0, 3, 0x82, 0, 12]);
+
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            read_encoded_byte_array(&mut reader, values.len()).unwrap(),
+            values
+        );
+        assert_eq!(reader.offset(), bytes.len());
+
+        let zeros = vec![0; 16_383];
+        let mut zero_bytes = Vec::new();
+        write_encoded_byte_array_runs(&mut zero_bytes, &zeros);
+        assert_eq!(zero_bytes.len(), 128);
+        let mut reader = Reader::new(&zero_bytes);
+        assert_eq!(
+            read_encoded_byte_array(&mut reader, zeros.len()).unwrap(),
+            zeros
+        );
+        assert_eq!(reader.offset(), zero_bytes.len());
     }
 
     #[test]

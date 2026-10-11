@@ -5923,13 +5923,15 @@ impl SimulationManagerData {
         Ok((data, manager_end))
     }
 
-    /// Replaces the versioned citizen-column prefix at slot 7, allowing its
-    /// encoded columns and the complete manager body to change length.
+    /// Replaces citizen flag values and the versioned citizen-column prefix at
+    /// slot 7, allowing encoded fields and the complete manager body to change
+    /// length.
     ///
-    /// The edited value must come from this stream's inner version and have
-    /// unchanged citizen flags, legacy columns, and body bytes after the
-    /// prefix. The manager graph is resized at the validated TransferManager
-    /// boundary, preserving all following graph data.
+    /// Citizen flag edits must preserve every slot's zero/nonzero active
+    /// state. The edited value must come from this stream's inner version and
+    /// retain the legacy columns and body bytes after the prefix. The manager
+    /// graph is resized at the validated TransferManager boundary, preserving
+    /// all following graph data.
     pub fn replace_citizen_manager_prefix(
         &mut self,
         edited: &CitizenManagerData,
@@ -5944,7 +5946,9 @@ impl SimulationManagerData {
         expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
 
         let (current, manager_end) = self.decode_citizen_manager_data()?;
-        if edited.citizens().citizen_flags() != current.citizens().citizen_flags()
+        if !edited
+            .citizens()
+            .has_same_citizen_activity(current.citizens())
             || edited.citizens().legacy_columns() != current.citizens().legacy_columns()
         {
             return Err(invalid(
@@ -21210,10 +21214,20 @@ mod manager_boundary_tests {
         let (mut edited, original_end) = manager.decode_citizen_manager_data().unwrap();
         let original_prefix_len = edited.citizens().original_prefix().len();
         assert_eq!(edited.citizens().health(), Some([0; 64].as_slice()));
+        edited.set_citizen_flag_bits(0, 2).unwrap();
         edited.set_citizen_health(0, 0x21).unwrap();
         edited.set_citizen_wellbeing(63, 0x32).unwrap();
 
-        let mut expected_prefix = citizen_flags;
+        let mut expected_prefix = vec![
+            0, 0, 0, 0, 2, // first citizen flag literal
+            0, 0, 0, 0, 1, // second flag resets the delta
+            0, 0, 0, 0, 1,    // third flag resets the delta
+            0xbc, // repeat the remaining 61 active flags
+            0, 0, 0, 0, 0, // first inactive flag
+            0, 0, 0, 0, 0, // second inactive flag resets the delta
+        ];
+        expected_prefix.extend(std::iter::repeat_n(0xff, 8_191));
+        expected_prefix.push(0xbc); // repeat the final 61 zero flags
         expected_prefix.push(63);
         expected_prefix.push(0x21);
         expected_prefix.extend_from_slice(&[0; 63]);
@@ -21223,14 +21237,15 @@ mod manager_boundary_tests {
         let mut expected_body = expected_prefix;
         expected_body.extend_from_slice(&body[original_prefix_len..]);
         assert_eq!(edited.encode(), expected_body);
-        assert_eq!(expected_body.len(), body.len() + 128);
+        assert_eq!(expected_body.len(), body.len() - 112);
 
         manager
             .replace_citizen_manager_prefix(&edited)
             .expect("resize CitizenManager body");
         let (updated, updated_end) = manager.decode_citizen_manager_data().unwrap();
-        assert_eq!(updated_end, original_end + 128);
+        assert_eq!(updated_end, original_end - 112);
         assert_eq!(updated.encode(), expected_body);
+        assert_eq!(updated.citizens().citizen_flags()[0], 2);
         assert_eq!(updated.citizens().health().unwrap()[0], 0x21);
         assert_eq!(updated.citizens().wellbeing().unwrap()[63], 0x32);
         assert!(manager.serialized_object_graph()[updated_end..].starts_with(&transfer_tag));

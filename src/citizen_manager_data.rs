@@ -4,7 +4,8 @@ use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
     EncodedUIntArrayReader, read_encoded_byte_array, read_encoded_uint_array,
-    read_encoded_ushort_array, write_encoded_byte_array, write_encoded_ushort_array,
+    read_encoded_ushort_array, write_encoded_byte_array, write_encoded_byte_array_runs,
+    write_encoded_uint_array_runs, write_encoded_ushort_array,
 };
 
 const CITIZEN_FLAG_COUNT: usize = 1_048_575;
@@ -41,14 +42,15 @@ const CITIZEN_INSTANCE_COLOR_FLAG: u32 = 1 << 24;
 /// The prefix ends before the fixed-capacity citizen-unit and citizen-instance
 /// arrays. Those later fields remain in the serialized manager graph and are
 /// not decoded here. Unedited columns retain their exact source bytes; an
-/// edited sparse column is re-encoded and may change the prefix length. Reader
-/// gates come from `CitizenManager+Data.Deserialize` in the supplied
-/// Assembly-CSharp.dll; the local map corpus has no active citizens, so
-/// nonzero values have synthetic test coverage only.
+/// edited sparse column or flag array is re-encoded and may change the prefix
+/// length. Reader gates come from `CitizenManager+Data.Deserialize` in the
+/// supplied Assembly-CSharp.dll; the local map corpus has no active citizens,
+/// so nonzero values have synthetic test coverage only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CitizenManagerDataPrefix {
     format_version: u32,
     citizen_flags: Vec<u32>,
+    citizen_flags_range: Range<usize>,
     legacy_columns: Option<Vec<Vec<u8>>>,
     health: Option<Vec<u8>>,
     wellbeing: Option<Vec<u8>>,
@@ -83,6 +85,7 @@ impl CitizenManagerDataPrefix {
         bytes: &[u8],
     ) -> Result<(Self, usize), CrpError> {
         let mut reader = Reader::new(bytes);
+        let citizen_flags_start = reader.offset();
         let citizen_flags = if format_version < BYTE_CITIZEN_FLAGS_VERSION {
             read_encoded_byte_array(&mut reader, flag_count)?
                 .into_iter()
@@ -91,6 +94,7 @@ impl CitizenManagerDataPrefix {
         } else {
             EncodedUIntArrayReader::default().read_array(&mut reader, flag_count)?
         };
+        let citizen_flags_range = citizen_flags_start..reader.offset();
         let active_count = citizen_flags.iter().filter(|flags| **flags != 0).count();
         let mut column_ranges = Vec::new();
 
@@ -181,6 +185,7 @@ impl CitizenManagerDataPrefix {
             Self {
                 format_version,
                 citizen_flags,
+                citizen_flags_range,
                 legacy_columns,
                 health,
                 wellbeing,
@@ -212,6 +217,67 @@ impl CitizenManagerDataPrefix {
     /// index is the serialized array index minus one.
     pub fn citizen_flags(&self) -> &[u32] {
         &self.citizen_flags
+    }
+
+    /// Replaces raw flag bits for one citizen slot without changing its
+    /// zero/nonzero active state.
+    ///
+    /// The meanings of the bits are not fully mapped. Index zero represents
+    /// serialized citizen slot one. Before version 30, values must fit a byte.
+    /// Out-of-range indexes, activity-state changes, and pre-30 byte overflow
+    /// return errors without changing this prefix.
+    pub fn set_citizen_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        let current = *self
+            .citizen_flags
+            .get(index)
+            .ok_or_else(|| invalid(index, "CitizenManager citizen flag index is out of range"))?;
+        if (current == 0) != (value == 0) {
+            return Err(invalid(
+                index,
+                "CitizenManager flag edits must preserve the slot's active state",
+            ));
+        }
+        if self.format_version < BYTE_CITIZEN_FLAGS_VERSION && value > u8::MAX.into() {
+            return Err(invalid(
+                index,
+                "CitizenManager flag exceeds byte storage before inner version 30",
+            ));
+        }
+        if current == value {
+            return Ok(());
+        }
+
+        let mut flags = self.citizen_flags.clone();
+        flags[index] = value;
+        let mut encoded = Vec::new();
+        if self.format_version < BYTE_CITIZEN_FLAGS_VERSION {
+            let byte_flags: Vec<u8> = flags
+                .iter()
+                .map(|flag| {
+                    u8::try_from(*flag).map_err(|_| {
+                        invalid(
+                            index,
+                            "CitizenManager flag exceeds byte storage before inner version 30",
+                        )
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            write_encoded_byte_array_runs(&mut encoded, &byte_flags);
+        } else {
+            write_encoded_uint_array_runs(&mut encoded, &flags);
+        }
+        self.replace_citizen_flags_bytes(&encoded)?;
+        self.citizen_flags = flags;
+        Ok(())
+    }
+
+    pub(crate) fn has_same_citizen_activity(&self, other: &Self) -> bool {
+        self.citizen_flags.len() == other.citizen_flags.len()
+            && self
+                .citizen_flags
+                .iter()
+                .zip(&other.citizen_flags)
+                .all(|(left, right)| (*left == 0) == (*right == 0))
     }
 
     /// Returns one column before version 23 or four columns in versions 23–29.
@@ -412,6 +478,63 @@ impl CitizenManagerDataPrefix {
         let mut encoded = Vec::new();
         write_encoded_byte_array(&mut encoded, values);
         self.replace_encoded_column(column, &encoded, name)
+    }
+
+    fn replace_citizen_flags_bytes(&mut self, encoded: &[u8]) -> Result<(), CrpError> {
+        let range = self.citizen_flags_range.clone();
+        if range.start > range.end || range.end > self.serialized_prefix.len() {
+            return Err(invalid(
+                range.start,
+                "CitizenManager flag byte range is invalid",
+            ));
+        }
+        let old_flags_len = range.end - range.start;
+        let new_flags_end =
+            range
+                .start
+                .checked_add(encoded.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager flag array end",
+                ))?;
+        let retained_len = self
+            .serialized_prefix
+            .len()
+            .checked_sub(old_flags_len)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "CitizenManager flag replacement",
+            ))?;
+        let new_len =
+            retained_len
+                .checked_add(encoded.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager flag replacement",
+                ))?;
+        let mut replacement = Vec::with_capacity(new_len);
+        replacement.extend_from_slice(&self.serialized_prefix[..range.start]);
+        replacement.extend_from_slice(encoded);
+        replacement.extend_from_slice(&self.serialized_prefix[range.end..]);
+
+        let mut updated_ranges = self.column_ranges.clone();
+        for column_range in &mut updated_ranges {
+            column_range.start = shift_offset(
+                column_range.start,
+                old_flags_len,
+                encoded.len(),
+                range.end,
+                "CitizenManager flag columns",
+            )?;
+            column_range.end = shift_offset(
+                column_range.end,
+                old_flags_len,
+                encoded.len(),
+                range.end,
+                "CitizenManager flag columns",
+            )?;
+        }
+        self.serialized_prefix = replacement;
+        self.citizen_flags_range = range.start..new_flags_end;
+        self.column_ranges = updated_ranges;
+        Ok(())
     }
 
     fn replace_encoded_column(
@@ -1546,6 +1669,13 @@ impl CitizenManagerData {
         &self.citizen_prefix
     }
 
+    /// Replaces raw bits in one citizen flag while preserving that slot's
+    /// zero/nonzero active state. Returns an error for an invalid index,
+    /// activity-state change, or pre-30 value that exceeds byte storage.
+    pub fn set_citizen_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        self.edit_citizen_prefix(|prefix| prefix.set_citizen_flag_bits(index, value))
+    }
+
     /// Replaces one health value from version 65 onward.
     ///
     /// `sparse_index` is zero-based among citizens with nonzero flags, ordered
@@ -1618,7 +1748,7 @@ impl CitizenManagerData {
 
     fn replace_citizen_prefix(&mut self, prefix: CitizenManagerDataPrefix) -> Result<(), CrpError> {
         if prefix.format_version != self.format_version
-            || prefix.citizen_flags != self.citizen_prefix.citizen_flags
+            || !prefix.has_same_citizen_activity(&self.citizen_prefix)
             || prefix.legacy_columns != self.citizen_prefix.legacy_columns
         {
             return Err(invalid(
@@ -2670,6 +2800,55 @@ mod tests {
         assert_eq!(modern.citizen_flags(), [1, 0, 0]);
         assert_eq!(modern.legacy_columns(), None);
         assert_eq!(modern_consumed, v30.len());
+    }
+
+    #[test]
+    fn edits_citizen_flag_values_without_changing_sparse_activity() {
+        let mut byte_flags = byte_array(&[2, 1, 0]);
+        byte_flags.extend_from_slice(&byte_array(&[0x55, 0x66]));
+        let (mut legacy, _) =
+            CitizenManagerDataPrefix::decode_prefix_with_count(22, 3, &byte_flags)
+                .expect("legacy byte flags");
+        legacy.set_citizen_flag_bits(0, 3).unwrap();
+        assert!(legacy.set_citizen_flag_bits(0, 0).is_err());
+        assert!(legacy.set_citizen_flag_bits(0, 256).is_err());
+        assert!(legacy.set_citizen_flag_bits(3, 1).is_err());
+        let mut expected_byte_flags = vec![0, 3, 0, 1, 0, 0];
+        expected_byte_flags.extend_from_slice(&byte_array(&[0x55, 0x66]));
+        assert_eq!(legacy.citizen_flags(), [3, 1, 0]);
+        assert_eq!(legacy.legacy_columns(), Some([vec![0x55, 0x66]].as_slice()));
+        let encoded_byte_flags = legacy.encode();
+        assert_eq!(encoded_byte_flags, expected_byte_flags);
+        let (decoded_legacy, consumed) =
+            CitizenManagerDataPrefix::decode_prefix_with_count(22, 3, &encoded_byte_flags)
+                .expect("reencoded byte flags");
+        assert_eq!(consumed, encoded_byte_flags.len());
+        assert_eq!(decoded_legacy.citizen_flags(), [3, 1, 0]);
+        assert_eq!(
+            decoded_legacy.legacy_columns(),
+            Some([vec![0x55, 0x66]].as_slice())
+        );
+
+        let v30_flags = uint_array(&[1, 0, 2]);
+        let (mut modern, _) = CitizenManagerDataPrefix::decode_prefix_with_count(30, 3, &v30_flags)
+            .expect("UInt citizen flags");
+        modern.set_citizen_flag_bits(2, 3).unwrap();
+        assert!(modern.set_citizen_flag_bits(1, 4).is_err());
+        assert_eq!(modern.citizen_flags(), [1, 0, 3]);
+        let encoded_modern_flags = modern.encode();
+        assert_eq!(
+            encoded_modern_flags,
+            [
+                0, 0, 0, 0, 1, // first literal
+                0, 0, 0, 0, 0, // second literal
+                0, 0, 0, 0, 3, // third literal
+            ]
+        );
+        let (decoded_modern, consumed) =
+            CitizenManagerDataPrefix::decode_prefix_with_count(30, 3, &encoded_modern_flags)
+                .expect("reencoded UInt flags");
+        assert_eq!(consumed, encoded_modern_flags.len());
+        assert_eq!(decoded_modern.citizen_flags(), [1, 0, 3]);
     }
 
     #[test]
