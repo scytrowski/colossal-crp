@@ -148,11 +148,12 @@ impl TransportManagerMilestone {
     }
 }
 
-/// In-place editor for existing TransportManager milestone object references.
+/// Editor for existing TransportManager milestone prefab indexes and references.
 ///
 /// Only references encoded as an existing object ID can be redirected. The
 /// replacement must point to an earlier object of the same runtime type.
-/// Null and newly allocated references retain their original form.
+/// Null and newly allocated references retain their original form. Changing a
+/// prefab index may resize the encoded index scope and shift later body fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerMilestoneEditor {
     format_version: u32,
@@ -162,6 +163,8 @@ pub struct TransportManagerMilestoneEditor {
     header_ranges: Vec<Range<usize>>,
     available_object_counts: Vec<usize>,
     object_types: Vec<String>,
+    original_prefab_indices: Vec<u16>,
+    prefab_index_range: Range<usize>,
     original_body: Vec<u8>,
 }
 
@@ -174,6 +177,22 @@ impl TransportManagerMilestoneEditor {
     /// Returns milestones in their serialized order.
     pub fn milestones(&self) -> &[TransportManagerMilestone] {
         &self.milestones
+    }
+
+    /// Changes the prefab index of an existing milestone.
+    pub fn set_prefab_index(
+        &mut self,
+        milestone_index: usize,
+        prefab_index: u16,
+    ) -> Result<(), CrpError> {
+        let milestone = self.milestones.get_mut(milestone_index).ok_or_else(|| {
+            invalid(
+                milestone_index,
+                "TransportManager milestone index is out of bounds",
+            )
+        })?;
+        milestone.prefab_index = prefab_index;
+        Ok(())
     }
 
     /// Redirects a milestone reference to an earlier object of the same type.
@@ -234,13 +253,16 @@ impl TransportManagerMilestoneEditor {
         Ok(())
     }
 
-    /// Writes redirected references into the source body without changing its length.
+    /// Writes edited indexes and redirected references while preserving all other bytes.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let count = self.milestones.len();
         if self.format_version < 151
             || self.original_headers.len() != count
             || self.header_ranges.len() != count
             || self.available_object_counts.len() != count
+            || self.original_prefab_indices.len() < count
+            || self.prefab_index_range.start > self.prefab_index_range.end
+            || self.prefab_index_range.end > self.original_body.len()
         {
             return Err(invalid(
                 0,
@@ -248,6 +270,39 @@ impl TransportManagerMilestoneEditor {
             ));
         }
         let mut body = self.original_body.clone();
+        let mut prefab_indices = self.original_prefab_indices.clone();
+        let active_line_prefab_count = prefab_indices
+            .len()
+            .checked_sub(count)
+            .ok_or_else(|| invalid(0, "TransportManager milestone prefab count is invalid"))?;
+        for (index, milestone) in self.milestones.iter().enumerate() {
+            let prefab_index =
+                active_line_prefab_count
+                    .checked_add(index)
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "TransportManager milestone prefab index",
+                    ))?;
+            *prefab_indices.get_mut(prefab_index).ok_or_else(|| {
+                invalid(
+                    index,
+                    "TransportManager milestone prefab index is out of bounds",
+                )
+            })? = milestone.prefab_index;
+        }
+        let mut header_ranges = self.header_ranges.clone();
+        if prefab_indices != self.original_prefab_indices {
+            let mut encoded_prefab_indices = Vec::new();
+            write_encoded_ushort_array(&mut encoded_prefab_indices, &prefab_indices);
+            for range in &mut header_ranges {
+                *range = shift_range_after_replacement(
+                    range,
+                    &self.prefab_index_range,
+                    encoded_prefab_indices.len(),
+                    "TransportManager milestone header",
+                )?;
+            }
+            body.splice(self.prefab_index_range.clone(), encoded_prefab_indices);
+        }
         for (index, header) in self.original_headers.iter().enumerate() {
             let NetObjectHeader::Existing(_) = header else {
                 continue;
@@ -261,7 +316,7 @@ impl TransportManagerMilestoneEditor {
                     "existing TransportManager milestone reference became null",
                 )
             })?;
-            let range = self.header_ranges.get(index).ok_or_else(|| {
+            let range = header_ranges.get(index).ok_or_else(|| {
                 invalid(
                     index,
                     "TransportManager milestone header range was not captured",
@@ -2455,6 +2510,44 @@ fn shift_selection_range_for_insert(
             .ok_or(CrpError::ArithmeticOverflow(
                 "TransportManager selection range end after insertion",
             ))?)
+}
+
+fn shift_range_after_replacement(
+    range: &Range<usize>,
+    replaced_range: &Range<usize>,
+    replacement_length: usize,
+    description: &str,
+) -> Result<Range<usize>, CrpError> {
+    if range.end <= replaced_range.start {
+        return Ok(range.clone());
+    }
+    if range.start < replaced_range.end {
+        return Err(invalid(
+            range.start,
+            format!("{description} overlaps the replaced range"),
+        ));
+    }
+    if replacement_length >= replaced_range.len() {
+        let growth = replacement_length - replaced_range.len();
+        Ok(range
+            .start
+            .checked_add(growth)
+            .ok_or(CrpError::ArithmeticOverflow("replaced range start"))?
+            ..range
+                .end
+                .checked_add(growth)
+                .ok_or(CrpError::ArithmeticOverflow("replaced range end"))?)
+    } else {
+        let shrinkage = replaced_range.len() - replacement_length;
+        Ok(range
+            .start
+            .checked_sub(shrinkage)
+            .ok_or(CrpError::ArithmeticOverflow("replaced range start"))?
+            ..range
+                .end
+                .checked_sub(shrinkage)
+                .ok_or(CrpError::ArithmeticOverflow("replaced range end"))?)
+    }
 }
 
 fn shift_selection_ranges_for_insert(
@@ -10363,6 +10456,7 @@ impl SimulationManagerData {
         let fields = self.decode_transport_manager_reference_headers(&prefix.object_table, true)?;
         if fields.milestone_prefab_indices.len() != fields.milestone_object_ids.len()
             || fields.milestone_object_ids.len() != fields.milestone_object_headers.len()
+            || fields.all_prefab_indices.len() < fields.milestone_prefab_indices.len()
         {
             return Err(invalid(
                 TRANSPORT_MANAGER_SLOT,
@@ -10417,16 +10511,24 @@ impl SimulationManagerData {
             header_ranges: fields.milestone_header_ranges,
             available_object_counts: fields.milestone_available_object_counts,
             object_types: fields.milestone_object_types,
+            original_prefab_indices: fields.all_prefab_indices,
+            prefab_index_range: fields.prefab_index_range.ok_or_else(|| {
+                invalid(
+                    TRANSPORT_MANAGER_SLOT,
+                    "TransportManager prefab-index range was not captured",
+                )
+            })?,
             original_body,
         })
     }
 
-    /// Applies existing-object redirects to TransportManager milestone references.
+    /// Replaces existing TransportManager milestone prefab indexes and references.
     ///
     /// The editor must come from this manager's current bytes and version.
     /// Only existing IDs can change; each target must be available at that
     /// point in the object stream and retain the original runtime type. The
-    /// manager graph length and all other bytes remain unchanged.
+    /// prefab-index scope may resize the manager body; all other bytes remain
+    /// unchanged.
     pub fn replace_transport_manager_milestone_references(
         &mut self,
         edited: &TransportManagerMilestoneEditor,
@@ -10455,22 +10557,29 @@ impl SimulationManagerData {
             ));
         }
         let replacement = edited.encode()?;
-        if replacement.len() != current.len() {
-            return Err(invalid(
-                body_range.start,
-                "TransportManager milestone edits must preserve the bounded body length",
-            ));
-        }
         let mut candidate_graph = self.serialized_object_graph.clone();
-        candidate_graph[body_range.start..bounded_end].copy_from_slice(&replacement);
+        candidate_graph.splice(body_range.start..bounded_end, replacement.iter().copied());
         let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
         let validation = self
             .decode_transport_manager_milestone_editor(edited.save_app_version)
             .and_then(|decoded| {
-                if decoded.milestones != edited.milestones {
+                let expected_body_len = replacement
+                    .len()
+                    .checked_sub(LOADING_PROFILER_END_TAG_BYTES)
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "rewritten TransportManager body length",
+                    ))?;
+                let expected_body_end = body_range.start.checked_add(expected_body_len).ok_or(
+                    CrpError::ArithmeticOverflow("rewritten TransportManager body end"),
+                )?;
+                let (validated_body_range, _) = self.transport_manager_body_range()?;
+                if decoded.milestones != edited.milestones
+                    || validated_body_range.start != body_range.start
+                    || validated_body_range.end != expected_body_end
+                {
                     return Err(invalid(
                         body_range.start,
-                        "rewritten TransportManager milestones do not match the editor",
+                        "rewritten TransportManager milestones or boundary do not match the editor",
                     ));
                 }
                 Ok(())
@@ -14310,15 +14419,18 @@ fn decode_transport_manager_reference_body_with_milestones(
             .ok_or(CrpError::ArithmeticOverflow(
                 "TransportManager prefab index count",
             ))?;
-    let milestone_prefab_indices = if capture_milestones {
+    let (all_prefab_indices, milestone_prefab_indices, prefab_index_range) = if capture_milestones {
+        let start = reader.offset();
         let all_indices = read_encoded_ushort_array(&mut reader, prefab_index_count)?;
-        all_indices
+        let milestone_indices = all_indices
             .get(active_line_count..)
             .ok_or_else(|| reader.invalid("TransportManager milestone prefab range is invalid"))?
-            .to_vec()
+            .to_vec();
+        let end = reader.offset();
+        (all_indices, milestone_indices, Some(start..end))
     } else {
         skip_encoded_ushort_array(&mut reader, prefab_index_count)?;
-        Vec::new()
+        (Vec::new(), Vec::new(), None)
     };
 
     let prefab_name_count = usize::from(reader.read_u16_be()?);
@@ -14577,6 +14689,8 @@ fn decode_transport_manager_reference_body_with_milestones(
     Ok(TransportManagerReferenceFields {
         milestone_object_headers,
         milestone_prefab_indices,
+        all_prefab_indices,
+        prefab_index_range,
         milestone_header_ranges,
         milestone_object_ids,
         milestone_available_object_counts,
@@ -14603,6 +14717,8 @@ fn decode_transport_manager_reference_body_with_milestones(
 struct TransportManagerReferenceFields {
     milestone_object_headers: Vec<NetObjectHeader>,
     milestone_prefab_indices: Vec<u16>,
+    all_prefab_indices: Vec<u16>,
+    prefab_index_range: Option<Range<usize>>,
     milestone_header_ranges: Vec<Range<usize>>,
     milestone_object_ids: Vec<Option<u32>>,
     milestone_available_object_counts: Vec<usize>,
@@ -20685,8 +20801,11 @@ mod manager_boundary_tests {
             header_ranges: fields.milestone_header_ranges,
             available_object_counts: fields.milestone_available_object_counts,
             object_types: fields.milestone_object_types,
+            original_prefab_indices: fields.all_prefab_indices,
+            prefab_index_range: fields.prefab_index_range.unwrap(),
             original_body: bytes.clone(),
         };
+        assert_eq!(editor.encode().unwrap(), bytes);
         editor.set_reference_object_id(0, 2).unwrap();
         assert_eq!(editor.milestones()[0].prefab_index(), 8);
         assert_eq!(
@@ -20704,6 +20823,79 @@ mod manager_boundary_tests {
         assert!(editor.set_reference_object_id(0, 3).is_err());
         assert!(editor.set_reference_object_id(1, 2).is_err());
         assert_eq!(editor.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn transport_manager_milestone_prefab_edits_resize_index_scope_and_shift_references() {
+        let (bytes, _) = active_transport_manager_reference_body(112_004, 14, 4, 7);
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        table
+            .register(&NetObjectHeader::NewType(
+                "TransportLine+Data, Assembly-CSharp".to_owned(),
+            ))
+            .unwrap();
+        let fields = decode_transport_manager_reference_body_with_milestones(
+            112_004,
+            &bytes,
+            Some(&table),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(fields.all_prefab_indices, [7, 8, 9, 10, 11]);
+        assert_eq!(fields.milestone_prefab_indices, [8, 9, 10, 11]);
+        let original_prefab_range = fields.prefab_index_range.clone().unwrap();
+        assert_eq!(
+            &bytes[original_prefab_range.clone()],
+            &[4, 0, 7, 0, 8, 0, 9, 0, 10, 0, 11]
+        );
+
+        let milestones = fields
+            .milestone_prefab_indices
+            .iter()
+            .zip(&fields.milestone_object_ids)
+            .map(|(prefab_index, object_id)| TransportManagerMilestone {
+                prefab_index: *prefab_index,
+                reference: object_id.map(|object_id| ResolvedObjectReference {
+                    object_id,
+                    type_name: fields.milestone_object_types[object_id as usize].clone(),
+                }),
+            })
+            .collect();
+        let mut editor = TransportManagerMilestoneEditor {
+            format_version: 112_004,
+            save_app_version: None,
+            milestones,
+            original_headers: fields.milestone_object_headers,
+            header_ranges: fields.milestone_header_ranges,
+            available_object_counts: fields.milestone_available_object_counts,
+            object_types: fields.milestone_object_types,
+            original_prefab_indices: fields.all_prefab_indices,
+            prefab_index_range: original_prefab_range.clone(),
+            original_body: bytes.clone(),
+        };
+        assert_eq!(editor.encode().unwrap(), bytes);
+        for index in 0..4 {
+            editor.set_prefab_index(index, 7).unwrap();
+        }
+        assert!(editor.set_prefab_index(4, 7).is_err());
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded.len(), bytes.len() - 5);
+
+        let mut expected = bytes.clone();
+        expected.splice(original_prefab_range, [0x01, 0x00, 0x07, 0x00, 0x07, 0x82]);
+        assert_eq!(encoded, expected);
+        let decoded = decode_transport_manager_reference_body_with_milestones(
+            112_004,
+            &encoded,
+            Some(&table),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(decoded.all_prefab_indices, [7, 7, 7, 7, 7]);
+        assert_eq!(decoded.milestone_object_ids, [Some(1); 4]);
+        assert_eq!(decoded.object_headers, vec![NetObjectHeader::Null; 7]);
     }
 
     #[test]
