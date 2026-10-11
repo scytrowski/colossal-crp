@@ -82,8 +82,11 @@ pub struct WaterManagerData {
     conductivity_heating: Option<Vec<u8>>,
     heating_cells: Vec<usize>,
     water_pressure: Vec<i16>,
+    water_pressure_snapshot: EncodedArraySnapshot<i16>,
     sewage_pressure: Vec<i16>,
+    sewage_pressure_snapshot: EncodedArraySnapshot<i16>,
     heating_pressure: Option<Vec<i16>>,
+    heating_pressure_snapshot: Option<EncodedArraySnapshot<i16>>,
     water_pulse_group_indexes: Vec<u16>,
     sewage_pulse_group_indexes: Vec<u16>,
     heating_pulse_group_indexes: Option<Vec<u16>>,
@@ -189,12 +192,16 @@ impl WaterManagerData {
             .map(indexes_with_nonzero_values)
             .unwrap_or_default();
 
-        let water_pressure = read_signed_ushort_array(&mut reader, conductive_cells.len())?;
-        let sewage_pressure = read_signed_ushort_array(&mut reader, conductive_cells.len())?;
-        let heating_pressure = if format_version >= HEATING_VERSION {
-            Some(read_signed_ushort_array(&mut reader, heating_cells.len())?)
+        let (water_pressure, water_pressure_snapshot) =
+            read_captured_signed_ushort_array(&mut reader, conductive_cells.len())?;
+        let (sewage_pressure, sewage_pressure_snapshot) =
+            read_captured_signed_ushort_array(&mut reader, conductive_cells.len())?;
+        let (heating_pressure, heating_pressure_snapshot) = if format_version >= HEATING_VERSION {
+            let (values, snapshot) =
+                read_captured_signed_ushort_array(&mut reader, heating_cells.len())?;
+            (Some(values), Some(snapshot))
         } else {
-            None
+            (None, None)
         };
 
         let water_pulse_group_indexes =
@@ -430,8 +437,11 @@ impl WaterManagerData {
             conductivity_heating,
             heating_cells,
             water_pressure,
+            water_pressure_snapshot,
             sewage_pressure,
+            sewage_pressure_snapshot,
             heating_pressure,
+            heating_pressure_snapshot,
             water_pulse_group_indexes,
             sewage_pulse_group_indexes,
             heating_pulse_group_indexes,
@@ -557,14 +567,54 @@ impl WaterManagerData {
         &self.water_pressure
     }
 
+    /// Replaces water pressure for one existing conductive cell.
+    pub fn set_water_pressure(&mut self, cell: usize, pressure: i16) -> Result<(), CrpError> {
+        set_sparse_i16_cell(
+            &mut self.water_pressure,
+            &self.conductive_cells,
+            cell,
+            pressure,
+            "water pressure",
+        )
+    }
+
     /// Returns sparse signed sewage pressures in primary-conductive-cell order.
     pub fn sewage_pressure(&self) -> &[i16] {
         &self.sewage_pressure
     }
 
+    /// Replaces sewage pressure for one existing conductive cell.
+    pub fn set_sewage_pressure(&mut self, cell: usize, pressure: i16) -> Result<(), CrpError> {
+        set_sparse_i16_cell(
+            &mut self.sewage_pressure,
+            &self.conductive_cells,
+            cell,
+            pressure,
+            "sewage pressure",
+        )
+    }
+
     /// Returns sparse signed heating pressures from version 227.
     pub fn heating_pressure(&self) -> Option<&[i16]> {
         self.heating_pressure.as_deref()
+    }
+
+    /// Replaces heating pressure for one existing heating-conductive cell from
+    /// inner version 227.
+    pub fn set_heating_pressure(&mut self, cell: usize, pressure: i16) -> Result<(), CrpError> {
+        let Some(values) = self.heating_pressure.as_mut() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating pressure values are absent before inner version 227",
+            ));
+        };
+        set_sparse_i16_cell(
+            values,
+            &self.heating_cells,
+            cell,
+            pressure,
+            "heating pressure",
+        )
     }
 
     /// Returns sparse water pulse-group indexes in primary-conductive order.
@@ -1456,6 +1506,51 @@ impl WaterManagerData {
             .copy_from_slice(&[u8::from(self.can_continue)]);
         let stored_node_count = stored_node_count(self.format_version);
         let mut replacements = Vec::new();
+        for (values, snapshot, field) in [
+            (
+                &self.water_pressure,
+                &self.water_pressure_snapshot,
+                "water pressure",
+            ),
+            (
+                &self.sewage_pressure,
+                &self.sewage_pressure_snapshot,
+                "sewage pressure",
+            ),
+        ] {
+            if let Some(encoded) = changed_signed_ushort_array(
+                values,
+                Some(&snapshot.values),
+                self.conductive_cells.len(),
+                snapshot.range.0,
+                field,
+            )? {
+                replacements.push((snapshot.range.0, snapshot.range.1, encoded));
+            }
+        }
+        match (
+            self.heating_pressure.as_deref(),
+            self.heating_pressure_snapshot.as_ref(),
+        ) {
+            (Some(values), Some(snapshot)) => {
+                if let Some(encoded) = changed_signed_ushort_array(
+                    values,
+                    Some(&snapshot.values),
+                    self.heating_cells.len(),
+                    snapshot.range.0,
+                    "heating pressure",
+                )? {
+                    replacements.push((snapshot.range.0, snapshot.range.1, encoded));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid_cell_grid(
+                    self.scalar_fields_offset,
+                    "heating pressure fields do not match the version gate",
+                ));
+            }
+        }
         let (start, end) = self.water_node_pulse_groups_range;
         if let Some(encoded) = changed_ushort_array(
             &self.water_node_pulse_groups,
@@ -1974,6 +2069,24 @@ fn set_sparse_byte_cell(
     Ok(())
 }
 
+fn set_sparse_i16_cell(
+    values: &mut [i16],
+    cells: &[usize],
+    cell: usize,
+    value: i16,
+    field: &str,
+) -> Result<(), CrpError> {
+    let index = sparse_cell_position(cells, cell, field)?;
+    let Some(target) = values.get_mut(index) else {
+        return Err(invalid_cell_grid(
+            cell,
+            &format!("{field} values are shorter than the conductivity grid"),
+        ));
+    };
+    *target = value;
+    Ok(())
+}
+
 fn stored_node_count(format_version: u32) -> usize {
     if format_version >= FULL_NODE_COUNT_VERSION {
         NODE_COUNT
@@ -2006,6 +2119,34 @@ fn changed_ushort_array(
     }
     let mut encoded = Vec::new();
     write_encoded_ushort_array(&mut encoded, current);
+    Ok(Some(encoded))
+}
+
+fn changed_signed_ushort_array(
+    values: &[i16],
+    original_values: Option<&[i16]>,
+    count: usize,
+    offset: usize,
+    field: &str,
+) -> Result<Option<Vec<u8>>, CrpError> {
+    let current = values.get(..count).ok_or_else(|| {
+        invalid_cell_grid(offset, &format!("{field} decoded prefix is truncated"))
+    })?;
+    let original = original_values.ok_or_else(|| {
+        invalid_cell_grid(offset, &format!("{field} original values are missing"))
+    })?;
+    if original.len() != count {
+        return Err(invalid_cell_grid(
+            offset,
+            &format!("{field} original prefix has an invalid length"),
+        ));
+    }
+    if current == original {
+        return Ok(None);
+    }
+    let unsigned_values: Vec<u16> = current.iter().map(|value| *value as u16).collect();
+    let mut encoded = Vec::new();
+    write_encoded_ushort_array(&mut encoded, &unsigned_values);
     Ok(Some(encoded))
 }
 
@@ -2173,6 +2314,22 @@ fn read_signed_ushort_array(reader: &mut Reader<'_>, count: usize) -> Result<Vec
         .into_iter()
         .map(|value| value as i16)
         .collect())
+}
+
+fn read_captured_signed_ushort_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<(Vec<i16>, EncodedArraySnapshot<i16>), CrpError> {
+    let start = reader.offset();
+    let values = read_signed_ushort_array(reader, count)?;
+    let end = reader.offset();
+    Ok((
+        values.clone(),
+        EncodedArraySnapshot {
+            range: (start, end),
+            values,
+        },
+    ))
 }
 
 fn read_node_ushort_array(
@@ -2697,6 +2854,39 @@ mod tests {
         assert!(before_heating.set_heating_electrified(0, true).is_err());
         let mut before_pollution = WaterManagerData::decode(22, &empty_body(22)).unwrap();
         assert!(before_pollution.set_conductive_pollution(0, 1).is_err());
+    }
+
+    #[test]
+    fn sparse_signed_pressure_edits_preserve_conductive_cell_order() {
+        let body = active_body(265);
+        let mut data = WaterManagerData::decode(265, &body).unwrap();
+        let mut expected = body.clone();
+        let mut replacements = vec![
+            (data.water_pressure_snapshot.range, vec![0, 0x80, 0x00]),
+            (data.sewage_pressure_snapshot.range, vec![0, 0x7f, 0xff]),
+            (
+                data.heating_pressure_snapshot.as_ref().unwrap().range,
+                vec![0, 0xff, 0xff],
+            ),
+        ];
+        data.set_water_pressure(2, i16::MIN).unwrap();
+        data.set_sewage_pressure(2, i16::MAX).unwrap();
+        data.set_heating_pressure(4, -1).unwrap();
+        replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in replacements.into_iter().rev() {
+            expected.splice(start..end, replacement);
+        }
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = WaterManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.water_pressure(), [i16::MIN]);
+        assert_eq!(decoded.sewage_pressure(), [i16::MAX]);
+        assert_eq!(decoded.heating_pressure(), Some([-1].as_slice()));
+        assert!(data.set_water_pressure(3, 0).is_err());
+
+        let mut before_heating = WaterManagerData::decode(226, &empty_body(226)).unwrap();
+        assert!(before_heating.set_heating_pressure(0, 1).is_err());
     }
 
     #[test]
