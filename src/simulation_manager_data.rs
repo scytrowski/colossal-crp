@@ -3,6 +3,7 @@ use std::ops::Range;
 
 use crate::CrpError;
 use crate::GameAreaManagerData;
+use crate::GameAreaManagerEditor;
 use crate::InstanceManagerData;
 use crate::InstanceManagerEditor;
 use crate::PropManagerDataPrefix;
@@ -3082,6 +3083,71 @@ impl SimulationManagerData {
         reader.read_bytes(body_length)?;
         expect_profile_tag(&mut reader, &mut strings, "GameAreaManager")?;
         Ok((area, reader.offset()))
+    }
+
+    /// Replaces the known GameAreaManager fields while retaining its opaque
+    /// reference, saved camera bytes, profiler tags, and following objects.
+    ///
+    /// The editor must come from this graph and inner version. A changed area
+    /// grid can resize the body; the closing profiler reference is rechecked.
+    pub fn replace_game_area(&mut self, edited: &GameAreaManagerEditor) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                1,
+                "edited GameAreaManager version does not match this stream",
+            ));
+        }
+        let (current, original_game_area_end) = self.decode_game_area_prefix()?;
+        if current.encode().as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                1,
+                "GameAreaManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        let original_body = current.encode();
+
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        let mut strings = vec!["SimulationManager".to_owned()];
+        expect_profile_tag(&mut reader, &mut strings, "GameAreaManager")?;
+        let body_start = reader.offset();
+        let body_end = body_start
+            .checked_add(original_body.len())
+            .ok_or(CrpError::ArithmeticOverflow("GameAreaManager body end"))?;
+        let bounded_end = body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES).ok_or(
+            CrpError::ArithmeticOverflow("GameAreaManager closing tag end"),
+        )?;
+        if bounded_end != original_game_area_end {
+            return Err(invalid(
+                body_end,
+                "GameAreaManager body does not end at its closing profiler tag",
+            ));
+        }
+        let new_game_area_end = original_game_area_end
+            .checked_sub(original_body.len())
+            .and_then(|end| end.checked_add(replacement.len()))
+            .ok_or(CrpError::ArithmeticOverflow("edited GameAreaManager end"))?;
+
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(body_start..body_end, replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        match self.decode_game_area_prefix() {
+            Ok((_, updated_end)) if updated_end == new_game_area_end => Ok(()),
+            Ok(_) => {
+                self.serialized_object_graph = original_graph;
+                Err(invalid(
+                    body_end,
+                    "edited GameAreaManager changed its queued-body boundary",
+                ))
+            }
+            Err(error) => {
+                self.serialized_object_graph = original_graph;
+                Err(invalid(
+                    body_start,
+                    format!("edited GameAreaManager failed boundary validation: {error}"),
+                ))
+            }
+        }
     }
 
     /// Decodes the queued `TerrainManager+Data` body after the game-area body.
@@ -12977,6 +13043,38 @@ mod manager_boundary_tests {
         let mut bytes = vec![0xfe];
         write_unique_string(&mut bytes, name).expect("short test tag is encodable");
         bytes
+    }
+
+    #[test]
+    fn game_area_replacement_resizes_body_and_preserves_following_bytes() {
+        let body = include_bytes!("../tests/fixtures/game-area-manager-body-v112004.bin");
+        let mut graph = profiler_tag("GameAreaManager");
+        graph.extend_from_slice(body);
+        graph.extend_from_slice(&[0, 1]);
+        graph.extend(profiler_tag("TerrainManager"));
+        graph.extend_from_slice(b"opaque following bytes");
+
+        let mut manager = manager_with_graph(graph);
+        manager.manager_objects = Some(vec![Some(ManagerObjectReference {
+            object_id: 1,
+            type_name: "GameAreaManager+Data, Assembly-CSharp".to_owned(),
+        })]);
+        let (area, original_end) = manager.decode_game_area_prefix().unwrap();
+        let suffix = manager.serialized_object_graph()[original_end..].to_vec();
+        let mut editor = area.into_editor();
+        editor.area_grid_mut()[0] = 1;
+
+        manager.replace_game_area(&editor).unwrap();
+        let (updated, updated_end) = manager.decode_game_area_prefix().unwrap();
+        assert_eq!(updated.area_grid()[0], 1);
+        assert_eq!(updated_end, original_end + 25);
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_end..],
+            suffix.as_slice()
+        );
+        let graph_after_edit = manager.serialized_object_graph().to_vec();
+        assert!(manager.replace_game_area(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), graph_after_edit);
     }
 
     fn synthetic_path_manager(path_body: &[u8]) -> (SimulationManagerData, usize) {

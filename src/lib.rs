@@ -82,7 +82,7 @@ pub use electricity_manager_data::{
     ElectricityConductiveCellData, ElectricityManagerData, ElectricityPulseGroup,
     ElectricityPulseUnit,
 };
-pub use game_area_data::{GameAreaManagerData, SavedCameraView};
+pub use game_area_data::{GameAreaManagerData, GameAreaManagerEditor, SavedCameraView};
 pub use guide_data::{
     GuideInstanceBody, GuideInstanceEditor, GuideTriggerBaseEditor, GuideTriggerBasePrefix,
 };
