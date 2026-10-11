@@ -85,7 +85,8 @@ pub use electricity_manager_data::{
 };
 pub use event_manager_data::{
     EventManagerEventRecord, EventManagerEventRecordsEditor, EventManagerPrefabIndicesEditor,
-    EventManagerRaceEventData, EventManagerRaceRacer, EventManagerRouteRecord,
+    EventManagerRaceEventData, EventManagerRaceEventRouteSpline,
+    EventManagerRaceEventSubBezierRecord, EventManagerRaceRacer, EventManagerRouteRecord,
     EventManagerRouteRecordsEditor, EventManagerRouteSchedule, EventManagerTailData,
     EventManagerTailEditor, EventManagerTypeData, EventManagerTypeDataEditor,
 };

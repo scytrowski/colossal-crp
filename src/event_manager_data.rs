@@ -67,14 +67,14 @@ pub struct EventManagerEventRecord {
 
 /// Known values decoded from an active nested `RaceEventData` block.
 ///
-/// Fixed-width scalar fields, racer values, and opaque fixed-size arrays are
-/// editable. Unmodeled team references, spline bytes, and other nested values
-/// remain preserved as raw source bytes. The fields are available for
-/// EventManager inner versions 120004–121030.
+/// Fixed-width scalar fields, racer values, opaque fixed-size arrays, and
+/// route-spline fields are editable. Unmodeled team references and other
+/// nested values remain preserved as raw source bytes. The fields are
+/// available for EventManager inner versions 120004–121030.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerRaceEventData {
     /// Existing racers in serialized order. The count and optional-reference
-    /// presence are fixed; changing racer names is rejected by the editor.
+    /// presence are fixed.
     pub racers: Vec<EventManagerRaceRacer>,
     /// Opaque 24-byte state records in racer order.
     pub racer_state_records: Vec<[u8; 24]>,
@@ -110,6 +110,37 @@ pub struct EventManagerRaceEventData {
     pub racer_oscillation_records: Vec<[u8; 8]>,
     /// Opaque eight-byte racer state-timer records.
     pub racer_state_timer_records: Vec<[u8; 8]>,
+    /// Route spline when the source presence flag is true. Presence, count,
+    /// closed/open layout, and record counts cannot change in the editor.
+    pub route_spline: Option<EventManagerRaceEventRouteSpline>,
+}
+
+/// Editable route spline fields from the legacy RaceEventData layout.
+///
+/// The serialized bezier count and closed flag select the record layout and
+/// therefore remain fixed. Open splines store `count` records. Closed legacy
+/// splines store `count - 1` records and a terminal record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventManagerRaceEventRouteSpline {
+    /// Serialized bezier count.
+    pub bezier_count: u32,
+    /// Start/end building and node indexes in serialized order.
+    pub indexes: [u16; 4],
+    /// Original DataSerializer bool byte for the closed flag.
+    pub closed_raw: u8,
+    /// Serialized sub-bezier records, in route order.
+    pub records: Vec<EventManagerRaceEventSubBezierRecord>,
+    /// Final type/source record stored by a legacy closed spline.
+    pub terminal_record: Option<EventManagerRaceEventSubBezierRecord>,
+}
+
+/// One serialized three-byte `RouteSpline` type/source record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventManagerRaceEventSubBezierRecord {
+    /// Raw `SubBezierType` value. Known values are 0 through 4.
+    pub kind: u8,
+    /// Building or node source index.
+    pub source: u16,
 }
 
 /// Known values from one racer entry in `RaceEventData`.
@@ -512,6 +543,7 @@ struct EventManagerRaceEventDataFieldRanges {
     track_path_segments: Range<usize>,
     racer_oscillation_records: Range<usize>,
     racer_state_timer_records: Range<usize>,
+    route_spline: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -970,6 +1002,31 @@ impl EventManagerEventRecordsEditor {
                         &data.racer_state_timer_records,
                         "racer state timer",
                     )?;
+                    match (
+                        data.route_spline.as_ref(),
+                        original_data.route_spline.as_ref(),
+                        ranges.route_spline.as_ref(),
+                    ) {
+                        (Some(spline), Some(original_spline), Some(range)) => {
+                            let encoded = encode_race_event_route_spline(
+                                self.original.format_version,
+                                spline,
+                                original_spline,
+                                range.start,
+                            )?;
+                            patch_race_event_field(&mut output, range, &encoded, "route spline")?;
+                        }
+                        (None, None, None) => {}
+                        _ => {
+                            return Err(invalid_event_record(
+                                ranges
+                                    .route_spline
+                                    .as_ref()
+                                    .map_or(ranges.schedule_id.start, |range| range.start),
+                                "race-event route-spline presence cannot change in this editor",
+                            ));
+                        }
+                    }
                     for (racer_index, ((racer, original_racer), racer_ranges)) in data
                         .racers
                         .iter()
@@ -2330,9 +2387,17 @@ fn skip_race_event_data(
     let (racer_state_timer_records, racer_state_timer_record_range) =
         read_race_event_raw_records::<8>(reader, racer_count, "racer state timer")?;
 
-    if data_serializer_bool_is_true(reader.read_u8()?) {
-        skip_race_event_route_spline(reader, format_version)?;
-    }
+    let route_spline = if data_serializer_bool_is_true(reader.read_u8()?) {
+        let start = reader.offset();
+        let route_spline = read_race_event_route_spline(reader, format_version)?;
+        Some((route_spline, start..reader.offset()))
+    } else {
+        None
+    };
+    let (route_spline, route_spline_range) = match route_spline {
+        Some((route_spline, range)) => (Some(route_spline), Some(range)),
+        None => (None, None),
+    };
     Ok((
         EventManagerRaceEventData {
             racers,
@@ -2353,6 +2418,7 @@ fn skip_race_event_data(
             track_path_segments,
             racer_oscillation_records,
             racer_state_timer_records,
+            route_spline,
         },
         EventManagerRaceEventDataFieldRanges {
             racers: racer_field_ranges,
@@ -2373,6 +2439,7 @@ fn skip_race_event_data(
             track_path_segments: track_path_segment_range,
             racer_oscillation_records: racer_oscillation_record_range,
             racer_state_timer_records: racer_state_timer_record_range,
+            route_spline: route_spline_range,
         },
     ))
 }
@@ -2403,44 +2470,66 @@ fn read_race_event_raw_records<const WIDTH: usize>(
     Ok((records, start..reader.offset()))
 }
 
-fn skip_race_event_route_spline(
+fn read_race_event_route_spline(
     reader: &mut Reader<'_>,
     format_version: u32,
-) -> Result<(), CrpError> {
-    let serialized_bezier_count = usize::try_from(reader.read_u32_be()?)
+) -> Result<EventManagerRaceEventRouteSpline, CrpError> {
+    let bezier_count = reader.read_u32_be()?;
+    let serialized_bezier_count = usize::try_from(bezier_count)
         .map_err(|_| reader.invalid("route-spline count does not fit this platform"))?;
     if serialized_bezier_count > MAX_RACE_EVENT_ENTRIES {
         return Err(reader.invalid(format!(
             "route-spline count exceeds {MAX_RACE_EVENT_ENTRIES}"
         )));
     }
-    reader.read_bytes(8)?; // Start/end buildings and nodes.
-    let closed = data_serializer_bool_is_true(reader.read_u8()?);
+    let indexes = [
+        reader.read_u16_be()?,
+        reader.read_u16_be()?,
+        reader.read_u16_be()?,
+        reader.read_u16_be()?,
+    ];
+    let closed_raw = reader.read_u8()?;
+    let closed = data_serializer_bool_is_true(closed_raw);
 
-    if format_version >= 121_034 {
+    let record_count = if format_version >= 121_034 {
         // This branch is currently outside the supported EventManager record range.
-        skip_race_event_values(
-            reader,
-            serialized_bezier_count,
-            3,
-            "route-spline sub-bezier",
-        )?;
+        serialized_bezier_count
     } else if closed {
-        let record_count = serialized_bezier_count
+        serialized_bezier_count
             .checked_sub(1)
-            .ok_or_else(|| reader.invalid("closed route-spline count must be nonzero"))?;
-        skip_race_event_values(reader, record_count, 3, "route-spline sub-bezier")?;
-        reader.read_bytes(3)?; // Legacy closed-spline terminal values.
+            .ok_or_else(|| reader.invalid("closed route-spline count must be nonzero"))?
     } else {
         // The legacy reader synthesizes start/end building entries around these records.
-        skip_race_event_values(
-            reader,
-            serialized_bezier_count,
-            3,
-            "route-spline sub-bezier",
-        )?;
+        serialized_bezier_count
+    };
+    if record_count > reader.remaining() / 3 {
+        return Err(reader.invalid("route-spline records cannot fit in the remaining body"));
     }
-    Ok(())
+    let mut records = Vec::with_capacity(record_count);
+    for _ in 0..record_count {
+        records.push(read_race_event_sub_bezier_record(reader)?);
+    }
+    let terminal_record = if format_version < 121_034 && closed {
+        Some(read_race_event_sub_bezier_record(reader)?)
+    } else {
+        None
+    };
+    Ok(EventManagerRaceEventRouteSpline {
+        bezier_count,
+        indexes,
+        closed_raw,
+        records,
+        terminal_record,
+    })
+}
+
+fn read_race_event_sub_bezier_record(
+    reader: &mut Reader<'_>,
+) -> Result<EventManagerRaceEventSubBezierRecord, CrpError> {
+    Ok(EventManagerRaceEventSubBezierRecord {
+        kind: reader.read_u8()?,
+        source: reader.read_u16_be()?,
+    })
 }
 
 fn read_race_event_count(
@@ -2462,19 +2551,6 @@ fn read_race_event_count(
         )));
     }
     Ok(count)
-}
-
-fn skip_race_event_values(
-    reader: &mut Reader<'_>,
-    count: usize,
-    width: usize,
-    description: &str,
-) -> Result<(), CrpError> {
-    let byte_count = count
-        .checked_mul(width)
-        .ok_or_else(|| reader.invalid(format!("{description} byte length overflow")))?;
-    reader.read_bytes(byte_count)?;
-    Ok(())
 }
 
 fn skip_event_prefab_scope(reader: &mut Reader<'_>, count: usize) -> Result<(), CrpError> {
@@ -2833,6 +2909,88 @@ fn patch_race_event_u16_values(
         destination_value.copy_from_slice(&value.to_be_bytes());
     }
     Ok(())
+}
+
+fn encode_race_event_route_spline(
+    format_version: u32,
+    spline: &EventManagerRaceEventRouteSpline,
+    original: &EventManagerRaceEventRouteSpline,
+    offset: usize,
+) -> Result<Vec<u8>, CrpError> {
+    if spline.bezier_count != original.bezier_count
+        || spline.closed_raw != original.closed_raw
+        || spline.records.len() != original.records.len()
+        || spline.terminal_record.is_some() != original.terminal_record.is_some()
+    {
+        return Err(invalid_event_record(
+            offset,
+            "race-event route-spline count and layout cannot change in this editor",
+        ));
+    }
+    let bezier_count = usize::try_from(spline.bezier_count)
+        .map_err(|_| CrpError::ArithmeticOverflow("EventManager route-spline count"))?;
+    if bezier_count > MAX_RACE_EVENT_ENTRIES {
+        return Err(invalid_event_record(
+            offset,
+            "race-event route-spline count exceeds the supported limit",
+        ));
+    }
+    let closed = data_serializer_bool_is_true(spline.closed_raw);
+    let expected_record_count = if format_version >= 121_034 {
+        bezier_count
+    } else if closed {
+        bezier_count.checked_sub(1).ok_or_else(|| {
+            invalid_event_record(
+                offset,
+                "closed race-event route-spline count must be nonzero",
+            )
+        })?
+    } else {
+        bezier_count
+    };
+    let has_legacy_terminal = format_version < 121_034 && closed;
+    if spline.records.len() != expected_record_count
+        || spline.terminal_record.is_some() != has_legacy_terminal
+    {
+        return Err(invalid_event_record(
+            offset,
+            "race-event route-spline records do not match the source version layout",
+        ));
+    }
+    let record_bytes = spline
+        .records
+        .len()
+        .checked_mul(3)
+        .and_then(|length| {
+            length.checked_add(if spline.terminal_record.is_some() {
+                3
+            } else {
+                0
+            })
+        })
+        .ok_or(CrpError::ArithmeticOverflow(
+            "EventManager route-spline record bytes",
+        ))?;
+    let capacity = 13_usize
+        .checked_add(record_bytes)
+        .ok_or(CrpError::ArithmeticOverflow(
+            "EventManager route-spline serialized width",
+        ))?;
+    let mut output = Vec::with_capacity(capacity);
+    output.extend_from_slice(&spline.bezier_count.to_be_bytes());
+    for index in spline.indexes {
+        output.extend_from_slice(&index.to_be_bytes());
+    }
+    output.push(spline.closed_raw);
+    for record in &spline.records {
+        output.push(record.kind);
+        output.extend_from_slice(&record.source.to_be_bytes());
+    }
+    if let Some(record) = spline.terminal_record {
+        output.push(record.kind);
+        output.extend_from_slice(&record.source.to_be_bytes());
+    }
+    Ok(output)
 }
 
 fn invalid_type_data(offset: usize, reason: impl Into<String>) -> CrpError {
@@ -4426,6 +4584,7 @@ mod tests {
                 track_path_segments: Vec::new(),
                 racer_oscillation_records: Vec::new(),
                 racer_state_timer_records: Vec::new(),
+                route_spline: None,
             })
         );
         let race_data_range = decoded.active_event_race_data_ranges[0]
@@ -4506,6 +4665,7 @@ mod tests {
             track_path_segments: Vec::new(),
             racer_oscillation_records: Vec::new(),
             racer_state_timer_records: Vec::new(),
+            route_spline: None,
         });
         assert!(invalid_editor.encode().is_err());
 
@@ -4575,6 +4735,7 @@ mod tests {
                 track_path_segments: vec![0x000d],
                 racer_oscillation_records: vec![[0x3f, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,]],
                 racer_state_timer_records: vec![[0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,]],
+                route_spline: None,
             })
         );
         for (source_name, replacement_name, value) in [
@@ -4822,12 +4983,47 @@ mod tests {
                 assert_eq!(consumed, event.len(), "{description}, version {version}");
                 let race_range = decoded.active_event_race_data_ranges[0]
                     .as_ref()
-                    .expect("race-event data range exists");
+                    .expect("race-event data range exists")
+                    .clone();
                 assert_eq!(
                     decoded.serialized_body.get(race_range.clone()),
                     Some(race_data.as_slice()),
                     "{description}, version {version}"
                 );
+                let spline = decoded.active_event_race_data[0]
+                    .as_ref()
+                    .expect("race-event data exists")
+                    .route_spline
+                    .as_ref()
+                    .expect("route spline exists");
+                assert_eq!(
+                    spline.indexes,
+                    [1, 2, 3, 4],
+                    "{description}, version {version}"
+                );
+                assert_eq!(spline.closed_raw, u8::from(description == "closed"));
+                assert_eq!(spline.records.len(), 2, "{description}, version {version}");
+                if description == "open" {
+                    assert_eq!(spline.bezier_count, 2);
+                    assert_eq!(spline.records[0].kind, 1);
+                    assert_eq!(spline.records[0].source, 5);
+                    assert_eq!(spline.records[1].kind, 0xff);
+                    assert_eq!(spline.records[1].source, 0x1234);
+                    assert_eq!(spline.terminal_record, None);
+                } else {
+                    assert_eq!(spline.bezier_count, 3);
+                    assert_eq!(spline.records[0].kind, 2);
+                    assert_eq!(spline.records[0].source, 6);
+                    assert_eq!(spline.records[1].kind, 4);
+                    assert_eq!(spline.records[1].source, 7);
+                    assert_eq!(
+                        spline.terminal_record,
+                        Some(super::EventManagerRaceEventSubBezierRecord {
+                            kind: 0x80,
+                            source: 0x1234,
+                        })
+                    );
+                }
                 assert_eq!(
                     decoded
                         .clone()
@@ -4838,6 +5034,34 @@ mod tests {
                     "{description}, version {version}"
                 );
 
+                let mut spline_editor = decoded.into_event_records_editor();
+                let edited_spline = spline_editor.race_event_data_mut()[0]
+                    .as_mut()
+                    .expect("race-event data exists")
+                    .route_spline
+                    .as_mut()
+                    .expect("route spline exists");
+                edited_spline.indexes[0] = 0xabcd;
+                edited_spline.records[0].source = 0x1234;
+                if let Some(terminal) = edited_spline.terminal_record.as_mut() {
+                    terminal.kind = 0x55;
+                }
+                let mut expected_race_data = (*race_data).clone();
+                let spline_start = EMPTY_RACE_EVENT_DATA.len();
+                expected_race_data[spline_start + 4..spline_start + 6]
+                    .copy_from_slice(&0xabcd_u16.to_be_bytes());
+                expected_race_data[spline_start + 14..spline_start + 16]
+                    .copy_from_slice(&0x1234_u16.to_be_bytes());
+                if description == "closed" {
+                    expected_race_data[spline_start + 19] = 0x55;
+                }
+                let expected_event = one_active_event_with_race_data(version, &expected_race_data);
+                assert_eq!(
+                    spline_editor.encode().unwrap(),
+                    expected_event,
+                    "edited {description}, version {version}"
+                );
+
                 let route_data_end = race_range.end;
                 let truncated = event[..route_data_end - 1].to_vec();
                 assert!(
@@ -4846,6 +5070,30 @@ mod tests {
                 );
             }
         }
+
+        let closed_event = one_active_event_with_race_data(120_004, &closed_race_data);
+        let (decoded_closed, _) =
+            EventManagerReferenceData::decode_reader(120_004, &closed_event).unwrap();
+        let mut invalid_spline_count_editor = decoded_closed.clone().into_event_records_editor();
+        invalid_spline_count_editor.race_event_data_mut()[0]
+            .as_mut()
+            .unwrap()
+            .route_spline
+            .as_mut()
+            .unwrap()
+            .bezier_count += 1;
+        assert!(invalid_spline_count_editor.encode().is_err());
+
+        let mut invalid_spline_topology_editor = decoded_closed.into_event_records_editor();
+        invalid_spline_topology_editor.race_event_data_mut()[0]
+            .as_mut()
+            .unwrap()
+            .route_spline
+            .as_mut()
+            .unwrap()
+            .records
+            .pop();
+        assert!(invalid_spline_topology_editor.encode().is_err());
 
         let mut empty_closed_race_data = EMPTY_RACE_EVENT_DATA.to_vec();
         *empty_closed_race_data.last_mut().unwrap() = 1;

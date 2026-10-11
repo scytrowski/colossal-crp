@@ -14633,6 +14633,7 @@ mod manager_boundary_tests {
                 track_path_segments: Vec::new(),
                 racer_oscillation_records: Vec::new(),
                 racer_state_timer_records: Vec::new(),
+                route_spline: None,
             })]
         );
         editor.race_event_data_mut()[0]
