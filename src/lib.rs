@@ -128,7 +128,7 @@ pub use statistics_manager_data::{
     StatisticArrayReferences, StatisticInt32Data, StatisticInt32Editor, StatisticInt64Data,
     StatisticInt64Editor, StatisticsManagerData, StatisticsManagerEditor,
 };
-pub use terrain_manager_data::TerrainManagerData;
+pub use terrain_manager_data::{TerrainManagerData, TerrainManagerEditor};
 pub use texture::TextureAsset;
 pub use transfer_manager_data::{TransferManagerData, TransferManagerEditor, TransferOffer};
 pub use tree_manager_data::{
@@ -1182,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn replacing_water_preserves_neighboring_manager_bodies() -> Result<(), CrpError> {
+    fn replacing_terrain_and_water_preserves_neighboring_manager_bodies() -> Result<(), CrpError> {
         fn begin_tag(bytes: &mut Vec<u8>, name: &str) -> Result<(), CrpError> {
             bytes.push(0xfe);
             crate::data_serializer::write_unique_string(bytes, name)
@@ -1233,7 +1233,26 @@ mod tests {
             root_data,
         )?;
         let mut manager = SimulationManagerData::decode(&stream.encode())?;
-        let (_, terrain_end) = manager.decode_terrain_prefix()?;
+        let (terrain, original_terrain_end) = manager.decode_terrain_prefix()?;
+        let graph_before_terrain_edit = manager.serialized_object_graph().to_vec();
+        let mut terrain_editor = terrain.into_editor();
+        terrain_editor.set_raw_height(0, 12).unwrap();
+        terrain_editor.set_block_height_delta(0, 34).unwrap();
+        terrain_editor.set_dirt_buffer(777).unwrap();
+        manager.replace_terrain(&terrain_editor)?;
+        let (updated_terrain, terrain_end) = manager.decode_terrain_prefix()?;
+        assert_eq!(updated_terrain.raw_heights()[0], 12);
+        assert_eq!(updated_terrain.block_height_deltas()[0], 34);
+        assert_eq!(updated_terrain.dirt_buffer(), 777);
+        assert_eq!(terrain_end, original_terrain_end + 10);
+        assert_eq!(
+            &manager.serialized_object_graph()[terrain_end..],
+            &graph_before_terrain_edit[original_terrain_end..]
+        );
+        let graph_after_terrain_edit = manager.serialized_object_graph().to_vec();
+        assert!(manager.replace_terrain(&terrain_editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), graph_after_terrain_edit);
+
         let (water, old_water_end) = manager.decode_water_prefix()?;
         let old_graph = manager.serialized_object_graph().to_vec();
         let mut editor = water.into_editor();
@@ -1275,6 +1294,10 @@ mod tests {
         assert!(manager.replace_water(&other_version.into_editor()).is_err());
         assert_eq!(manager.serialized_object_graph(), stable_graph);
         let rewritten = SimulationManagerData::decode(&manager.encode()?)?;
+        let (terrain, _) = rewritten.decode_terrain_prefix()?;
+        assert_eq!(terrain.raw_heights()[0], 12);
+        assert_eq!(terrain.block_height_deltas()[0], 34);
+        assert_eq!(terrain.dirt_buffer(), 777);
         let (water, _) = rewritten.decode_water_prefix()?;
         assert_eq!(water.sea_level(), 41.5);
         assert_eq!(water.sources()[0].parameters[4], 42);

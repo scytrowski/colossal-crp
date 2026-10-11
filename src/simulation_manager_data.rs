@@ -8,6 +8,7 @@ use crate::InstanceManagerEditor;
 use crate::PropManagerDataPrefix;
 use crate::PropManagerEditor;
 use crate::TerrainManagerData;
+use crate::TerrainManagerEditor;
 use crate::TreeManagerDataPrefix;
 use crate::TreeManagerEditor;
 use crate::VehicleInstanceFieldsPrefix;
@@ -3117,6 +3118,76 @@ impl SimulationManagerData {
         reader.read_bytes(terrain_length)?;
         expect_profile_tag(&mut reader, &mut strings, "TerrainManager")?;
         Ok((terrain_data, reader.offset()))
+    }
+
+    /// Replaces the TerrainManager body while retaining its profiler tags and
+    /// every following queued object byte.
+    ///
+    /// The editor must come from this graph and inner version. Changed height
+    /// arrays can resize the body; the TerrainManager closing tag is rechecked.
+    pub fn replace_terrain(&mut self, edited: &TerrainManagerEditor) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                1,
+                "edited TerrainManager version does not match this stream",
+            ));
+        }
+        let (current, original_terrain_end) = self.decode_terrain_prefix()?;
+        if current.encode().as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                1,
+                "TerrainManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        let original_body = current.encode();
+
+        let mut reader = Reader::new(&self.serialized_object_graph);
+        let mut strings = vec!["SimulationManager".to_owned()];
+        expect_profile_tag(&mut reader, &mut strings, "GameAreaManager")?;
+        let (_, game_area_body_len) =
+            GameAreaManagerData::decode_prefix(self.format_version, reader.remaining_bytes())?;
+        reader.read_bytes(game_area_body_len)?;
+        expect_profile_tag(&mut reader, &mut strings, "GameAreaManager")?;
+        expect_profile_tag(&mut reader, &mut strings, "TerrainManager")?;
+        let body_start = reader.offset();
+        let body_end = body_start
+            .checked_add(original_body.len())
+            .ok_or(CrpError::ArithmeticOverflow("TerrainManager body end"))?;
+        let bounded_end = body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES).ok_or(
+            CrpError::ArithmeticOverflow("TerrainManager closing tag end"),
+        )?;
+        if bounded_end != original_terrain_end {
+            return Err(invalid(
+                body_end,
+                "TerrainManager body does not end at its closing profiler tag",
+            ));
+        }
+        let new_terrain_end = original_terrain_end
+            .checked_sub(original_body.len())
+            .and_then(|end| end.checked_add(replacement.len()))
+            .ok_or(CrpError::ArithmeticOverflow("edited TerrainManager end"))?;
+
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(body_start..body_end, replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        match self.decode_terrain_prefix() {
+            Ok((_, updated_end)) if updated_end == new_terrain_end => Ok(()),
+            Ok(_) => {
+                self.serialized_object_graph = original_graph;
+                Err(invalid(
+                    body_end,
+                    "edited TerrainManager changed its queued-body boundary",
+                ))
+            }
+            Err(error) => {
+                self.serialized_object_graph = original_graph;
+                Err(invalid(
+                    body_start,
+                    format!("edited TerrainManager failed boundary validation: {error}"),
+                ))
+            }
+        }
     }
 
     /// Decodes the queued `WaterSimulation+Data` body after GameArea and Terrain.
