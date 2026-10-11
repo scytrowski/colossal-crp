@@ -141,7 +141,7 @@ pub use vehicle_manager_data::{
     VehicleInstanceFields, VehicleInstanceFieldsPrefix, VehicleLastFrameDataPrefix,
     VehicleLastFrameRecord, VehicleManagerData, VehicleManagerDataPrefix,
     VehicleManagerSparseFieldsPrefix, VehicleManagerTailDataPrefix, VehicleParkedInstanceRecord,
-    VehicleParkedRecordsPrefix, VehicleTargetPosition0,
+    VehicleParkedRecordsEditor, VehicleParkedRecordsPrefix, VehicleTargetPosition0,
 };
 pub use water_manager_data::{
     HeatingConductiveCellData, WaterConductiveCellData, WaterManagerData, WaterPulseGroup,
@@ -5931,6 +5931,58 @@ mod tests {
             rewritten_base.serialized_object_graph().len(),
             manager.serialized_object_graph().len()
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "set CRP_CORPUS_DIR and run explicitly to check the parked-vehicle sample"]
+    fn validates_parked_vehicle_editor_against_north_europe_sample()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let maps_dir = std::env::var_os("CRP_CORPUS_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| std::io::Error::other("CRP_CORPUS_DIR is not set"))?;
+        let mut file = File::open(maps_dir.join("NorthEurope3FINAL.crp"))?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("NorthEurope3FINAL has no type-52 asset"))?;
+        let (_, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let mut manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 293);
+
+        let (vehicle_data, manager_end) = manager.decode_vehicle_manager_data()?;
+        assert_eq!(
+            vehicle_data.prefix().active_parked_vehicle_count(),
+            Some(327)
+        );
+        let (parked, records_end) = manager.decode_vehicle_manager_parked_records_prefix()?;
+        let (_, records_start) = manager.decode_vehicle_manager_instance_fields_prefix()?;
+        let suffix = manager.serialized_object_graph()[records_end..].to_vec();
+        let original_position = parked.records().unwrap()[0].position();
+        let mut editor = parked.into_editor();
+        let edited_position = [
+            original_position[0] ^ 1,
+            original_position[1],
+            original_position[2],
+        ];
+        editor.set_position_bits(0, edited_position)?;
+        manager.replace_vehicle_parked_records(&editor)?;
+
+        let (updated, updated_manager_end) = manager.decode_vehicle_manager_data()?;
+        assert_eq!(updated_manager_end, manager_end);
+        assert_eq!(
+            updated.parked_records().records().unwrap()[0].position(),
+            edited_position
+        );
+        let (_, updated_records_end) = manager.decode_vehicle_manager_parked_records_prefix()?;
+        assert_eq!(updated_records_end, records_end);
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_records_end..],
+            suffix.as_slice()
+        );
+        assert!(records_start < records_end);
         Ok(())
     }
 

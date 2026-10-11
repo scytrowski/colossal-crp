@@ -24,6 +24,7 @@ const VEHICLE_CARGO_PARENT_VERSION: u32 = 104;
 const VEHICLE_CUSTOM_VALUE_VERSION: u32 = 113_012;
 const VEHICLE_TRAFFIC_TOTALS_VERSION: u32 = 315;
 const VEHICLE_COUNTS_VERSION: u32 = 116_013;
+const PARKED_VEHICLE_RECORD_LEN: usize = 31;
 
 /// The serialized flag and prefab-table prefix of `VehicleManager+Data`.
 ///
@@ -694,6 +695,14 @@ pub struct VehicleParkedRecordsPrefix {
     serialized_prefix: Vec<u8>,
 }
 
+/// Editor for position, rotation, and owner references of existing parked
+/// vehicles. The record count and parked-vehicle slots remain fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleParkedRecordsEditor {
+    original: VehicleParkedRecordsPrefix,
+    records: Option<Vec<VehicleParkedInstanceRecord>>,
+}
+
 impl VehicleParkedRecordsPrefix {
     /// Returns the inner DataSerializer version.
     pub fn format_version(&self) -> u32 {
@@ -708,6 +717,14 @@ impl VehicleParkedRecordsPrefix {
     /// Writes the original parked-record bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Creates an editor for the parked records represented in this prefix.
+    pub fn into_editor(self) -> VehicleParkedRecordsEditor {
+        VehicleParkedRecordsEditor {
+            records: self.records.clone(),
+            original: self,
+        }
     }
 
     /// Decodes versioned counters following the parked-record array.
@@ -752,6 +769,111 @@ impl VehicleParkedRecordsPrefix {
             },
             consumed,
         ))
+    }
+}
+
+impl VehicleParkedRecordsEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns current parked records, absent before version 115.
+    pub fn records(&self) -> Option<&[VehicleParkedInstanceRecord]> {
+        self.records.as_deref()
+    }
+
+    /// Changes one parked vehicle's position component bit patterns.
+    pub fn set_position_bits(&mut self, index: usize, position: [u32; 3]) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        record.position = position;
+        Ok(())
+    }
+
+    /// Changes one parked vehicle's quaternion component bit patterns.
+    pub fn set_rotation_bits(&mut self, index: usize, rotation: [u32; 4]) -> Result<(), CrpError> {
+        let record = self.record_mut(index)?;
+        record.rotation = rotation;
+        Ok(())
+    }
+
+    /// Changes one parked vehicle's 24-bit owner-citizen reference.
+    pub fn set_owner_citizen(&mut self, index: usize, owner: u32) -> Result<(), CrpError> {
+        if owner > 0x00ff_ffff {
+            return Err(invalid(
+                index,
+                "parked-vehicle owner reference does not fit u24",
+            ));
+        }
+        let record = self.record_mut(index)?;
+        record.owner_citizen = owner;
+        Ok(())
+    }
+
+    /// Writes edited records in the game's fixed-width field order while
+    /// preserving the original bytes when no record changed.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.records == self.original.records {
+            return Ok(self.original.serialized_prefix.clone());
+        }
+        let records = self.records.as_ref().ok_or_else(|| {
+            invalid(
+                0,
+                "parked-vehicle records are unavailable before inner version 115",
+            )
+        })?;
+        let original_records = self.original.records.as_ref().ok_or_else(|| {
+            invalid(
+                0,
+                "parked-vehicle records are unavailable before inner version 115",
+            )
+        })?;
+        if records.len() != original_records.len() {
+            return Err(invalid(0, "parked-vehicle record count cannot change"));
+        }
+
+        let mut bytes = Vec::with_capacity(records.len() * PARKED_VEHICLE_RECORD_LEN);
+        for (index, record) in records.iter().enumerate() {
+            if record.owner_citizen > 0x00ff_ffff {
+                return Err(invalid(
+                    index,
+                    "parked-vehicle owner reference does not fit u24",
+                ));
+            }
+            for value in record.position {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            for value in record.rotation {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            bytes.push((record.owner_citizen >> 16) as u8);
+            bytes.push((record.owner_citizen >> 8) as u8);
+            bytes.push(record.owner_citizen as u8);
+        }
+        if bytes.len() != self.original.serialized_prefix.len() {
+            return Err(invalid(
+                0,
+                "parked-vehicle records changed their serialized width",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn original_bytes(&self) -> &[u8] {
+        &self.original.serialized_prefix
+    }
+
+    fn record_mut(&mut self, index: usize) -> Result<&mut VehicleParkedInstanceRecord, CrpError> {
+        self.records
+            .as_mut()
+            .ok_or_else(|| {
+                invalid(
+                    index,
+                    "parked-vehicle records are unavailable before inner version 115",
+                )
+            })?
+            .get_mut(index)
+            .ok_or_else(|| invalid(index, "parked-vehicle record index is out of bounds"))
     }
 }
 
@@ -1049,6 +1171,55 @@ mod tests {
             records: Some(Vec::new()),
             serialized_prefix: Vec::new(),
         }
+    }
+
+    #[test]
+    fn parked_vehicle_editor_writes_fixed_big_endian_records_and_checks_u24() {
+        let mut source = Vec::new();
+        for bits in [0x3f80_0000_u32, 0xc020_0000, 0x42f6_e979] {
+            source.extend_from_slice(&bits.to_be_bytes());
+        }
+        for bits in [0x3f00_0000_u32, 0x3f80_0000, 0xbf00_0000, 0x3e80_0000] {
+            source.extend_from_slice(&bits.to_be_bytes());
+        }
+        source.extend_from_slice(&[0x01, 0x23, 0x45]);
+
+        let fields = instance_fields_prefix(115, Some(1));
+        let (records, consumed) = fields.decode_parked_vehicle_records(&source).unwrap();
+        assert_eq!(consumed, 31);
+        assert_eq!(
+            records.records().unwrap()[0].position(),
+            [0x3f80_0000, 0xc020_0000, 0x42f6_e979,]
+        );
+        assert_eq!(records.records().unwrap()[0].owner_citizen(), 0x0123_45);
+
+        let mut editor = records.into_editor();
+        editor
+            .set_position_bits(0, [0x3f00_0000, 0xbf80_0000, 0x4120_0000])
+            .unwrap();
+        editor
+            .set_rotation_bits(0, [0x3e80_0000, 0x3f40_0000, 0xbf40_0000, 0x3f80_0000])
+            .unwrap();
+        editor.set_owner_citizen(0, 0x00ab_cdef).unwrap();
+
+        let mut expected = Vec::new();
+        for bits in [0x3f00_0000_u32, 0xbf80_0000, 0x4120_0000] {
+            expected.extend_from_slice(&bits.to_be_bytes());
+        }
+        for bits in [0x3e80_0000_u32, 0x3f40_0000, 0xbf40_0000, 0x3f80_0000] {
+            expected.extend_from_slice(&bits.to_be_bytes());
+        }
+        expected.extend_from_slice(&[0xab, 0xcd, 0xef]);
+        assert_eq!(editor.encode().unwrap(), expected);
+        assert!(editor.set_owner_citizen(0, 0x0100_0000).is_err());
+        assert!(editor.set_owner_citizen(1, 0).is_err());
+
+        let absent = instance_fields_prefix(114, None);
+        let (legacy, _) = absent.decode_parked_vehicle_records(&[]).unwrap();
+        let mut legacy_editor = legacy.into_editor();
+        assert!(legacy_editor.records().is_none());
+        assert!(legacy_editor.set_position_bits(0, [0; 3]).is_err());
+        assert_eq!(legacy_editor.encode().unwrap(), []);
     }
 
     fn words_as_bytes(words: &[u32]) -> Vec<u8> {

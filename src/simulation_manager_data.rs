@@ -18,6 +18,7 @@ use crate::VehicleManagerData;
 use crate::VehicleManagerDataPrefix;
 use crate::VehicleManagerSparseFieldsPrefix;
 use crate::VehicleManagerTailDataPrefix;
+use crate::VehicleParkedRecordsEditor;
 use crate::VehicleParkedRecordsPrefix;
 use crate::WaterSimulationData;
 use crate::WaterSimulationEditor;
@@ -6229,6 +6230,89 @@ impl SimulationManagerData {
                 "VehicleManager parked-record prefix end",
             ))?;
         Ok((parked, graph_end))
+    }
+
+    /// Replaces fields of the existing parked-vehicle records in place.
+    ///
+    /// The editor must come from this VehicleManager body and inner version.
+    /// Record count and width remain fixed; all following manager bytes are
+    /// checked after the edit.
+    pub fn replace_vehicle_parked_records(
+        &mut self,
+        edited: &VehicleParkedRecordsEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                17,
+                "edited parked-vehicle version does not match this stream",
+            ));
+        }
+        let (vehicle_data, original_manager_end) = self.decode_vehicle_manager_data()?;
+        let (current, original_records_end) =
+            self.decode_vehicle_manager_parked_records_prefix()?;
+        if current.encode().as_slice() != edited.original_bytes()
+            || vehicle_data.parked_records().encode() != current.encode()
+        {
+            return Err(invalid(
+                17,
+                "parked-vehicle bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        let original_records = current.encode();
+        if replacement.len() != original_records.len() {
+            return Err(invalid(
+                17,
+                "parked-vehicle edit changed the serialized record width",
+            ));
+        }
+
+        let (_, records_start) = self.decode_vehicle_manager_instance_fields_prefix()?;
+        let records_end = records_start
+            .checked_add(original_records.len())
+            .ok_or(CrpError::ArithmeticOverflow("parked-vehicle records end"))?;
+        if records_end != original_records_end {
+            return Err(invalid(
+                records_start,
+                "parked-vehicle records do not end at their decoded boundary",
+            ));
+        }
+        if self.serialized_object_graph.get(records_start..records_end)
+            != Some(original_records.as_slice())
+        {
+            return Err(invalid(
+                records_start,
+                "parked-vehicle range differs from its decoded source bytes",
+            ));
+        }
+
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate
+            .get_mut(records_start..records_end)
+            .ok_or_else(|| invalid(records_start, "parked-vehicle range exceeds manager graph"))?
+            .copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        let validation =
+            self.decode_vehicle_manager_data()
+                .and_then(|(data, updated_manager_end)| {
+                    if updated_manager_end != original_manager_end
+                        || data.parked_records().encode() != replacement
+                    {
+                        return Err(invalid(
+                            records_start,
+                            "edited parked-vehicle fields changed the manager boundary",
+                        ));
+                    }
+                    Ok(())
+                });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                records_start,
+                format!("edited parked-vehicle fields failed boundary validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes the VehicleManager counters and checks the manager boundary.
@@ -13074,6 +13158,76 @@ mod manager_boundary_tests {
         );
         let graph_after_edit = manager.serialized_object_graph().to_vec();
         assert!(manager.replace_game_area(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), graph_after_edit);
+    }
+
+    #[test]
+    fn parked_vehicle_replacement_keeps_manager_boundary_and_neighbor_bytes() {
+        let mut graph = profiler_tag("VehicleManager");
+        write_encoded_uint_array(&mut graph, &vec![0; 16_383]);
+        let mut parked_flags = vec![0_u16; 16_383];
+        parked_flags[0] = 1;
+        write_encoded_ushort_array(&mut graph, &parked_flags);
+        write_encoded_ushort_array(&mut graph, &[0]); // Parked prefab index.
+        graph.extend_from_slice(&[0, 0]); // Empty prefab-name table.
+        for bits in [0x3f80_0000_u32, 0xc020_0000, 0x42f6_e979] {
+            graph.extend_from_slice(&bits.to_be_bytes());
+        }
+        for bits in [0x3f00_0000_u32, 0x3f80_0000, 0xbf00_0000, 0x3e80_0000] {
+            graph.extend_from_slice(&bits.to_be_bytes());
+        }
+        graph.extend_from_slice(&[0x01, 0x23, 0x45]);
+        graph.extend_from_slice(&[0, 0]); // Closing profiler reference.
+        graph.extend(profiler_tag("TransportManager"));
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 115;
+        let mut manager_objects = vec![None; 19];
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[18] = Some(ManagerObjectReference {
+            object_id: 18,
+            type_name: "TransportManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (vehicle_data, original_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        let (parked, original_records_end) = manager
+            .decode_vehicle_manager_parked_records_prefix()
+            .unwrap();
+        let (_, records_start) = manager
+            .decode_vehicle_manager_instance_fields_prefix()
+            .unwrap();
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let mut editor = parked.into_editor();
+        editor
+            .set_position_bits(0, [0x4020_0000, 0x4070_0000, 0x4090_0000])
+            .unwrap();
+        editor
+            .set_rotation_bits(0, [0x3f80_0000, 0, 0, 0x3f80_0000])
+            .unwrap();
+        editor.set_owner_citizen(0, 0x00ab_cdef).unwrap();
+
+        manager.replace_vehicle_parked_records(&editor).unwrap();
+        let (updated_data, updated_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        let updated = &updated_data.parked_records().records().unwrap()[0];
+        assert_eq!(updated.position(), [0x4020_0000, 0x4070_0000, 0x4090_0000]);
+        assert_eq!(updated.rotation(), [0x3f80_0000, 0, 0, 0x3f80_0000]);
+        assert_eq!(updated.owner_citizen(), 0x00ab_cdef);
+        assert_eq!(updated_manager_end, original_manager_end);
+        assert_eq!(
+            &manager.serialized_object_graph()[..records_start],
+            &original_graph[..records_start]
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[original_records_end..],
+            &original_graph[original_records_end..]
+        );
+        assert_eq!(vehicle_data.encode().len(), updated_data.encode().len());
+        let graph_after_edit = manager.serialized_object_graph().to_vec();
+        assert!(manager.replace_vehicle_parked_records(&editor).is_err());
         assert_eq!(manager.serialized_object_graph(), graph_after_edit);
     }
 
