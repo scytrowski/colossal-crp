@@ -14386,7 +14386,7 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn water_collect_pressure_edits_resize_only_the_bounded_manager_body() {
+    fn water_node_array_edits_resize_only_the_bounded_manager_body() {
         let mut manager = water_manager_with_next_version(
             272,
             "ZoneManager+Data, Assembly-CSharp",
@@ -14395,10 +14395,17 @@ mod manager_boundary_tests {
         let original_graph = manager.serialized_object_graph.clone();
         let mut stale_editor = manager.decode_water_manager_data().unwrap();
         let mut edited = manager.decode_water_manager_data().unwrap();
+        edited.set_water_node_pulse_group_index(9, 0x1111).unwrap();
         edited.set_water_node_pressure(3, 0x1020).unwrap();
         edited.set_water_node_extra_pressure(5, 0x2030).unwrap();
+        edited
+            .set_sewage_node_pulse_group_index(10, 0x2222)
+            .unwrap();
         edited.set_sewage_node_pressure(4, 0x3040).unwrap();
         edited.set_sewage_node_extra_pressure(6, 0x4050).unwrap();
+        edited
+            .set_heating_node_pulse_group_index(11, 0x3333)
+            .unwrap();
         edited.set_heating_node_pressure(7, 0x5060).unwrap();
         edited.set_heating_node_extra_pressure(8, 0x6070).unwrap();
         edited.set_collect_water_pressure(1, 0x1234).unwrap();
@@ -14428,10 +14435,13 @@ mod manager_boundary_tests {
             &original_graph[old_next_start..]
         );
         let decoded = manager.decode_water_manager_data().unwrap();
+        assert_eq!(decoded.water_node_pulse_groups()[9], 0x1111);
         assert_eq!(decoded.water_node_pressure()[3], 0x1020);
         assert_eq!(decoded.water_node_extra_pressure()[5], 0x2030);
+        assert_eq!(decoded.sewage_node_pulse_groups()[10], 0x2222);
         assert_eq!(decoded.sewage_node_pressure()[4], 0x3040);
         assert_eq!(decoded.sewage_node_extra_pressure()[6], 0x4050);
+        assert_eq!(decoded.heating_node_pulse_groups().unwrap()[11], 0x3333);
         assert_eq!(decoded.heating_node_pressure().unwrap()[7], 0x5060);
         assert_eq!(decoded.heating_node_extra_pressure().unwrap()[8], 0x6070);
         assert_eq!(decoded.collect_water_pressure()[1], 0x1234);
