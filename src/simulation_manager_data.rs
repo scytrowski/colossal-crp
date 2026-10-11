@@ -2424,9 +2424,10 @@ impl SimulationManagerData {
         ElectricityManagerData::decode(self.format_version, bytes)
     }
 
-    /// Replaces ElectricityManager's processed-cell counter, conductive-cell
-    /// counter, and continuation flag in place. Encoded network columns and
-    /// the closing profiler reference remain byte-identical.
+    /// Replaces edited ElectricityManager counters, continuation state, and
+    /// conductive-cell columns. The body can change length when its encoded
+    /// arrays are rewritten; the following WaterManager bytes are retained and
+    /// the new boundary is checked.
     pub fn replace_electricity_manager_data(
         &mut self,
         edited: &ElectricityManagerData,
@@ -2437,48 +2438,30 @@ impl SimulationManagerData {
                 "edited ElectricityManager version does not match this stream",
             ));
         }
-        let current = self.decode_electricity_manager_data()?;
-        if current.encode_unchanged() != edited.encode_unchanged() {
+        let field_range = self.electricity_manager_field_range()?;
+        let current_bytes = self
+            .serialized_object_graph
+            .get(field_range.clone())
+            .ok_or_else(|| {
+                invalid(
+                    field_range.start,
+                    "ElectricityManager body range is invalid",
+                )
+            })?;
+        if current_bytes != edited.encode_unchanged() {
             return Err(invalid(
-                16,
+                field_range.start,
                 "ElectricityManager bytes do not match the editor's source body",
             ));
         }
         let replacement = edited.encode()?;
-        if replacement.len() != edited.encode_unchanged().len() {
-            return Err(invalid(
-                16,
-                "ElectricityManager edits must preserve the decoded body length",
-            ));
-        }
-        let (body_start, next_tag_start) = self.manager_body_boundary(11)?;
-        let body_end =
-            body_start
-                .checked_add(replacement.len())
-                .ok_or(CrpError::ArithmeticOverflow(
-                    "ElectricityManager replacement end",
-                ))?;
-        if body_end != next_tag_start {
-            return Err(invalid(
-                body_end,
-                "ElectricityManager replacement no longer ends at the WaterManager boundary",
-            ));
-        }
         let mut candidate_graph = self.serialized_object_graph.clone();
-        candidate_graph
-            .get_mut(body_start..body_end)
-            .ok_or_else(|| {
-                invalid(
-                    body_start,
-                    "ElectricityManager replacement range is invalid",
-                )
-            })?
-            .copy_from_slice(&replacement);
+        candidate_graph.splice(field_range.clone(), replacement.clone());
         let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
         let validation = self.decode_electricity_manager_data().and_then(|decoded| {
             if decoded.encode_unchanged() != replacement {
                 return Err(invalid(
-                    body_start,
+                    field_range.start,
                     "rewritten ElectricityManager body does not match the edited fields",
                 ));
             }
@@ -2487,7 +2470,7 @@ impl SimulationManagerData {
         if let Err(error) = validation {
             self.serialized_object_graph = original_graph;
             return Err(invalid(
-                body_start,
+                field_range.start,
                 format!("rewritten ElectricityManager body failed validation: {error}"),
             ));
         }
@@ -12648,8 +12631,8 @@ mod manager_boundary_tests {
     };
     use crate::net_manager_data::NetObjectHeader;
     use crate::{
-        GuideInstanceBody, GuideTriggerBasePrefix, Package, SimulationMetaData, StatisticInt32Data,
-        StatisticInt64Data, WaterConductiveCellData,
+        ElectricityConductiveCellData, GuideInstanceBody, GuideTriggerBasePrefix, Package,
+        SimulationMetaData, StatisticInt32Data, StatisticInt64Data, WaterConductiveCellData,
     };
     use std::fs::{self, File};
     use std::path::PathBuf;
@@ -14296,6 +14279,60 @@ mod manager_boundary_tests {
         manager.format_version += 1;
         assert!(manager.replace_electricity_manager_data(&edited).is_err());
         assert_eq!(manager.serialized_object_graph, replaced_graph);
+    }
+
+    #[test]
+    fn electricity_manager_topology_edits_resize_body_and_preserve_water_boundary() {
+        let mut manager =
+            electricity_manager_with_next("WaterManager+Data, Assembly-CSharp", "WaterManager");
+        let original_graph = manager.serialized_object_graph.clone();
+        let next_tag = profiler_tag("WaterManager");
+        let old_next_start = original_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        let next_manager_bytes = original_graph[old_next_start..].to_vec();
+        let body_start = profiler_tag("ElectricityManager").len();
+
+        let mut edited = manager.decode_electricity_manager_data().unwrap();
+        let state = ElectricityConductiveCellData {
+            conductivity: 1,
+            current_charge: -4,
+            extra_charge: 0x1234,
+            pulse_group_index: 0x5678,
+            electrified: true,
+            temporary_electrified: false,
+            legacy_temporary_electrified_byte: None,
+            version_75_compatibility_value: None,
+        };
+        edited.insert_conductive_cell(42, state).unwrap();
+        let replacement = edited.encode().unwrap();
+        assert_ne!(replacement.len(), old_next_start - body_start);
+
+        manager.replace_electricity_manager_data(&edited).unwrap();
+
+        let new_next_start = manager
+            .serialized_object_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        assert_ne!(manager.serialized_object_graph.len(), original_graph.len());
+        assert_eq!(
+            &manager.serialized_object_graph[..body_start],
+            &original_graph[..body_start]
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[new_next_start..],
+            next_manager_bytes
+        );
+        let decoded = manager.decode_electricity_manager_data().unwrap();
+        assert_eq!(decoded.encode_unchanged(), replacement);
+        assert_eq!(decoded.conductive_cells(), [42]);
+        assert_eq!(decoded.current_charge(), [-4]);
+        assert_eq!(decoded.extra_charge(), [0x1234]);
+        assert_eq!(decoded.pulse_group_indexes(), [0x5678]);
+        assert_eq!(decoded.electrified(), [true]);
+        assert_eq!(decoded.temporary_electrified(), [false]);
     }
 
     #[test]

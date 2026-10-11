@@ -79,7 +79,8 @@ pub use district_manager_data::{
     DistrictSubCultureKind, DistrictTourismBlock, DistrictTourismKind,
 };
 pub use electricity_manager_data::{
-    ElectricityManagerData, ElectricityPulseGroup, ElectricityPulseUnit,
+    ElectricityConductiveCellData, ElectricityManagerData, ElectricityPulseGroup,
+    ElectricityPulseUnit,
 };
 pub use game_area_data::{GameAreaManagerData, SavedCameraView};
 pub use guide_data::{
