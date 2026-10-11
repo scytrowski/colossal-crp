@@ -5348,9 +5348,9 @@ impl SimulationManagerData {
     /// Replaces WeatherManager height planes, scalar values, and lightning records.
     ///
     /// The editor must come from this manager's current body and inner version.
-    /// Re-encoded height planes can resize the body; unknown bytes, lightning
-    /// count, closing profiler reference, and following manager bytes are
-    /// preserved and checked.
+    /// Re-encoded height planes or added/removed lightning records can resize
+    /// the body. Unknown bytes, the closing profiler reference, and following
+    /// manager bytes are preserved and checked.
     pub fn replace_weather_manager_data(
         &mut self,
         edited: &WeatherManagerEditor,
@@ -19149,6 +19149,67 @@ mod manager_boundary_tests {
         assert!(manager.replace_weather_manager_data(&editor).is_err());
         assert_eq!(manager.serialized_object_graph(), expected);
         assert_eq!(body_len, 256 + 12);
+    }
+
+    #[test]
+    fn weather_manager_lightning_edit_resizes_body_and_preserves_vehicle_boundary() {
+        let mut graph = profiler_tag("WeatherManager");
+        let body_start = graph.len();
+        graph.extend([0xff; 2 * 128]);
+        for _ in 0..12 {
+            graph.extend_from_slice(&0.0_f32.to_bits().to_be_bytes());
+        }
+        graph.push(1); // force weather on
+        for _ in 0..5 {
+            graph.extend_from_slice(&0.0_f32.to_bits().to_be_bytes());
+        }
+        graph.push(0); // Empty lightning table.
+        let body_len = graph.len() - body_start;
+        graph.extend_from_slice(&[0x00, 0x10]);
+        graph.extend(profiler_tag("VehicleManager"));
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 277;
+        let mut manager_objects = vec![None; 18];
+        manager_objects[16] = Some(ManagerObjectReference {
+            object_id: 16,
+            type_name: "WeatherManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let mut editor = manager.decode_weather_manager_editor().unwrap();
+        editor
+            .add_lightning_strike(crate::weather_manager_data::WeatherLightningStrike {
+                start_frame: 1234,
+                position: [1.0, 2.0, 3.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            })
+            .unwrap();
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let next_tag = profiler_tag("VehicleManager");
+        let old_next_start = original_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        manager.replace_weather_manager_data(&editor).unwrap();
+
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            original_graph.len() + 32
+        );
+        let (decoded, new_next_start) = manager.decode_weather_manager_data().unwrap();
+        assert_eq!(new_next_start, old_next_start + 32);
+        assert_eq!(decoded.lightning_strikes().unwrap().len(), 1);
+        assert_eq!(decoded.lightning_strikes().unwrap()[0].start_frame, 1234);
+        assert_eq!(
+            &manager.serialized_object_graph()[new_next_start..],
+            &original_graph[old_next_start..]
+        );
+        assert_eq!(body_len, 256 + 70);
     }
 
     #[test]

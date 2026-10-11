@@ -7,6 +7,7 @@ const WIND_CELL_COUNT: usize = 16_384;
 const WIND_DELTA_VERSION: u32 = 117_013;
 const LIGHTNING_VERSION: u32 = 277;
 const LIGHTNING_RECORD_LENGTH: usize = 32;
+const MAX_LIGHTNING_STRIKE_COUNT: usize = u8::MAX as usize;
 const VERSION_276_COMPATIBILITY_LENGTH: usize = 36;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,14 +58,16 @@ pub struct WeatherManagerData {
     force_weather_on_range: Option<Range<usize>>,
     ground_wetness_range: Option<Range<usize>>,
     northern_lights_and_rainbow_range: Option<Range<usize>>,
+    lightning_strikes_count_offset: Option<usize>,
     lightning_strikes_range: Option<Range<usize>>,
     serialized_body: Vec<u8>,
 }
 
 /// Editor for WeatherManager height planes, scalar fields, and lightning records.
 ///
-/// The version-276 compatibility block, lightning count, and all other source
-/// bytes are retained. Lightning records cannot be added or removed.
+/// The version-276 compatibility block and all other unedited source bytes are
+/// retained. From version 277, lightning records can be added or removed
+/// within the serialized byte-count limit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WeatherManagerEditor {
     data: WeatherManagerData,
@@ -181,6 +184,8 @@ impl WeatherManagerData {
             None
         };
         let lightning_strikes_start = reader.offset();
+        let lightning_strikes_count_offset =
+            (format_version >= LIGHTNING_VERSION).then_some(lightning_strikes_start);
         let lightning_strikes = if format_version >= LIGHTNING_VERSION {
             let count = usize::from(reader.read_u8()?);
             if count > reader.remaining() / LIGHTNING_RECORD_LENGTH {
@@ -247,6 +252,7 @@ impl WeatherManagerData {
                 force_weather_on_range,
                 ground_wetness_range,
                 northern_lights_and_rainbow_range,
+                lightning_strikes_count_offset,
                 lightning_strikes_range,
                 serialized_body: bytes[..consumed].to_vec(),
             },
@@ -394,6 +400,61 @@ impl WeatherManagerEditor {
         self.data.lightning_strikes.as_deref_mut()
     }
 
+    /// Adds an existing-format lightning record from inner version 277 onward.
+    /// Returns an error before version 277 or when the byte-sized count is full.
+    pub fn add_lightning_strike(&mut self, strike: WeatherLightningStrike) -> Result<(), CrpError> {
+        let count_offset = self.data.lightning_strikes_count_offset.ok_or_else(|| {
+            invalid(
+                0,
+                "lightning records are not serialized before inner version 277",
+            )
+        })?;
+        let strikes = self.data.lightning_strikes.as_mut().ok_or_else(|| {
+            invalid(
+                count_offset,
+                "WeatherManager lightning record storage is missing",
+            )
+        })?;
+        if strikes.len() >= MAX_LIGHTNING_STRIKE_COUNT {
+            return Err(invalid(
+                count_offset,
+                "WeatherManager lightning count exceeds the byte-sized limit of 255",
+            ));
+        }
+        strikes.push(strike);
+        Ok(())
+    }
+
+    /// Removes and returns one lightning record by zero-based serialized index.
+    /// Returns an error before version 277 or for an out-of-range index.
+    pub fn remove_lightning_strike(
+        &mut self,
+        index: usize,
+    ) -> Result<WeatherLightningStrike, CrpError> {
+        let count_offset = self.data.lightning_strikes_count_offset.ok_or_else(|| {
+            invalid(
+                0,
+                "lightning records are not serialized before inner version 277",
+            )
+        })?;
+        let strikes = self.data.lightning_strikes.as_mut().ok_or_else(|| {
+            invalid(
+                count_offset,
+                "WeatherManager lightning record storage is missing",
+            )
+        })?;
+        if index >= strikes.len() {
+            return Err(invalid(
+                count_offset,
+                format!(
+                    "WeatherManager lightning index {index} is outside the {} serialized records",
+                    strikes.len()
+                ),
+            ));
+        }
+        Ok(strikes.remove(index))
+    }
+
     /// Writes edited height planes and scalar fields into the original body
     /// while retaining all other bytes. Changed encoded planes can resize the
     /// body. Returns an error if a captured field range or plane length is
@@ -450,12 +511,16 @@ impl WeatherManagerEditor {
                 .map(|values| values.as_slice()),
             "northern lights and rainbow",
         )?;
-        encode_lightning_strikes(
+        let lightning_replacement = encode_lightning_strikes(
             &mut bytes,
+            self.data.lightning_strikes_count_offset,
             self.data.lightning_strikes_range.as_ref(),
             self.data.lightning_strikes.as_deref(),
         )?;
         let mut replacements = Vec::new();
+        if let Some(replacement) = lightning_replacement {
+            replacements.push(replacement);
+        }
         if let Some(replacement) = changed_height_plane(
             &self.data.self_heights,
             &self.data.self_heights_snapshot,
@@ -625,52 +690,73 @@ fn encode_force_weather_flag(
 
 fn encode_lightning_strikes(
     output: &mut [u8],
+    count_offset: Option<usize>,
     range: Option<&Range<usize>>,
     strikes: Option<&[WeatherLightningStrike]>,
-) -> Result<(), CrpError> {
-    match (range, strikes) {
-        (Some(range), Some(strikes)) => {
-            let expected_len = strikes.len().checked_mul(LIGHTNING_RECORD_LENGTH).ok_or(
-                CrpError::ArithmeticOverflow("WeatherManager lightning range length"),
-            )?;
-            if range.len() != expected_len {
+) -> Result<Option<(Range<usize>, Vec<u8>)>, CrpError> {
+    match (count_offset, range, strikes) {
+        (Some(count_offset), Some(range), Some(strikes)) => {
+            if strikes.len() > MAX_LIGHTNING_STRIKE_COUNT {
                 return Err(invalid(
-                    range.start,
-                    "WeatherManager lightning record count changes its source range length",
+                    count_offset,
+                    "WeatherManager lightning count exceeds the byte-sized limit of 255",
                 ));
             }
-            let destination = output.get_mut(range.clone()).ok_or_else(|| {
+            let count_end = count_offset
+                .checked_add(1)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "WeatherManager lightning count end",
+                ))?;
+            if range.start != count_end
+                || range.start > range.end
+                || range.end > output.len()
+                || range.len() % LIGHTNING_RECORD_LENGTH != 0
+            {
+                return Err(invalid(
+                    count_offset,
+                    "WeatherManager lightning count and source record range are inconsistent",
+                ));
+            }
+            let count = u8::try_from(strikes.len()).map_err(|_| {
                 invalid(
-                    range.start,
-                    "WeatherManager lightning range exceeds source body",
+                    count_offset,
+                    "WeatherManager lightning count does not fit its serialized byte",
                 )
             })?;
-            for (record_bytes, strike) in destination
-                .chunks_exact_mut(LIGHTNING_RECORD_LENGTH)
-                .zip(strikes)
-            {
-                let mut encoded = [0_u8; LIGHTNING_RECORD_LENGTH];
-                encoded[..4].copy_from_slice(&strike.start_frame.to_be_bytes());
-                let mut offset = 4_usize;
+            let count_byte = output.get_mut(count_offset).ok_or_else(|| {
+                invalid(
+                    count_offset,
+                    "WeatherManager lightning count exceeds source body",
+                )
+            })?;
+            *count_byte = count;
+
+            let encoded_len = strikes.len().checked_mul(LIGHTNING_RECORD_LENGTH).ok_or(
+                CrpError::ArithmeticOverflow("WeatherManager lightning range length"),
+            )?;
+            let mut encoded = Vec::with_capacity(encoded_len);
+            for strike in strikes {
+                encoded.extend_from_slice(&strike.start_frame.to_be_bytes());
                 for value in strike.position.into_iter().chain(strike.rotation) {
-                    let end = offset.checked_add(4).ok_or(CrpError::ArithmeticOverflow(
-                        "WeatherManager lightning field end",
-                    ))?;
-                    encoded[offset..end].copy_from_slice(&value.to_bits().to_be_bytes());
-                    offset = end;
-                }
-                if record_bytes != encoded {
-                    record_bytes.copy_from_slice(&encoded);
+                    encoded.extend_from_slice(&value.to_bits().to_be_bytes());
                 }
             }
-            Ok(())
+            if output.get(range.clone()) == Some(encoded.as_slice()) {
+                Ok(None)
+            } else {
+                Ok(Some((range.clone(), encoded)))
+            }
         }
-        (None, None) => Ok(()),
-        (Some(range), _) => Err(invalid(
+        (None, None, None) => Ok(None),
+        (_, Some(range), _) => Err(invalid(
             range.start,
             "WeatherManager lightning records and source range disagree",
         )),
-        _ => Err(invalid(
+        (Some(offset), None, _) => Err(invalid(
+            offset,
+            "WeatherManager lightning records and source range disagree",
+        )),
+        (None, None, Some(_)) => Err(invalid(
             0,
             "WeatherManager lightning records and source range disagree",
         )),
@@ -948,10 +1034,66 @@ mod tests {
     }
 
     #[test]
+    fn weather_editor_adds_and_removes_lightning_records_with_expected_count_bytes() {
+        let bytes = base_body(277);
+        let (weather, consumed) = WeatherManagerData::decode_prefix(277, &bytes).unwrap();
+        let original_strike = weather.lightning_strikes().unwrap()[0];
+        let mut editor = weather.into_editor();
+        let added_strike = super::WeatherLightningStrike {
+            start_frame: 0xaabb_ccdd,
+            position: [21.0, 22.0, 23.0],
+            rotation: [0.1, 0.2, 0.3, 0.4],
+        };
+        editor.add_lightning_strike(added_strike).unwrap();
+        assert_eq!(editor.lightning_strikes_mut().unwrap().len(), 2);
+
+        let count_offset = consumed - 33;
+        let mut expected = bytes.clone();
+        expected[count_offset] = 2;
+        expected.extend_from_slice(&added_strike.start_frame.to_be_bytes());
+        append_floats(&mut expected, &[21.0, 22.0, 23.0, 0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(editor.encode().unwrap(), expected);
+        let (decoded, decoded_len) = WeatherManagerData::decode_prefix(277, &expected).unwrap();
+        assert_eq!(decoded_len, expected.len());
+        assert_eq!(decoded.lightning_strikes().unwrap().len(), 2);
+        assert_eq!(
+            decoded.lightning_strikes().unwrap()[1].start_frame,
+            added_strike.start_frame
+        );
+
+        assert_eq!(editor.remove_lightning_strike(0).unwrap(), original_strike);
+        let mut expected_one = bytes[..count_offset + 1].to_vec();
+        expected_one[count_offset] = 1;
+        expected_one.extend_from_slice(&added_strike.start_frame.to_be_bytes());
+        append_floats(&mut expected_one, &[21.0, 22.0, 23.0, 0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(editor.encode().unwrap(), expected_one);
+        assert!(editor.remove_lightning_strike(1).is_err());
+        editor.remove_lightning_strike(0).unwrap();
+        let mut expected_empty = bytes[..count_offset + 1].to_vec();
+        expected_empty[count_offset] = 0;
+        assert_eq!(editor.encode().unwrap(), expected_empty);
+
+        let (weather, _) = WeatherManagerData::decode_prefix(277, &bytes).unwrap();
+        let mut full_editor = weather.into_editor();
+        for _ in 1..u8::MAX {
+            full_editor.add_lightning_strike(added_strike).unwrap();
+        }
+        assert_eq!(full_editor.lightning_strikes_mut().unwrap().len(), 255);
+        assert!(full_editor.add_lightning_strike(added_strike).is_err());
+    }
+
+    #[test]
     fn weather_editor_keeps_version_276_compatibility_bytes_opaque() {
         let bytes = base_body(276);
         let (weather, consumed) = WeatherManagerData::decode_prefix(276, &bytes).unwrap();
         let mut editor = weather.into_editor();
+        let strike = super::WeatherLightningStrike {
+            start_frame: 0,
+            position: [0.0; 3],
+            rotation: [0.0; 4],
+        };
+        assert!(editor.add_lightning_strike(strike).is_err());
+        assert!(editor.remove_lightning_strike(0).is_err());
         *editor.ground_wetness_mut().unwrap() = 42.0;
         let mut expected = bytes[..consumed].to_vec();
         expected[305..309].copy_from_slice(&42.0_f32.to_bits().to_be_bytes());
