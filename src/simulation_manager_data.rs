@@ -14395,6 +14395,7 @@ mod manager_boundary_tests {
         let original_graph = manager.serialized_object_graph.clone();
         let mut stale_editor = manager.decode_water_manager_data().unwrap();
         let mut edited = manager.decode_water_manager_data().unwrap();
+        edited.set_node_pollution(12, 0x44).unwrap();
         edited.set_water_node_pulse_group_index(9, 0x1111).unwrap();
         edited.set_water_node_pressure(3, 0x1020).unwrap();
         edited.set_water_node_extra_pressure(5, 0x2030).unwrap();
@@ -14435,6 +14436,7 @@ mod manager_boundary_tests {
             &original_graph[old_next_start..]
         );
         let decoded = manager.decode_water_manager_data().unwrap();
+        assert_eq!(decoded.node_pollution().unwrap()[12], 0x44);
         assert_eq!(decoded.water_node_pulse_groups()[9], 0x1111);
         assert_eq!(decoded.water_node_pressure()[3], 0x1020);
         assert_eq!(decoded.water_node_extra_pressure()[5], 0x2030);

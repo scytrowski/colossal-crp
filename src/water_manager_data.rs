@@ -2,7 +2,7 @@ use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
     read_encoded_bool_array, read_encoded_byte_array, read_encoded_ushort_array,
-    write_encoded_ushort_array,
+    write_encoded_byte_array, write_encoded_ushort_array,
 };
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 
@@ -127,6 +127,8 @@ pub struct WaterManagerData {
     heating_node_extra_pressure_range: Option<(usize, usize)>,
     original_heating_node_extra_pressure: Option<Vec<u16>>,
     node_pollution: Option<Vec<u8>>,
+    node_pollution_range: Option<(usize, usize)>,
+    original_node_pollution: Option<Vec<u8>>,
     collect_water_pressure: Vec<u16>,
     collect_water_pressure_range: Option<(usize, usize)>,
     original_collect_water_pressure: Option<Vec<u16>>,
@@ -314,11 +316,16 @@ impl WaterManagerData {
         } else {
             (None, None, None, None, None, None, None, None, None)
         };
-        let node_pollution = if format_version >= POLLUTION_VERSION {
-            Some(read_node_byte_array(&mut reader, stored_node_count, 0)?)
-        } else {
-            None
-        };
+        let (node_pollution, node_pollution_range, original_node_pollution) =
+            if format_version >= POLLUTION_VERSION {
+                let start = reader.offset();
+                let values = read_node_byte_array(&mut reader, stored_node_count, 0)?;
+                let end = reader.offset();
+                let original = values[..stored_node_count].to_vec();
+                (Some(values), Some((start, end)), Some(original))
+            } else {
+                (None, None, None)
+            };
 
         let mut collect_water_pressure = vec![0; NODE_COUNT];
         let mut collect_water_pressure_range = None;
@@ -436,6 +443,8 @@ impl WaterManagerData {
             heating_node_extra_pressure_range,
             original_heating_node_extra_pressure,
             node_pollution,
+            node_pollution_range,
+            original_node_pollution,
             collect_water_pressure,
             collect_water_pressure_range,
             original_collect_water_pressure,
@@ -922,6 +931,19 @@ impl WaterManagerData {
         self.node_pollution.as_deref()
     }
 
+    /// Replaces one stored node pollution value from inner version 23.
+    /// The serialized prefix contains 16,384 nodes before inner version 202
+    /// and all 32,768 nodes from version 202 onward.
+    pub fn set_node_pollution(&mut self, node: usize, value: u8) -> Result<(), CrpError> {
+        let Some(values) = self.node_pollution.as_mut() else {
+            return Err(invalid_node_array(
+                node,
+                "node pollution values are absent before inner version 23",
+            ));
+        };
+        set_node_byte_value(values, self.format_version, node, value, "node pollution")
+    }
+
     /// Returns the full collect-water pressure grid, including old defaults.
     pub fn collect_water_pressure(&self) -> &[u16] {
         &self.collect_water_pressure
@@ -1046,9 +1068,10 @@ impl WaterManagerData {
     /// Encodes edited pulse records, node pulse-group indexes and pressures,
     /// collect-pressure arrays, counters, and the continuation flag while
     /// preserving all unedited bytes, including conductivity grids, guide
-    /// references, and the closing profiler reference. Changed node arrays use
-    /// the canonical UShort encoding and may change body length. Returns an
-    /// error if a captured field range is invalid.
+    /// references, and the closing profiler reference. Changed UShort arrays
+    /// use the canonical UShort encoding; changed Byte arrays use literal
+    /// blocks. Either can change body length. Returns an error if a captured
+    /// field range is invalid.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.original_body.clone();
         encode_pulse_groups(
@@ -1271,6 +1294,30 @@ impl WaterManagerData {
                 ));
             }
         }
+        match (
+            self.node_pollution_range,
+            self.node_pollution.as_deref(),
+            self.original_node_pollution.as_deref(),
+        ) {
+            (Some((start, end)), Some(values), Some(original)) => {
+                if let Some(encoded) = changed_byte_array(
+                    values,
+                    Some(original),
+                    stored_node_count,
+                    start,
+                    "node pollution",
+                )? {
+                    replacements.push((start, end, encoded));
+                }
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(invalid_node_array(
+                    self.scalar_fields_offset,
+                    "node pollution fields do not match the version gate",
+                ));
+            }
+        }
         if let Some((start, end)) = self.collect_water_pressure_range {
             if let Some(encoded) = changed_ushort_array(
                 &self.collect_water_pressure,
@@ -1362,6 +1409,29 @@ fn set_node_ushort_value(
     Ok(())
 }
 
+fn set_node_byte_value(
+    values: &mut [u8],
+    format_version: u32,
+    node: usize,
+    value: u8,
+    kind: &str,
+) -> Result<(), CrpError> {
+    if node >= stored_node_count(format_version) {
+        return Err(invalid_node_array(
+            node,
+            &format!("{kind} node index is outside the stored prefix"),
+        ));
+    }
+    let Some(target) = values.get_mut(node) else {
+        return Err(invalid_node_array(
+            node,
+            &format!("{kind} node index is outside the decoded grid"),
+        ));
+    };
+    *target = value;
+    Ok(())
+}
+
 fn stored_node_count(format_version: u32) -> usize {
     if format_version >= FULL_NODE_COUNT_VERSION {
         NODE_COUNT
@@ -1394,6 +1464,33 @@ fn changed_ushort_array(
     }
     let mut encoded = Vec::new();
     write_encoded_ushort_array(&mut encoded, current);
+    Ok(Some(encoded))
+}
+
+fn changed_byte_array(
+    values: &[u8],
+    original_values: Option<&[u8]>,
+    count: usize,
+    offset: usize,
+    field: &str,
+) -> Result<Option<Vec<u8>>, CrpError> {
+    let current = values.get(..count).ok_or_else(|| {
+        invalid_node_array(offset, &format!("{field} decoded prefix is truncated"))
+    })?;
+    let original = original_values.ok_or_else(|| {
+        invalid_node_array(offset, &format!("{field} original values are missing"))
+    })?;
+    if original.len() != count {
+        return Err(invalid_node_array(
+            offset,
+            &format!("{field} original prefix has an invalid length"),
+        ));
+    }
+    if current == original {
+        return Ok(None);
+    }
+    let mut encoded = Vec::new();
+    write_encoded_byte_array(&mut encoded, current);
     Ok(Some(encoded))
 }
 
@@ -2353,6 +2450,51 @@ mod tests {
                 .set_heating_node_pulse_group_index(0, 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn node_pollution_edits_follow_byte_array_and_node_count_gates() {
+        let body = active_body(265);
+        let mut data = WaterManagerData::decode(265, &body).unwrap();
+        assert_eq!(data.encode().unwrap(), body);
+        let range = data.node_pollution_range.unwrap();
+        let mut expected_values = vec![0; NODE_COUNT];
+        expected_values[0] = 30;
+        expected_values[1] = 0xa5;
+        let mut expected_array = Vec::new();
+        for chunk in expected_values.chunks(128) {
+            expected_array.push((chunk.len() - 1) as u8);
+            expected_array.extend_from_slice(chunk);
+        }
+        let mut expected = body;
+        expected.splice(range.0..range.1, expected_array);
+        data.set_node_pollution(1, 0xa5).unwrap();
+
+        let encoded = data.encode().unwrap();
+        if encoded != expected {
+            let mismatch = encoded
+                .iter()
+                .zip(&expected)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(encoded.len().min(expected.len()));
+            panic!(
+                "encoded WaterManager differs at byte {mismatch}; actual length {}, expected length {}, actual bytes {:?}, expected bytes {:?}",
+                encoded.len(),
+                expected.len(),
+                &encoded[mismatch.saturating_sub(4)..(mismatch + 12).min(encoded.len())],
+                &expected[mismatch.saturating_sub(4)..(mismatch + 12).min(expected.len())],
+            );
+        }
+        let decoded = WaterManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.node_pollution().unwrap()[0], 30);
+        assert_eq!(decoded.node_pollution().unwrap()[1], 0xa5);
+        assert!(data.set_node_pollution(NODE_COUNT, 1).is_err());
+
+        let mut legacy = WaterManagerData::decode(201, &empty_body(201)).unwrap();
+        assert!(legacy.set_node_pollution(LEGACY_NODE_COUNT, 1).is_err());
+
+        let mut before_pollution = WaterManagerData::decode(22, &empty_body(22)).unwrap();
+        assert!(before_pollution.set_node_pollution(0, 1).is_err());
     }
 
     #[test]
