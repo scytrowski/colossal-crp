@@ -302,6 +302,201 @@ impl TransportManagerMilestoneEditor {
     }
 }
 
+/// A version-gated fixed reference at the end of `TransportManager+Data`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportManagerTailReferenceField {
+    /// Monorail transport line, present from inner version 316.
+    MonorailLine,
+    /// Monorail end-of-line station, present from inner version 316.
+    MonorailEndOfLineStation,
+    /// Ferry-bus hub, present from inner version 317.
+    FerryBusHub,
+    /// Ferry transport line, present from inner version 318.
+    FerryLine,
+    /// Ferry depot, present from inner version 318.
+    FerryDepot,
+    /// Blimp transport line, present from inner version 318.
+    BlimpLine,
+    /// Blimp depot, present from inner version 318.
+    BlimpDepot,
+}
+
+/// One fixed `TransportManager+Data` tail field and its resolved reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportManagerTailReference {
+    field: TransportManagerTailReferenceField,
+    reference: Option<ResolvedObjectReference>,
+}
+
+impl TransportManagerTailReference {
+    /// Returns the serialized field represented by this entry.
+    pub fn field(&self) -> TransportManagerTailReferenceField {
+        self.field
+    }
+
+    /// Returns the resolved target, or `None` for a null header.
+    pub fn reference(&self) -> Option<&ResolvedObjectReference> {
+        self.reference.as_ref()
+    }
+}
+
+/// In-place editor for `TransportManager+Data`'s fixed tail object references.
+///
+/// Only existing object IDs can be redirected. A target must already be
+/// available at that position in the object stream and have the same runtime
+/// type. Null and newly allocated headers retain their original bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportManagerTailReferenceEditor {
+    format_version: u32,
+    save_app_version: Option<u32>,
+    references: Vec<TransportManagerTailReference>,
+    original_headers: Vec<NetObjectHeader>,
+    header_ranges: Vec<Range<usize>>,
+    available_object_counts: Vec<usize>,
+    object_types: Vec<String>,
+    original_body: Vec<u8>,
+}
+
+impl TransportManagerTailReferenceEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns fixed tail fields in serialized order.
+    pub fn references(&self) -> &[TransportManagerTailReference] {
+        &self.references
+    }
+
+    /// Redirects an existing reference to an earlier object of the same type.
+    pub fn set_reference_object_id(
+        &mut self,
+        reference_index: usize,
+        object_id: u32,
+    ) -> Result<(), CrpError> {
+        let header = self.original_headers.get(reference_index).ok_or_else(|| {
+            invalid(
+                reference_index,
+                "TransportManager tail-reference index is out of bounds",
+            )
+        })?;
+        if !matches!(header, NetObjectHeader::Existing(_)) {
+            return Err(invalid(
+                reference_index,
+                "TransportManager tail reference is not an existing object ID",
+            ));
+        }
+        let available_count = *self
+            .available_object_counts
+            .get(reference_index)
+            .ok_or_else(|| {
+                invalid(
+                    reference_index,
+                    "tail-reference object bounds were not captured",
+                )
+            })?;
+        let object_index = usize::try_from(object_id)
+            .map_err(|_| CrpError::ArithmeticOverflow("TransportManager tail object ID"))?;
+        if object_index >= available_count {
+            return Err(invalid(
+                reference_index,
+                "TransportManager tail target is not available at this entry",
+            ));
+        }
+        let target_type = self.object_types.get(object_index).ok_or_else(|| {
+            invalid(
+                reference_index,
+                "TransportManager tail target type is unresolved",
+            )
+        })?;
+        let entry = self.references.get_mut(reference_index).ok_or_else(|| {
+            invalid(
+                reference_index,
+                "TransportManager tail-reference index is out of bounds",
+            )
+        })?;
+        let reference = entry
+            .reference
+            .as_mut()
+            .ok_or_else(|| invalid(reference_index, "TransportManager tail reference is null"))?;
+        if target_type != &reference.type_name {
+            return Err(invalid(
+                reference_index,
+                "TransportManager tail target has a different runtime type",
+            ));
+        }
+        reference.object_id = object_id;
+        Ok(())
+    }
+
+    /// Writes redirected references into the source body without changing its length.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let count = self.references.len();
+        if count != transport_manager_object_header_count(self.format_version)
+            || self.original_headers.len() != count
+            || self.header_ranges.len() != count
+            || self.available_object_counts.len() != count
+        {
+            return Err(invalid(
+                0,
+                "TransportManager tail-reference editor has inconsistent version or entry counts",
+            ));
+        }
+        let mut body = self.original_body.clone();
+        for (index, header) in self.original_headers.iter().enumerate() {
+            let NetObjectHeader::Existing(_) = header else {
+                continue;
+            };
+            let entry = self.references.get(index).ok_or_else(|| {
+                invalid(
+                    index,
+                    "TransportManager tail reference is missing from editor",
+                )
+            })?;
+            let reference = entry.reference.as_ref().ok_or_else(|| {
+                invalid(
+                    index,
+                    "existing TransportManager tail reference became null",
+                )
+            })?;
+            let range = self.header_ranges.get(index).ok_or_else(|| {
+                invalid(index, "TransportManager tail header range was not captured")
+            })?;
+            if range.len() != 3 {
+                return Err(invalid(
+                    range.start,
+                    "existing TransportManager tail header is not three bytes",
+                ));
+            }
+            let object_index = usize::try_from(reference.object_id)
+                .map_err(|_| CrpError::ArithmeticOverflow("TransportManager tail object ID"))?;
+            if reference.object_id >= MAX_OBJECT_ID
+                || object_index >= self.available_object_counts[index]
+                || self.object_types.get(object_index) != Some(&reference.type_name)
+            {
+                return Err(invalid(
+                    range.start,
+                    "TransportManager tail target is unavailable or has a different runtime type",
+                ));
+            }
+            let bytes = [
+                (reference.object_id >> 16) as u8,
+                (reference.object_id >> 8) as u8,
+                reference.object_id as u8,
+            ];
+            body.get_mut(range.clone())
+                .ok_or_else(|| {
+                    invalid(
+                        range.start,
+                        "TransportManager tail header range exceeds source body",
+                    )
+                })?
+                .copy_from_slice(&bytes);
+        }
+        Ok(body)
+    }
+}
+
 /// One active EconomyManager investment's serialized float history.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EconomyInvestmentValueSeries {
@@ -10290,6 +10485,150 @@ impl SimulationManagerData {
         Ok(())
     }
 
+    /// Decodes the version-gated fixed tail references for inner versions 164–115999.
+    ///
+    /// The result follows the manager queue and preserves the source bytes for
+    /// exact rewriting. Tail fields begin at version 316. Pass the saved
+    /// application version for inner-version-221+ guide fields in earlier managers.
+    pub fn decode_transport_manager_tail_reference_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<TransportManagerTailReferenceEditor, CrpError> {
+        if self.format_version < 164 || self.format_version > 115_999 {
+            return Err(invalid(
+                0,
+                "TransportManager tail-reference editing is supported for inner versions 164–115999",
+            ));
+        }
+        let prefix = self.zone_manager_guide_queue_prefix(save_app_version)?;
+        let fields = self.decode_transport_manager_reference_headers(&prefix.object_table, true)?;
+        let tail_fields = transport_manager_tail_reference_fields(self.format_version);
+        if fields.object_headers.len() != tail_fields.len()
+            || fields.object_header_ids.len() != tail_fields.len()
+            || fields.object_header_ranges.len() != tail_fields.len()
+            || fields.object_header_available_object_counts.len() != tail_fields.len()
+            || fields.milestone_object_types.is_empty()
+        {
+            return Err(invalid(
+                TRANSPORT_MANAGER_SLOT,
+                "TransportManager fixed tail-reference fields have inconsistent counts",
+            ));
+        }
+        let references = tail_fields
+            .iter()
+            .zip(&fields.object_header_ids)
+            .map(|(field, object_id)| {
+                let reference = object_id
+                    .map(|object_id| {
+                        let object_index = usize::try_from(object_id).map_err(|_| {
+                            CrpError::ArithmeticOverflow("TransportManager tail object ID")
+                        })?;
+                        let type_name = fields
+                            .milestone_object_types
+                            .get(object_index)
+                            .ok_or_else(|| {
+                                invalid(0, "TransportManager tail object type is unresolved")
+                            })?;
+                        Ok::<ResolvedObjectReference, CrpError>(ResolvedObjectReference {
+                            object_id,
+                            type_name: type_name.clone(),
+                        })
+                    })
+                    .transpose()?;
+                Ok(TransportManagerTailReference {
+                    field: *field,
+                    reference,
+                })
+            })
+            .collect::<Result<Vec<_>, CrpError>>()?;
+        let (body_range, _) = self.transport_manager_body_range()?;
+        let bounded_end = body_range
+            .end
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager bounded body end",
+            ))?;
+        let original_body = self
+            .serialized_object_graph
+            .get(body_range.start..bounded_end)
+            .ok_or_else(|| invalid(body_range.start, "TransportManager bounded body is invalid"))?
+            .to_vec();
+        Ok(TransportManagerTailReferenceEditor {
+            format_version: self.format_version,
+            save_app_version,
+            references,
+            original_headers: fields.object_headers,
+            header_ranges: fields.object_header_ranges,
+            available_object_counts: fields.object_header_available_object_counts,
+            object_types: fields.milestone_object_types,
+            original_body,
+        })
+    }
+
+    /// Applies existing-object redirects to TransportManager's fixed tail references.
+    ///
+    /// The editor must come from this manager's current bytes and version.
+    /// Only existing IDs can change; each target must be available at that
+    /// point in the object stream and retain the original runtime type. The
+    /// manager graph length and all other bytes remain unchanged.
+    pub fn replace_transport_manager_tail_references(
+        &mut self,
+        edited: &TransportManagerTailReferenceEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version != self.format_version {
+            return Err(invalid(
+                0,
+                "edited TransportManager tail references use a different DataSerializer version",
+            ));
+        }
+        let (body_range, _) = self.transport_manager_body_range()?;
+        let bounded_end = body_range
+            .end
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "TransportManager bounded body end",
+            ))?;
+        let current = self
+            .serialized_object_graph
+            .get(body_range.start..bounded_end)
+            .ok_or_else(|| invalid(body_range.start, "TransportManager bounded body is invalid"))?;
+        if current != edited.original_body {
+            return Err(invalid(
+                body_range.start,
+                "TransportManager bytes do not match the tail-reference editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != current.len() {
+            return Err(invalid(
+                body_range.start,
+                "TransportManager tail-reference edits must preserve the bounded body length",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph[body_range.start..bounded_end].copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_transport_manager_tail_reference_editor(edited.save_app_version)
+            .and_then(|decoded| {
+                if decoded.references != edited.references {
+                    return Err(invalid(
+                        body_range.start,
+                        "rewritten TransportManager tail references do not match the editor",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_range.start,
+                format!("rewritten TransportManager tail references failed validation: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Decodes TransportManager's final vehicle-selection table from version 114001.
     ///
     /// New shared strings are decoded, and existing indexes are resolved against
@@ -13769,6 +14108,35 @@ fn transport_manager_object_header_count(format_version: u32) -> usize {
     }
 }
 
+fn transport_manager_tail_reference_fields(
+    format_version: u32,
+) -> &'static [TransportManagerTailReferenceField] {
+    const FROM_316: [TransportManagerTailReferenceField; 2] = [
+        TransportManagerTailReferenceField::MonorailLine,
+        TransportManagerTailReferenceField::MonorailEndOfLineStation,
+    ];
+    const FROM_317: [TransportManagerTailReferenceField; 3] = [
+        TransportManagerTailReferenceField::MonorailLine,
+        TransportManagerTailReferenceField::MonorailEndOfLineStation,
+        TransportManagerTailReferenceField::FerryBusHub,
+    ];
+    const FROM_318: [TransportManagerTailReferenceField; 7] = [
+        TransportManagerTailReferenceField::MonorailLine,
+        TransportManagerTailReferenceField::MonorailEndOfLineStation,
+        TransportManagerTailReferenceField::FerryBusHub,
+        TransportManagerTailReferenceField::FerryLine,
+        TransportManagerTailReferenceField::FerryDepot,
+        TransportManagerTailReferenceField::BlimpLine,
+        TransportManagerTailReferenceField::BlimpDepot,
+    ];
+    match format_version {
+        318.. => &FROM_318,
+        317 => &FROM_317,
+        316 => &FROM_316,
+        _ => &[],
+    }
+}
+
 fn transport_manager_line_number_count(format_version: u32) -> usize {
     if format_version >= 113_008 {
         17
@@ -14040,8 +14408,11 @@ fn decode_transport_manager_reference_body_with_milestones(
 
     let header_count = transport_manager_object_header_count(format_version);
     let mut headers = Vec::with_capacity(header_count);
+    let mut object_header_ranges = Vec::with_capacity(header_count);
     for _ in 0..header_count {
+        let start = reader.offset();
         headers.push(read_net_object_header(&mut reader)?);
+        object_header_ranges.push(start..reader.offset());
     }
     let selection_start = reader.offset();
     let mut selections = Vec::new();
@@ -14164,6 +14535,8 @@ fn decode_transport_manager_reference_body_with_milestones(
     let mut milestone_object_ids = Vec::new();
     let mut milestone_available_object_counts = Vec::new();
     let mut milestone_object_types = Vec::new();
+    let mut object_header_ids = Vec::new();
+    let mut object_header_available_object_counts = Vec::new();
     if let Some(object_table) = object_table {
         let mut checked_table = object_table.clone();
         if capture_milestones {
@@ -14178,8 +14551,11 @@ fn decode_transport_manager_reference_body_with_milestones(
                 checked_table.register(header)?;
             }
         }
+        object_header_ids.reserve(headers.len());
+        object_header_available_object_counts.reserve(headers.len());
         for header in &headers {
-            checked_table.register(header)?;
+            object_header_available_object_counts.push(checked_table.object_types.len());
+            object_header_ids.push(checked_table.register(header)?);
         }
         if capture_milestones {
             milestone_object_types = checked_table.object_types;
@@ -14206,6 +14582,9 @@ fn decode_transport_manager_reference_body_with_milestones(
         milestone_available_object_counts,
         milestone_object_types,
         object_headers: headers,
+        object_header_ranges,
+        object_header_ids,
+        object_header_available_object_counts,
         line_numbers,
         line_number_range,
         line_records,
@@ -14229,6 +14608,9 @@ struct TransportManagerReferenceFields {
     milestone_available_object_counts: Vec<usize>,
     milestone_object_types: Vec<String>,
     object_headers: Vec<NetObjectHeader>,
+    object_header_ranges: Vec<Range<usize>>,
+    object_header_ids: Vec<Option<u32>>,
+    object_header_available_object_counts: Vec<usize>,
     line_numbers: Option<Vec<u16>>,
     line_number_range: Option<Range<usize>>,
     line_records: Vec<TransportManagerLineRecord>,
@@ -14572,8 +14954,9 @@ mod manager_boundary_tests {
         TransportLineVehicleSelection, TransportManagerActiveLineEditor, TransportManagerMilestone,
         TransportManagerMilestoneEditor, TransportManagerSelection,
         TransportManagerSharedStringValue, TransportManagerStringEncoding,
-        decode_economy_manager_body_layout, decode_economy_manager_budget_editor,
-        decode_economy_manager_income_expense_editor,
+        TransportManagerTailReference, TransportManagerTailReferenceEditor,
+        TransportManagerTailReferenceField, decode_economy_manager_body_layout,
+        decode_economy_manager_budget_editor, decode_economy_manager_income_expense_editor,
         decode_economy_manager_income_expense_editor_with_layout,
         decode_economy_manager_investment_editor,
         decode_economy_manager_investment_flags_from_body,
@@ -14591,7 +14974,8 @@ mod manager_boundary_tests {
         find_economy_manager_guide_header_positions, find_economy_manager_guide_headers,
         find_trailing_object_headers, locate_queued_object_bodies, locate_queued_object_body,
         register_reference_headers, transport_manager_line_number_count,
-        transport_manager_object_header_count, write_unique_string_with_mode,
+        transport_manager_object_header_count, transport_manager_tail_reference_fields,
+        write_unique_string_with_mode,
     };
     use crate::data_serializer::Reader;
     use crate::data_serializer::write_unique_string;
@@ -20323,6 +20707,125 @@ mod manager_boundary_tests {
     }
 
     #[test]
+    fn transport_manager_fixed_tail_reference_redirect_preserves_header_order() {
+        let (mut bytes, _) = active_transport_manager_reference_body(112_004, 14, 0, 7);
+        let header_start = bytes.len() - 7;
+        let mut tail_headers = vec![0xfe, 0xfe];
+        write_unique_string(&mut tail_headers, "TailVehicle+Data, Assembly-CSharp").unwrap();
+        tail_headers.extend_from_slice(&[
+            0xfe, 0x00, 0x01, // New object using the TransportLine shared type.
+            0x00, 0x00, 0x01, // Existing TransportLine object.
+            0x00, 0x00, 0x02, // Existing Building object.
+            0xff, 0xff, 0xff,
+        ]);
+        bytes.splice(header_start.., tail_headers);
+
+        let mut table = DataSerializerObjectTable::new("SimulationManager+Data");
+        table
+            .register(&NetObjectHeader::NewType(
+                "TransportLine+Data, Assembly-CSharp".to_owned(),
+            ))
+            .unwrap();
+        table
+            .register(&NetObjectHeader::NewType(
+                "Building+Data, Assembly-CSharp".to_owned(),
+            ))
+            .unwrap();
+        let fields = decode_transport_manager_reference_body_with_milestones(
+            112_004,
+            &bytes,
+            Some(&table),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            fields.object_headers,
+            [
+                NetObjectHeader::NewType("TailVehicle+Data, Assembly-CSharp".to_owned()),
+                NetObjectHeader::NewSharedType(1),
+                NetObjectHeader::Existing(1),
+                NetObjectHeader::Existing(2),
+                NetObjectHeader::Null,
+                NetObjectHeader::Null,
+                NetObjectHeader::Null,
+            ]
+        );
+        assert_eq!(
+            fields.object_header_ids[..4],
+            [Some(3), Some(4), Some(1), Some(2)]
+        );
+        assert_eq!(
+            fields.object_header_available_object_counts[..4],
+            [3, 4, 5, 5]
+        );
+        assert!(fields.object_header_ranges[0].len() > 3);
+        assert_eq!(fields.object_header_ranges[1].len(), 3);
+        assert_eq!(fields.object_header_ranges[2].len(), 3);
+        assert_eq!(
+            transport_manager_tail_reference_fields(112_004),
+            [
+                TransportManagerTailReferenceField::MonorailLine,
+                TransportManagerTailReferenceField::MonorailEndOfLineStation,
+                TransportManagerTailReferenceField::FerryBusHub,
+                TransportManagerTailReferenceField::FerryLine,
+                TransportManagerTailReferenceField::FerryDepot,
+                TransportManagerTailReferenceField::BlimpLine,
+                TransportManagerTailReferenceField::BlimpDepot,
+            ]
+        );
+
+        let references = transport_manager_tail_reference_fields(112_004)
+            .iter()
+            .zip(&fields.object_header_ids)
+            .map(|(field, object_id)| TransportManagerTailReference {
+                field: *field,
+                reference: object_id.map(|object_id| ResolvedObjectReference {
+                    object_id,
+                    type_name: fields.milestone_object_types[object_id as usize].clone(),
+                }),
+            })
+            .collect();
+        let mut editor = TransportManagerTailReferenceEditor {
+            format_version: 112_004,
+            save_app_version: None,
+            references,
+            original_headers: fields.object_headers,
+            header_ranges: fields.object_header_ranges,
+            available_object_counts: fields.object_header_available_object_counts,
+            object_types: fields.milestone_object_types,
+            original_body: bytes.clone(),
+        };
+        assert_eq!(
+            editor.references()[0].field(),
+            TransportManagerTailReferenceField::MonorailLine
+        );
+        assert_eq!(
+            editor.references()[1].field(),
+            TransportManagerTailReferenceField::MonorailEndOfLineStation
+        );
+        assert_eq!(
+            editor.references()[2].reference(),
+            Some(&ResolvedObjectReference {
+                object_id: 1,
+                type_name: "TransportLine+Data, Assembly-CSharp".to_owned(),
+            })
+        );
+
+        editor.set_reference_object_id(2, 4).unwrap();
+        let mut expected = bytes.clone();
+        let target_range = editor.header_ranges[2].clone();
+        expected[target_range].copy_from_slice(&[0x00, 0x00, 0x04]);
+        assert_eq!(editor.encode().unwrap(), expected);
+        assert!(editor.set_reference_object_id(1, 3).is_err());
+        assert!(editor.set_reference_object_id(2, 2).is_err());
+        assert!(editor.set_reference_object_id(2, 5).is_err());
+        assert!(editor.set_reference_object_id(4, 1).is_err());
+        assert!(editor.set_reference_object_id(7, 1).is_err());
+        assert_eq!(editor.encode().unwrap(), expected);
+    }
+
+    #[test]
     #[ignore = "reads the local CL Wolf Creek sample from data/maps"]
     fn unlock_manager_unused_guides_match_wolf_creek_queued_bodies()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -20394,6 +20897,23 @@ mod manager_boundary_tests {
         assert_eq!(transport_manager_object_header_count(316), 2);
         assert_eq!(transport_manager_object_header_count(317), 3);
         assert_eq!(transport_manager_object_header_count(318), 7);
+        assert_eq!(transport_manager_tail_reference_fields(315), []);
+        assert_eq!(
+            transport_manager_tail_reference_fields(316),
+            [
+                TransportManagerTailReferenceField::MonorailLine,
+                TransportManagerTailReferenceField::MonorailEndOfLineStation,
+            ]
+        );
+        assert_eq!(
+            transport_manager_tail_reference_fields(317),
+            [
+                TransportManagerTailReferenceField::MonorailLine,
+                TransportManagerTailReferenceField::MonorailEndOfLineStation,
+                TransportManagerTailReferenceField::FerryBusHub,
+            ]
+        );
+        assert_eq!(transport_manager_tail_reference_fields(318).len(), 7);
 
         assert_eq!(transport_manager_line_number_count(121), 0);
         assert_eq!(transport_manager_line_number_count(122), 5);
