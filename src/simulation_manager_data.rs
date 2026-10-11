@@ -5692,11 +5692,13 @@ impl SimulationManagerData {
         Ok(prefix.into_flags_editor())
     }
 
-    /// Replaces raw active and parked vehicle flag values.
+    /// Replaces raw active, secondary, and parked vehicle flag values.
     ///
-    /// Edits retain each slot's zero/nonzero activity state, so prefab
-    /// assignments and records remain aligned. Changed encoded scopes can
-    /// resize the prefix; the complete VehicleManager body and following
+    /// Edits to `m_flags` and parked flags retain each slot's zero/nonzero
+    /// activity state, so prefab assignments and records remain aligned.
+    /// Version-274-and-newer `m_flags2` values can be changed independently
+    /// because they do not determine the active count. Changed encoded scopes
+    /// can resize the prefix; the complete VehicleManager body and following
     /// TransportManager boundary are checked after replacement.
     pub fn replace_vehicle_manager_flags(
         &mut self,
@@ -20409,6 +20411,60 @@ mod manager_boundary_tests {
         assert_eq!(
             updated_manager_end,
             original_manager_end - original.prefix().encode().len() + replacement_len
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_manager_end..],
+            original_suffix.as_slice()
+        );
+    }
+
+    #[test]
+    fn vehicle_flags2_editor_preserves_v274_vehicle_boundary_and_following_manager() {
+        let mut graph = profiler_tag("VehicleManager");
+        crate::encoded_array::write_encoded_uint_array_runs(&mut graph, &vec![0; 16_383]);
+        crate::encoded_array::write_encoded_uint_array_runs(&mut graph, &vec![0; 16_383]);
+        crate::encoded_array::write_encoded_ushort_array(&mut graph, &vec![0; 32_767]);
+        graph.extend_from_slice(&[0, 0]); // empty prefab-name table
+        graph.extend_from_slice(&[0, 16]); // closing profiler reference
+        let transport_tag = profiler_tag("TransportManager");
+        graph.extend_from_slice(&transport_tag);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 274;
+        let mut manager_objects = vec![None; 19];
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[18] = Some(ManagerObjectReference {
+            object_id: 18,
+            type_name: "TransportManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (original, original_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(original.prefix().vehicle_flags2().unwrap()[0], 0);
+        let original_prefix_len = original.prefix().encode().len();
+        let original_suffix = manager.serialized_object_graph()[original_manager_end..].to_vec();
+        let mut editor = manager.decode_vehicle_manager_flags_editor().unwrap();
+        editor.set_vehicle_flag2_bits(0, 7).unwrap();
+        let replacement_len = editor.encode().unwrap().len();
+        manager.replace_vehicle_manager_flags(&editor).unwrap();
+
+        let (updated, updated_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(updated.prefix().vehicle_flags2().unwrap()[0], 7);
+        assert_eq!(
+            updated
+                .prefix()
+                .vehicle_flags()
+                .iter()
+                .filter(|flag| **flag != 0)
+                .count(),
+            0
+        );
+        assert_eq!(
+            updated_manager_end,
+            original_manager_end - original_prefix_len + replacement_len
         );
         assert_eq!(
             &manager.serialized_object_graph()[updated_manager_end..],

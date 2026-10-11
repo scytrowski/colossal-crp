@@ -66,16 +66,17 @@ pub struct VehicleManagerPrefabEditor {
     prefab_names: Option<Vec<Option<String>>>,
 }
 
-/// Editor for existing raw active and parked vehicle flag values.
+/// Editor for existing raw active, secondary, and parked vehicle flag values.
 ///
-/// Flag bit meanings remain opaque. The editor permits changing nonzero values
-/// only when that slot stays active, preserving the record counts and all
-/// following sparse fields. Changes re-encode the shared UInt flag scope and
-/// the parked UShort scope only when those values change.
+/// Flag bit meanings remain opaque. The editor preserves each `m_flags` slot's
+/// zero/nonzero activity state; `m_flags2` values do not determine that count.
+/// Changes re-encode the shared UInt flag scope and parked UShort scope only
+/// when those values change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VehicleManagerFlagsEditor {
     original: VehicleManagerDataPrefix,
     vehicle_flags: Vec<u32>,
+    vehicle_flags2: Option<Vec<u32>>,
     parked_vehicle_flags: Option<Vec<u16>>,
 }
 
@@ -240,6 +241,7 @@ impl VehicleManagerDataPrefix {
     pub fn into_flags_editor(self) -> VehicleManagerFlagsEditor {
         VehicleManagerFlagsEditor {
             vehicle_flags: self.vehicle_flags.clone(),
+            vehicle_flags2: self.vehicle_flags2.clone(),
             parked_vehicle_flags: self.parked_vehicle_flags.clone(),
             original: self,
         }
@@ -316,6 +318,14 @@ impl VehicleManagerFlagsEditor {
         &self.vehicle_flags
     }
 
+    /// Returns raw second-array flag values from inner version 274, if present.
+    ///
+    /// These values do not determine the active-vehicle record count; that
+    /// count follows `m_flags`.
+    pub fn vehicle_flags2(&self) -> Option<&[u32]> {
+        self.vehicle_flags2.as_deref()
+    }
+
     /// Changes raw flag bits for an existing vehicle slot.
     ///
     /// The value must keep the slot's current zero/nonzero activity state.
@@ -332,6 +342,24 @@ impl VehicleManagerFlagsEditor {
             ));
         }
         self.vehicle_flags[index] = value;
+        Ok(())
+    }
+
+    /// Changes an existing raw value in the version-274-and-newer `m_flags2` array.
+    ///
+    /// The bit meanings are unknown. This fixed-length array does not determine
+    /// the active-vehicle record count. Index zero represents serialized slot one.
+    pub fn set_vehicle_flag2_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        let flags = self.vehicle_flags2.as_mut().ok_or_else(|| {
+            invalid(
+                0,
+                "VehicleManager m_flags2 is absent before inner version 274",
+            )
+        })?;
+        let flag = flags
+            .get_mut(index)
+            .ok_or_else(|| invalid(index, "VehicleManager m_flags2 index is out of range"))?;
+        *flag = value;
         Ok(())
     }
 
@@ -371,8 +399,11 @@ impl VehicleManagerFlagsEditor {
     }
 
     /// Writes edited flag scopes while preserving all other prefix bytes.
+    ///
+    /// The fixed array lengths and `m_flags` activity state are retained.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         if self.vehicle_flags == self.original.vehicle_flags
+            && self.vehicle_flags2 == self.original.vehicle_flags2
             && self.parked_vehicle_flags == self.original.parked_vehicle_flags
         {
             return Ok(self.original.serialized_prefix.clone());
@@ -380,14 +411,21 @@ impl VehicleManagerFlagsEditor {
 
         let source = &self.original.serialized_prefix;
         let mut replacements = Vec::new();
-        if self.vehicle_flags != self.original.vehicle_flags {
+        if self.vehicle_flags != self.original.vehicle_flags
+            || self.vehicle_flags2 != self.original.vehicle_flags2
+        {
             if self.vehicle_flags.len() != self.original.vehicle_flags.len() {
                 return Err(invalid(0, "VehicleManager vehicle flag count changed"));
+            }
+            if self.vehicle_flags2.as_ref().map(Vec::len)
+                != self.original.vehicle_flags2.as_ref().map(Vec::len)
+            {
+                return Err(invalid(0, "VehicleManager m_flags2 count changed"));
             }
             let range = &self.original.vehicle_flags_range;
             validate_replacement_range(range, source.len(), "VehicleManager vehicle flags")?;
             let mut values = self.vehicle_flags.clone();
-            if let Some(flags2) = &self.original.vehicle_flags2 {
+            if let Some(flags2) = &self.vehicle_flags2 {
                 values.extend_from_slice(flags2);
             }
             let mut encoded = Vec::new();
@@ -2624,6 +2662,63 @@ mod tests {
             updated.parked_vehicle_prefab_indices(),
             Some([0].as_slice())
         );
+    }
+
+    #[test]
+    fn vehicle_flags_editor_changes_raw_flags2_without_activating_vehicle_slots() {
+        let bytes = empty_prefix(274);
+        let (decoded, _) = VehicleManagerDataPrefix::decode_prefix(274, &bytes).unwrap();
+        assert_eq!(decoded.vehicle_flags2().unwrap()[0], 0);
+        let original_flag_scope_end = decoded.vehicle_flags_range.end;
+
+        let mut editor = decoded.into_flags_editor();
+        assert_eq!(editor.vehicle_flags2().unwrap().len(), 16_383);
+        assert!(editor.set_vehicle_flag2_bits(16_383, 1).is_err());
+        editor.set_vehicle_flag2_bits(0, 7).unwrap();
+
+        let encoded = editor.encode().unwrap();
+        let mut expected_flag_scope = vec![0xff; 127];
+        expected_flag_scope.push(0xfe); // 16,383 zero values in m_flags
+        expected_flag_scope.extend_from_slice(&[
+            0, 0, 0, 0, 7, // first m_flags2 literal
+            0, 0, 0, 0, 0, // second m_flags2 literal
+            0, 0, 0, 0, 0, // third m_flags2 literal resets delta to zero
+        ]);
+        expected_flag_scope.extend(std::iter::repeat_n(0xff, 127));
+        expected_flag_scope.push(0xfb); // 16,380 remaining zeros in m_flags2
+        assert_eq!(&encoded[..expected_flag_scope.len()], expected_flag_scope);
+        assert_eq!(
+            &encoded[expected_flag_scope.len()..],
+            &bytes[original_flag_scope_end..]
+        );
+
+        let (updated, consumed) = VehicleManagerDataPrefix::decode_prefix(274, &encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(
+            updated
+                .vehicle_flags()
+                .iter()
+                .filter(|flag| **flag != 0)
+                .count(),
+            0
+        );
+        assert_eq!(updated.vehicle_flags2().unwrap()[0], 7);
+        assert!(
+            updated.vehicle_flags2().unwrap()[1..]
+                .iter()
+                .all(|flag| *flag == 0)
+        );
+        assert_eq!(updated.parked_vehicle_flags().unwrap().len(), 32_767);
+    }
+
+    #[test]
+    fn vehicle_flags_editor_rejects_flags2_before_version_gate() {
+        let bytes = empty_prefix(273);
+        let (decoded, _) = VehicleManagerDataPrefix::decode_prefix(273, &bytes).unwrap();
+        let mut editor = decoded.into_flags_editor();
+        assert!(editor.vehicle_flags2().is_none());
+        assert!(editor.set_vehicle_flag2_bits(0, 1).is_err());
+        assert_eq!(editor.encode().unwrap(), bytes);
     }
 
     #[test]
