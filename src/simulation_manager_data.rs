@@ -2280,6 +2280,76 @@ impl SimulationManagerData {
         ElectricityManagerData::decode(self.format_version, bytes)
     }
 
+    /// Replaces ElectricityManager's processed-cell counter, conductive-cell
+    /// counter, and continuation flag in place. Encoded network columns and
+    /// the closing profiler reference remain byte-identical.
+    pub fn replace_electricity_manager_data(
+        &mut self,
+        edited: &ElectricityManagerData,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                16,
+                "edited ElectricityManager version does not match this stream",
+            ));
+        }
+        let current = self.decode_electricity_manager_data()?;
+        if current.encode_unchanged() != edited.encode_unchanged() {
+            return Err(invalid(
+                16,
+                "ElectricityManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != edited.encode_unchanged().len() {
+            return Err(invalid(
+                16,
+                "ElectricityManager edits must preserve the decoded body length",
+            ));
+        }
+        let (body_start, next_tag_start) = self.manager_body_boundary(11)?;
+        let body_end =
+            body_start
+                .checked_add(replacement.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "ElectricityManager replacement end",
+                ))?;
+        if body_end != next_tag_start {
+            return Err(invalid(
+                body_end,
+                "ElectricityManager replacement no longer ends at the WaterManager boundary",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph
+            .get_mut(body_start..body_end)
+            .ok_or_else(|| {
+                invalid(
+                    body_start,
+                    "ElectricityManager replacement range is invalid",
+                )
+            })?
+            .copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self.decode_electricity_manager_data().and_then(|decoded| {
+            if decoded.encode_unchanged() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten ElectricityManager body does not match the edited fields",
+                ));
+            }
+            Ok(())
+        });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten ElectricityManager body failed validation: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Decodes WaterManager's versioned water, sewage, and heating grids,
     /// pulse records, node arrays, and unresolved guide headers before
     /// ZoneManager. The complete bounded body remains available for exact
@@ -13831,6 +13901,58 @@ mod manager_boundary_tests {
         let wrong_tag =
             electricity_manager_with_next("WaterManager+Data, Assembly-CSharp", "ZoneManager");
         assert!(wrong_tag.decode_electricity_manager_data().is_err());
+    }
+
+    #[test]
+    fn electricity_manager_scalar_edits_replace_only_the_bounded_body() {
+        let mut manager =
+            electricity_manager_with_next("WaterManager+Data, Assembly-CSharp", "WaterManager");
+        let original_graph = manager.serialized_object_graph.clone();
+        let mut stale_editor = manager.decode_electricity_manager_data().unwrap();
+        let mut edited = manager.decode_electricity_manager_data().unwrap();
+        edited.set_processed_cell_count(-17);
+        edited.set_conductive_cell_count(23);
+        edited.set_can_continue(false);
+        let expected_body = edited.encode().unwrap();
+
+        manager.replace_electricity_manager_data(&edited).unwrap();
+
+        let body_start = profiler_tag("ElectricityManager").len();
+        let next_tag = profiler_tag("WaterManager");
+        let next_start = original_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph.len(), original_graph.len());
+        assert_eq!(
+            &manager.serialized_object_graph[..body_start],
+            &original_graph[..body_start]
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[body_start..next_start],
+            expected_body
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[next_start..],
+            &original_graph[next_start..]
+        );
+        let decoded = manager.decode_electricity_manager_data().unwrap();
+        assert_eq!(decoded.processed_cell_count(), -17);
+        assert_eq!(decoded.conductive_cell_count(), 23);
+        assert!(!decoded.can_continue());
+
+        let replaced_graph = manager.serialized_object_graph.clone();
+        assert!(
+            manager
+                .replace_electricity_manager_data(&stale_editor)
+                .is_err()
+        );
+        stale_editor.set_processed_cell_count(99);
+        assert_eq!(manager.serialized_object_graph, replaced_graph);
+
+        manager.format_version += 1;
+        assert!(manager.replace_electricity_manager_data(&edited).is_err());
+        assert_eq!(manager.serialized_object_graph, replaced_graph);
     }
 
     #[test]

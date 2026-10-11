@@ -65,6 +65,7 @@ pub struct ElectricityManagerData {
     processed_cell_count: i32,
     conductive_cell_count: i32,
     can_continue: bool,
+    scalar_fields_offset: usize,
     original_body: Vec<u8>,
 }
 
@@ -158,6 +159,7 @@ impl ElectricityManagerData {
             values
         };
 
+        let scalar_fields_offset = reader.offset();
         let processed_cell_count = reader.read_i32_be()?;
         let conductive_cell_count = reader.read_i32_be()?;
         let can_continue = reader.read_u8()? != 0;
@@ -184,6 +186,7 @@ impl ElectricityManagerData {
             processed_cell_count,
             conductive_cell_count,
             can_continue,
+            scalar_fields_offset,
             original_body: bytes.to_vec(),
         })
     }
@@ -258,6 +261,21 @@ impl ElectricityManagerData {
         self.can_continue
     }
 
+    /// Replaces the stored processed-cell counter without changing the body length.
+    pub fn set_processed_cell_count(&mut self, value: i32) {
+        self.processed_cell_count = value;
+    }
+
+    /// Replaces the stored conductive-cell counter without changing the body length.
+    pub fn set_conductive_cell_count(&mut self, value: i32) {
+        self.conductive_cell_count = value;
+    }
+
+    /// Replaces the serialized continuation flag without changing the body length.
+    pub fn set_can_continue(&mut self, value: bool) {
+        self.can_continue = value;
+    }
+
     /// Returns whether the game reader derives `refreshGrid` as true.
     pub fn refresh_grid(&self) -> bool {
         self.format_version < TEMPORARY_ELECTRIFIED_BOOL_VERSION
@@ -268,13 +286,71 @@ impl ElectricityManagerData {
     pub fn encode_unchanged(&self) -> Vec<u8> {
         self.original_body.clone()
     }
+
+    /// Encodes edited counters and the continuation flag while preserving every
+    /// other byte, including encoded network columns and the closing profiler
+    /// reference. Returns an error if the captured scalar field range is invalid.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let mut bytes = self.original_body.clone();
+        let processed_end =
+            self.scalar_fields_offset
+                .checked_add(4)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "ElectricityManager processed-cell counter end",
+                ))?;
+        let conductive_end = processed_end
+            .checked_add(4)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "ElectricityManager conductive-cell counter end",
+            ))?;
+        let flag_end = conductive_end
+            .checked_add(1)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "ElectricityManager continuation flag end",
+            ))?;
+        if flag_end
+            .checked_add(END_PROFILER_REFERENCE_LEN)
+            .is_none_or(|end| end != bytes.len())
+        {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "ElectricityManager+Data".to_owned(),
+                offset: self.scalar_fields_offset,
+                reason: "scalar fields do not end before the closing profiler reference".to_owned(),
+            });
+        }
+        bytes
+            .get_mut(self.scalar_fields_offset..processed_end)
+            .ok_or_else(|| CrpError::InvalidAssetPayload {
+                name: "ElectricityManager+Data".to_owned(),
+                offset: self.scalar_fields_offset,
+                reason: "processed-cell counter range is invalid".to_owned(),
+            })?
+            .copy_from_slice(&self.processed_cell_count.to_be_bytes());
+        bytes
+            .get_mut(processed_end..conductive_end)
+            .ok_or_else(|| CrpError::InvalidAssetPayload {
+                name: "ElectricityManager+Data".to_owned(),
+                offset: processed_end,
+                reason: "conductive-cell counter range is invalid".to_owned(),
+            })?
+            .copy_from_slice(&self.conductive_cell_count.to_be_bytes());
+        bytes
+            .get_mut(conductive_end..flag_end)
+            .ok_or_else(|| CrpError::InvalidAssetPayload {
+                name: "ElectricityManager+Data".to_owned(),
+                offset: conductive_end,
+                reason: "continuation flag range is invalid".to_owned(),
+            })?
+            .copy_from_slice(&[u8::from(self.can_continue)]);
+        Ok(bytes)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CELL_COUNT, ElectricityManagerData, FULL_NODE_GROUPS_VERSION, NODE_GROUP_COUNT,
-        PULSE_GROUP_CAPACITY, PULSE_UNIT_CAPACITY,
+        CELL_COUNT, END_PROFILER_REFERENCE_LEN, ElectricityManagerData, FULL_NODE_GROUPS_VERSION,
+        NODE_GROUP_COUNT, PULSE_GROUP_CAPACITY, PULSE_UNIT_CAPACITY,
     };
     fn append_zero_encoded_byte_array(output: &mut Vec<u8>, mut count: usize) {
         while count > 0 {
@@ -381,6 +457,35 @@ mod tests {
         assert_eq!(data.conductive_cell_count(), 18);
         assert!(data.can_continue());
         assert_eq!(data.encode_unchanged(), body);
+    }
+
+    #[test]
+    fn edits_scalar_tail_using_big_endian_values_and_preserves_other_bytes() {
+        let body = empty_body(117_000);
+        let mut data = ElectricityManagerData::decode(117_000, &body).unwrap();
+        data.set_processed_cell_count(-17);
+        data.set_conductive_cell_count(0x0102_0304);
+        data.set_can_continue(false);
+
+        let encoded = data.encode().unwrap();
+        let scalar_start = body.len() - END_PROFILER_REFERENCE_LEN - 9;
+        assert_eq!(&encoded[..scalar_start], &body[..scalar_start]);
+        assert_eq!(
+            &encoded[scalar_start..scalar_start + 4],
+            &(-17_i32).to_be_bytes()
+        );
+        assert_eq!(
+            &encoded[scalar_start + 4..scalar_start + 8],
+            &0x0102_0304_i32.to_be_bytes()
+        );
+        assert_eq!(encoded[scalar_start + 8], 0);
+        assert_eq!(&encoded[scalar_start + 9..], &body[scalar_start + 9..]);
+        assert_eq!(data.encode_unchanged(), body);
+
+        let decoded = ElectricityManagerData::decode(117_000, &encoded).unwrap();
+        assert_eq!(decoded.processed_cell_count(), -17);
+        assert_eq!(decoded.conductive_cell_count(), 0x0102_0304);
+        assert!(!decoded.can_continue());
     }
 
     #[test]
