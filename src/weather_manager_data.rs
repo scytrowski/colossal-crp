@@ -1,6 +1,6 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::read_encoded_ushort_array;
+use crate::encoded_array::{read_encoded_ushort_array, write_encoded_ushort_array};
 use std::ops::Range;
 
 const WIND_CELL_COUNT: usize = 16_384;
@@ -8,6 +8,12 @@ const WIND_DELTA_VERSION: u32 = 117_013;
 const LIGHTNING_VERSION: u32 = 277;
 const LIGHTNING_RECORD_LENGTH: usize = 32;
 const VERSION_276_COMPATIBILITY_LENGTH: usize = 36;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EncodedHeightPlaneSnapshot {
+    range: Range<usize>,
+    original_values: Vec<u16>,
+}
 
 /// One serialized `WeatherManager` lightning strike from inner version 277.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -30,8 +36,11 @@ pub struct WeatherLightningStrike {
 pub struct WeatherManagerData {
     format_version: u32,
     self_heights: Vec<u16>,
+    self_heights_snapshot: EncodedHeightPlaneSnapshot,
     total_heights: Vec<u16>,
+    total_heights_snapshot: EncodedHeightPlaneSnapshot,
     delta_heights: Option<Vec<u16>>,
+    delta_heights_snapshot: Option<EncodedHeightPlaneSnapshot>,
     wind_directions: [f32; 3],
     temperature: Option<[f32; 3]>,
     rain_and_fog: Option<[f32; 4]>,
@@ -52,11 +61,10 @@ pub struct WeatherManagerData {
     serialized_body: Vec<u8>,
 }
 
-/// In-place editor for existing WeatherManager scalar fields and lightning records.
+/// Editor for WeatherManager height planes, scalar fields, and lightning records.
 ///
-/// Wind-height planes, the version-276 compatibility block, lightning count,
-/// and all other source bytes are retained. Lightning records cannot be added
-/// or removed.
+/// The version-276 compatibility block, lightning count, and all other source
+/// bytes are retained. Lightning records cannot be added or removed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WeatherManagerEditor {
     data: WeatherManagerData,
@@ -72,12 +80,13 @@ impl WeatherManagerData {
     /// Truncated arrays, fields, or lightning records return an error.
     pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         let mut reader = Reader::new(bytes);
-        let self_heights = read_encoded_ushort_array(&mut reader, WIND_CELL_COUNT)?;
-        let total_heights = read_encoded_ushort_array(&mut reader, WIND_CELL_COUNT)?;
-        let delta_heights = if format_version >= WIND_DELTA_VERSION {
-            Some(read_encoded_ushort_array(&mut reader, WIND_CELL_COUNT)?)
+        let (self_heights, self_heights_snapshot) = read_height_plane(&mut reader)?;
+        let (total_heights, total_heights_snapshot) = read_height_plane(&mut reader)?;
+        let (delta_heights, delta_heights_snapshot) = if format_version >= WIND_DELTA_VERSION {
+            let (values, snapshot) = read_height_plane(&mut reader)?;
+            (Some(values), Some(snapshot))
         } else {
-            None
+            (None, None)
         };
 
         let wind_directions_start = reader.offset();
@@ -217,8 +226,11 @@ impl WeatherManagerData {
             Self {
                 format_version,
                 self_heights,
+                self_heights_snapshot,
                 total_heights,
+                total_heights_snapshot,
                 delta_heights,
+                delta_heights_snapshot,
                 wind_directions,
                 temperature,
                 rain_and_fog,
@@ -247,7 +259,8 @@ impl WeatherManagerData {
         self.format_version
     }
 
-    /// Creates an editor for the scalar fields present in this source version.
+    /// Creates an editor for the height planes and scalar fields present in
+    /// this source version.
     pub fn into_editor(self) -> WeatherManagerEditor {
         WeatherManagerEditor { data: self }
     }
@@ -325,6 +338,22 @@ impl WeatherManagerEditor {
         self.data.format_version
     }
 
+    /// Returns mutable access to the 16,384 self-height cells.
+    pub fn self_heights_mut(&mut self) -> &mut [u16] {
+        &mut self.data.self_heights
+    }
+
+    /// Returns mutable access to the 16,384 total-height cells.
+    pub fn total_heights_mut(&mut self) -> &mut [u16] {
+        &mut self.data.total_heights
+    }
+
+    /// Returns mutable access to the version-117013-and-newer delta-height
+    /// cells.
+    pub fn delta_heights_mut(&mut self) -> Option<&mut [u16]> {
+        self.data.delta_heights.as_deref_mut()
+    }
+
     /// Returns mutable current wind direction, target direction, and speed.
     pub fn wind_directions_mut(&mut self) -> &mut [f32; 3] {
         &mut self.data.wind_directions
@@ -365,8 +394,10 @@ impl WeatherManagerEditor {
         self.data.lightning_strikes.as_deref_mut()
     }
 
-    /// Writes edited values into the original body while retaining all other bytes.
-    /// Returns an error if a captured field range is inconsistent or exceeds the body.
+    /// Writes edited height planes and scalar fields into the original body
+    /// while retaining all other bytes. Changed encoded planes can resize the
+    /// body. Returns an error if a captured field range or plane length is
+    /// inconsistent.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.data.serialized_body.clone();
         write_f32_range(
@@ -424,12 +455,93 @@ impl WeatherManagerEditor {
             self.data.lightning_strikes_range.as_ref(),
             self.data.lightning_strikes.as_deref(),
         )?;
+        let mut replacements = Vec::new();
+        if let Some(replacement) = changed_height_plane(
+            &self.data.self_heights,
+            &self.data.self_heights_snapshot,
+            bytes.len(),
+            "self-height plane",
+        )? {
+            replacements.push(replacement);
+        }
+        if let Some(replacement) = changed_height_plane(
+            &self.data.total_heights,
+            &self.data.total_heights_snapshot,
+            bytes.len(),
+            "total-height plane",
+        )? {
+            replacements.push(replacement);
+        }
+        match (
+            self.data.delta_heights.as_deref(),
+            self.data.delta_heights_snapshot.as_ref(),
+        ) {
+            (Some(values), Some(snapshot)) => {
+                if let Some(replacement) =
+                    changed_height_plane(values, snapshot, bytes.len(), "delta-height plane")?
+                {
+                    replacements.push(replacement);
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid(
+                    0,
+                    "WeatherManager delta-height values and version gate disagree",
+                ));
+            }
+        }
+        replacements.sort_by_key(|(range, _)| range.start);
+        for (range, encoded) in replacements.into_iter().rev() {
+            bytes.splice(range, encoded);
+        }
         Ok(bytes)
     }
 
     pub(crate) fn original_body_bytes(&self) -> &[u8] {
         &self.data.serialized_body
     }
+}
+
+fn read_height_plane(
+    reader: &mut Reader<'_>,
+) -> Result<(Vec<u16>, EncodedHeightPlaneSnapshot), CrpError> {
+    let start = reader.offset();
+    let values = read_encoded_ushort_array(reader, WIND_CELL_COUNT)?;
+    let end = reader.offset();
+    Ok((
+        values.clone(),
+        EncodedHeightPlaneSnapshot {
+            range: start..end,
+            original_values: values,
+        },
+    ))
+}
+
+fn changed_height_plane(
+    values: &[u16],
+    snapshot: &EncodedHeightPlaneSnapshot,
+    source_body_len: usize,
+    field_name: &str,
+) -> Result<Option<(Range<usize>, Vec<u8>)>, CrpError> {
+    if values.len() != WIND_CELL_COUNT || snapshot.original_values.len() != WIND_CELL_COUNT {
+        return Err(invalid(
+            snapshot.range.start,
+            format!("WeatherManager {field_name} has an invalid cell count"),
+        ));
+    }
+    if snapshot.range.start > snapshot.range.end || snapshot.range.end > source_body_len {
+        return Err(invalid(
+            snapshot.range.start,
+            format!("WeatherManager {field_name} source range exceeds the body"),
+        ));
+    }
+    if values == snapshot.original_values {
+        return Ok(None);
+    }
+    let mut encoded = Vec::new();
+    write_encoded_ushort_array(&mut encoded, values);
+    Ok(Some((snapshot.range.clone(), encoded)))
 }
 
 fn encode_optional_f32_range(
@@ -588,6 +700,23 @@ mod tests {
         }
     }
 
+    fn expected_ushort_plane_with_first_nonzero(value: u16) -> Vec<u8> {
+        let mut bytes = vec![2]; // Three initial literals seed the delta state.
+        bytes.extend_from_slice(&value.to_be_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend(std::iter::repeat_n(0xff, 127));
+        bytes.push(0xfc); // The remaining 125 zero values.
+        bytes
+    }
+
+    fn expected_ushort_plane_with_last_nonzero(value: u16) -> Vec<u8> {
+        let mut bytes = vec![0xff; (WIND_CELL_COUNT - 1) / 128];
+        bytes.push(0xfe); // 127 zero values before the final literal.
+        bytes.push(0);
+        bytes.extend_from_slice(&value.to_be_bytes());
+        bytes
+    }
+
     fn base_body(format_version: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         zero_plane(&mut bytes);
@@ -709,6 +838,57 @@ mod tests {
         *editor.force_weather_on_mut().unwrap() = false;
         expected[bool_offset] = 0x80;
         assert_eq!(editor.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn weather_editor_reencodes_changed_height_planes_and_preserves_other_fields() {
+        let bytes = base_body(117_013);
+        let (weather, _) = WeatherManagerData::decode_prefix(117_013, &bytes).unwrap();
+        let mut editor = weather.into_editor();
+        editor.self_heights_mut()[0] = 0x1234;
+        editor.total_heights_mut()[WIND_CELL_COUNT - 1] = 0x5678;
+        editor.delta_heights_mut().unwrap()[0] = 0x9abc;
+
+        let mut expected = bytes.clone();
+        let mut replacements = vec![
+            (
+                editor.data.self_heights_snapshot.range.clone(),
+                expected_ushort_plane_with_first_nonzero(0x1234),
+            ),
+            (
+                editor.data.total_heights_snapshot.range.clone(),
+                expected_ushort_plane_with_last_nonzero(0x5678),
+            ),
+            (
+                editor
+                    .data
+                    .delta_heights_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range
+                    .clone(),
+                expected_ushort_plane_with_first_nonzero(0x9abc),
+            ),
+        ];
+        replacements.sort_by_key(|(range, _)| range.start);
+        for (range, encoded) in replacements.into_iter().rev() {
+            expected.splice(range, encoded);
+        }
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+        assert_ne!(encoded.len(), bytes.len());
+        let (decoded, consumed) = WeatherManagerData::decode_prefix(117_013, &encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.self_heights()[0], 0x1234);
+        assert_eq!(decoded.total_heights()[WIND_CELL_COUNT - 1], 0x5678);
+        assert_eq!(decoded.delta_heights().unwrap()[0], 0x9abc);
+        assert_eq!(decoded.wind_directions(), [1.0, 2.0, 3.0]);
+
+        let older_bytes = base_body(117_012);
+        let (older, _) = WeatherManagerData::decode_prefix(117_012, &older_bytes).unwrap();
+        let mut older_editor = older.into_editor();
+        assert!(older_editor.delta_heights_mut().is_none());
+        assert_eq!(older_editor.encode().unwrap(), older_bytes);
     }
 
     #[test]

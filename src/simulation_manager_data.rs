@@ -5390,17 +5390,18 @@ impl SimulationManagerData {
         Ok((weather, next_tag_start))
     }
 
-    /// Decodes WeatherManager or legacy WindManager into its scalar-field editor.
+    /// Decodes WeatherManager or legacy WindManager into its field editor.
     pub fn decode_weather_manager_editor(&self) -> Result<WeatherManagerEditor, CrpError> {
         let (weather, _) = self.decode_weather_manager_data()?;
         Ok(weather.into_editor())
     }
 
-    /// Replaces existing WeatherManager scalar values and lightning records in place.
+    /// Replaces WeatherManager height planes, scalar values, and lightning records.
     ///
     /// The editor must come from this manager's current body and inner version.
-    /// Encoded wind planes, unknown bytes, record counts, closing profiler tag,
-    /// and graph length are preserved.
+    /// Re-encoded height planes can resize the body; unknown bytes, lightning
+    /// count, closing profiler reference, and following manager bytes are
+    /// preserved and checked.
     pub fn replace_weather_manager_data(
         &mut self,
         edited: &WeatherManagerEditor,
@@ -5411,7 +5412,7 @@ impl SimulationManagerData {
                 "edited WeatherManager version does not match this stream",
             ));
         }
-        let (current, _) = self.decode_weather_manager_data()?;
+        let (current, next_tag_start) = self.decode_weather_manager_data()?;
         if current.encode().as_slice() != edited.original_body_bytes() {
             return Err(invalid(
                 16,
@@ -5419,43 +5420,55 @@ impl SimulationManagerData {
             ));
         }
         let replacement = edited.encode()?;
-        if replacement.len() != edited.original_body_bytes().len() {
+        let (body_start, current_next_tag_start) = self.manager_body_boundary(16)?;
+        if current_next_tag_start != next_tag_start {
             return Err(invalid(
-                16,
-                "WeatherManager edits must preserve the decoded body length",
+                body_start,
+                "WeatherManager boundary changed while preparing the replacement",
             ));
         }
-        let (body_start, next_tag_start) = self.manager_body_boundary(16)?;
-        let body_end =
-            body_start
-                .checked_add(replacement.len())
-                .ok_or(CrpError::ArithmeticOverflow(
-                    "WeatherManager replacement end",
-                ))?;
-        let bounded_end = body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES).ok_or(
-            CrpError::ArithmeticOverflow("WeatherManager closing profiler reference end"),
-        )?;
-        if bounded_end != next_tag_start {
+        let old_body_end = body_start
+            .checked_add(edited.original_body_bytes().len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "WeatherManager original body end",
+            ))?;
+        let old_bounded_end = old_body_end
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "WeatherManager original closing profiler reference end",
+            ))?;
+        if old_bounded_end != next_tag_start || old_body_end > self.serialized_object_graph.len() {
             return Err(invalid(
-                body_end,
-                "WeatherManager replacement no longer ends at the VehicleManager boundary",
+                old_body_end,
+                "WeatherManager source body no longer ends before its closing profiler reference",
             ));
         }
+        let new_next_tag_start = body_start
+            .checked_add(replacement.len())
+            .and_then(|end| end.checked_add(LOADING_PROFILER_END_TAG_BYTES))
+            .ok_or(CrpError::ArithmeticOverflow(
+                "WeatherManager replacement VehicleManager boundary",
+            ))?;
         let mut candidate_graph = self.serialized_object_graph.clone();
-        candidate_graph
-            .get_mut(body_start..body_end)
-            .ok_or_else(|| invalid(body_start, "WeatherManager replacement range is invalid"))?
-            .copy_from_slice(&replacement);
+        candidate_graph.splice(body_start..old_body_end, replacement.iter().copied());
         let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
-        let validation = self.decode_weather_manager_data().and_then(|(decoded, _)| {
-            if decoded.encode() != replacement {
-                return Err(invalid(
-                    body_start,
-                    "rewritten WeatherManager body does not match the editor",
-                ));
-            }
-            Ok(())
-        });
+        let validation = self
+            .decode_weather_manager_data()
+            .and_then(|(decoded, actual_next_tag_start)| {
+                if actual_next_tag_start != new_next_tag_start {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten WeatherManager body moved the VehicleManager boundary unexpectedly",
+                    ));
+                }
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten WeatherManager body does not match the editor",
+                    ));
+                }
+                Ok(())
+            });
         if let Err(error) = validation {
             self.serialized_object_graph = original_graph;
             return Err(invalid(
@@ -18943,7 +18956,7 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn weather_manager_editor_replaces_body_without_moving_vehicle_boundary() {
+    fn weather_manager_height_edit_resizes_body_and_preserves_vehicle_boundary() {
         let mut graph = profiler_tag("WeatherManager");
         let body_start = graph.len();
         graph.extend([0xff; 2 * 128]);
@@ -18968,21 +18981,31 @@ mod manager_boundary_tests {
         manager.manager_objects = Some(manager_objects);
 
         let mut editor = manager.decode_weather_manager_editor().unwrap();
+        editor.self_heights_mut()[0] = 0x1234;
         editor.wind_directions_mut()[1] = 9.0;
-        let mut expected = manager.serialized_object_graph().to_vec();
-        expected[body_start + 260..body_start + 264]
-            .copy_from_slice(&9.0_f32.to_bits().to_be_bytes());
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let next_tag = profiler_tag("VehicleManager");
+        let old_next_start = original_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        let replacement = editor.encode().unwrap();
+        let mut expected = original_graph.clone();
+        expected.splice(
+            body_start..body_start + body_len,
+            replacement.iter().copied(),
+        );
         manager.replace_weather_manager_data(&editor).unwrap();
         assert_eq!(manager.serialized_object_graph(), expected);
         assert_eq!(manager.serialized_object_graph().len(), expected.len());
+        let (decoded, new_next_start) = manager.decode_weather_manager_data().unwrap();
+        assert!(new_next_start > old_next_start);
         assert_eq!(
-            manager
-                .decode_weather_manager_data()
-                .unwrap()
-                .0
-                .wind_directions(),
-            [1.0, 9.0, 3.0]
+            &manager.serialized_object_graph()[new_next_start..],
+            &original_graph[old_next_start..]
         );
+        assert_eq!(decoded.self_heights()[0], 0x1234);
+        assert_eq!(decoded.wind_directions(), [1.0, 9.0, 3.0]);
         assert!(manager.replace_weather_manager_data(&editor).is_err());
         assert_eq!(manager.serialized_object_graph(), expected);
         assert_eq!(body_len, 256 + 12);
