@@ -1719,8 +1719,9 @@ impl TransportManagerSelectionEditor {
     /// Updating a new string changes the shared-string value at its stream
     /// index, so later references to that same index resolve to the updated
     /// value. Use [`Self::set_existing_string_index`] to redirect an existing
-    /// entry. The replacement must retain the source null state and compact or
-    /// wide string encoding; its serialized length may change.
+    /// entry. A non-null source string retains its compact or wide encoding. A
+    /// null source uses the standard encoding chosen for the replacement text.
+    /// The replacement may change the serialized length.
     pub fn set_new_string_value(
         &mut self,
         entry_index: usize,
@@ -1943,28 +1944,31 @@ fn encode_selection_unique_string(
     value: Option<&str>,
     original: &[u8],
 ) -> Result<Vec<u8>, CrpError> {
-    match (value, original) {
-        (None, [0xff]) => Ok(vec![0xff]),
-        (None, _) => Err(invalid(
-            0,
-            "TransportManager selection string nullness cannot change",
-        )),
-        (Some(_), [0xff]) => Err(invalid(
-            0,
-            "TransportManager selection string nullness cannot change",
-        )),
-        (Some(value), [first, second, third, ..]) => {
-            let encoded_length =
-                (u32::from(*first) << 16) | (u32::from(*second) << 8) | u32::from(*third);
-            let compact = encoded_length & COMPACT_STRING_FLAG != 0;
+    match value {
+        None => {
             let mut encoded = Vec::new();
-            write_unique_string_with_mode(&mut encoded, value, compact)?;
+            write_nullable_unique_string(&mut encoded, None)?;
             Ok(encoded)
         }
-        (Some(_), _) => Err(invalid(
-            0,
-            "TransportManager selection string has an invalid source encoding",
-        )),
+        Some(value) => match original {
+            [0xff] => {
+                let mut encoded = Vec::new();
+                write_unique_string(&mut encoded, value)?;
+                Ok(encoded)
+            }
+            [first, second, third, ..] => {
+                let encoded_length =
+                    (u32::from(*first) << 16) | (u32::from(*second) << 8) | u32::from(*third);
+                let compact = encoded_length & COMPACT_STRING_FLAG != 0;
+                let mut encoded = Vec::new();
+                write_unique_string_with_mode(&mut encoded, value, compact)?;
+                Ok(encoded)
+            }
+            _ => Err(invalid(
+                0,
+                "TransportManager selection string has an invalid source encoding",
+            )),
+        },
     }
 }
 
@@ -18351,6 +18355,118 @@ mod manager_boundary_tests {
             .unwrap();
         manager
             .replace_transport_manager_selection_prefix(&shrink_editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+
+        let (body_range, _) = manager.transport_manager_body_range().unwrap();
+        let body = manager
+            .serialized_object_graph()
+            .get(body_range.clone())
+            .unwrap();
+        let fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let table_range = fields.selection_range.unwrap();
+        let mut null_editor = fields.selection_prefix.unwrap().into_editor();
+        null_editor.set_new_string_value(0, None).unwrap();
+        let null_table = [0x00, 0x02, 0x12, 0x34, 0xfe, 0xff, 0x00, 0x08, 0x00, 0x01];
+        assert_eq!(null_editor.encode().unwrap(), null_table);
+        let selection_start = body_range.start.checked_add(table_range.start).unwrap();
+        let selection_end = body_range.start.checked_add(table_range.end).unwrap();
+        let mut expected_null_graph = expected_graph.clone();
+        expected_null_graph.splice(selection_start..selection_end, null_table.iter().copied());
+        manager
+            .replace_transport_manager_selection_prefix(&null_editor)
+            .unwrap();
+        assert_eq!(
+            manager.serialized_object_graph(),
+            expected_null_graph.as_slice()
+        );
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            expected_graph.len() - 5
+        );
+
+        let (null_body_range, _) = manager.transport_manager_body_range().unwrap();
+        let null_body = manager
+            .serialized_object_graph()
+            .get(null_body_range.clone())
+            .unwrap();
+        let null_fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            null_body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let null_selection = null_fields.selection_prefix.unwrap();
+        assert_eq!(
+            null_selection.selections()[0].value,
+            TransportManagerSharedStringValue::New(None)
+        );
+        assert_eq!(
+            null_selection.selections()[1].value,
+            TransportManagerSharedStringValue::Existing {
+                index: 1,
+                value: None,
+            }
+        );
+
+        let mut from_null_editor = null_selection.into_editor();
+        from_null_editor
+            .set_new_string_value(0, Some("Carriage".to_owned()))
+            .unwrap();
+        let carriage_table = [
+            0x00, 0x02, 0x12, 0x34, 0xfe, 0x80, 0x00, 0x08, 0xc3, 0x1e, 0x11, 0x00, 0xf7, 0xf8,
+            0x06, 0xfe, 0x00, 0x08, 0x00, 0x01,
+        ];
+        assert_eq!(from_null_editor.encode().unwrap(), carriage_table);
+        let null_table_range = null_fields.selection_range.unwrap();
+        let carriage_start = null_body_range
+            .start
+            .checked_add(null_table_range.start)
+            .unwrap();
+        let carriage_end = null_body_range
+            .start
+            .checked_add(null_table_range.end)
+            .unwrap();
+        let mut expected_carriage_graph = expected_null_graph.clone();
+        expected_carriage_graph
+            .splice(carriage_start..carriage_end, carriage_table.iter().copied());
+        manager
+            .replace_transport_manager_selection_prefix(&from_null_editor)
+            .unwrap();
+        assert_eq!(
+            manager.serialized_object_graph(),
+            expected_carriage_graph.as_slice()
+        );
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            expected_null_graph.len() + 10
+        );
+
+        let (carriage_body_range, _) = manager.transport_manager_body_range().unwrap();
+        let carriage_body = manager
+            .serialized_object_graph()
+            .get(carriage_body_range)
+            .unwrap();
+        let carriage_fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            carriage_body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let mut restore_editor = carriage_fields.selection_prefix.unwrap().into_editor();
+        restore_editor
+            .set_new_string_value(0, Some("Car".to_owned()))
+            .unwrap();
+        manager
+            .replace_transport_manager_selection_prefix(&restore_editor)
             .unwrap();
         assert_eq!(manager.serialized_object_graph(), expected_graph);
 
