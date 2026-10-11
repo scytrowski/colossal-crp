@@ -104,14 +104,22 @@ pub struct WaterManagerData {
     water_node_pressure_range: (usize, usize),
     original_water_node_pressure: Vec<u16>,
     water_node_extra_pressure: Vec<u16>,
+    water_node_extra_pressure_range: (usize, usize),
+    original_water_node_extra_pressure: Vec<u16>,
     sewage_node_pulse_groups: Vec<u16>,
     sewage_node_pressure: Vec<u16>,
     sewage_node_pressure_range: (usize, usize),
     original_sewage_node_pressure: Vec<u16>,
     sewage_node_extra_pressure: Vec<u16>,
+    sewage_node_extra_pressure_range: (usize, usize),
+    original_sewage_node_extra_pressure: Vec<u16>,
     heating_node_pulse_groups: Option<Vec<u16>>,
     heating_node_pressure: Option<Vec<u16>>,
+    heating_node_pressure_range: Option<(usize, usize)>,
+    original_heating_node_pressure: Option<Vec<u16>>,
     heating_node_extra_pressure: Option<Vec<u16>>,
+    heating_node_extra_pressure_range: Option<(usize, usize)>,
+    original_heating_node_extra_pressure: Option<Vec<u16>>,
     node_pollution: Option<Vec<u8>>,
     collect_water_pressure: Vec<u16>,
     collect_water_pressure_range: Option<(usize, usize)>,
@@ -239,28 +247,52 @@ impl WaterManagerData {
         let water_node_pressure = read_node_ushort_array(&mut reader, stored_node_count, 0)?;
         let water_node_pressure_end = reader.offset();
         let original_water_node_pressure = water_node_pressure[..stored_node_count].to_vec();
+        let water_node_extra_pressure_start = reader.offset();
         let water_node_extra_pressure = read_node_ushort_array(&mut reader, stored_node_count, 0)?;
+        let water_node_extra_pressure_end = reader.offset();
+        let original_water_node_extra_pressure =
+            water_node_extra_pressure[..stored_node_count].to_vec();
         let sewage_node_pulse_groups =
             read_node_ushort_array(&mut reader, stored_node_count, u16::MAX)?;
         let sewage_node_pressure_start = reader.offset();
         let sewage_node_pressure = read_node_ushort_array(&mut reader, stored_node_count, 0)?;
         let sewage_node_pressure_end = reader.offset();
         let original_sewage_node_pressure = sewage_node_pressure[..stored_node_count].to_vec();
+        let sewage_node_extra_pressure_start = reader.offset();
         let sewage_node_extra_pressure = read_node_ushort_array(&mut reader, stored_node_count, 0)?;
-        let (heating_node_pulse_groups, heating_node_pressure, heating_node_extra_pressure) =
-            if format_version >= HEATING_VERSION {
-                (
-                    Some(read_node_ushort_array(
-                        &mut reader,
-                        stored_node_count,
-                        u16::MAX,
-                    )?),
-                    Some(read_node_ushort_array(&mut reader, stored_node_count, 0)?),
-                    Some(read_node_ushort_array(&mut reader, stored_node_count, 0)?),
-                )
-            } else {
-                (None, None, None)
-            };
+        let sewage_node_extra_pressure_end = reader.offset();
+        let original_sewage_node_extra_pressure =
+            sewage_node_extra_pressure[..stored_node_count].to_vec();
+        let (
+            heating_node_pulse_groups,
+            heating_node_pressure,
+            heating_node_pressure_range,
+            original_heating_node_pressure,
+            heating_node_extra_pressure,
+            heating_node_extra_pressure_range,
+            original_heating_node_extra_pressure,
+        ) = if format_version >= HEATING_VERSION {
+            let pulse_groups = read_node_ushort_array(&mut reader, stored_node_count, u16::MAX)?;
+            let pressure_start = reader.offset();
+            let pressure = read_node_ushort_array(&mut reader, stored_node_count, 0)?;
+            let pressure_end = reader.offset();
+            let original_pressure = pressure[..stored_node_count].to_vec();
+            let extra_pressure_start = reader.offset();
+            let extra_pressure = read_node_ushort_array(&mut reader, stored_node_count, 0)?;
+            let extra_pressure_end = reader.offset();
+            let original_extra_pressure = extra_pressure[..stored_node_count].to_vec();
+            (
+                Some(pulse_groups),
+                Some(pressure),
+                Some((pressure_start, pressure_end)),
+                Some(original_pressure),
+                Some(extra_pressure),
+                Some((extra_pressure_start, extra_pressure_end)),
+                Some(original_extra_pressure),
+            )
+        } else {
+            (None, None, None, None, None, None, None)
+        };
         let node_pollution = if format_version >= POLLUTION_VERSION {
             Some(read_node_byte_array(&mut reader, stored_node_count, 0)?)
         } else {
@@ -348,14 +380,28 @@ impl WaterManagerData {
             water_node_pressure_range: (water_node_pressure_start, water_node_pressure_end),
             original_water_node_pressure,
             water_node_extra_pressure,
+            water_node_extra_pressure_range: (
+                water_node_extra_pressure_start,
+                water_node_extra_pressure_end,
+            ),
+            original_water_node_extra_pressure,
             sewage_node_pulse_groups,
             sewage_node_pressure,
             sewage_node_pressure_range: (sewage_node_pressure_start, sewage_node_pressure_end),
             original_sewage_node_pressure,
             sewage_node_extra_pressure,
+            sewage_node_extra_pressure_range: (
+                sewage_node_extra_pressure_start,
+                sewage_node_extra_pressure_end,
+            ),
+            original_sewage_node_extra_pressure,
             heating_node_pulse_groups,
             heating_node_pressure,
+            heating_node_pressure_range,
+            original_heating_node_pressure,
             heating_node_extra_pressure,
+            heating_node_extra_pressure_range,
+            original_heating_node_extra_pressure,
             node_pollution,
             collect_water_pressure,
             collect_water_pressure_range,
@@ -665,26 +711,33 @@ impl WaterManagerData {
     /// 16,384 nodes before inner version 202 and all 32,768 nodes from version
     /// 202 onward.
     pub fn set_water_node_pressure(&mut self, node: usize, pressure: u16) -> Result<(), CrpError> {
-        let stored_node_count = stored_node_count(self.format_version);
-        if node >= stored_node_count {
-            return Err(invalid_node_pressure(
-                node,
-                "water node-pressure index is outside the stored prefix",
-            ));
-        }
-        let Some(value) = self.water_node_pressure.get_mut(node) else {
-            return Err(invalid_node_pressure(
-                node,
-                "water node-pressure index is outside the decoded grid",
-            ));
-        };
-        *value = pressure;
-        Ok(())
+        set_node_pressure_value(
+            &mut self.water_node_pressure,
+            self.format_version,
+            node,
+            pressure,
+            "water",
+        )
     }
 
     /// Returns all 32,768 extra water node pressures.
     pub fn water_node_extra_pressure(&self) -> &[u16] {
         &self.water_node_extra_pressure
+    }
+
+    /// Replaces one stored extra water node pressure.
+    pub fn set_water_node_extra_pressure(
+        &mut self,
+        node: usize,
+        pressure: u16,
+    ) -> Result<(), CrpError> {
+        set_node_pressure_value(
+            &mut self.water_node_extra_pressure,
+            self.format_version,
+            node,
+            pressure,
+            "extra water",
+        )
     }
 
     /// Returns all 32,768 sewage node pulse-group indexes.
@@ -701,26 +754,33 @@ impl WaterManagerData {
     /// 16,384 nodes before inner version 202 and all 32,768 nodes from version
     /// 202 onward.
     pub fn set_sewage_node_pressure(&mut self, node: usize, pressure: u16) -> Result<(), CrpError> {
-        let stored_node_count = stored_node_count(self.format_version);
-        if node >= stored_node_count {
-            return Err(invalid_node_pressure(
-                node,
-                "sewage node-pressure index is outside the stored prefix",
-            ));
-        }
-        let Some(value) = self.sewage_node_pressure.get_mut(node) else {
-            return Err(invalid_node_pressure(
-                node,
-                "sewage node-pressure index is outside the decoded grid",
-            ));
-        };
-        *value = pressure;
-        Ok(())
+        set_node_pressure_value(
+            &mut self.sewage_node_pressure,
+            self.format_version,
+            node,
+            pressure,
+            "sewage",
+        )
     }
 
     /// Returns all 32,768 extra sewage node pressures.
     pub fn sewage_node_extra_pressure(&self) -> &[u16] {
         &self.sewage_node_extra_pressure
+    }
+
+    /// Replaces one stored extra sewage node pressure.
+    pub fn set_sewage_node_extra_pressure(
+        &mut self,
+        node: usize,
+        pressure: u16,
+    ) -> Result<(), CrpError> {
+        set_node_pressure_value(
+            &mut self.sewage_node_extra_pressure,
+            self.format_version,
+            node,
+            pressure,
+            "extra sewage",
+        )
     }
 
     /// Returns the version-227 heating node pulse-group indexes.
@@ -733,9 +793,39 @@ impl WaterManagerData {
         self.heating_node_pressure.as_deref()
     }
 
+    /// Replaces one stored heating node pressure from inner version 227.
+    pub fn set_heating_node_pressure(
+        &mut self,
+        node: usize,
+        pressure: u16,
+    ) -> Result<(), CrpError> {
+        let Some(values) = self.heating_node_pressure.as_mut() else {
+            return Err(invalid_node_pressure(
+                node,
+                "heating node-pressure values are absent before inner version 227",
+            ));
+        };
+        set_node_pressure_value(values, self.format_version, node, pressure, "heating")
+    }
+
     /// Returns the version-227 extra heating node pressures.
     pub fn heating_node_extra_pressure(&self) -> Option<&[u16]> {
         self.heating_node_extra_pressure.as_deref()
+    }
+
+    /// Replaces one stored extra heating node pressure from inner version 227.
+    pub fn set_heating_node_extra_pressure(
+        &mut self,
+        node: usize,
+        pressure: u16,
+    ) -> Result<(), CrpError> {
+        let Some(values) = self.heating_node_extra_pressure.as_mut() else {
+            return Err(invalid_node_pressure(
+                node,
+                "heating extra node-pressure values are absent before inner version 227",
+            ));
+        };
+        set_node_pressure_value(values, self.format_version, node, pressure, "extra heating")
     }
 
     /// Returns the version-23 node pollution grid.
@@ -970,6 +1060,16 @@ impl WaterManagerData {
         )? {
             replacements.push((start, end, encoded));
         }
+        let (start, end) = self.water_node_extra_pressure_range;
+        if let Some(encoded) = changed_ushort_array(
+            &self.water_node_extra_pressure,
+            Some(&self.original_water_node_extra_pressure),
+            stored_node_count,
+            start,
+            "extra water node pressure",
+        )? {
+            replacements.push((start, end, encoded));
+        }
         let (start, end) = self.sewage_node_pressure_range;
         if let Some(encoded) = changed_ushort_array(
             &self.sewage_node_pressure,
@@ -979,6 +1079,64 @@ impl WaterManagerData {
             "sewage node pressure",
         )? {
             replacements.push((start, end, encoded));
+        }
+        let (start, end) = self.sewage_node_extra_pressure_range;
+        if let Some(encoded) = changed_ushort_array(
+            &self.sewage_node_extra_pressure,
+            Some(&self.original_sewage_node_extra_pressure),
+            stored_node_count,
+            start,
+            "extra sewage node pressure",
+        )? {
+            replacements.push((start, end, encoded));
+        }
+        match (
+            self.heating_node_pressure_range,
+            self.heating_node_pressure.as_deref(),
+            self.original_heating_node_pressure.as_deref(),
+        ) {
+            (Some((start, end)), Some(values), Some(original)) => {
+                if let Some(encoded) = changed_ushort_array(
+                    values,
+                    Some(original),
+                    stored_node_count,
+                    start,
+                    "heating node pressure",
+                )? {
+                    replacements.push((start, end, encoded));
+                }
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(invalid_node_pressure(
+                    self.scalar_fields_offset,
+                    "heating node-pressure fields do not match the version gate",
+                ));
+            }
+        }
+        match (
+            self.heating_node_extra_pressure_range,
+            self.heating_node_extra_pressure.as_deref(),
+            self.original_heating_node_extra_pressure.as_deref(),
+        ) {
+            (Some((start, end)), Some(values), Some(original)) => {
+                if let Some(encoded) = changed_ushort_array(
+                    values,
+                    Some(original),
+                    stored_node_count,
+                    start,
+                    "extra heating node pressure",
+                )? {
+                    replacements.push((start, end, encoded));
+                }
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(invalid_node_pressure(
+                    self.scalar_fields_offset,
+                    "heating extra node-pressure fields do not match the version gate",
+                ));
+            }
         }
         if let Some((start, end)) = self.collect_water_pressure_range {
             if let Some(encoded) = changed_ushort_array(
@@ -1046,6 +1204,29 @@ fn invalid_node_pressure(offset: usize, reason: &str) -> CrpError {
         offset,
         reason: reason.to_owned(),
     }
+}
+
+fn set_node_pressure_value(
+    values: &mut [u16],
+    format_version: u32,
+    node: usize,
+    pressure: u16,
+    kind: &str,
+) -> Result<(), CrpError> {
+    if node >= stored_node_count(format_version) {
+        return Err(invalid_node_pressure(
+            node,
+            &format!("{kind} node-pressure index is outside the stored prefix"),
+        ));
+    }
+    let Some(value) = values.get_mut(node) else {
+        return Err(invalid_node_pressure(
+            node,
+            &format!("{kind} node-pressure index is outside the decoded grid"),
+        ));
+    };
+    *value = pressure;
+    Ok(())
 }
 
 fn stored_node_count(format_version: u32) -> usize {
@@ -1919,6 +2100,55 @@ mod tests {
         assert!(
             legacy
                 .set_water_node_pressure(LEGACY_NODE_COUNT, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn extra_and_heating_node_pressure_edits_follow_node_array_gates() {
+        let body = active_body(265);
+        let mut data = WaterManagerData::decode(265, &body).unwrap();
+        let mut expected = body.clone();
+        let mut replacements = vec![
+            (
+                data.water_node_extra_pressure_range,
+                expected_ushort_array_with_two_nonzero_values(NODE_COUNT, 0x23, 0x1111),
+            ),
+            (
+                data.sewage_node_extra_pressure_range,
+                expected_ushort_array_with_two_nonzero_values(NODE_COUNT, 0x26, 0x2222),
+            ),
+            (
+                data.heating_node_pressure_range.unwrap(),
+                expected_ushort_array_with_two_nonzero_values(NODE_COUNT, 0x28, 0x3333),
+            ),
+            (
+                data.heating_node_extra_pressure_range.unwrap(),
+                expected_ushort_array_with_two_nonzero_values(NODE_COUNT, 0x29, 0x4444),
+            ),
+        ];
+        data.set_water_node_extra_pressure(1, 0x1111).unwrap();
+        data.set_sewage_node_extra_pressure(1, 0x2222).unwrap();
+        data.set_heating_node_pressure(1, 0x3333).unwrap();
+        data.set_heating_node_extra_pressure(1, 0x4444).unwrap();
+        replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in replacements.into_iter().rev() {
+            expected.splice(start..end, replacement);
+        }
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = WaterManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.water_node_extra_pressure()[1], 0x1111);
+        assert_eq!(decoded.sewage_node_extra_pressure()[1], 0x2222);
+        assert_eq!(decoded.heating_node_pressure().unwrap()[1], 0x3333);
+        assert_eq!(decoded.heating_node_extra_pressure().unwrap()[1], 0x4444);
+
+        let mut before_heating = WaterManagerData::decode(226, &empty_body(226)).unwrap();
+        assert!(before_heating.set_heating_node_pressure(0, 1).is_err());
+        assert!(
+            before_heating
+                .set_heating_node_extra_pressure(0, 1)
                 .is_err()
         );
     }

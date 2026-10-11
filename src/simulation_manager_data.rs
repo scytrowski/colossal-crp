@@ -14396,7 +14396,11 @@ mod manager_boundary_tests {
         let mut stale_editor = manager.decode_water_manager_data().unwrap();
         let mut edited = manager.decode_water_manager_data().unwrap();
         edited.set_water_node_pressure(3, 0x1020).unwrap();
+        edited.set_water_node_extra_pressure(5, 0x2030).unwrap();
         edited.set_sewage_node_pressure(4, 0x3040).unwrap();
+        edited.set_sewage_node_extra_pressure(6, 0x4050).unwrap();
+        edited.set_heating_node_pressure(7, 0x5060).unwrap();
+        edited.set_heating_node_extra_pressure(8, 0x6070).unwrap();
         edited.set_collect_water_pressure(1, 0x1234).unwrap();
         edited.set_collect_sewage_pressure(2, 0x5678).unwrap();
         let expected_body = edited.encode().unwrap();
@@ -14425,7 +14429,11 @@ mod manager_boundary_tests {
         );
         let decoded = manager.decode_water_manager_data().unwrap();
         assert_eq!(decoded.water_node_pressure()[3], 0x1020);
+        assert_eq!(decoded.water_node_extra_pressure()[5], 0x2030);
         assert_eq!(decoded.sewage_node_pressure()[4], 0x3040);
+        assert_eq!(decoded.sewage_node_extra_pressure()[6], 0x4050);
+        assert_eq!(decoded.heating_node_pressure().unwrap()[7], 0x5060);
+        assert_eq!(decoded.heating_node_extra_pressure().unwrap()[8], 0x6070);
         assert_eq!(decoded.collect_water_pressure()[1], 0x1234);
         assert_eq!(decoded.collect_sewage_pressure()[2], 0x5678);
 
