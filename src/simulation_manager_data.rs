@@ -2258,6 +2258,7 @@ impl SimulationManagerData {
             .and_then(|decoded| {
                 if decoded.serialized_body != replacement
                     || decoded.active_event_records != edited.records()
+                    || decoded.active_event_race_data != edited.race_event_data()
                 {
                     return Err(invalid(
                         body_start,
@@ -14555,6 +14556,105 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph(), updated_graph);
+    }
+
+    #[test]
+    fn event_manager_replaces_selected_race_event_scalars_in_place() {
+        const EMPTY_RACE_EVENT_DATA: [u8; 66] = [
+            0, 0, 0, 0, // No racers.
+            0, 0, // Empty RaceTeamInfo reference scope.
+            0, 0, // Empty ParadeGroupInfo reference scope.
+            1, 2, 3, 4, // Last spawn frame.
+            5, 6, 7, 8, // Next spawn frame.
+            9, 10, 11, 12, // Schedule ID.
+            13, 14, 15, 16, // Lap count.
+            17, 18, 19, 20, // State.
+            21, 22, 23, 24, // Frames in state.
+            25, 32, // Race marshal ID.
+            0, 0, 0, 0, // No track path points.
+            0, // Track is open.
+            33, 34, 35, 36, // Event end frame.
+            37, 38, // Finished racer count.
+            39, 40, 41, 42, 43, 44, // First three finishers.
+            45, 46, 47, 48, // Frames to next overtake.
+            0, 0, 0, 0, // No race teams.
+            0, 0, // Empty RaceTeamInfo team scope.
+            0, 0, 0, 0, // No team members.
+            0, // No route spline.
+        ];
+        let mut body = vec![0, 1, 0]; // Two event slots; one literal flag follows.
+        body.extend_from_slice(&1_u32.to_be_bytes()); // Active event.
+        body.extend_from_slice(&0x1234_u16.to_be_bytes()); // Building index.
+        body.extend_from_slice(&0x0506_0708_u32.to_be_bytes()); // Created frame.
+        body.extend_from_slice(&0x3f80_0000_u32.to_be_bytes()); // First toga-party time.
+        body.extend_from_slice(&0xbf00_0000_u32.to_be_bytes()); // Second toga-party time.
+        body.extend_from_slice(&0x0102_0304_u32.to_be_bytes()); // Start frame.
+        body.extend_from_slice(&0x0506_0708_u32.to_be_bytes()); // Expiry frame.
+        body.extend_from_slice(&[0x12, 0x34]); // Ticket price.
+        body.extend_from_slice(&[0x11, 0x22, 0x33]); // RGB color.
+        body.extend_from_slice(&0x2122_2324_2526_2728_u64.to_be_bytes()); // Ticket income.
+        body.extend_from_slice(&0x3132_3334_3536_3738_u64.to_be_bytes()); // Total ticket.
+        body.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes()); // Reward money.
+        body.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes()); // Total reward.
+        body.extend_from_slice(&[0x21, 0x22, 0x23, 0x24]); // Result counts.
+        body.extend_from_slice(&0x1234_i16.to_be_bytes()); // Popularity delta.
+        body.extend_from_slice(&[0x56, 0x78]); // Security budget.
+        let race_start = body.len();
+        body.extend_from_slice(&EMPTY_RACE_EVENT_DATA);
+        body.extend_from_slice(&[0, 0]); // No unlock milestones.
+        body.extend_from_slice(&[0, 0, 7]); // One event prefab index.
+        body.extend_from_slice(&[0, 0]); // No prefab names.
+        body.push(0xff); // Match-preparing reference.
+        body.extend_from_slice(&[0xff, 0xff]); // Band references.
+        body.extend_from_slice(&[0x34, 0x56]); // Band-popularity bonus.
+        body.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
+
+        let (mut manager, body_start) = manager_with_event_manager_body(120_004, &body);
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let mut editor = manager.decode_event_manager_event_records().unwrap();
+        assert_eq!(
+            editor.race_event_data(),
+            [Some(crate::EventManagerRaceEventData {
+                schedule_id: 0x090a_0b0c,
+                lap_count: 0x0d0e_0f10,
+                state: 0x1112_1314,
+                frames_in_state: 0x1516_1718,
+                race_marshal_id: 0x1920,
+                event_end_frame: 0x2122_2324,
+                frames_to_next_overtake: 0x2d2e_2f30,
+            })]
+        );
+        editor.race_event_data_mut()[0]
+            .as_mut()
+            .expect("race-event data is present")
+            .event_end_frame = 0xa1b2_c3d4;
+
+        let mut invalid_editor = editor.clone();
+        invalid_editor.race_event_data_mut()[0] = None;
+        assert!(
+            manager
+                .replace_event_manager_event_records(&invalid_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), original_graph);
+
+        manager
+            .replace_event_manager_event_records(&editor)
+            .unwrap();
+        let mut expected_body = body.clone();
+        expected_body[race_start + 39..race_start + 43]
+            .copy_from_slice(&0xa1b2_c3d4_u32.to_be_bytes());
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start..body_start + body.len()],
+            expected_body
+        );
+        assert_eq!(
+            manager
+                .decode_event_manager_event_records()
+                .unwrap()
+                .race_event_data(),
+            editor.race_event_data()
+        );
     }
 
     #[test]
