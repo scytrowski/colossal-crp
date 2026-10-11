@@ -433,15 +433,16 @@ impl TransportManagerTailReference {
 
 /// In-place editor for `TransportManager+Data`'s fixed tail object references.
 ///
-/// Only existing object IDs can be redirected. A target must already be
-/// available at that position in the object stream and have the same runtime
-/// type. Null and newly allocated headers retain their original bytes.
+/// Existing object IDs can be redirected to an earlier object of the same type
+/// or cleared to null. Null and newly allocated headers retain their original
+/// bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerTailReferenceEditor {
     format_version: u32,
     save_app_version: Option<u32>,
     references: Vec<TransportManagerTailReference>,
     original_headers: Vec<NetObjectHeader>,
+    original_reference_types: Vec<Option<String>>,
     header_ranges: Vec<Range<usize>>,
     available_object_counts: Vec<usize>,
     object_types: Vec<String>,
@@ -460,6 +461,7 @@ impl TransportManagerTailReferenceEditor {
     }
 
     /// Redirects an existing reference to an earlier object of the same type.
+    /// A reference previously cleared through this editor can be restored.
     pub fn set_reference_object_id(
         &mut self,
         reference_index: usize,
@@ -500,23 +502,56 @@ impl TransportManagerTailReferenceEditor {
                 "TransportManager tail target type is unresolved",
             )
         })?;
+        let original_type = self
+            .original_reference_types
+            .get(reference_index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                invalid(
+                    reference_index,
+                    "TransportManager tail reference type was not captured",
+                )
+            })?;
+        if target_type != original_type {
+            return Err(invalid(
+                reference_index,
+                "TransportManager tail target has a different runtime type",
+            ));
+        }
         let entry = self.references.get_mut(reference_index).ok_or_else(|| {
             invalid(
                 reference_index,
                 "TransportManager tail-reference index is out of bounds",
             )
         })?;
-        let reference = entry
-            .reference
-            .as_mut()
-            .ok_or_else(|| invalid(reference_index, "TransportManager tail reference is null"))?;
-        if target_type != &reference.type_name {
+        entry.reference = Some(ResolvedObjectReference {
+            object_id,
+            type_name: original_type.clone(),
+        });
+        Ok(())
+    }
+
+    /// Clears an existing tail reference while preserving its serialized slot.
+    pub fn clear_reference(&mut self, reference_index: usize) -> Result<(), CrpError> {
+        let header = self.original_headers.get(reference_index).ok_or_else(|| {
+            invalid(
+                reference_index,
+                "TransportManager tail-reference index is out of bounds",
+            )
+        })?;
+        if !matches!(header, NetObjectHeader::Existing(_)) {
             return Err(invalid(
                 reference_index,
-                "TransportManager tail target has a different runtime type",
+                "TransportManager tail reference is not an existing object ID",
             ));
         }
-        reference.object_id = object_id;
+        let entry = self.references.get_mut(reference_index).ok_or_else(|| {
+            invalid(
+                reference_index,
+                "TransportManager tail-reference index is out of bounds",
+            )
+        })?;
+        entry.reference = None;
         Ok(())
     }
 
@@ -525,6 +560,7 @@ impl TransportManagerTailReferenceEditor {
         let count = self.references.len();
         if count != transport_manager_object_header_count(self.format_version)
             || self.original_headers.len() != count
+            || self.original_reference_types.len() != count
             || self.header_ranges.len() != count
             || self.available_object_counts.len() != count
         {
@@ -544,12 +580,6 @@ impl TransportManagerTailReferenceEditor {
                     "TransportManager tail reference is missing from editor",
                 )
             })?;
-            let reference = entry.reference.as_ref().ok_or_else(|| {
-                invalid(
-                    index,
-                    "existing TransportManager tail reference became null",
-                )
-            })?;
             let range = self.header_ranges.get(index).ok_or_else(|| {
                 invalid(index, "TransportManager tail header range was not captured")
             })?;
@@ -559,22 +589,27 @@ impl TransportManagerTailReferenceEditor {
                     "existing TransportManager tail header is not three bytes",
                 ));
             }
-            let object_index = usize::try_from(reference.object_id)
-                .map_err(|_| CrpError::ArithmeticOverflow("TransportManager tail object ID"))?;
-            if reference.object_id >= MAX_OBJECT_ID
-                || object_index >= self.available_object_counts[index]
-                || self.object_types.get(object_index) != Some(&reference.type_name)
-            {
-                return Err(invalid(
-                    range.start,
-                    "TransportManager tail target is unavailable or has a different runtime type",
-                ));
-            }
-            let bytes = [
-                (reference.object_id >> 16) as u8,
-                (reference.object_id >> 8) as u8,
-                reference.object_id as u8,
-            ];
+            let bytes = if let Some(reference) = entry.reference.as_ref() {
+                let object_index = usize::try_from(reference.object_id)
+                    .map_err(|_| CrpError::ArithmeticOverflow("TransportManager tail object ID"))?;
+                if reference.object_id >= MAX_OBJECT_ID
+                    || object_index >= self.available_object_counts[index]
+                    || self.object_types.get(object_index) != Some(&reference.type_name)
+                    || self.original_reference_types[index].as_ref() != Some(&reference.type_name)
+                {
+                    return Err(invalid(
+                        range.start,
+                        "TransportManager tail target is unavailable or has a different runtime type",
+                    ));
+                }
+                [
+                    (reference.object_id >> 16) as u8,
+                    (reference.object_id >> 8) as u8,
+                    reference.object_id as u8,
+                ]
+            } else {
+                [0xff; 3]
+            };
             body.get_mut(range.clone())
                 .ok_or_else(|| {
                     invalid(
@@ -10890,6 +10925,15 @@ impl SimulationManagerData {
                 })
             })
             .collect::<Result<Vec<_>, CrpError>>()?;
+        let original_reference_types = references
+            .iter()
+            .map(|entry| {
+                entry
+                    .reference
+                    .as_ref()
+                    .map(|reference| reference.type_name.clone())
+            })
+            .collect();
         let (body_range, _) = self.transport_manager_body_range()?;
         let bounded_end = body_range
             .end
@@ -10907,6 +10951,7 @@ impl SimulationManagerData {
             save_app_version,
             references,
             original_headers: fields.object_headers,
+            original_reference_types,
             header_ranges: fields.object_header_ranges,
             available_object_counts: fields.object_header_available_object_counts,
             object_types: fields.milestone_object_types,
@@ -10914,12 +10959,12 @@ impl SimulationManagerData {
         })
     }
 
-    /// Applies existing-object redirects to TransportManager's fixed tail references.
+    /// Applies redirects or clears to TransportManager's fixed tail references.
     ///
     /// The editor must come from this manager's current bytes and version.
-    /// Only existing IDs can change; each target must be available at that
-    /// point in the object stream and retain the original runtime type. The
-    /// manager graph length and all other bytes remain unchanged.
+    /// Existing IDs can be redirected to earlier objects of the same type or
+    /// cleared to null. The manager graph length and all other bytes remain
+    /// unchanged.
     pub fn replace_transport_manager_tail_references(
         &mut self,
         edited: &TransportManagerTailReferenceEditor,
@@ -21503,15 +21548,25 @@ mod manager_boundary_tests {
             ]
         );
 
-        let references = transport_manager_tail_reference_fields(112_004)
+        let references: Vec<TransportManagerTailReference> =
+            transport_manager_tail_reference_fields(112_004)
+                .iter()
+                .zip(&fields.object_header_ids)
+                .map(|(field, object_id)| TransportManagerTailReference {
+                    field: *field,
+                    reference: object_id.map(|object_id| ResolvedObjectReference {
+                        object_id,
+                        type_name: fields.milestone_object_types[object_id as usize].clone(),
+                    }),
+                })
+                .collect();
+        let original_reference_types = references
             .iter()
-            .zip(&fields.object_header_ids)
-            .map(|(field, object_id)| TransportManagerTailReference {
-                field: *field,
-                reference: object_id.map(|object_id| ResolvedObjectReference {
-                    object_id,
-                    type_name: fields.milestone_object_types[object_id as usize].clone(),
-                }),
+            .map(|entry| {
+                entry
+                    .reference
+                    .as_ref()
+                    .map(|reference| reference.type_name.clone())
             })
             .collect();
         let mut editor = TransportManagerTailReferenceEditor {
@@ -21519,6 +21574,7 @@ mod manager_boundary_tests {
             save_app_version: None,
             references,
             original_headers: fields.object_headers,
+            original_reference_types,
             header_ranges: fields.object_header_ranges,
             available_object_counts: fields.object_header_available_object_counts,
             object_types: fields.milestone_object_types,
@@ -21543,7 +21599,7 @@ mod manager_boundary_tests {
         editor.set_reference_object_id(2, 4).unwrap();
         let mut expected = bytes.clone();
         let target_range = editor.header_ranges[2].clone();
-        expected[target_range].copy_from_slice(&[0x00, 0x00, 0x04]);
+        expected[target_range.clone()].copy_from_slice(&[0x00, 0x00, 0x04]);
         assert_eq!(editor.encode().unwrap(), expected);
         assert!(editor.set_reference_object_id(1, 3).is_err());
         assert!(editor.set_reference_object_id(2, 2).is_err());
@@ -21551,6 +21607,16 @@ mod manager_boundary_tests {
         assert!(editor.set_reference_object_id(4, 1).is_err());
         assert!(editor.set_reference_object_id(7, 1).is_err());
         assert_eq!(editor.encode().unwrap(), expected);
+
+        editor.clear_reference(2).unwrap();
+        assert_eq!(editor.references()[2].reference(), None);
+        let mut expected_null = expected;
+        expected_null[target_range.clone()].copy_from_slice(&[0xff; 3]);
+        assert_eq!(editor.encode().unwrap(), expected_null);
+        assert!(editor.clear_reference(1).is_err());
+        assert!(editor.clear_reference(4).is_err());
+        editor.set_reference_object_id(2, 1).unwrap();
+        assert_eq!(editor.encode().unwrap(), bytes);
     }
 
     #[test]
