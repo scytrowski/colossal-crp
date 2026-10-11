@@ -1040,21 +1040,7 @@ impl TransportManagerLineRecord {
                     )
                 })?;
                 let encoded = encode_legacy_vehicle_selection(selection, original)?;
-                if encoded.len() != range.len() {
-                    return Err(invalid(
-                        range.start,
-                        "edited legacy vehicle selection changes its serialized length",
-                    ));
-                }
-                bytes
-                    .get_mut(range.clone())
-                    .ok_or_else(|| {
-                        invalid(
-                            range.start,
-                            "legacy vehicle-selection range exceeds active line",
-                        )
-                    })?
-                    .copy_from_slice(&encoded);
+                bytes.splice(range.clone(), encoded);
             }
             (None, None) => {}
             _ => {
@@ -1083,32 +1069,37 @@ fn encode_legacy_vehicle_selection(
             Ok(index.to_be_bytes().to_vec())
         }
         TransportLineVehicleSelection::Name(None) => {
-            if original != [0xff] {
-                return Err(invalid(
-                    0,
-                    "legacy vehicle-selection nullness cannot change in a fixed-width edit",
-                ));
-            }
-            Ok(vec![0xff])
-        }
-        TransportLineVehicleSelection::Name(Some(name)) => {
-            if original.len() < 3 || original[0] == 0xff {
+            if original != [0xff] && (original.len() < 3 || original[0] == 0xff) {
                 return Err(invalid(
                     0,
                     "legacy vehicle-selection name has an invalid source encoding",
                 ));
             }
-            let encoded_length = (u32::from(original[0]) << 16)
-                | (u32::from(original[1]) << 8)
-                | u32::from(original[2]);
-            let compact = encoded_length & COMPACT_STRING_FLAG != 0;
+            Ok(vec![0xff])
+        }
+        TransportLineVehicleSelection::Name(Some(name)) => {
             let mut encoded = Vec::new();
-            write_unique_string_with_mode(&mut encoded, name, compact)?;
-            if encoded.len() != original.len() || encoded.get(..3) != Some(&original[..3]) {
-                return Err(invalid(
-                    0,
-                    "legacy vehicle-selection name changes its serialized length",
-                ));
+            if original == [0xff] {
+                write_unique_string(&mut encoded, name)?;
+            } else {
+                if original.len() < 3 || original[0] == 0xff {
+                    return Err(invalid(
+                        0,
+                        "legacy vehicle-selection name has an invalid source encoding",
+                    ));
+                }
+                let encoded_length = (u32::from(original[0]) << 16)
+                    | (u32::from(original[1]) << 8)
+                    | u32::from(original[2]);
+                let compact = encoded_length & COMPACT_STRING_FLAG != 0;
+                let replacement_is_compact =
+                    name.chars().all(|character| u32::from(character) < 256);
+                match (compact, replacement_is_compact) {
+                    (true, true) => write_unique_string_with_mode(&mut encoded, name, true)?,
+                    (true, false) | (false, _) => {
+                        write_unique_string_with_mode(&mut encoded, name, false)?
+                    }
+                }
             }
             Ok(encoded)
         }
@@ -1137,7 +1128,8 @@ fn overwrite_active_line_field(
 /// Mutable view of one active TransportManager line.
 ///
 /// Only fields present in the source version can be edited. Legacy selection
-/// names must retain their encoded length and compact or wide representation.
+/// names can change length; existing compact or wide encoding is retained when
+/// the replacement can be represented in that mode.
 pub struct TransportManagerActiveLineEditor<'a> {
     record: &'a mut TransportManagerLineRecord,
 }
@@ -1190,9 +1182,11 @@ impl TransportManagerActiveLineEditor<'_> {
 
     /// Returns the legacy vehicle selection for editing on versions 112004–114000.
     ///
-    /// Replacing a name is accepted only when it preserves the source string's
-    /// encoded length and compact or wide representation. The source version
-    /// determines whether the value is a numeric index or a nullable name.
+    /// A replacement may change the serialized length. Existing compact or
+    /// wide encoding is retained when possible; compact strings that cannot
+    /// represent the replacement are written wide. A null source uses the
+    /// default string encoding. The source version determines whether the
+    /// value is a numeric index or a nullable name.
     pub fn legacy_vehicle_selection_mut(&mut self) -> Option<&mut TransportLineVehicleSelection> {
         self.record.legacy_vehicle_selection.as_mut()
     }
@@ -1264,10 +1258,11 @@ impl TransportManagerLineData {
     }
 }
 
-/// Editor for fixed-width TransportManager line and passenger data.
+/// Editor for TransportManager line and passenger data.
 ///
-/// This retains the original bounded manager body and permits same-width
-/// edits only. Passenger counts must fit in the serialized 24-bit fields.
+/// This retains the original bounded manager body. Legacy vehicle names may
+/// resize active-line records; line and passenger table counts remain fixed.
+/// Passenger counts must fit in the serialized 24-bit fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerLineDataEditor {
     format_version: u32,
@@ -1334,25 +1329,42 @@ impl TransportManagerLineDataEditor {
         self.global_passengers.as_deref_mut()
     }
 
-    /// Writes the original bounded body with edited line-number and passenger
-    /// counters. Other manager bytes, including the closing profiler
-    /// reference, remain unchanged. Returns an error if an edit changes a
-    /// table's length, changes passenger group counts, exceeds the 24-bit
-    /// passenger limit, or would exceed the captured source ranges.
+    /// Writes the original bounded body with edited line records, line-number
+    /// values, and passenger counters. Resized legacy vehicle names shift the
+    /// following bytes while preserving their contents, including the closing
+    /// profiler reference. Returns an error if an edit changes a table's
+    /// length, changes passenger group counts, exceeds the 24-bit passenger
+    /// limit, or would exceed the captured source ranges.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut body = self.original_body.clone();
-        for line in &self.active_lines {
+        let mut line_growth = 0_usize;
+        let mut line_shrinkage = 0_usize;
+        let mut next_line_start = self.original_body.len();
+        for line in self.active_lines.iter().rev() {
             let range = line.serialized_range.clone();
-            let encoded = line.encode_with_passenger_edits()?;
-            if range.len() != encoded.len() {
+            if range.start > range.end
+                || range.end > self.original_body.len()
+                || range.end > next_line_start
+            {
                 return Err(invalid(
                     range.start,
-                    "edited active-line record changes its serialized length",
+                    "active-line ranges overlap or exceed the source body",
                 ));
             }
-            body.get_mut(range.clone())
-                .ok_or_else(|| invalid(range.start, "active-line range exceeds source body"))?
-                .copy_from_slice(&encoded);
+            let encoded = line.encode_with_passenger_edits()?;
+            if encoded.len() >= range.len() {
+                line_growth = line_growth.checked_add(encoded.len() - range.len()).ok_or(
+                    CrpError::ArithmeticOverflow("TransportManager active-line growth"),
+                )?;
+            } else {
+                line_shrinkage = line_shrinkage
+                    .checked_add(range.len() - encoded.len())
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "TransportManager active-line shrinkage",
+                    ))?;
+            }
+            body.splice(range.clone(), encoded);
+            next_line_start = range.start;
         }
 
         if let Some(numbers) = &self.line_numbers {
@@ -1416,19 +1428,46 @@ impl TransportManagerLineDataEditor {
                     "edited TransportManager passenger table changes its serialized length",
                 ));
             }
+            let net_shift = line_growth.abs_diff(line_shrinkage);
+            let adjusted_range = if line_growth >= line_shrinkage {
+                let start =
+                    range
+                        .start
+                        .checked_add(net_shift)
+                        .ok_or(CrpError::ArithmeticOverflow(
+                            "TransportManager passenger table offset",
+                        ))?;
+                let end = range
+                    .end
+                    .checked_add(net_shift)
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "TransportManager passenger table end",
+                    ))?;
+                start..end
+            } else {
+                let start = range.start.checked_sub(net_shift).ok_or_else(|| {
+                    invalid(
+                        range.start,
+                        "resized active lines move passenger table before body",
+                    )
+                })?;
+                let end = range.end.checked_sub(net_shift).ok_or_else(|| {
+                    invalid(
+                        range.end,
+                        "resized active lines move passenger table before body",
+                    )
+                })?;
+                start..end
+            };
             let destination = body
-                .get_mut(range.clone())
+                .get_mut(adjusted_range.clone())
                 .ok_or_else(|| invalid(range.start, "passenger range exceeds source body"))?;
             let mut offset = 0_usize;
             for (record, original) in records.iter().zip(original_records) {
                 if record.groups().len() != original.groups().len() {
-                    let error_offset =
-                        range
-                            .start
-                            .checked_add(offset)
-                            .ok_or(CrpError::ArithmeticOverflow(
-                                "TransportManager passenger record offset",
-                            ))?;
+                    let error_offset = adjusted_range.start.checked_add(offset).ok_or(
+                        CrpError::ArithmeticOverflow("TransportManager passenger record offset"),
+                    )?;
                     return Err(invalid(
                         error_offset,
                         "edited TransportManager passenger record changes its group count",
@@ -1446,7 +1485,7 @@ impl TransportManagerLineDataEditor {
                             let end = offset.checked_add(3).ok_or(CrpError::ArithmeticOverflow(
                                 "TransportManager passenger field end",
                             ))?;
-                            let error_offset = range.start.checked_add(offset).ok_or(
+                            let error_offset = adjusted_range.start.checked_add(offset).ok_or(
                                 CrpError::ArithmeticOverflow(
                                     "TransportManager passenger field offset",
                                 ),
@@ -10430,12 +10469,12 @@ impl SimulationManagerData {
         })
     }
 
-    /// Replaces the shared line-number and global passenger tables.
+    /// Replaces TransportManager line records, line numbers, and passenger tables.
     ///
     /// The editor must come from this manager's current bytes and version.
-    /// The fixed-width tables are rewritten in place; all other manager bytes
-    /// and the serialized graph length remain unchanged. Values that do not
-    /// fit the format's 24-bit passenger fields return an error.
+    /// Legacy vehicle-name edits may resize the bounded manager body and graph;
+    /// all other manager bytes are preserved. Values that do not fit the
+    /// format's 24-bit passenger fields return an error.
     pub fn replace_transport_manager_line_data(
         &mut self,
         edited: &TransportManagerLineDataEditor,
@@ -10465,20 +10504,26 @@ impl SimulationManagerData {
         }
 
         let replacement = edited.encode()?;
-        if replacement.len() != current.len() {
-            return Err(invalid(
-                body_range.start,
-                "TransportManager line-data edits must preserve the bounded body length",
-            ));
-        }
         let mut candidate_graph = self.serialized_object_graph.clone();
-        candidate_graph[body_range.start..bounded_end].copy_from_slice(&replacement);
+        candidate_graph.splice(body_range.start..bounded_end, replacement.iter().copied());
         let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
         let validation = self
             .decode_transport_manager_line_data()
             .and_then(|decoded| {
+                let expected_body_len = replacement
+                    .len()
+                    .checked_sub(LOADING_PROFILER_END_TAG_BYTES)
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "rewritten TransportManager body length",
+                    ))?;
+                let expected_body_end = body_range.start.checked_add(expected_body_len).ok_or(
+                    CrpError::ArithmeticOverflow("rewritten TransportManager body end"),
+                )?;
+                let (validated_body_range, _) = self.transport_manager_body_range()?;
                 if decoded.line_numbers != edited.line_numbers
                     || decoded.global_passengers != edited.global_passengers
+                    || validated_body_range.start != body_range.start
+                    || validated_body_range.end != expected_body_end
                     || decoded.active_lines.len() != edited.active_lines.len()
                     || decoded.active_lines.iter().zip(&edited.active_lines).any(
                         |(decoded, edited)| {
@@ -19356,15 +19401,328 @@ mod manager_boundary_tests {
                 *line.legacy_vehicle_selection_mut().unwrap() =
                     TransportLineVehicleSelection::Name(Some("Bus".to_owned()));
                 drop(line);
-                let before_rejection = manager.serialized_object_graph().to_vec();
-                assert!(
+                let before_shrink = manager.serialized_object_graph().len();
+                manager
+                    .replace_transport_manager_line_data(&stale_length_editor)
+                    .unwrap();
+                assert_eq!(manager.serialized_object_graph().len(), before_shrink - 8);
+                assert_eq!(
                     manager
-                        .replace_transport_manager_line_data(&stale_length_editor)
-                        .is_err()
+                        .decode_transport_manager_line_data()
+                        .unwrap()
+                        .active_lines()[0]
+                        .legacy_vehicle_selection(),
+                    Some(&TransportLineVehicleSelection::Name(Some("Bus".to_owned())))
                 );
-                assert_eq!(manager.serialized_object_graph(), before_rejection);
+            } else {
+                let current_data = manager.decode_transport_manager_line_data().unwrap();
+                let current_line = &current_data.active_lines()[0];
+                let current_range = current_line
+                    .legacy_vehicle_selection_range
+                    .as_ref()
+                    .unwrap();
+                let absolute_start =
+                    body_start + current_line.serialized_range.start + current_range.start;
+                let absolute_end =
+                    body_start + current_line.serialized_range.start + current_range.end;
+                let before_shrink = manager.serialized_object_graph().to_vec();
+                let mut wide_shrink_editor = current_data.into_editor();
+                let mut line = wide_shrink_editor.active_line_mut(0).unwrap();
+                *line.legacy_vehicle_selection_mut().unwrap() =
+                    TransportLineVehicleSelection::Name(Some("Bus".to_owned()));
+                drop(line);
+                let mut expected_wide_graph = before_shrink.clone();
+                expected_wide_graph.splice(
+                    absolute_start..absolute_end,
+                    [0x00, 0x00, 0x03, 0xff, 0xc2, 0x00, 0x33, 0xff, 0xfe],
+                );
+                manager
+                    .replace_transport_manager_line_data(&wide_shrink_editor)
+                    .unwrap();
+                assert_eq!(manager.serialized_object_graph(), expected_wide_graph);
+                assert_eq!(
+                    manager.serialized_object_graph().len(),
+                    before_shrink.len() - 16
+                );
+                assert_eq!(
+                    manager
+                        .decode_transport_manager_line_data()
+                        .unwrap()
+                        .active_lines()[0]
+                        .legacy_vehicle_selection(),
+                    Some(&TransportLineVehicleSelection::Name(Some("Bus".to_owned())))
+                );
             }
         }
+    }
+
+    #[test]
+    fn transport_manager_legacy_vehicle_selection_can_resize_line_and_manager_bodies() {
+        let (mut body, _) = active_transport_manager_reference_body(112_022, 14, 0, 7);
+        let fields = decode_transport_manager_reference_body(112_022, &body, None, None).unwrap();
+        let record_start = fields.line_records[0].serialized_range.start;
+        let original_selection_range = fields.line_records[0]
+            .legacy_vehicle_selection_range
+            .clone()
+            .unwrap();
+        let compact_bus = [0x80, 0x00, 0x03, 0xc2, 0x33, 0xfe];
+        let selection_start = record_start + original_selection_range.start;
+        let source_selection_range = selection_start..record_start + original_selection_range.end;
+        let selection_range = selection_start..selection_start + compact_bus.len();
+        assert_eq!(original_selection_range.len(), 14);
+        assert_eq!(selection_range.start, record_start + 90);
+        body.splice(source_selection_range, compact_bus);
+        let resized_fields = decode_transport_manager_reference_body(112_022, &body, None, None)
+            .expect("decode compact Bus source line");
+        assert_eq!(
+            resized_fields.line_records[0].legacy_vehicle_selection(),
+            Some(&TransportLineVehicleSelection::Name(Some("Bus".to_owned())))
+        );
+
+        let (mut manager, body_start) = manager_with_transport_body(112_022, &body);
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let line_data = manager.decode_transport_manager_line_data().unwrap();
+        let global_passenger_range = line_data.global_passenger_range.clone().unwrap();
+        let mut editor = line_data.into_editor();
+        {
+            let mut line = editor.active_line_mut(0).unwrap();
+            *line.legacy_vehicle_selection_mut().unwrap() =
+                TransportLineVehicleSelection::Name(Some("TrainEngine".to_owned()));
+        }
+        editor.global_passengers_mut().unwrap()[0].groups_mut()[0].set_temporary(0x12_3456);
+
+        let train_engine = [
+            0x80, 0x00, 0x0b, 0xd4, 0x1e, 0xef, 0x08, 0x05, 0xd7, 0x29, 0xf9, 0x02, 0x05, 0xf7,
+        ];
+        let absolute_selection_start = body_start + selection_range.start;
+        let absolute_selection_end = body_start + selection_range.end;
+        let mut expected_graph = original_graph.clone();
+        expected_graph.splice(
+            absolute_selection_start..absolute_selection_end,
+            train_engine.iter().copied(),
+        );
+        let shifted_global_start = body_start + global_passenger_range.start + 8;
+        expected_graph[shifted_global_start..shifted_global_start + 3]
+            .copy_from_slice(&[0x12, 0x34, 0x56]);
+        manager
+            .replace_transport_manager_line_data(&editor)
+            .unwrap();
+        let rewritten_graph = manager.serialized_object_graph();
+        let first_difference = rewritten_graph
+            .iter()
+            .zip(&expected_graph)
+            .position(|(actual, expected)| actual != expected);
+        assert_eq!(rewritten_graph.len(), expected_graph.len());
+        assert_eq!(
+            first_difference, None,
+            "graph differs at {first_difference:?}"
+        );
+        assert_eq!(rewritten_graph, expected_graph);
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            original_graph.len() + 8
+        );
+        let rewritten = manager.decode_transport_manager_line_data().unwrap();
+        assert_eq!(
+            rewritten.active_lines()[0].legacy_vehicle_selection(),
+            Some(&TransportLineVehicleSelection::Name(Some(
+                "TrainEngine".to_owned()
+            )))
+        );
+        assert_eq!(
+            rewritten.global_passengers().unwrap()[0].groups()[0].temporary(),
+            0x12_3456
+        );
+
+        let mut fallback_editor = rewritten.into_editor();
+        {
+            let mut line = fallback_editor.active_line_mut(0).unwrap();
+            *line.legacy_vehicle_selection_mut().unwrap() =
+                TransportLineVehicleSelection::Name(Some("☃".to_owned()));
+        }
+        let before_fallback = manager.serialized_object_graph().to_vec();
+        let current_data = manager.decode_transport_manager_line_data().unwrap();
+        let current_selection_range = current_data.active_lines()[0]
+            .legacy_vehicle_selection_range
+            .as_ref()
+            .unwrap();
+        let current_line_start = current_data.active_lines()[0].serialized_range.start;
+        let current_selection_start =
+            body_start + current_line_start + current_selection_range.start;
+        let current_selection_end = body_start + current_line_start + current_selection_range.end;
+        let mut expected_fallback_graph = before_fallback.clone();
+        expected_fallback_graph.splice(
+            current_selection_start..current_selection_end,
+            [0x00, 0x00, 0x01, 0x25, 0x83],
+        );
+        manager
+            .replace_transport_manager_line_data(&fallback_editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_fallback_graph);
+        let wide_rewritten = manager.decode_transport_manager_line_data().unwrap();
+        assert_eq!(
+            wide_rewritten.active_lines()[0].legacy_vehicle_selection(),
+            Some(&TransportLineVehicleSelection::Name(Some("☃".to_owned())))
+        );
+
+        let mut null_editor = wide_rewritten.into_editor();
+        {
+            let mut line = null_editor.active_line_mut(0).unwrap();
+            *line.legacy_vehicle_selection_mut().unwrap() =
+                TransportLineVehicleSelection::Name(None);
+        }
+        let before_null = manager.serialized_object_graph().to_vec();
+        let current_data = manager.decode_transport_manager_line_data().unwrap();
+        let current_selection_range = current_data.active_lines()[0]
+            .legacy_vehicle_selection_range
+            .as_ref()
+            .unwrap();
+        let current_line_start = current_data.active_lines()[0].serialized_range.start;
+        let current_selection_start =
+            body_start + current_line_start + current_selection_range.start;
+        let current_selection_end = body_start + current_line_start + current_selection_range.end;
+        let mut expected_null_graph = before_null.clone();
+        expected_null_graph.splice(current_selection_start..current_selection_end, [0xff]);
+        manager
+            .replace_transport_manager_line_data(&null_editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_null_graph);
+
+        let mut nullable_editor = manager
+            .decode_transport_manager_line_data()
+            .unwrap()
+            .into_editor();
+        {
+            let mut line = nullable_editor.active_line_mut(0).unwrap();
+            *line.legacy_vehicle_selection_mut().unwrap() =
+                TransportLineVehicleSelection::Name(Some("Bus".to_owned()));
+        }
+        let before_nullable = manager.serialized_object_graph().to_vec();
+        let current_data = manager.decode_transport_manager_line_data().unwrap();
+        let current_selection_range = current_data.active_lines()[0]
+            .legacy_vehicle_selection_range
+            .as_ref()
+            .unwrap();
+        let current_line_start = current_data.active_lines()[0].serialized_range.start;
+        let current_selection_start =
+            body_start + current_line_start + current_selection_range.start;
+        let current_selection_end = body_start + current_line_start + current_selection_range.end;
+        let mut expected_nullable_graph = before_nullable.clone();
+        expected_nullable_graph.splice(
+            current_selection_start..current_selection_end,
+            [0x80, 0x00, 0x03, 0xc2, 0x33, 0xfe],
+        );
+        manager
+            .replace_transport_manager_line_data(&nullable_editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_nullable_graph);
+        assert_eq!(
+            manager
+                .decode_transport_manager_line_data()
+                .unwrap()
+                .active_lines()[0]
+                .legacy_vehicle_selection(),
+            Some(&TransportLineVehicleSelection::Name(Some("Bus".to_owned())))
+        );
+    }
+
+    #[test]
+    fn transport_manager_multiple_resized_lines_adjust_the_following_passenger_table() {
+        let (source_body, _) = active_transport_manager_reference_body(112_022, 14, 0, 7);
+        let source_fields =
+            decode_transport_manager_reference_body(112_022, &source_body, None, None).unwrap();
+        let source_line_range = source_fields.line_records[0].serialized_range.clone();
+        let source_line = source_body[source_line_range.clone()].to_vec();
+        let mut flags = vec![0_u32; 255];
+        flags[0] = 1;
+        flags[1] = 1;
+        let mut prefix = Vec::new();
+        write_encoded_uint_array(&mut prefix, &flags);
+        prefix.extend_from_slice(&0_u16.to_be_bytes()); // No milestones.
+        write_encoded_ushort_array(&mut prefix, &[7, 8]);
+        prefix.extend_from_slice(&0_u16.to_be_bytes()); // Empty prefab-name table.
+        let source_prefix_end = source_fields.line_number_range.as_ref().unwrap().start;
+        let mut body = prefix;
+        body.extend_from_slice(&source_body[source_prefix_end..source_line_range.end]);
+        body.extend_from_slice(&source_line);
+        body.extend_from_slice(&source_body[source_line_range.end..]);
+
+        let fields = decode_transport_manager_reference_body(112_022, &body, None, None).unwrap();
+        assert_eq!(fields.line_records.len(), 2);
+        let (mut manager, body_start) = manager_with_transport_body(112_022, &body);
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let line_data = manager.decode_transport_manager_line_data().unwrap();
+        let global_passenger_range = line_data.global_passenger_range.clone().unwrap();
+        let first_source_length = line_data.active_lines()[0]
+            .legacy_vehicle_selection_range
+            .as_ref()
+            .unwrap()
+            .len();
+        let second_source_length = line_data.active_lines()[1]
+            .legacy_vehicle_selection_range
+            .as_ref()
+            .unwrap()
+            .len();
+        let mut editor = line_data.into_editor();
+        {
+            let mut first = editor.active_line_mut(0).unwrap();
+            *first.legacy_vehicle_selection_mut().unwrap() =
+                TransportLineVehicleSelection::Name(Some("VeryLongTramVehicle".to_owned()));
+            let mut second = editor.active_line_mut(1).unwrap();
+            *second.legacy_vehicle_selection_mut().unwrap() =
+                TransportLineVehicleSelection::Name(None);
+        }
+        editor.global_passengers_mut().unwrap()[0].groups_mut()[0].set_final_count(0x65_4321);
+
+        let mut encoded_long_name = Vec::new();
+        write_unique_string_with_mode(&mut encoded_long_name, "VeryLongTramVehicle", true).unwrap();
+        assert_eq!(encoded_long_name.len() - first_source_length, 8);
+        assert_eq!(second_source_length - 1, 13);
+        let first_line = &fields.line_records[0];
+        let first_name_range = first_line.legacy_vehicle_selection_range.as_ref().unwrap();
+        let first_name_start =
+            body_start + first_line.serialized_range.start + first_name_range.start;
+        let first_name_end = body_start + first_line.serialized_range.start + first_name_range.end;
+        let second_line = &fields.line_records[1];
+        let second_name_range = second_line.legacy_vehicle_selection_range.as_ref().unwrap();
+        let second_name_start =
+            body_start + second_line.serialized_range.start + second_name_range.start;
+        let second_name_end =
+            body_start + second_line.serialized_range.start + second_name_range.end;
+        let mut expected_graph = original_graph.clone();
+        expected_graph.splice(second_name_start..second_name_end, [0xff]);
+        expected_graph.splice(
+            first_name_start..first_name_end,
+            encoded_long_name.iter().copied(),
+        );
+        let shifted_global_start = body_start + global_passenger_range.start - 5;
+        expected_graph[shifted_global_start + 3..shifted_global_start + 6]
+            .copy_from_slice(&[0x65, 0x43, 0x21]);
+
+        manager
+            .replace_transport_manager_line_data(&editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            original_graph.len() - 5
+        );
+        let rewritten = manager.decode_transport_manager_line_data().unwrap();
+        assert_eq!(rewritten.active_lines().len(), 2);
+        assert_eq!(
+            rewritten.active_lines()[0].legacy_vehicle_selection(),
+            Some(&TransportLineVehicleSelection::Name(Some(
+                "VeryLongTramVehicle".to_owned()
+            )))
+        );
+        assert_eq!(
+            rewritten.active_lines()[1].legacy_vehicle_selection(),
+            Some(&TransportLineVehicleSelection::Name(None))
+        );
+        assert_eq!(
+            rewritten.global_passengers().unwrap()[0].groups()[0].final_count(),
+            0x65_4321
+        );
     }
 
     #[test]
