@@ -163,7 +163,7 @@ pub(crate) struct EventManagerReferenceData {
     active_event_route_ranges: Vec<Range<usize>>,
     route_schedule_name_ranges: Vec<Vec<Range<usize>>>,
     route_schedule_name_compact_modes: Vec<Vec<Option<bool>>>,
-    route_schedule_prefab_scope_range: Option<Range<usize>>,
+    route_schedule_prefab_scope: Option<EventPrefabScope>,
     pub(crate) object_headers: Vec<NetObjectHeader>,
     pub(crate) unidentified_counted_block: Option<UnidentifiedCountedBlock>,
     pub(crate) type_data: Vec<EventManagerTypeData>,
@@ -226,12 +226,12 @@ pub struct EventManagerTailEditor {
     tail_data: EventManagerTailData,
 }
 
-/// Editor for existing EventManager event, milestone, and type-data prefab data.
+/// Editor for existing EventManager event, milestone, type-data, and route-schedule prefab data.
 ///
-/// All indexes share one encoded UShort scope. A changed scope is written with
+/// Event, milestone, and type-data indexes share one encoded UShort scope.
+/// Schedule indexes use a second scope from version 121015. Changed scopes use
 /// the crate's canonical UShort encoding and can change the manager body size.
-/// Changed names retain their original compact or wide string encoding when
-/// possible, and the table can also change the manager body size.
+/// Changed names retain their original compact or wide encoding when possible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerPrefabIndicesEditor {
     original: EventManagerReferenceData,
@@ -239,11 +239,25 @@ pub struct EventManagerPrefabIndicesEditor {
     milestone_indexes: Vec<u16>,
     type_data_indexes: Vec<u16>,
     prefab_names: Vec<Option<String>>,
+    route_schedule_indexes: Vec<u16>,
+    route_schedule_names: Vec<Option<String>>,
 }
 
 impl EventManagerReferenceData {
     pub(crate) fn prefab_names(&self) -> &[Option<String>] {
         &self.prefab_names
+    }
+
+    pub(crate) fn route_schedule_indexes(&self) -> &[u16] {
+        self.route_schedule_prefab_scope
+            .as_ref()
+            .map_or(&[], |scope| &scope.indexes)
+    }
+
+    pub(crate) fn route_schedule_names(&self) -> &[Option<String>] {
+        self.route_schedule_prefab_scope
+            .as_ref()
+            .map_or(&[], |scope| &scope.names)
     }
 
     pub(crate) fn equivalent_reference_layout(&self, other: &Self) -> bool {
@@ -300,14 +314,14 @@ impl EventManagerReferenceData {
                     }
                 })
             && match (
-                self.route_schedule_prefab_scope_range.as_ref(),
-                other.route_schedule_prefab_scope_range.as_ref(),
+                self.route_schedule_prefab_scope.as_ref(),
+                other.route_schedule_prefab_scope.as_ref(),
             ) {
                 (None, None) => true,
                 (Some(left), Some(right)) => {
                     match (
-                        self.serialized_body.get(left.clone()),
-                        other.serialized_body.get(right.clone()),
+                        self.serialized_body.get(left.scope_range.clone()),
+                        other.serialized_body.get(right.scope_range.clone()),
                     ) {
                         (Some(left), Some(right)) => left == right,
                         _ => false,
@@ -353,12 +367,22 @@ impl EventManagerReferenceData {
         let type_data_indexes =
             self.prefab_indexes[milestone_end..milestone_end + type_data_count].to_vec();
         let prefab_names = self.prefab_names.clone();
+        let route_schedule_indexes = self
+            .route_schedule_prefab_scope
+            .as_ref()
+            .map_or_else(Vec::new, |scope| scope.indexes.clone());
+        let route_schedule_names = self
+            .route_schedule_prefab_scope
+            .as_ref()
+            .map_or_else(Vec::new, |scope| scope.names.clone());
         EventManagerPrefabIndicesEditor {
             original: self,
             event_indexes,
             milestone_indexes,
             type_data_indexes,
             prefab_names,
+            route_schedule_indexes,
+            route_schedule_names,
         }
     }
 }
@@ -370,6 +394,7 @@ pub(crate) struct UnidentifiedCountedBlock {
     pub(crate) contains_only_null_headers: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EventPrefabScope {
     indexes: Vec<u16>,
     scope_range: Range<usize>,
@@ -452,9 +477,13 @@ impl EventManagerReferenceData {
         let type_data_has_ticket_price = type_data_ticket_price_present(format_version, false);
         let type_data_range = type_data_start..reader.offset();
 
-        let route_schedule_prefab_scope_range = if format_version >= 121_015 {
-            let scope = read_event_prefab_scope(&mut reader, 0, 0, route_schedule_count)?;
-            Some(scope.scope_range)
+        let route_schedule_prefab_scope = if format_version >= 121_015 {
+            Some(read_event_prefab_scope(
+                &mut reader,
+                0,
+                0,
+                route_schedule_count,
+            )?)
         } else {
             None
         };
@@ -489,7 +518,7 @@ impl EventManagerReferenceData {
             active_event_route_ranges,
             route_schedule_name_ranges,
             route_schedule_name_compact_modes,
-            route_schedule_prefab_scope_range,
+            route_schedule_prefab_scope,
             object_headers,
             unidentified_counted_block,
             type_data,
@@ -530,8 +559,7 @@ impl EventManagerReferenceData {
         let type_data_range = type_data_start..reader.offset();
 
         // The current writer opens the schedule-prefab scope at every version.
-        let route_schedule_prefab_scope_range =
-            read_event_prefab_scope(&mut reader, 0, 0, 0)?.scope_range;
+        let route_schedule_prefab_scope = Some(read_event_prefab_scope(&mut reader, 0, 0, 0)?);
         object_headers.push(read_net_object_header(&mut reader)?);
         object_headers.push(read_net_object_header(&mut reader)?);
         object_headers.push(read_net_object_header(&mut reader)?);
@@ -552,7 +580,7 @@ impl EventManagerReferenceData {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            Some(route_schedule_prefab_scope_range),
+            route_schedule_prefab_scope,
             object_headers,
             None,
             type_data,
@@ -1092,13 +1120,36 @@ impl EventManagerPrefabIndicesEditor {
         &mut self.type_data_indexes
     }
 
+    /// Returns route-schedule prefab indexes in serialized schedule order.
+    pub fn route_schedule_indexes(&self) -> &[u16] {
+        &self.route_schedule_indexes
+    }
+
+    /// Returns mutable route-schedule prefab indexes without changing their count.
+    pub fn route_schedule_indexes_mut(&mut self) -> &mut [u16] {
+        &mut self.route_schedule_indexes
+    }
+
     /// Returns the EventInfo prefab-name table, preserving null entries.
     pub fn prefab_names(&self) -> &[Option<String>] {
         &self.prefab_names
     }
 
+    /// Returns the separate route-schedule EventInfo name table.
+    pub fn route_schedule_names(&self) -> &[Option<String>] {
+        &self.route_schedule_names
+    }
+
     pub(crate) fn all_prefab_names(&self) -> &[Option<String>] {
         &self.prefab_names
+    }
+
+    pub(crate) fn all_route_schedule_indexes(&self) -> &[u16] {
+        &self.route_schedule_indexes
+    }
+
+    pub(crate) fn all_route_schedule_names(&self) -> &[Option<String>] {
+        &self.route_schedule_names
     }
 
     /// Replaces one existing EventInfo prefab name without changing the table count.
@@ -1115,6 +1166,19 @@ impl EventManagerPrefabIndicesEditor {
         Ok(())
     }
 
+    /// Replaces one existing route-schedule EventInfo name without changing its table count.
+    pub fn set_route_schedule_name(
+        &mut self,
+        index: usize,
+        value: Option<String>,
+    ) -> Result<(), CrpError> {
+        let name = self.route_schedule_names.get_mut(index).ok_or_else(|| {
+            invalid_event_prefabs(index, "route-schedule prefab-name index is out of range")
+        })?;
+        *name = value;
+        Ok(())
+    }
+
     pub(crate) fn all_indexes(&self) -> Vec<u16> {
         let mut indexes = Vec::with_capacity(self.original.prefab_indexes.len());
         indexes.extend_from_slice(&self.event_indexes);
@@ -1127,7 +1191,7 @@ impl EventManagerPrefabIndicesEditor {
         let indexes = self.all_indexes();
         let indexes_changed = indexes != self.original.prefab_indexes;
         let names_changed = self.prefab_names != self.original.prefab_names;
-        if indexes_changed || names_changed {
+        let primary_scope_replacement = if indexes_changed || names_changed {
             let encoded_indexes = if indexes_changed {
                 if indexes.len() != self.original.prefab_indexes.len() {
                     return Err(invalid_event_prefabs(
@@ -1156,106 +1220,172 @@ impl EventManagerPrefabIndicesEditor {
             let names = self.encode_prefab_names()?;
             let mut replacement_scope = encoded_indexes;
             replacement_scope.extend_from_slice(&names);
-            let mut output = self.original.serialized_body.clone();
-            output
-                .splice(self.original.prefab_scope_range.clone(), replacement_scope)
-                .for_each(drop);
-            Ok(output)
+            Some(replacement_scope)
         } else {
-            Ok(self.original.serialized_body.clone())
+            None
+        };
+        let route_schedule_scope_replacement =
+            match self.original.route_schedule_prefab_scope.as_ref() {
+                Some(scope)
+                    if self.route_schedule_indexes != scope.indexes
+                        || self.route_schedule_names != scope.names =>
+                {
+                    if self.route_schedule_indexes.len() != scope.indexes.len() {
+                        return Err(invalid_event_prefabs(
+                            scope.scope_range.start,
+                            "route-schedule prefab-index counts changed",
+                        ));
+                    }
+                    let encoded_indexes = if self.route_schedule_indexes == scope.indexes {
+                        self.original
+                            .serialized_body
+                            .get(scope.scope_range.start..scope.names_range.start)
+                            .ok_or_else(|| {
+                                invalid_event_prefabs(
+                                    scope.scope_range.start,
+                                    "route-schedule prefab-index bytes exceed body",
+                                )
+                            })?
+                            .to_vec()
+                    } else {
+                        let mut encoded = Vec::new();
+                        write_encoded_ushort_array(&mut encoded, &self.route_schedule_indexes);
+                        encoded
+                    };
+                    let names = encode_prefab_name_table(
+                        &self.original.serialized_body,
+                        scope.names_range.clone(),
+                        &scope.names,
+                        &scope.name_ranges,
+                        &scope.name_compact_modes,
+                        &self.route_schedule_names,
+                    )?;
+                    let mut replacement_scope = encoded_indexes;
+                    replacement_scope.extend_from_slice(&names);
+                    Some((scope.scope_range.clone(), replacement_scope))
+                }
+                Some(_) => None,
+                None if self.route_schedule_indexes.is_empty()
+                    && self.route_schedule_names.is_empty() =>
+                {
+                    None
+                }
+                None => {
+                    return Err(invalid_event_prefabs(
+                        0,
+                        "route-schedule prefab data is unavailable before version 121015",
+                    ));
+                }
+            };
+
+        let mut output = self.original.serialized_body.clone();
+        if let Some((range, replacement)) = route_schedule_scope_replacement {
+            output.splice(range, replacement).for_each(drop);
         }
+        if let Some(replacement) = primary_scope_replacement {
+            output
+                .splice(self.original.prefab_scope_range.clone(), replacement)
+                .for_each(drop);
+        }
+        Ok(output)
     }
 
     fn encode_prefab_names(&self) -> Result<Vec<u8>, CrpError> {
-        let original_names = &self.original.prefab_names;
-        let ranges = &self.original.prefab_name_ranges;
-        let compact_modes = &self.original.prefab_name_compact_modes;
-        if self.prefab_names.len() != original_names.len()
-            || ranges.len() != original_names.len()
-            || compact_modes.len() != original_names.len()
-        {
-            return Err(invalid_event_prefabs(
-                self.original.prefab_names_range.start,
-                "EventManager prefab-name counts changed",
-            ));
-        }
-        let source_table = self
-            .original
-            .serialized_body
-            .get(self.original.prefab_names_range.clone())
-            .ok_or_else(|| {
-                invalid_event_prefabs(
-                    self.original.prefab_names_range.start,
-                    "EventManager prefab-name table exceeds body",
-                )
-            })?;
-        let count_prefix = source_table.get(..2).ok_or_else(|| {
-            invalid_event_prefabs(
-                self.original.prefab_names_range.start,
-                "EventManager prefab-name count is truncated",
-            )
-        })?;
-        let mut output = Vec::with_capacity(source_table.len());
-        output.extend_from_slice(count_prefix);
-        let mut expected_source_start = self
-            .original
-            .prefab_names_range
-            .start
-            .checked_add(2)
-            .ok_or(CrpError::ArithmeticOverflow(
-                "EventManager prefab-name start",
-            ))?;
-        for (index, name) in self.prefab_names.iter().enumerate() {
-            let range = &ranges[index];
-            if range.start != expected_source_start || range.end < range.start {
-                return Err(invalid_event_prefabs(
-                    range.start,
-                    "EventManager prefab-name ranges are not contiguous",
-                ));
-            }
-            let raw_name = self
-                .original
-                .serialized_body
-                .get(range.clone())
-                .ok_or_else(|| {
-                    invalid_event_prefabs(range.start, "EventManager prefab name exceeds body")
-                })?;
-            if name == &original_names[index] {
-                output.extend_from_slice(raw_name);
-            } else {
-                let mut encoded_name = Vec::new();
-                match name {
-                    None => encoded_name.push(0xff),
-                    Some(value) => {
-                        let can_keep_compact =
-                            value.chars().all(|character| u32::from(character) < 256);
-                        match compact_modes[index] {
-                            Some(true) if can_keep_compact => {
-                                write_unique_string_with_mode(&mut encoded_name, value, true)?;
-                            }
-                            Some(false) => {
-                                write_unique_string_with_mode(&mut encoded_name, value, false)?;
-                            }
-                            _ => write_unique_string(&mut encoded_name, value)?,
-                        }
-                    }
-                }
-                output.extend_from_slice(&encoded_name);
-            }
-            expected_source_start = range.end;
-        }
-        if expected_source_start != self.original.prefab_names_range.end {
-            return Err(invalid_event_prefabs(
-                expected_source_start,
-                "EventManager prefab-name ranges do not cover the complete table",
-            ));
-        }
-        Ok(output)
+        encode_prefab_name_table(
+            &self.original.serialized_body,
+            self.original.prefab_names_range.clone(),
+            &self.original.prefab_names,
+            &self.original.prefab_name_ranges,
+            &self.original.prefab_name_compact_modes,
+            &self.prefab_names,
+        )
     }
 
     pub(crate) fn original_body_bytes(&self) -> &[u8] {
         &self.original.serialized_body
     }
+}
+
+fn encode_prefab_name_table(
+    source_body: &[u8],
+    table_range: Range<usize>,
+    original_names: &[Option<String>],
+    name_ranges: &[Range<usize>],
+    compact_modes: &[Option<bool>],
+    edited_names: &[Option<String>],
+) -> Result<Vec<u8>, CrpError> {
+    if edited_names.len() != original_names.len()
+        || name_ranges.len() != original_names.len()
+        || compact_modes.len() != original_names.len()
+    {
+        return Err(invalid_event_prefabs(
+            table_range.start,
+            "EventManager prefab-name counts changed",
+        ));
+    }
+    let source_table = source_body.get(table_range.clone()).ok_or_else(|| {
+        invalid_event_prefabs(
+            table_range.start,
+            "EventManager prefab-name table exceeds body",
+        )
+    })?;
+    let count_prefix = source_table.get(..2).ok_or_else(|| {
+        invalid_event_prefabs(
+            table_range.start,
+            "EventManager prefab-name count is truncated",
+        )
+    })?;
+    let mut output = Vec::with_capacity(source_table.len());
+    output.extend_from_slice(count_prefix);
+    let mut expected_source_start =
+        table_range
+            .start
+            .checked_add(2)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EventManager prefab-name table start",
+            ))?;
+    for (index, name) in edited_names.iter().enumerate() {
+        let range = &name_ranges[index];
+        if range.start != expected_source_start || range.end < range.start {
+            return Err(invalid_event_prefabs(
+                range.start,
+                "EventManager prefab-name ranges are not contiguous",
+            ));
+        }
+        let raw_name = source_body.get(range.clone()).ok_or_else(|| {
+            invalid_event_prefabs(range.start, "EventManager prefab name exceeds body")
+        })?;
+        if name == &original_names[index] {
+            output.extend_from_slice(raw_name);
+        } else {
+            let mut encoded_name = Vec::new();
+            match name {
+                None => encoded_name.push(0xff),
+                Some(value) => {
+                    let can_keep_compact =
+                        value.chars().all(|character| u32::from(character) < 256);
+                    match compact_modes[index] {
+                        Some(true) if can_keep_compact => {
+                            write_unique_string_with_mode(&mut encoded_name, value, true)?;
+                        }
+                        Some(false) => {
+                            write_unique_string_with_mode(&mut encoded_name, value, false)?;
+                        }
+                        _ => write_unique_string(&mut encoded_name, value)?,
+                    }
+                }
+            }
+            output.extend_from_slice(&encoded_name);
+        }
+        expected_source_start = range.end;
+    }
+    if expected_source_start != table_range.end {
+        return Err(invalid_event_prefabs(
+            expected_source_start,
+            "EventManager prefab-name ranges do not cover the complete table",
+        ));
+    }
+    Ok(output)
 }
 
 fn read_capacity(reader: &mut Reader<'_>, description: &str) -> Result<usize, CrpError> {
@@ -1952,7 +2082,7 @@ fn finish(
     active_event_route_ranges: Vec<Range<usize>>,
     route_schedule_name_ranges: Vec<Vec<Range<usize>>>,
     route_schedule_name_compact_modes: Vec<Vec<Option<bool>>>,
-    route_schedule_prefab_scope_range: Option<Range<usize>>,
+    route_schedule_prefab_scope: Option<EventPrefabScope>,
     object_headers: Vec<NetObjectHeader>,
     unidentified_counted_block: Option<UnidentifiedCountedBlock>,
     type_data: Vec<EventManagerTypeData>,
@@ -1978,7 +2108,7 @@ fn finish(
             active_event_route_ranges,
             route_schedule_name_ranges,
             route_schedule_name_compact_modes,
-            route_schedule_prefab_scope_range,
+            route_schedule_prefab_scope,
             object_headers,
             unidentified_counted_block,
             type_data,
@@ -2658,8 +2788,15 @@ mod tests {
                 bytes,
                 "route editor version {version}"
             );
+            let prefab_editor = decoded.clone().into_prefab_indices_editor();
             assert_eq!(
-                decoded.route_schedule_prefab_scope_range.is_some(),
+                prefab_editor.route_schedule_indexes(),
+                vec![0x1234; expected_schedule_count]
+            );
+            assert!(prefab_editor.route_schedule_names().is_empty());
+            assert_eq!(prefab_editor.encode().unwrap(), bytes);
+            assert_eq!(
+                decoded.route_schedule_prefab_scope.is_some(),
                 version >= 121_015,
                 "schedule prefab scope at version {version}"
             );
@@ -2693,6 +2830,12 @@ mod tests {
             EventManagerReferenceData::decode_reader(121_030, &two_route_body).unwrap();
         assert_eq!(consumed_two_routes, two_route_body.len());
         assert_eq!(decoded_two_routes.active_event_route_ranges.len(), 2);
+        let two_route_prefab_editor = decoded_two_routes.clone().into_prefab_indices_editor();
+        assert_eq!(
+            two_route_prefab_editor.route_schedule_indexes(),
+            [0x1234, 0x1234, 0x1234]
+        );
+        assert_eq!(two_route_prefab_editor.encode().unwrap(), two_route_body);
         assert_eq!(
             decoded_two_routes
                 .clone()

@@ -2531,10 +2531,10 @@ impl SimulationManagerData {
         Ok(())
     }
 
-    /// Decodes the shared EventManager event, milestone, and type-data prefab indexes.
+    /// Decodes EventManager prefab indexes for events, milestones, type data, and route schedules.
     ///
-    /// The three groups occupy one encoded UShort array. Active route records
-    /// and their separate schedule-prefab scope are preserved as source bytes.
+    /// Event, milestone, and type-data indexes share one encoded UShort array.
+    /// From version 121015, route schedules have a second prefab scope.
     pub fn decode_event_manager_prefab_indices(
         &self,
     ) -> Result<EventManagerPrefabIndicesEditor, CrpError> {
@@ -2548,12 +2548,12 @@ impl SimulationManagerData {
             .into_prefab_indices_editor())
     }
 
-    /// Replaces existing EventManager prefab indexes and resizes the encoded scope as needed.
+    /// Replaces existing EventManager prefab indexes and names in both scopes.
     ///
     /// The editor must match this stream's version and exact source body. Index
-    /// counts and group order remain fixed. Unchanged names, later body fields,
-    /// and the following manager tag are preserved byte-for-byte; changed names
-    /// keep the source string encoding when possible and may resize the body.
+    /// counts and group order remain fixed. Unchanged names and unrelated body
+    /// bytes are preserved; changed names keep the source string encoding when
+    /// possible and may resize the body.
     pub fn replace_event_manager_prefab_indices(
         &mut self,
         edited: &EventManagerPrefabIndicesEditor,
@@ -2609,6 +2609,8 @@ impl SimulationManagerData {
                 if decoded.serialized_body != replacement
                     || decoded.prefab_indexes != edited.all_indexes()
                     || decoded.prefab_names() != edited.all_prefab_names()
+                    || decoded.route_schedule_indexes() != edited.all_route_schedule_indexes()
+                    || decoded.route_schedule_names() != edited.all_route_schedule_names()
                 {
                     return Err(invalid(
                         body_start,
@@ -14433,6 +14435,116 @@ mod manager_boundary_tests {
         assert_eq!(rewritten.type_data_indexes(), [3, 4, 5, 6]);
         assert_eq!(rewritten.prefab_names(), [Some("City".to_owned())]);
 
+        let updated_graph = manager.serialized_object_graph().to_vec();
+        assert!(
+            manager
+                .replace_event_manager_prefab_indices(&stale_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), updated_graph);
+    }
+
+    #[test]
+    fn event_manager_prefab_editor_updates_route_schedule_scope_and_resizes_body() {
+        let version = 121_030;
+        let mut body = vec![
+            0x00, 0x00, // One event slot, no active events.
+            0x00, 0x01, // Two route slots, including reserved slot zero.
+        ];
+        write_encoded_uint_array(&mut body, &[1]);
+        body.extend_from_slice(&[0; 4]); // Event policies.
+        body.extend_from_slice(&[0; 14]); // Seven route indexes.
+        body.extend_from_slice(&[0; 12]); // Route version, color, and endpoint nodes.
+        body.extend_from_slice(&[0; 2]); // Event prefab index.
+        body.push(1); // One route schedule.
+        body.extend_from_slice(&[0; 4]); // Schedule ID.
+        body.extend_from_slice(&[0; 6]); // Tier, laps, and ticket price.
+        body.push(0xff); // Null schedule name.
+        body.extend_from_slice(&[0; 2 + 3]); // Schedule flags and remaining bytes.
+        body.extend_from_slice(&[0x00, 0x01]); // One unlock milestone.
+        let main_scope_start = body.len();
+        write_encoded_ushort_array(&mut body, &[5]);
+        body.extend_from_slice(&[0x00, 0x01]); // One event-prefab name.
+        write_unique_string(&mut body, "Milestone")
+            .expect("short milestone-prefab name is encodable");
+        let main_scope_end = body.len();
+        body.push(0xff); // Null unlock-milestone reference.
+        let route_scope_start = body.len();
+        write_encoded_ushort_array(&mut body, &[0x1234]);
+        body.extend_from_slice(&[0x00, 0x01]); // One schedule-prefab name.
+        write_unique_string(&mut body, "A").expect("short schedule-prefab name is encodable");
+        let route_scope_end = body.len();
+        body.extend_from_slice(&[0xff, 0xff, 0xff]); // Tail object references.
+        body.extend_from_slice(&[0; 2 + 4 + 2]); // Tail scalars and end-profiler index.
+
+        let (mut manager, body_start) = manager_with_event_manager_body(version, &body);
+        manager
+            .serialized_object_graph
+            .extend_from_slice(b"following manager payload");
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let mut editor = manager.decode_event_manager_prefab_indices().unwrap();
+        assert!(editor.event_indexes().is_empty());
+        assert_eq!(editor.milestone_indexes(), [5]);
+        assert!(editor.type_data_indexes().is_empty());
+        assert_eq!(editor.prefab_names(), [Some("Milestone".to_owned())]);
+        assert_eq!(editor.route_schedule_indexes(), [0x1234]);
+        assert_eq!(editor.route_schedule_names(), [Some("A".to_owned())]);
+        let stale_editor = editor.clone();
+        editor.milestone_indexes_mut()[0] = 6;
+        editor.set_prefab_name(0, Some("M".to_owned())).unwrap();
+        editor.route_schedule_indexes_mut()[0] = 0xbeef;
+        editor
+            .set_route_schedule_name(0, Some("Bigger".to_owned()))
+            .unwrap();
+        assert!(
+            editor
+                .set_route_schedule_name(1, Some("Out of range".to_owned()))
+                .is_err()
+        );
+
+        let mut expected_body = body[..main_scope_start].to_vec();
+        expected_body.extend_from_slice(&[
+            0x00, 0x00, 0x06, // One encoded UShort milestone-prefab index.
+            0x00, 0x01, // One event-prefab name.
+            0x80, 0x00, 0x01, 0xcd, // Compact "M".
+        ]);
+        expected_body.extend_from_slice(&body[main_scope_end..route_scope_start]);
+        expected_body.extend_from_slice(&[
+            0x00, 0xbe, 0xef, // One encoded UShort schedule-prefab index.
+            0x00, 0x01, // One schedule-prefab name.
+            0x80, 0x00, 0x06, 0xc2, 0x27, 0xfe, 0x00, 0xfe, 0x0d, // Compact "Bigger".
+        ]);
+        expected_body.extend_from_slice(&body[route_scope_end..]);
+        let original_body_end = body_start + body.len();
+        let expected_body_end = body_start + expected_body.len();
+        assert_eq!(
+            manager.manager_body_boundary(0).unwrap().1,
+            original_body_end
+        );
+
+        manager
+            .replace_event_manager_prefab_indices(&editor)
+            .unwrap();
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start..expected_body_end],
+            expected_body
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[expected_body_end..],
+            &original_graph[original_body_end..]
+        );
+        assert_eq!(
+            manager.manager_body_boundary(0).unwrap().1,
+            expected_body_end
+        );
+        let rewritten = manager.decode_event_manager_prefab_indices().unwrap();
+        assert_eq!(rewritten.milestone_indexes(), [6]);
+        assert_eq!(rewritten.prefab_names(), [Some("M".to_owned())]);
+        assert_eq!(rewritten.route_schedule_indexes(), [0xbeef]);
+        assert_eq!(
+            rewritten.route_schedule_names(),
+            [Some("Bigger".to_owned())]
+        );
         let updated_graph = manager.serialized_object_graph().to_vec();
         assert!(
             manager
