@@ -24,7 +24,8 @@ struct EncodedGridSnapshot {
 /// positional entries. Used-resource counters and pollution-disposal rates
 /// can be edited at their version gates. Direct grid columns can be edited by
 /// cell while retaining the sparse forest selection and pre-version-22 legacy
-/// topology; the complete source body is retained for all other bytes.
+/// topology. Sparse tree and fertility values can be edited by their selected
+/// cell; the complete source body is retained for all other bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NaturalResourceManagerData {
     format_version: u32,
@@ -37,8 +38,11 @@ pub struct NaturalResourceManagerData {
     sand: Option<Vec<u8>>,
     sand_snapshot: Option<EncodedGridSnapshot>,
     forest: Vec<u8>,
+    forest_snapshot: EncodedGridSnapshot,
     trees: Vec<u8>,
+    trees_snapshot: EncodedGridSnapshot,
     fertility: Vec<u8>,
+    fertility_snapshot: EncodedGridSnapshot,
     water: Option<Vec<u8>>,
     water_snapshot: Option<EncodedGridSnapshot>,
     shore: Option<Vec<u8>>,
@@ -90,7 +94,7 @@ impl NaturalResourceManagerData {
         } else {
             (None, None)
         };
-        let forest = read_encoded_byte_array(&mut reader, CELL_COUNT)?;
+        let (forest, forest_snapshot) = read_captured_grid(&mut reader, CELL_COUNT)?;
         let nonzero_forest_count = forest.iter().filter(|value| **value != 0).count();
         let zero_forest_count =
             CELL_COUNT
@@ -98,8 +102,8 @@ impl NaturalResourceManagerData {
                 .ok_or(CrpError::ArithmeticOverflow(
                     "NaturalResourceManager fertility count",
                 ))?;
-        let trees = read_encoded_byte_array(&mut reader, nonzero_forest_count)?;
-        let fertility = read_encoded_byte_array(&mut reader, zero_forest_count)?;
+        let (trees, trees_snapshot) = read_captured_grid(&mut reader, nonzero_forest_count)?;
+        let (fertility, fertility_snapshot) = read_captured_grid(&mut reader, zero_forest_count)?;
         let (water, water_snapshot) = if format_version >= 22 {
             let (values, snapshot) = read_captured_grid(&mut reader, CELL_COUNT)?;
             (Some(values), Some(snapshot))
@@ -175,8 +179,11 @@ impl NaturalResourceManagerData {
             sand,
             sand_snapshot,
             forest,
+            forest_snapshot,
             trees,
+            trees_snapshot,
             fertility,
+            fertility_snapshot,
             water,
             water_snapshot,
             shore,
@@ -273,14 +280,57 @@ impl NaturalResourceManagerData {
         &self.forest
     }
 
+    /// Replaces one forest value while keeping its zero/nonzero selection
+    /// state unchanged. Changing that state would shift the sparse tree and
+    /// fertility arrays and therefore returns an error.
+    pub fn set_forest(&mut self, cell: usize, value: u8) -> Result<(), CrpError> {
+        set_grid_cell(
+            &mut self.forest,
+            &self.forest_snapshot,
+            cell,
+            value,
+            "forest",
+            true,
+        )
+    }
+
     /// Returns tree values for cells with nonzero forest, in cell order.
     pub fn trees_for_nonzero_forest(&self) -> &[u8] {
         &self.trees
     }
 
+    /// Replaces the tree value associated with a cell whose forest value is
+    /// nonzero. Cells without forest and indexes outside the grid return an
+    /// error.
+    pub fn set_tree_for_cell(&mut self, cell: usize, value: u8) -> Result<(), CrpError> {
+        set_sparse_grid_cell(
+            &mut self.trees,
+            &self.forest,
+            &self.trees_snapshot,
+            cell,
+            true,
+            value,
+            "tree",
+        )
+    }
+
     /// Returns fertility values for cells with zero forest, in cell order.
     pub fn fertility_for_zero_forest(&self) -> &[u8] {
         &self.fertility
+    }
+
+    /// Replaces the fertility value associated with a cell whose forest value
+    /// is zero. Cells with forest and indexes outside the grid return an error.
+    pub fn set_fertility_for_cell(&mut self, cell: usize, value: u8) -> Result<(), CrpError> {
+        set_sparse_grid_cell(
+            &mut self.fertility,
+            &self.forest,
+            &self.fertility_snapshot,
+            cell,
+            false,
+            value,
+            "fertility",
+        )
     }
 
     /// Returns the water column from version 22 onward.
@@ -499,11 +549,30 @@ impl NaturalResourceManagerData {
             }
         }
         let mut replacements = Vec::new();
+        let tree_count = self.forest.iter().filter(|value| **value != 0).count();
+        let fertility_count =
+            CELL_COUNT
+                .checked_sub(tree_count)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "NaturalResourceManager fertility count",
+                ))?;
+        if self.forest.len() != CELL_COUNT
+            || self.trees.len() != tree_count
+            || self.trees_snapshot.values.len() != tree_count
+            || self.fertility.len() != fertility_count
+            || self.fertility_snapshot.values.len() != fertility_count
+        {
+            return Err(invalid_manager_field(
+                self.forest_snapshot.range.start,
+                "forest, tree, and fertility values do not match their sparse layout",
+            ));
+        }
         push_changed_grid(
             &mut replacements,
             &self.ore,
             &self.ore_snapshot,
             bytes.len(),
+            CELL_COUNT,
             "ore",
         )?;
         push_changed_grid(
@@ -511,13 +580,39 @@ impl NaturalResourceManagerData {
             &self.oil,
             &self.oil_snapshot,
             bytes.len(),
+            CELL_COUNT,
             "oil",
+        )?;
+        push_changed_grid(
+            &mut replacements,
+            &self.forest,
+            &self.forest_snapshot,
+            bytes.len(),
+            CELL_COUNT,
+            "forest",
+        )?;
+        push_changed_grid(
+            &mut replacements,
+            &self.trees,
+            &self.trees_snapshot,
+            bytes.len(),
+            tree_count,
+            "tree",
+        )?;
+        push_changed_grid(
+            &mut replacements,
+            &self.fertility,
+            &self.fertility_snapshot,
+            bytes.len(),
+            fertility_count,
+            "fertility",
         )?;
         push_optional_changed_grid(
             &mut replacements,
             self.sand.as_deref(),
             self.sand_snapshot.as_ref(),
             bytes.len(),
+            CELL_COUNT,
             "sand",
         )?;
         push_optional_changed_grid(
@@ -525,6 +620,7 @@ impl NaturalResourceManagerData {
             self.water.as_deref(),
             self.water_snapshot.as_ref(),
             bytes.len(),
+            CELL_COUNT,
             "water",
         )?;
         push_optional_changed_grid(
@@ -532,6 +628,7 @@ impl NaturalResourceManagerData {
             self.shore.as_deref(),
             self.shore_snapshot.as_ref(),
             bytes.len(),
+            CELL_COUNT,
             "shore",
         )?;
         push_changed_grid(
@@ -539,6 +636,7 @@ impl NaturalResourceManagerData {
             &self.pollution,
             &self.pollution_snapshot,
             bytes.len(),
+            CELL_COUNT,
             "pollution",
         )?;
         push_optional_changed_grid(
@@ -546,6 +644,7 @@ impl NaturalResourceManagerData {
             self.burned.as_deref(),
             self.burned_snapshot.as_ref(),
             bytes.len(),
+            CELL_COUNT,
             "burned",
         )?;
         push_optional_changed_grid(
@@ -553,6 +652,7 @@ impl NaturalResourceManagerData {
             self.destroyed.as_deref(),
             self.destroyed_snapshot.as_ref(),
             bytes.len(),
+            CELL_COUNT,
             "destroyed",
         )?;
         replacements.sort_by_key(|(range, _)| range.start);
@@ -610,10 +710,54 @@ fn set_grid_cell(
         return Err(invalid_manager_field(
             snapshot.range.start,
             format!(
-                "changing the {field} zero/nonzero mask would shift a pre-version-22 legacy column"
+                "changing the {field} zero/nonzero mask would alter a sparse or legacy column layout"
             ),
         ));
     }
+    *target = value;
+    Ok(())
+}
+
+fn set_sparse_grid_cell(
+    values: &mut [u8],
+    selector: &[u8],
+    snapshot: &EncodedGridSnapshot,
+    cell: usize,
+    selected: bool,
+    value: u8,
+    field: &str,
+) -> Result<(), CrpError> {
+    if cell >= CELL_COUNT {
+        return Err(invalid_manager_field(
+            snapshot.range.start,
+            format!("{field} cell index {cell} is outside the {CELL_COUNT}-cell grid"),
+        ));
+    }
+    let selector_value = selector.get(cell).ok_or_else(|| {
+        invalid_manager_field(
+            snapshot.range.start,
+            "forest selector is shorter than its 262144-cell layout",
+        )
+    })?;
+    if (*selector_value != 0) != selected {
+        return Err(invalid_manager_field(
+            snapshot.range.start,
+            format!(
+                "{field} value is not stored for cell {cell} under the current forest selection"
+            ),
+        ));
+    }
+    let sparse_index = if selected {
+        selector[..cell].iter().filter(|value| **value != 0).count()
+    } else {
+        selector[..cell].iter().filter(|value| **value == 0).count()
+    };
+    let Some(target) = values.get_mut(sparse_index) else {
+        return Err(invalid_manager_field(
+            snapshot.range.start,
+            format!("{field} sparse array is shorter than the forest selection"),
+        ));
+    };
     *target = value;
     Ok(())
 }
@@ -647,12 +791,18 @@ fn push_optional_changed_grid(
     values: Option<&[u8]>,
     snapshot: Option<&EncodedGridSnapshot>,
     source_body_len: usize,
+    expected_count: usize,
     field: &'static str,
 ) -> Result<(), CrpError> {
     match (values, snapshot) {
-        (Some(values), Some(snapshot)) => {
-            push_changed_grid(replacements, values, snapshot, source_body_len, field)
-        }
+        (Some(values), Some(snapshot)) => push_changed_grid(
+            replacements,
+            values,
+            snapshot,
+            source_body_len,
+            expected_count,
+            field,
+        ),
         (None, None) => Ok(()),
         _ => Err(invalid_manager_field(
             0,
@@ -666,6 +816,7 @@ fn push_changed_grid(
     values: &[u8],
     snapshot: &EncodedGridSnapshot,
     source_body_len: usize,
+    expected_count: usize,
     field: &'static str,
 ) -> Result<(), CrpError> {
     if snapshot.range.start > snapshot.range.end || snapshot.range.end > source_body_len {
@@ -674,10 +825,10 @@ fn push_changed_grid(
             format!("{field} source range exceeds the body"),
         ));
     }
-    if values.len() != CELL_COUNT || snapshot.values.len() != CELL_COUNT {
+    if values.len() != expected_count || snapshot.values.len() != expected_count {
         return Err(invalid_manager_field(
             snapshot.range.start,
-            format!("{field} grid values do not match the {CELL_COUNT}-cell layout"),
+            format!("{field} values do not match the expected {expected_count}-value layout"),
         ));
     }
     if values == snapshot.values {
@@ -785,6 +936,10 @@ mod tests {
     fn literal_byte_grid_with_value(cell: usize, value: u8) -> Vec<u8> {
         let mut values = vec![0; CELL_COUNT];
         values[cell] = value;
+        literal_byte_array(&values)
+    }
+
+    fn literal_byte_array(values: &[u8]) -> Vec<u8> {
         let mut encoded = Vec::new();
         let mut start = 0;
         while start < values.len() {
@@ -992,6 +1147,52 @@ mod tests {
 
         assert!(data.set_ore(CELL_COUNT, 1).is_err());
         assert_eq!(data.encode().unwrap(), encoded);
+    }
+
+    #[test]
+    fn forest_selection_and_sparse_values_edit_by_cell_without_changing_topology() {
+        let body = synthetic_body(265, true);
+        let mut data = NaturalResourceManagerData::decode(265, &body).unwrap();
+        data.set_forest(1, 5).unwrap();
+        data.set_tree_for_cell(1, 0x41).unwrap();
+        data.set_fertility_for_cell(0, 0x51).unwrap();
+        assert!(data.set_forest(0, 1).is_err());
+        assert!(data.set_tree_for_cell(0, 1).is_err());
+        assert!(data.set_fertility_for_cell(1, 1).is_err());
+        assert!(data.set_tree_for_cell(CELL_COUNT, 1).is_err());
+
+        let mut forest_values = data.forest_snapshot.values.clone();
+        forest_values[1] = 5;
+        let mut tree_values = data.trees_snapshot.values.clone();
+        tree_values[0] = 0x41;
+        let mut fertility_values = data.fertility_snapshot.values.clone();
+        fertility_values[0] = 0x51;
+        let mut expected = body.clone();
+        let mut replacements = vec![
+            (
+                data.forest_snapshot.range.clone(),
+                literal_byte_array(&forest_values),
+            ),
+            (
+                data.trees_snapshot.range.clone(),
+                literal_byte_array(&tree_values),
+            ),
+            (
+                data.fertility_snapshot.range.clone(),
+                literal_byte_array(&fertility_values),
+            ),
+        ];
+        replacements.sort_by_key(|(range, _)| range.start);
+        for (range, encoded) in replacements.into_iter().rev() {
+            expected.splice(range, encoded);
+        }
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = NaturalResourceManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.forest()[1], 5);
+        assert_eq!(decoded.trees_for_nonzero_forest(), [0x41, 0x32]);
+        assert_eq!(decoded.fertility_for_zero_forest()[0], 0x51);
     }
 
     #[test]
