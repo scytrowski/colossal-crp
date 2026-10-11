@@ -59,12 +59,13 @@ pub struct WaterPulseUnit {
 /// Sparse cell columns use the corresponding conductivity plane's ascending
 /// cell-index order. Node arrays retain their full 32,768-entry size, with
 /// version-derived defaults in the legacy upper half. The complete source body
-/// remains available for exact unchanged writing. Existing pulse-group and
-/// pulse-unit records, the processed-cell count, the conductive-cell count,
-/// and the continuation flag can be edited in place; all other fields remain
-/// byte-identical. The inner serializer version controls the 23, 73, 94, 202,
-/// 227, and 270–272 gates. Corpus samples cover versions 194–118011; active
-/// network values and gates 270–272 have synthetic coverage only.
+/// remains available for exact unchanged writing. Pulse-group and pulse-unit
+/// records and the scalar tail can be edited in place. Closest-segment,
+/// node, and collect-pressure arrays re-encode only when changed and can resize
+/// the body; all other bytes remain unchanged. The inner serializer version
+/// controls the 23, 73, 94, 202, 227, and 270–272 gates. Corpus samples cover
+/// versions 194–118011; active network values and gates 270–272 have synthetic
+/// coverage only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaterManagerData {
     format_version: u32,
@@ -79,7 +80,11 @@ pub struct WaterManagerData {
     sewage_pulse_group_indexes: Vec<u16>,
     heating_pulse_group_indexes: Option<Vec<u16>>,
     closest_pipe_segments: Option<Vec<u16>>,
+    closest_pipe_segments_range: Option<(usize, usize)>,
+    original_closest_pipe_segments: Option<Vec<u16>>,
     closest_heating_segments: Option<Vec<u16>>,
+    closest_heating_segments_range: Option<(usize, usize)>,
+    original_closest_heating_segments: Option<Vec<u16>>,
     water_electrified: Vec<bool>,
     water_temporary_electrified: Vec<bool>,
     sewage_electrified: Vec<bool>,
@@ -187,15 +192,26 @@ impl WaterManagerData {
             None
         };
 
-        let closest_pipe_segments = if format_version >= CLOSEST_PIPE_SEGMENT_VERSION {
-            Some(read_encoded_ushort_array(&mut reader, CELL_COUNT)?)
+        let (closest_pipe_segments, closest_pipe_segments_range, original_closest_pipe_segments) =
+            if format_version >= CLOSEST_PIPE_SEGMENT_VERSION {
+                let start = reader.offset();
+                let values = read_encoded_ushort_array(&mut reader, CELL_COUNT)?;
+                let end = reader.offset();
+                (Some(values.clone()), Some((start, end)), Some(values))
+            } else {
+                (None, None, None)
+            };
+        let (
+            closest_heating_segments,
+            closest_heating_segments_range,
+            original_closest_heating_segments,
+        ) = if format_version >= HEATING_VERSION {
+            let start = reader.offset();
+            let values = read_encoded_ushort_array(&mut reader, CELL_COUNT)?;
+            let end = reader.offset();
+            (Some(values.clone()), Some((start, end)), Some(values))
         } else {
-            None
-        };
-        let closest_heating_segments = if format_version >= HEATING_VERSION {
-            Some(read_encoded_ushort_array(&mut reader, CELL_COUNT)?)
-        } else {
-            None
+            (None, None, None)
         };
 
         let water_electrified = read_encoded_bool_array(&mut reader, conductive_cells.len())?;
@@ -394,7 +410,11 @@ impl WaterManagerData {
             sewage_pulse_group_indexes,
             heating_pulse_group_indexes,
             closest_pipe_segments,
+            closest_pipe_segments_range,
+            original_closest_pipe_segments,
             closest_heating_segments,
+            closest_heating_segments_range,
+            original_closest_heating_segments,
             water_electrified,
             water_temporary_electrified,
             sewage_electrified,
@@ -534,9 +554,35 @@ impl WaterManagerData {
         self.closest_pipe_segments.as_deref()
     }
 
+    /// Replaces one closest-pipe segment value from inner version 73.
+    pub fn set_closest_pipe_segment(&mut self, cell: usize, segment: u16) -> Result<(), CrpError> {
+        let Some(values) = self.closest_pipe_segments.as_mut() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "closest-pipe segment grid is absent before inner version 73",
+            ));
+        };
+        set_grid_ushort_value(values, cell, segment, "closest-pipe segment")
+    }
+
     /// Returns the second closest-segment grid from version 227.
     pub fn closest_heating_segments(&self) -> Option<&[u16]> {
         self.closest_heating_segments.as_deref()
+    }
+
+    /// Replaces one closest-heating segment value from inner version 227.
+    pub fn set_closest_heating_segment(
+        &mut self,
+        cell: usize,
+        segment: u16,
+    ) -> Result<(), CrpError> {
+        let Some(values) = self.closest_heating_segments.as_mut() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "closest-heating segment grid is absent before inner version 227",
+            ));
+        };
+        set_grid_ushort_value(values, cell, segment, "closest-heating segment")
     }
 
     /// Returns sparse current water electrification flags.
@@ -1407,6 +1453,54 @@ impl WaterManagerData {
             }
         }
         match (
+            self.closest_pipe_segments_range,
+            self.closest_pipe_segments.as_deref(),
+            self.original_closest_pipe_segments.as_deref(),
+        ) {
+            (Some((start, end)), Some(values), Some(original)) => {
+                if let Some(encoded) = changed_ushort_array(
+                    values,
+                    Some(original),
+                    CELL_COUNT,
+                    start,
+                    "closest-pipe segment grid",
+                )? {
+                    replacements.push((start, end, encoded));
+                }
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(invalid_cell_grid(
+                    self.scalar_fields_offset,
+                    "closest-pipe segment fields do not match the version gate",
+                ));
+            }
+        }
+        match (
+            self.closest_heating_segments_range,
+            self.closest_heating_segments.as_deref(),
+            self.original_closest_heating_segments.as_deref(),
+        ) {
+            (Some((start, end)), Some(values), Some(original)) => {
+                if let Some(encoded) = changed_ushort_array(
+                    values,
+                    Some(original),
+                    CELL_COUNT,
+                    start,
+                    "closest-heating segment grid",
+                )? {
+                    replacements.push((start, end, encoded));
+                }
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(invalid_cell_grid(
+                    self.scalar_fields_offset,
+                    "closest-heating segment fields do not match the version gate",
+                ));
+            }
+        }
+        match (
             self.collect_water_pressure_selector_range,
             self.collect_water_pressure_selector.as_deref(),
             self.original_collect_water_pressure_selector.as_deref(),
@@ -1498,6 +1592,14 @@ fn invalid_node_array(offset: usize, reason: &str) -> CrpError {
     }
 }
 
+fn invalid_cell_grid(offset: usize, reason: &str) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "WaterManager+Data".to_owned(),
+        offset,
+        reason: reason.to_owned(),
+    }
+}
+
 fn set_node_ushort_value(
     values: &mut [u16],
     format_version: u32,
@@ -1538,6 +1640,28 @@ fn set_node_byte_value(
         return Err(invalid_node_array(
             node,
             &format!("{kind} node index is outside the decoded grid"),
+        ));
+    };
+    *target = value;
+    Ok(())
+}
+
+fn set_grid_ushort_value(
+    values: &mut [u16],
+    cell: usize,
+    value: u16,
+    field: &str,
+) -> Result<(), CrpError> {
+    if cell >= CELL_COUNT {
+        return Err(invalid_cell_grid(
+            cell,
+            &format!("{field} cell index is outside the grid"),
+        ));
+    }
+    let Some(target) = values.get_mut(cell) else {
+        return Err(invalid_cell_grid(
+            cell,
+            &format!("{field} decoded grid is truncated"),
         ));
     };
     *target = value;
@@ -2711,6 +2835,54 @@ mod tests {
 
         let mut before_pollution = WaterManagerData::decode(22, &empty_body(22)).unwrap();
         assert!(before_pollution.set_node_pollution(0, 1).is_err());
+    }
+
+    #[test]
+    fn closest_segment_grids_edit_existing_cells_at_version_gates() {
+        let body = active_body(265);
+        let mut data = WaterManagerData::decode(265, &body).unwrap();
+        let mut expected = body.clone();
+        let mut replacements = vec![
+            (
+                data.closest_pipe_segments_range.unwrap(),
+                expected_ushort_array_with_two_nonzero_values(CELL_COUNT, 0x1111, 0x2222),
+            ),
+            (
+                data.closest_heating_segments_range.unwrap(),
+                expected_ushort_array_with_two_nonzero_values(CELL_COUNT, 0x3333, 0x4444),
+            ),
+        ];
+        data.set_closest_pipe_segment(0, 0x1111).unwrap();
+        data.set_closest_pipe_segment(1, 0x2222).unwrap();
+        data.set_closest_heating_segment(0, 0x3333).unwrap();
+        data.set_closest_heating_segment(1, 0x4444).unwrap();
+        replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in replacements.into_iter().rev() {
+            expected.splice(start..end, replacement);
+        }
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = WaterManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(
+            decoded.closest_pipe_segments().unwrap()[..2],
+            [0x1111, 0x2222]
+        );
+        assert_eq!(
+            decoded.closest_heating_segments().unwrap()[..2],
+            [0x3333, 0x4444]
+        );
+        assert!(data.set_closest_pipe_segment(CELL_COUNT, 1).is_err());
+        assert!(data.set_closest_heating_segment(CELL_COUNT, 1).is_err());
+
+        let mut before_pipe_grid = WaterManagerData::decode(72, &empty_body(72)).unwrap();
+        assert!(before_pipe_grid.set_closest_pipe_segment(0, 1).is_err());
+        let mut before_heating_grid = WaterManagerData::decode(226, &empty_body(226)).unwrap();
+        assert!(
+            before_heating_grid
+                .set_closest_heating_segment(0, 1)
+                .is_err()
+        );
     }
 
     #[test]
