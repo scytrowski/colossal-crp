@@ -31,8 +31,9 @@ struct EncodedUIntScopeSnapshot {
 /// positional entries. Used-resource counters and pollution-disposal rates
 /// can be edited at their version gates. Direct grid columns can be edited by
 /// cell while retaining the sparse forest selection and pre-version-22 legacy
-/// topology. Sparse tree and fertility values can be edited by their selected
-/// cell; the complete source body is retained for all other bytes.
+/// topology. Legacy zero-ore/oil values, sparse tree values, and fertility
+/// values can be edited by their selected cell; the complete source body is
+/// retained for all other bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NaturalResourceManagerData {
     format_version: u32,
@@ -41,7 +42,9 @@ pub struct NaturalResourceManagerData {
     oil: Vec<u8>,
     oil_snapshot: EncodedGridSnapshot,
     legacy_zero_ore: Option<Vec<u8>>,
+    legacy_zero_ore_snapshot: Option<EncodedGridSnapshot>,
     legacy_zero_oil: Option<Vec<u8>>,
+    legacy_zero_oil_snapshot: Option<EncodedGridSnapshot>,
     sand: Option<Vec<u8>>,
     sand_snapshot: Option<EncodedGridSnapshot>,
     forest: Vec<u8>,
@@ -79,21 +82,19 @@ impl NaturalResourceManagerData {
         let (ore, ore_snapshot) = read_captured_grid(&mut reader, CELL_COUNT)?;
         let (oil, oil_snapshot) = read_captured_grid(&mut reader, CELL_COUNT)?;
 
-        let legacy_zero_ore = if format_version < 22 {
-            Some(read_encoded_byte_array(
-                &mut reader,
-                ore.iter().filter(|value| **value == 0).count(),
-            )?)
+        let (legacy_zero_ore, legacy_zero_ore_snapshot) = if format_version < 22 {
+            let count = ore.iter().filter(|value| **value == 0).count();
+            let (values, snapshot) = read_captured_grid(&mut reader, count)?;
+            (Some(values), Some(snapshot))
         } else {
-            None
+            (None, None)
         };
-        let legacy_zero_oil = if format_version < 22 {
-            Some(read_encoded_byte_array(
-                &mut reader,
-                oil.iter().filter(|value| **value == 0).count(),
-            )?)
+        let (legacy_zero_oil, legacy_zero_oil_snapshot) = if format_version < 22 {
+            let count = oil.iter().filter(|value| **value == 0).count();
+            let (values, snapshot) = read_captured_grid(&mut reader, count)?;
+            (Some(values), Some(snapshot))
         } else {
-            None
+            (None, None)
         };
 
         let (sand, sand_snapshot) = if format_version >= 27 {
@@ -189,7 +190,9 @@ impl NaturalResourceManagerData {
             oil,
             oil_snapshot,
             legacy_zero_ore,
+            legacy_zero_ore_snapshot,
             legacy_zero_oil,
+            legacy_zero_oil_snapshot,
             sand,
             sand_snapshot,
             forest,
@@ -266,9 +269,51 @@ impl NaturalResourceManagerData {
         self.legacy_zero_ore.as_deref()
     }
 
+    /// Replaces the pre-version-22 legacy ore value for a cell with zero ore.
+    /// Cells with nonzero ore, out-of-range indexes, and newer versions return
+    /// an error.
+    pub fn set_legacy_zero_ore_value_for_cell(
+        &mut self,
+        cell: usize,
+        value: u8,
+    ) -> Result<(), CrpError> {
+        set_optional_sparse_grid_cell(
+            &mut self.legacy_zero_ore,
+            &self.legacy_zero_ore_snapshot,
+            &self.ore,
+            cell,
+            false,
+            value,
+            "legacy zero-ore",
+            "ore",
+            self.format_version,
+        )
+    }
+
     /// Returns the pre-version-22 values for cells with zero oil, if present.
     pub fn legacy_zero_oil_values(&self) -> Option<&[u8]> {
         self.legacy_zero_oil.as_deref()
+    }
+
+    /// Replaces the pre-version-22 legacy oil value for a cell with zero oil.
+    /// Cells with nonzero oil, out-of-range indexes, and newer versions return
+    /// an error.
+    pub fn set_legacy_zero_oil_value_for_cell(
+        &mut self,
+        cell: usize,
+        value: u8,
+    ) -> Result<(), CrpError> {
+        set_optional_sparse_grid_cell(
+            &mut self.legacy_zero_oil,
+            &self.legacy_zero_oil_snapshot,
+            &self.oil,
+            cell,
+            false,
+            value,
+            "legacy zero-oil",
+            "oil",
+            self.format_version,
+        )
     }
 
     /// Returns the sand column from version 27 onward.
@@ -326,6 +371,7 @@ impl NaturalResourceManagerData {
             true,
             value,
             "tree",
+            "forest",
         )
     }
 
@@ -345,6 +391,7 @@ impl NaturalResourceManagerData {
             false,
             value,
             "fertility",
+            "forest",
         )
     }
 
@@ -640,6 +687,32 @@ impl NaturalResourceManagerData {
             CELL_COUNT,
             "oil",
         )?;
+        let legacy_zero_ore_count = if self.format_version < 22 {
+            self.ore.iter().filter(|value| **value == 0).count()
+        } else {
+            0
+        };
+        push_optional_changed_grid(
+            &mut replacements,
+            self.legacy_zero_ore.as_deref(),
+            self.legacy_zero_ore_snapshot.as_ref(),
+            bytes.len(),
+            legacy_zero_ore_count,
+            "legacy zero-ore",
+        )?;
+        let legacy_zero_oil_count = if self.format_version < 22 {
+            self.oil.iter().filter(|value| **value == 0).count()
+        } else {
+            0
+        };
+        push_optional_changed_grid(
+            &mut replacements,
+            self.legacy_zero_oil.as_deref(),
+            self.legacy_zero_oil_snapshot.as_ref(),
+            bytes.len(),
+            legacy_zero_oil_count,
+            "legacy zero-oil",
+        )?;
         push_changed_grid(
             &mut replacements,
             &self.forest,
@@ -791,6 +864,7 @@ fn set_sparse_grid_cell(
     selected: bool,
     value: u8,
     field: &str,
+    selector_field: &str,
 ) -> Result<(), CrpError> {
     if cell >= CELL_COUNT {
         return Err(invalid_manager_field(
@@ -801,14 +875,14 @@ fn set_sparse_grid_cell(
     let selector_value = selector.get(cell).ok_or_else(|| {
         invalid_manager_field(
             snapshot.range.start,
-            "forest selector is shorter than its 262144-cell layout",
+            format!("{selector_field} selector is shorter than its {CELL_COUNT}-cell layout"),
         )
     })?;
     if (*selector_value != 0) != selected {
         return Err(invalid_manager_field(
             snapshot.range.start,
             format!(
-                "{field} value is not stored for cell {cell} under the current forest selection"
+                "{field} value is not stored for cell {cell} under the current {selector_field} selection"
             ),
         ));
     }
@@ -825,6 +899,39 @@ fn set_sparse_grid_cell(
     };
     *target = value;
     Ok(())
+}
+
+fn set_optional_sparse_grid_cell(
+    values: &mut Option<Vec<u8>>,
+    snapshot: &Option<EncodedGridSnapshot>,
+    selector: &[u8],
+    cell: usize,
+    selected: bool,
+    value: u8,
+    field: &str,
+    selector_field: &str,
+    format_version: u32,
+) -> Result<(), CrpError> {
+    match (values.as_mut(), snapshot.as_ref()) {
+        (Some(values), Some(snapshot)) => set_sparse_grid_cell(
+            values,
+            selector,
+            snapshot,
+            cell,
+            selected,
+            value,
+            field,
+            selector_field,
+        ),
+        (None, None) => Err(invalid_manager_field(
+            0,
+            format!("{field} values are not serialized at inner version {format_version}"),
+        )),
+        _ => Err(invalid_manager_field(
+            0,
+            format!("{field} values and source range do not match version {format_version}"),
+        )),
+    }
 }
 
 fn set_versioned_grid_cell(
@@ -1412,6 +1519,57 @@ mod tests {
         assert_eq!(decoded.ore()[0], 1);
         assert_eq!(decoded.oil()[1], 2);
         assert_eq!(decoded.water().unwrap()[2], 3);
+    }
+
+    #[test]
+    fn pre_version_22_legacy_values_edit_by_zero_resource_cell() {
+        let body = synthetic_body(21, false);
+        let mut data = NaturalResourceManagerData::decode(21, &body).unwrap();
+        data.set_legacy_zero_ore_value_for_cell(17, 0x31).unwrap();
+        data.set_legacy_zero_oil_value_for_cell(42, 0x42).unwrap();
+        assert!(
+            data.set_legacy_zero_ore_value_for_cell(CELL_COUNT, 1)
+                .is_err()
+        );
+
+        let mut expected_ore = vec![0; CELL_COUNT];
+        expected_ore[17] = 0x31;
+        let mut expected_oil = vec![0; CELL_COUNT];
+        expected_oil[42] = 0x42;
+        let mut expected = body.clone();
+        let mut replacements = vec![
+            (
+                data.legacy_zero_ore_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range
+                    .clone(),
+                literal_byte_array(&expected_ore),
+            ),
+            (
+                data.legacy_zero_oil_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range
+                    .clone(),
+                literal_byte_array(&expected_oil),
+            ),
+        ];
+        replacements.sort_by_key(|(range, _)| range.start);
+        for (range, encoded) in replacements.into_iter().rev() {
+            expected.splice(range, encoded);
+        }
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = NaturalResourceManagerData::decode(21, &encoded).unwrap();
+        assert_eq!(decoded.legacy_zero_ore_values().unwrap()[17], 0x31);
+        assert_eq!(decoded.legacy_zero_oil_values().unwrap()[42], 0x42);
+
+        let mut current =
+            NaturalResourceManagerData::decode(22, &synthetic_body(22, false)).unwrap();
+        assert!(current.set_legacy_zero_ore_value_for_cell(0, 1).is_err());
+        assert!(current.set_legacy_zero_oil_value_for_cell(0, 1).is_err());
     }
 
     #[test]
