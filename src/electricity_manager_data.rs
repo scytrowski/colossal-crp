@@ -11,6 +11,9 @@ const NODE_GROUP_COUNT: usize = 32_768;
 const LEGACY_NODE_GROUP_COUNT: usize = 16_384;
 const PULSE_GROUP_CAPACITY: usize = 1_024;
 const PULSE_UNIT_CAPACITY: usize = 32_768;
+const PULSE_GROUP_RECORD_LEN: usize = 14;
+const PULSE_UNIT_LEGACY_RECORD_LEN: usize = 4;
+const PULSE_UNIT_NODE_RECORD_LEN: usize = 6;
 const END_PROFILER_REFERENCE_LEN: usize = 2;
 const TEMPORARY_ELECTRIFIED_BOOL_VERSION: u32 = 76;
 const PULSE_UNIT_NODE_VERSION: u32 = 8;
@@ -81,7 +84,8 @@ pub struct ElectricityConductiveCellData {
 /// Decoded reader fields from `ElectricityManager+Data`.
 ///
 /// Sparse cell columns use the order of [`Self::conductive_cells`]. Conductive
-/// cells can be inserted and removed with all their sparse values. The source
+/// cells can be inserted and removed with all their sparse values. Existing
+/// pulse records and stored node-group values can also be edited. The source
 /// body remains available for exact unchanged writing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElectricityManagerData {
@@ -104,8 +108,13 @@ pub struct ElectricityManagerData {
     legacy_temporary_electrified_snapshot: Option<EncodedArraySnapshot<u8>>,
     temporary_electrified_snapshot: Option<EncodedArraySnapshot<bool>>,
     pulse_groups: Vec<ElectricityPulseGroup>,
+    pulse_group_count: usize,
+    pulse_groups_offset: usize,
     pulse_units: Vec<ElectricityPulseUnit>,
+    pulse_unit_count: usize,
+    pulse_units_offset: usize,
     node_groups: Vec<u16>,
+    node_groups_snapshot: Option<EncodedArraySnapshot<u16>>,
     processed_cell_count: i32,
     conductive_cell_count: i32,
     can_continue: bool,
@@ -172,6 +181,7 @@ impl ElectricityManagerData {
                 "electricity pulse-group count {pulse_group_count} exceeds capacity {PULSE_GROUP_CAPACITY}"
             )));
         }
+        let pulse_groups_offset = reader.offset();
         let mut pulse_groups = Vec::with_capacity(pulse_group_count);
         for _ in 0..pulse_group_count {
             pulse_groups.push(ElectricityPulseGroup {
@@ -183,13 +193,13 @@ impl ElectricityManagerData {
                 z: reader.read_u8()?,
             });
         }
-
         let pulse_unit_count = usize::from(reader.read_u16_be()?);
         if pulse_unit_count > PULSE_UNIT_CAPACITY {
             return Err(reader.invalid(format!(
                 "electricity pulse-unit count {pulse_unit_count} exceeds capacity {PULSE_UNIT_CAPACITY}"
             )));
         }
+        let pulse_units_offset = reader.offset();
         let mut pulse_units = Vec::with_capacity(pulse_unit_count);
         for _ in 0..pulse_unit_count {
             pulse_units.push(ElectricityPulseUnit {
@@ -203,9 +213,8 @@ impl ElectricityManagerData {
                 z: reader.read_u8()?,
             });
         }
-
-        let node_groups = if format_version < PULSE_UNIT_NODE_VERSION {
-            vec![u16::MAX; NODE_GROUP_COUNT]
+        let (node_groups, node_groups_snapshot) = if format_version < PULSE_UNIT_NODE_VERSION {
+            (vec![u16::MAX; NODE_GROUP_COUNT], None)
         } else {
             let stored_count = if format_version >= FULL_NODE_GROUPS_VERSION {
                 NODE_GROUP_COUNT
@@ -213,9 +222,9 @@ impl ElectricityManagerData {
                 LEGACY_NODE_GROUP_COUNT
             };
             let mut values = vec![u16::MAX; NODE_GROUP_COUNT];
-            values[..stored_count]
-                .copy_from_slice(&read_encoded_ushort_array(&mut reader, stored_count)?);
-            values
+            let (stored_values, snapshot) = read_captured_ushort_array(&mut reader, stored_count)?;
+            values[..stored_count].copy_from_slice(&stored_values);
+            (values, Some(snapshot))
         };
 
         let scalar_fields_offset = reader.offset();
@@ -250,8 +259,13 @@ impl ElectricityManagerData {
             legacy_temporary_electrified_snapshot,
             temporary_electrified_snapshot,
             pulse_groups,
+            pulse_group_count,
+            pulse_groups_offset,
             pulse_units,
+            pulse_unit_count,
+            pulse_units_offset,
             node_groups,
+            node_groups_snapshot,
             processed_cell_count,
             conductive_cell_count,
             can_continue,
@@ -497,14 +511,84 @@ impl ElectricityManagerData {
         &self.pulse_groups
     }
 
+    /// Replaces an existing serialized pulse group without changing its
+    /// record count or the body length.
+    pub fn set_pulse_group(
+        &mut self,
+        index: usize,
+        value: ElectricityPulseGroup,
+    ) -> Result<(), CrpError> {
+        let Some(group) = self.pulse_groups.get_mut(index) else {
+            return Err(invalid(
+                self.pulse_groups_offset,
+                format!("electricity pulse-group index {index} is out of range"),
+            ));
+        };
+        *group = value;
+        Ok(())
+    }
+
     /// Returns active pulse units in serialized order.
     pub fn pulse_units(&self) -> &[ElectricityPulseUnit] {
         &self.pulse_units
     }
 
+    /// Replaces an existing serialized pulse unit without changing its record
+    /// count or the body length. Versions below 8 require `node` to be `None`;
+    /// version 8 and later require a serialized node value.
+    pub fn set_pulse_unit(
+        &mut self,
+        index: usize,
+        value: ElectricityPulseUnit,
+    ) -> Result<(), CrpError> {
+        if value.node.is_some() != (self.format_version >= PULSE_UNIT_NODE_VERSION) {
+            return Err(invalid(
+                self.pulse_units_offset,
+                "pulse-unit node field does not match the version gate",
+            ));
+        }
+        let Some(unit) = self.pulse_units.get_mut(index) else {
+            return Err(invalid(
+                self.pulse_units_offset,
+                format!("electricity pulse-unit index {index} is out of range"),
+            ));
+        };
+        *unit = value;
+        Ok(())
+    }
+
     /// Returns all 32,768 node-group values, including version-derived defaults.
     pub fn node_groups(&self) -> &[u16] {
         &self.node_groups
+    }
+
+    /// Replaces a serialized node-group value. Versions 8–201 store only the
+    /// first 16,384 entries; versions 202 and later store all 32,768. Versions
+    /// below 8 derive every entry and have no editable serialized values.
+    pub fn set_node_group(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        let Some(snapshot) = self.node_groups_snapshot.as_ref() else {
+            return Err(invalid(
+                self.scalar_fields_offset,
+                "node-group values are derived and not serialized before inner version 8",
+            ));
+        };
+        if index >= snapshot.values.len() {
+            return Err(invalid(
+                snapshot.range.end,
+                format!(
+                    "electricity node-group index {index} is outside the {} serialized values",
+                    snapshot.values.len()
+                ),
+            ));
+        }
+        let Some(node_group) = self.node_groups.get_mut(index) else {
+            return Err(invalid(
+                snapshot.range.start,
+                "electricity node-group storage is shorter than the serialized values",
+            ));
+        };
+        *node_group = value;
+        Ok(())
     }
 
     /// Returns the stored processed-cell counter.
@@ -613,12 +697,12 @@ impl ElectricityManagerData {
         self.original_body.clone()
     }
 
-    /// Encodes edited counters, continuation state, conductivity, and sparse
-    /// cell columns. Changed arrays use canonical encoded-array writers;
-    /// unchanged fields retain their original bytes, including pulse records,
-    /// node groups, and the closing profiler reference. The body can change
-    /// length. Returns an error if captured field ranges or sparse lengths are
-    /// invalid.
+    /// Encodes edited counters, continuation state, conductivity, sparse cell
+    /// columns, pulse records, and stored node-group values. Changed encoded
+    /// arrays use canonical writers; fixed-width pulse records retain their
+    /// field widths. Unchanged fields retain their original bytes, including
+    /// the closing profiler reference. The body can change length when arrays
+    /// are rewritten.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.original_body.clone();
         let processed_end =
@@ -672,6 +756,19 @@ impl ElectricityManagerData {
             })?
             .copy_from_slice(&[u8::from(self.can_continue)]);
         self.validate_sparse_lengths(self.scalar_fields_offset)?;
+        write_pulse_groups(
+            &mut bytes,
+            self.pulse_groups_offset,
+            &self.pulse_groups,
+            self.pulse_group_count,
+        )?;
+        write_pulse_units(
+            &mut bytes,
+            self.pulse_units_offset,
+            &self.pulse_units,
+            self.pulse_unit_count,
+            self.format_version >= PULSE_UNIT_NODE_VERSION,
+        )?;
         let mut replacements = Vec::new();
         if let Some(replacement) = changed_byte_array(
             &self.conductivity,
@@ -780,6 +877,40 @@ impl ElectricityManagerData {
                 ));
             }
         }
+        match self.node_groups_snapshot.as_ref() {
+            Some(snapshot) => {
+                if self.node_groups.len() != NODE_GROUP_COUNT {
+                    return Err(invalid(
+                        snapshot.range.start,
+                        "electricity node-group array has an invalid length",
+                    ));
+                }
+                let stored_values = self.node_groups.get(..snapshot.values.len()).ok_or_else(
+                    || {
+                        invalid(
+                            snapshot.range.start,
+                            "electricity node-group array is shorter than its serialized prefix",
+                        )
+                    },
+                )?;
+                if let Some(replacement) =
+                    changed_ushort_array(stored_values, snapshot, bytes.len(), "node-group values")?
+                {
+                    replacements.push(replacement);
+                }
+            }
+            None => {
+                if self.format_version >= PULSE_UNIT_NODE_VERSION
+                    || self.node_groups.len() != NODE_GROUP_COUNT
+                    || self.node_groups.iter().any(|value| *value != u16::MAX)
+                {
+                    return Err(invalid(
+                        self.scalar_fields_offset,
+                        "derived electricity node-group values do not match the version gate",
+                    ));
+                }
+            }
+        }
         replacements.sort_by_key(|(range, _)| range.start);
         for (range, encoded) in replacements.into_iter().rev() {
             bytes.splice(range, encoded);
@@ -794,6 +925,103 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
         offset,
         reason: reason.into(),
     }
+}
+
+fn write_pulse_groups(
+    bytes: &mut [u8],
+    offset: usize,
+    groups: &[ElectricityPulseGroup],
+    expected_count: usize,
+) -> Result<(), CrpError> {
+    if groups.len() != expected_count {
+        return Err(invalid(offset, "electricity pulse-group count changed"));
+    }
+    let range = checked_record_array_range(
+        bytes,
+        offset,
+        groups.len(),
+        PULSE_GROUP_RECORD_LEN,
+        "pulse groups",
+    )?;
+    let output = bytes
+        .get_mut(range)
+        .ok_or_else(|| invalid(offset, "electricity pulse-group range is invalid"))?;
+    for (record, group) in output.chunks_exact_mut(PULSE_GROUP_RECORD_LEN).zip(groups) {
+        record[0..4].copy_from_slice(&group.charge_value_1.to_be_bytes());
+        record[4..8].copy_from_slice(&group.charge_value_2.to_be_bytes());
+        record[8..10].copy_from_slice(&group.merge_value_1.to_be_bytes());
+        record[10..12].copy_from_slice(&group.merge_value_2.to_be_bytes());
+        record[12] = group.x;
+        record[13] = group.z;
+    }
+    Ok(())
+}
+
+fn write_pulse_units(
+    bytes: &mut [u8],
+    offset: usize,
+    units: &[ElectricityPulseUnit],
+    expected_count: usize,
+    has_node: bool,
+) -> Result<(), CrpError> {
+    if units.len() != expected_count {
+        return Err(invalid(offset, "electricity pulse-unit count changed"));
+    }
+    let record_len = if has_node {
+        PULSE_UNIT_NODE_RECORD_LEN
+    } else {
+        PULSE_UNIT_LEGACY_RECORD_LEN
+    };
+    for unit in units {
+        if unit.node.is_some() != has_node {
+            return Err(invalid(
+                offset,
+                "pulse-unit node field does not match the version gate",
+            ));
+        }
+    }
+    let range = checked_record_array_range(bytes, offset, units.len(), record_len, "pulse units")?;
+    let output = bytes
+        .get_mut(range)
+        .ok_or_else(|| invalid(offset, "electricity pulse-unit range is invalid"))?;
+    for (record, unit) in output.chunks_exact_mut(record_len).zip(units) {
+        record[0..2].copy_from_slice(&unit.group.to_be_bytes());
+        let coordinates_offset = if let Some(node) = unit.node {
+            record[2..4].copy_from_slice(&node.to_be_bytes());
+            4
+        } else {
+            2
+        };
+        record[coordinates_offset] = unit.x;
+        record[coordinates_offset + 1] = unit.z;
+    }
+    Ok(())
+}
+
+fn checked_record_array_range(
+    bytes: &[u8],
+    offset: usize,
+    count: usize,
+    record_len: usize,
+    field: &str,
+) -> Result<Range<usize>, CrpError> {
+    let end = count
+        .checked_mul(record_len)
+        .and_then(|byte_count| offset.checked_add(byte_count))
+        .ok_or(CrpError::ArithmeticOverflow(
+            "ElectricityManager record-array end",
+        ))?;
+    let payload_end = bytes
+        .len()
+        .checked_sub(END_PROFILER_REFERENCE_LEN)
+        .ok_or_else(|| invalid(offset, "body lacks its closing profiler reference"))?;
+    if offset > end || end > payload_end {
+        return Err(invalid(
+            offset,
+            format!("electricity {field} exceed the bounded body"),
+        ));
+    }
+    Ok(offset..end)
 }
 
 fn ensure_sparse_length<T>(
@@ -1013,8 +1241,9 @@ fn changed_bool_array(
 mod tests {
     use super::{
         CELL_COUNT, END_PROFILER_REFERENCE_LEN, ElectricityConductiveCellData,
-        ElectricityManagerData, FULL_NODE_GROUPS_VERSION, NODE_GROUP_COUNT, PULSE_GROUP_CAPACITY,
-        PULSE_UNIT_CAPACITY,
+        ElectricityManagerData, ElectricityPulseGroup, ElectricityPulseUnit,
+        FULL_NODE_GROUPS_VERSION, LEGACY_NODE_GROUP_COUNT, NODE_GROUP_COUNT, PULSE_GROUP_CAPACITY,
+        PULSE_GROUP_RECORD_LEN, PULSE_UNIT_CAPACITY,
     };
     fn append_zero_encoded_byte_array(output: &mut Vec<u8>, mut count: usize) {
         while count > 0 {
@@ -1067,6 +1296,14 @@ mod tests {
             output.push(0x7f + run as u8);
             count -= run;
         }
+    }
+
+    fn append_first_ushort_then_zero_runs(output: &mut Vec<u8>, count: usize, value: u16) {
+        assert!(count >= 3);
+        output.extend_from_slice(&[2]);
+        output.extend_from_slice(&value.to_be_bytes());
+        output.extend_from_slice(&[0; 4]);
+        append_zero_encoded_ushort_array(output, count - 3);
     }
 
     fn active_current_body() -> Vec<u8> {
@@ -1154,6 +1391,68 @@ mod tests {
         assert!(data.can_continue());
         assert_eq!(data.encode_unchanged(), body);
         assert_eq!(data.encode().unwrap(), body);
+    }
+
+    #[test]
+    fn edits_existing_pulse_records_and_node_groups_with_expected_bytes() {
+        let body = active_current_body();
+        let mut data = ElectricityManagerData::decode(117_000, &body).unwrap();
+        let edited_group = ElectricityPulseGroup {
+            charge_value_1: 0x1122_3344,
+            charge_value_2: 0x5566_7788,
+            merge_value_1: 0x99aa,
+            merge_value_2: 0xbbcc,
+            x: 0xdd,
+            z: 0xee,
+        };
+        let edited_unit = ElectricityPulseUnit {
+            group: 0x1357,
+            node: Some(0x2468),
+            x: 0x9a,
+            z: 0xbc,
+        };
+        data.set_pulse_group(0, edited_group).unwrap();
+        data.set_pulse_unit(0, edited_unit).unwrap();
+        data.set_node_group(0, 0xa1b2).unwrap();
+
+        let mut expected = body.clone();
+        let mut encoded_group = Vec::new();
+        encoded_group.extend_from_slice(&edited_group.charge_value_1.to_be_bytes());
+        encoded_group.extend_from_slice(&edited_group.charge_value_2.to_be_bytes());
+        encoded_group.extend_from_slice(&edited_group.merge_value_1.to_be_bytes());
+        encoded_group.extend_from_slice(&edited_group.merge_value_2.to_be_bytes());
+        encoded_group.extend_from_slice(&[edited_group.x, edited_group.z]);
+        expected.splice(
+            data.pulse_groups_offset..data.pulse_groups_offset + PULSE_GROUP_RECORD_LEN,
+            encoded_group,
+        );
+        let mut encoded_unit = Vec::new();
+        encoded_unit.extend_from_slice(&edited_unit.group.to_be_bytes());
+        encoded_unit.extend_from_slice(&edited_unit.node.unwrap().to_be_bytes());
+        encoded_unit.extend_from_slice(&[edited_unit.x, edited_unit.z]);
+        expected.splice(
+            data.pulse_units_offset..data.pulse_units_offset + 6,
+            encoded_unit,
+        );
+        let mut encoded_nodes = Vec::new();
+        append_first_ushort_then_zero_runs(&mut encoded_nodes, NODE_GROUP_COUNT, 0xa1b2);
+        expected.splice(
+            data.node_groups_snapshot.as_ref().unwrap().range.clone(),
+            encoded_nodes,
+        );
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded.len(), expected.len());
+        assert_eq!(encoded, expected);
+        let decoded = ElectricityManagerData::decode(117_000, &encoded).unwrap();
+        assert_eq!(decoded.pulse_groups(), [edited_group]);
+        assert_eq!(decoded.pulse_units(), [edited_unit]);
+        assert_eq!(decoded.node_groups()[0], 0xa1b2);
+        assert_eq!(decoded.node_groups()[1], 0);
+        assert!(data.set_pulse_group(1, edited_group).is_err());
+        assert!(data.set_pulse_unit(1, edited_unit).is_err());
+        assert!(data.set_node_group(NODE_GROUP_COUNT, 1).is_err());
+        assert_eq!(data.encode().unwrap(), expected);
     }
 
     #[test]
@@ -1352,6 +1651,7 @@ mod tests {
     #[test]
     fn version_7_topology_edits_require_its_derived_false_temporary_state() {
         let mut data = ElectricityManagerData::decode(7, &empty_body(7)).unwrap();
+        assert!(data.set_node_group(0, 1).is_err());
         let state = ElectricityConductiveCellData {
             conductivity: 1,
             current_charge: 0,
@@ -1401,6 +1701,7 @@ mod tests {
         );
         assert_eq!(decoded.version_75_compatibility_values(), None);
         assert_eq!(decoded.temporary_electrified(), [true]);
+        assert!(data.set_node_group(LEGACY_NODE_GROUP_COUNT, 1).is_err());
         assert_eq!(data.remove_conductive_cell(2).unwrap(), state);
         assert_eq!(data.encode().unwrap(), body);
 
@@ -1480,6 +1781,7 @@ mod tests {
             append_zero_encoded_byte_array(&mut body, CELL_COUNT);
             body.extend_from_slice(&0_u16.to_be_bytes()); // No pulse groups.
             body.extend_from_slice(&1_u16.to_be_bytes()); // One pulse unit.
+            let pulse_unit_offset = body.len();
             body.extend_from_slice(&0x0102_u16.to_be_bytes());
             if let Some(node) = node {
                 body.extend_from_slice(&node.to_be_bytes());
@@ -1491,12 +1793,65 @@ mod tests {
             body.extend_from_slice(&[0; 9]);
             body.extend_from_slice(&[0x12, 0x34]);
 
-            let data = ElectricityManagerData::decode(version, &body).unwrap();
+            let mut data = ElectricityManagerData::decode(version, &body).unwrap();
             assert_eq!(data.pulse_units().len(), 1);
             assert_eq!(data.pulse_units()[0].group, 0x0102);
             assert_eq!(data.pulse_units()[0].node, node);
             assert_eq!(data.pulse_units()[0].x, 3);
             assert_eq!(data.pulse_units()[0].z, 4);
+
+            let edited_unit = ElectricityPulseUnit {
+                group: 0x1112,
+                node,
+                x: 5,
+                z: 6,
+            };
+            data.set_pulse_unit(0, edited_unit).unwrap();
+            let mut expected = body.clone();
+            let mut encoded_unit = edited_unit.group.to_be_bytes().to_vec();
+            if let Some(node) = node {
+                encoded_unit.extend_from_slice(&node.to_be_bytes());
+            }
+            encoded_unit.extend_from_slice(&[edited_unit.x, edited_unit.z]);
+            expected.splice(
+                pulse_unit_offset..pulse_unit_offset + encoded_unit.len(),
+                encoded_unit,
+            );
+            assert_eq!(data.encode().unwrap(), expected);
+
+            let wrong_node_gate = ElectricityPulseUnit {
+                node: node.map_or(Some(1), |_| None),
+                ..edited_unit
+            };
+            assert!(data.set_pulse_unit(0, wrong_node_gate).is_err());
+            assert_eq!(data.encode().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn node_group_edits_follow_the_serialized_array_lengths() {
+        for (version, editable_count) in [(201, LEGACY_NODE_GROUP_COUNT), (202, NODE_GROUP_COUNT)] {
+            let body = empty_body(version);
+            let mut data = ElectricityManagerData::decode(version, &body).unwrap();
+            let index = editable_count - 1;
+            data.set_node_group(index, 0x1234).unwrap();
+            assert_eq!(data.node_groups()[index], 0x1234);
+            assert!(data.set_node_group(editable_count, 0x5678).is_err());
+            let encoded = data.encode().unwrap();
+            let mut expected = body.clone();
+            let mut encoded_nodes = Vec::new();
+            append_zero_encoded_ushort_array(&mut encoded_nodes, editable_count - 1);
+            encoded_nodes.extend_from_slice(&[0, 0x12, 0x34]);
+            expected.splice(
+                data.node_groups_snapshot.as_ref().unwrap().range.clone(),
+                encoded_nodes,
+            );
+            assert_eq!(encoded, expected);
+            let decoded = ElectricityManagerData::decode(version, &encoded).unwrap();
+            assert_eq!(decoded.node_groups()[index], 0x1234);
+            if editable_count < NODE_GROUP_COUNT {
+                assert_eq!(decoded.node_groups()[editable_count], u16::MAX);
+            }
         }
     }
 
