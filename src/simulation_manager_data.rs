@@ -1532,9 +1532,9 @@ impl TransportManagerSelectionPrefix {
 
 /// Editor for signed keys in the TransportManager vehicle-selection table.
 ///
-/// The table is patched in place. String markers and compact or wide encoding
-/// modes are retained. Entries cannot be added or removed. Newly declared
-/// strings can change only at the same serialized width, and existing entries
+/// The table is rewritten in the manager graph. String markers and compact or
+/// wide encoding modes are retained. Entries cannot be added or removed.
+/// Newly declared strings can change serialized width, and existing entries
 /// can redirect only to prior indexes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerSelectionEditor {
@@ -1580,8 +1580,8 @@ impl TransportManagerSelectionEditor {
     /// Updating a new string changes the shared-string value at its stream
     /// index, so later references to that same index resolve to the updated
     /// value. Use [`Self::set_existing_string_index`] to redirect an existing
-    /// entry. The replacement must retain the source null state, encoding mode,
-    /// and serialized length.
+    /// entry. The replacement must retain the source null state and compact or
+    /// wide string encoding; its serialized length may change.
     pub fn set_new_string_value(
         &mut self,
         entry_index: usize,
@@ -1699,7 +1699,7 @@ impl TransportManagerSelectionEditor {
     }
 
     /// Writes edited keys, string values, and indexes into the original table
-    /// bytes without changing entry count, encoding modes, or table length.
+    /// bytes without changing entry count or compact/wide encoding modes.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         if self.format_version < 114_001
             || self.keys.len() != self.key_ranges.len()
@@ -1715,6 +1715,7 @@ impl TransportManagerSelectionEditor {
             ));
         }
         let mut bytes = self.original_prefix.clone();
+        let mut new_string_edits = Vec::new();
         for (key, range) in self.keys.iter().zip(&self.key_ranges) {
             if range.len() != 2 {
                 return Err(invalid(
@@ -1746,21 +1747,7 @@ impl TransportManagerSelectionEditor {
                         )
                     })?;
                     let encoded = encode_selection_unique_string(value.as_deref(), original)?;
-                    if encoded.len() != range.len() {
-                        return Err(invalid(
-                            range.start,
-                            "TransportManager selection string changes its serialized length",
-                        ));
-                    }
-                    bytes
-                        .get_mut(range.clone())
-                        .ok_or_else(|| {
-                            invalid(
-                                range.start,
-                                "TransportManager new-string range exceeds source table",
-                            )
-                        })?
-                        .copy_from_slice(&encoded);
+                    new_string_edits.push((range.clone(), encoded));
                 }
                 (
                     TransportManagerSharedStringValue::Existing { index, .. },
@@ -1794,6 +1781,15 @@ impl TransportManagerSelectionEditor {
                 }
             }
         }
+        for (range, encoded) in new_string_edits.into_iter().rev() {
+            if range.start > range.end || range.end > bytes.len() {
+                return Err(invalid(
+                    range.start,
+                    "TransportManager new-string range exceeds source table",
+                ));
+            }
+            bytes.splice(range, encoded);
+        }
         Ok(bytes)
     }
 }
@@ -1806,11 +1802,11 @@ fn encode_selection_unique_string(
         (None, [0xff]) => Ok(vec![0xff]),
         (None, _) => Err(invalid(
             0,
-            "TransportManager selection string nullness cannot change in a fixed-width edit",
+            "TransportManager selection string nullness cannot change",
         )),
         (Some(_), [0xff]) => Err(invalid(
             0,
-            "TransportManager selection string nullness cannot change in a fixed-width edit",
+            "TransportManager selection string nullness cannot change",
         )),
         (Some(value), [first, second, third, ..]) => {
             let encoded_length =
@@ -1818,12 +1814,6 @@ fn encode_selection_unique_string(
             let compact = encoded_length & COMPACT_STRING_FLAG != 0;
             let mut encoded = Vec::new();
             write_unique_string_with_mode(&mut encoded, value, compact)?;
-            if encoded.get(..3) != Some(&original[..3]) {
-                return Err(invalid(
-                    0,
-                    "TransportManager selection string changes its encoded character count",
-                ));
-            }
             Ok(encoded)
         }
         (Some(_), _) => Err(invalid(
@@ -9756,9 +9746,9 @@ impl SimulationManagerData {
     /// Applies edits to TransportManager's vehicle-selection table.
     ///
     /// The editor must come from this manager's current table and inner
-    /// DataSerializer version. New strings retain their original encoding and
-    /// width, existing indexes must point to prior strings, and graph length
-    /// remains unchanged.
+    /// DataSerializer version. New strings retain their original compact or
+    /// wide encoding, existing indexes must point to prior strings, and a
+    /// changed string length may resize the manager graph.
     pub fn replace_transport_manager_selection_prefix(
         &mut self,
         edited: &TransportManagerSelectionEditor,
@@ -9803,37 +9793,42 @@ impl SimulationManagerData {
             ));
         }
 
+        let current_table_len = current.len();
         let replacement = edited.encode()?;
-        if replacement.len() != current.len() {
-            return Err(invalid(
-                absolute_start,
-                "TransportManager selection edits must preserve the table length",
-            ));
-        }
         let absolute_end =
             absolute_start
-                .checked_add(replacement.len())
+                .checked_add(current_table_len)
                 .ok_or(CrpError::ArithmeticOverflow(
                     "TransportManager selection table end",
                 ))?;
         let mut candidate_graph = self.serialized_object_graph.clone();
-        let target = candidate_graph
-            .get_mut(absolute_start..absolute_end)
-            .ok_or_else(|| {
-                invalid(
-                    absolute_start,
-                    "TransportManager selection range exceeds graph",
-                )
-            })?;
-        target.copy_from_slice(&replacement);
+        if absolute_end > candidate_graph.len() {
+            return Err(invalid(
+                absolute_start,
+                "TransportManager selection range exceeds graph",
+            ));
+        }
+        candidate_graph.splice(absolute_start..absolute_end, replacement.iter().copied());
 
         let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
         let validation = (|| {
             let (validated_body_range, _) = self.transport_manager_body_range()?;
-            if validated_body_range != body_range {
+            let expected_body_len = body_range
+                .len()
+                .checked_sub(current_table_len)
+                .and_then(|length| length.checked_add(replacement.len()))
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "rewritten TransportManager body length",
+                ))?;
+            let expected_body_end = body_range.start.checked_add(expected_body_len).ok_or(
+                CrpError::ArithmeticOverflow("rewritten TransportManager body end"),
+            )?;
+            if validated_body_range.start != body_range.start
+                || validated_body_range.end != expected_body_end
+            {
                 return Err(invalid(
                     body_range.start,
-                    "TransportManager body boundary changed after selection rewrite",
+                    "TransportManager body boundary does not match the resized selection table",
                 ));
             }
             let validated_body = self
@@ -9851,8 +9846,13 @@ impl SimulationManagerData {
                 None,
                 None,
             )?;
-            if validated_fields.selection_range.as_ref() != Some(&selection_range)
-                || validated_body.get(selection_range.clone()) != Some(replacement.as_slice())
+            let expected_selection_end =
+                selection_range.start.checked_add(replacement.len()).ok_or(
+                    CrpError::ArithmeticOverflow("rewritten TransportManager selection end"),
+                )?;
+            let validated_selection_range = selection_range.start..expected_selection_end;
+            if validated_fields.selection_range.as_ref() != Some(&validated_selection_range)
+                || validated_body.get(validated_selection_range) != Some(replacement.as_slice())
             {
                 return Err(invalid(
                     absolute_start,
@@ -18117,15 +18117,96 @@ mod manager_boundary_tests {
                 .replace_transport_manager_selection_prefix(&editor)
                 .is_err()
         );
-        let mut wrong_length = selection_after.into_editor();
-        wrong_length
-            .set_new_string_value(0, Some("Boat".to_owned()))
+        let mut wrong_encoding = selection_after.into_editor();
+        wrong_encoding
+            .set_new_string_value(0, Some("B€".to_owned()))
             .unwrap();
         assert!(
             manager
-                .replace_transport_manager_selection_prefix(&wrong_length)
+                .replace_transport_manager_selection_prefix(&wrong_encoding)
                 .is_err()
         );
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+
+        let (current_body_range, _) = manager.transport_manager_body_range().unwrap();
+        let current_body = manager
+            .serialized_object_graph()
+            .get(current_body_range.clone())
+            .unwrap();
+        let current_fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            current_body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let current_table_range = current_fields.selection_range.unwrap();
+        let mut resize_editor = current_fields.selection_prefix.unwrap().into_editor();
+        resize_editor
+            .set_new_string_value(0, Some("Carriage".to_owned()))
+            .unwrap();
+
+        let carriage_table = [
+            0x00, 0x02, 0x12, 0x34, 0xfe, 0x80, 0x00, 0x08, 0xc3, 0x1e, 0x11, 0x00, 0xf7, 0xf8,
+            0x06, 0xfe, 0x00, 0x08, 0x00, 0x01,
+        ];
+        let selection_start = current_body_range
+            .start
+            .checked_add(current_table_range.start)
+            .unwrap();
+        let selection_end = current_body_range
+            .start
+            .checked_add(current_table_range.end)
+            .unwrap();
+        let mut expected_resized_graph = expected_graph.clone();
+        expected_resized_graph.splice(
+            selection_start..selection_end,
+            carriage_table.iter().copied(),
+        );
+        manager
+            .replace_transport_manager_selection_prefix(&resize_editor)
+            .unwrap();
+        assert_eq!(
+            manager.serialized_object_graph(),
+            expected_resized_graph.as_slice()
+        );
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            expected_graph.len() + 5
+        );
+
+        let (resized_body_range, _) = manager.transport_manager_body_range().unwrap();
+        let resized_body = manager
+            .serialized_object_graph()
+            .get(resized_body_range.clone())
+            .unwrap();
+        let resized_fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            resized_body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let resized_selection = resized_fields.selection_prefix.unwrap();
+        assert_eq!(resized_selection.selections()[0].key, 0x1234);
+        assert_eq!(
+            resized_selection.selections()[0].value,
+            TransportManagerSharedStringValue::New(Some("Carriage".to_owned()))
+        );
+        assert_eq!(
+            resized_selection.selections()[1].value,
+            TransportManagerSharedStringValue::Existing {
+                index: 1,
+                value: Some("Carriage".to_owned()),
+            }
+        );
+        let mut shrink_editor = resized_selection.into_editor();
+        shrink_editor
+            .set_new_string_value(0, Some("Car".to_owned()))
+            .unwrap();
+        manager
+            .replace_transport_manager_selection_prefix(&shrink_editor)
+            .unwrap();
         assert_eq!(manager.serialized_object_graph(), expected_graph);
     }
 
