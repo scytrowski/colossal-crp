@@ -2502,8 +2502,9 @@ impl SimulationManagerData {
     }
 
     /// Replaces TransferManager's amount values, reason-count distribution,
-    /// and existing offer fields. The edited body may change length; the
-    /// following manager bytes are retained and the new boundary is checked.
+    /// and offer records. The offer count may change, so the body may change
+    /// length. Following manager bytes are retained and the new boundary is
+    /// checked.
     pub fn replace_transfer_manager_data(
         &mut self,
         edited: &TransferManagerEditor,
@@ -13943,7 +13944,7 @@ mod manager_boundary_tests {
             .into_editor();
         assert_eq!(edited.reason_counts().len(), 128 * 16);
         edited.reason_counts_mut()[0] = 0;
-        edited.reason_counts_mut()[1] = 1;
+        edited.set_offers(Vec::new()).unwrap();
         assert!(
             edited.encode().unwrap().len() < natural_start - profiler_tag("TransferManager").len()
         );
@@ -13953,8 +13954,8 @@ mod manager_boundary_tests {
         assert!(manager.serialized_object_graph.ends_with(&following_bytes));
         let decoded = manager.decode_transfer_manager_data().unwrap();
         assert_eq!(decoded.reason_counts()[0], 0);
-        assert_eq!(decoded.reason_counts()[1], 1);
-        assert_eq!(decoded.offers().len(), 1);
+        assert_eq!(decoded.reason_counts()[1], 0);
+        assert!(decoded.offers().is_empty());
 
         let mut stale_manager = transfer_manager_with_noncanonical_counts();
         let stale_editor = stale_manager

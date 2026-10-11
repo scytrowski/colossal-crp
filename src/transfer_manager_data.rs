@@ -257,8 +257,7 @@ impl TransferManagerData {
         self.original_bytes.clone()
     }
 
-    /// Creates a fixed-record editor for amount values, count distribution,
-    /// and existing offers. Offer slots cannot be inserted or removed.
+    /// Creates an editor for amount values, count distribution, and offers.
     pub fn into_editor(self) -> TransferManagerEditor {
         TransferManagerEditor {
             incoming_amounts: self.incoming_amounts.clone(),
@@ -270,7 +269,7 @@ impl TransferManagerData {
     }
 }
 
-/// Edits fixed-size TransferManager arrays and existing offer slots.
+/// Edits fixed-size TransferManager arrays and the variable-length offer list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferManagerEditor {
     original: TransferManagerData,
@@ -301,8 +300,8 @@ impl TransferManagerEditor {
         &self.reason_counts
     }
 
-    /// Returns mutable serialized reason counts. Their total must continue to
-    /// equal the number of existing offer slots.
+    /// Returns mutable serialized reason counts. Their total must equal the
+    /// number of offer records when encoding.
     pub fn reason_counts_mut(&mut self) -> &mut [u16] {
         &mut self.reason_counts
     }
@@ -317,13 +316,45 @@ impl TransferManagerEditor {
         &self.offers
     }
 
+    /// Replaces the offer records in serialized order.
+    ///
+    /// The list can contain at most one million records, matching the decoder's
+    /// allocation limit. Update the reason counts as well so their sum matches
+    /// the new list length. Before version 111001, added records must set
+    /// `excluded` to `None`; before 115001, they must set `local_park` to `None`.
+    pub fn set_offers(&mut self, offers: Vec<TransferOffer>) -> Result<(), CrpError> {
+        if offers.len() > MAX_DECODED_OFFERS {
+            return Err(invalid(
+                0,
+                format!("offer count exceeds the {MAX_DECODED_OFFERS}-record limit"),
+            ));
+        }
+        if self.format_version() < EXCLUDE_FLAG_VERSION
+            && offers.iter().any(|offer| offer.excluded.is_some())
+        {
+            return Err(invalid(
+                0,
+                "excluded values are unavailable before inner version 111001",
+            ));
+        }
+        if self.format_version() < LOCAL_PARK_VERSION
+            && offers.iter().any(|offer| offer.local_park.is_some())
+        {
+            return Err(invalid(
+                0,
+                "local-park values are unavailable before inner version 115001",
+            ));
+        }
+        self.offers = offers;
+        Ok(())
+    }
+
     /// Encodes edited arrays while copying every unchanged encoded column
     /// verbatim. The two-byte closing profiler reference remains unchanged.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         if self.incoming_amounts.len() != self.original.incoming_amounts.len()
             || self.outgoing_amounts.len() != self.original.outgoing_amounts.len()
             || self.reason_counts.len() != self.original.reason_counts.len()
-            || self.offers.len() != self.original.offers.len()
         {
             return Err(invalid(0, "TransferManager array length changed"));
         }
@@ -351,10 +382,16 @@ impl TransferManagerEditor {
                     .checked_add(usize::from(*count))
                     .ok_or(CrpError::ArithmeticOverflow("TransferManager offer count"))
             })?;
+        if offer_count > MAX_DECODED_OFFERS {
+            return Err(invalid(
+                0,
+                format!("offer count exceeds the {MAX_DECODED_OFFERS}-record limit"),
+            ));
+        }
         if offer_count != self.offers.len() {
             return Err(invalid(
                 0,
-                "TransferManager reason-count total must equal the existing offer count",
+                "TransferManager reason-count total must equal the edited offer count",
             ));
         }
 
@@ -607,7 +644,7 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
 
 #[cfg(test)]
 mod tests {
-    use super::{TransferManagerData, transfer_reason_count};
+    use super::{MAX_DECODED_OFFERS, TransferManagerData, TransferOffer, transfer_reason_count};
 
     const FORMAT_VERSION: u32 = 116_000;
 
@@ -692,6 +729,156 @@ mod tests {
 
         editor.reason_counts_mut()[0] = 0;
         assert!(editor.encode().is_err());
+    }
+
+    #[test]
+    fn editor_grows_and_shrinks_offers_with_expected_parallel_columns() {
+        let body = one_offer_body();
+        let reason_count = transfer_reason_count(FORMAT_VERSION);
+        let (first, second) = {
+            let data = TransferManagerData::decode(FORMAT_VERSION, &body).unwrap();
+            let mut offers = data.offers().to_vec();
+            let second = TransferOffer {
+                active: false,
+                excluded: Some(true),
+                priority: 12,
+                amount: 13,
+                x: 14,
+                z: 15,
+                instance_type: 16,
+                instance_index: 0xa0b0_c0d0,
+                local_park: Some(17),
+            };
+            offers.push(second.clone());
+            (offers, second)
+        };
+        let mut grow_editor = TransferManagerData::decode(FORMAT_VERSION, &body)
+            .unwrap()
+            .into_editor();
+        grow_editor.reason_counts_mut()[0] = 2;
+        grow_editor.set_offers(first).unwrap();
+
+        let mut expected_grown = body[..reason_count * 8].to_vec();
+        expected_grown.extend_from_slice(&[2, 0, 2, 0, 0, 0, 0]);
+        expected_grown.extend_from_slice(&[0xff; 15]);
+        expected_grown.push(0xfc);
+        expected_grown.extend_from_slice(&[0, 1]); // Active Bool values.
+        expected_grown.extend_from_slice(&[0, 2]); // Excluded Bool values.
+        expected_grown.extend_from_slice(&[1, 6, second.priority]);
+        expected_grown.extend_from_slice(&[1, 7, second.amount]);
+        expected_grown.extend_from_slice(&[1, 8, second.x]);
+        expected_grown.extend_from_slice(&[1, 9, second.z]);
+        expected_grown.extend_from_slice(&[1, 10, second.instance_type]);
+        expected_grown.push(1);
+        expected_grown.extend_from_slice(&0x0102_0304_u32.to_be_bytes());
+        expected_grown.extend_from_slice(&second.instance_index.to_be_bytes());
+        expected_grown.extend_from_slice(&[1, 11, second.local_park.unwrap()]);
+        expected_grown.extend_from_slice(&[0x12, 0x34]);
+        assert_eq!(grow_editor.encode().unwrap(), expected_grown);
+
+        let grown = TransferManagerData::decode(FORMAT_VERSION, &expected_grown).unwrap();
+        assert_eq!(grown.offers().len(), 2);
+        assert_eq!(grown.offers()[1], second);
+        let mut shrink_editor = grown.into_editor();
+        shrink_editor.reason_counts_mut().fill(0);
+        shrink_editor.set_offers(Vec::new()).unwrap();
+        let mut expected_empty = body[..reason_count * 8].to_vec();
+        expected_empty.extend_from_slice(&[0xff; 16]);
+        expected_empty.extend_from_slice(&[0x12, 0x34]);
+        assert_eq!(shrink_editor.encode().unwrap(), expected_empty);
+        assert!(
+            TransferManagerData::decode(FORMAT_VERSION, &expected_empty)
+                .unwrap()
+                .offers()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn offer_editor_checks_version_fields_count_limits_and_reason_totals() {
+        let old_version = 111_000;
+        let reason_count = transfer_reason_count(old_version);
+        let mut body = vec![0; reason_count * 8];
+        append_literal_ushort_values(&mut body, &vec![0; reason_count * 16]);
+        body.extend_from_slice(&[0x12, 0x34]);
+        let mut old_editor = TransferManagerData::decode(old_version, &body)
+            .unwrap()
+            .into_editor();
+        assert!(
+            old_editor
+                .set_offers(vec![TransferOffer {
+                    active: false,
+                    excluded: Some(false),
+                    priority: 0,
+                    amount: 0,
+                    x: 0,
+                    z: 0,
+                    instance_type: 0,
+                    instance_index: 0,
+                    local_park: None,
+                }])
+                .is_err()
+        );
+
+        let mut too_many = TransferManagerData::decode(37, &{
+            let reason_count = transfer_reason_count(37);
+            let mut body = vec![0; reason_count * 8];
+            append_literal_ushort_values(&mut body, &vec![0; reason_count * 16]);
+            body.extend_from_slice(&[0x12, 0x34]);
+            body
+        })
+        .unwrap()
+        .into_editor();
+        assert!(
+            too_many
+                .set_offers(vec![
+                    TransferOffer {
+                        active: false,
+                        excluded: None,
+                        priority: 0,
+                        amount: 0,
+                        x: 0,
+                        z: 0,
+                        instance_type: 0,
+                        instance_index: 0,
+                        local_park: None,
+                    };
+                    MAX_DECODED_OFFERS + 1
+                ])
+                .is_err()
+        );
+        too_many.reason_counts_mut()[..16].fill(u16::MAX);
+        assert!(too_many.encode().is_err());
+
+        let local_park_version = 115_000;
+        let reason_count = transfer_reason_count(local_park_version);
+        let mut body = vec![0; reason_count * 8];
+        append_literal_ushort_values(&mut body, &vec![0; reason_count * 16]);
+        body.extend_from_slice(&[0x12, 0x34]);
+        let mut local_park_editor = TransferManagerData::decode(local_park_version, &body)
+            .unwrap()
+            .into_editor();
+        assert!(
+            local_park_editor
+                .set_offers(vec![TransferOffer {
+                    active: false,
+                    excluded: None,
+                    priority: 0,
+                    amount: 0,
+                    x: 0,
+                    z: 0,
+                    instance_type: 0,
+                    instance_index: 0,
+                    local_park: Some(0),
+                }])
+                .is_err()
+        );
+
+        let mut mismatched = TransferManagerData::decode(FORMAT_VERSION, &one_offer_body())
+            .unwrap()
+            .into_editor();
+        assert!(mismatched.set_offers(Vec::new()).is_ok());
+        assert!(mismatched.encode().is_err());
     }
 
     #[test]
