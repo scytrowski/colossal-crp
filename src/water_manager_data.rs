@@ -60,12 +60,60 @@ pub struct WaterPulseUnit {
     pub z: u8,
 }
 
+/// All serialized sparse fields for one active water or sewage cell.
+///
+/// `conductivity` must be nonzero. `pollution` must be present from inner
+/// version 23 and absent before it. These values describe the saved fields;
+/// they do not imply that the cell is connected to a live network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaterConductiveCellData {
+    /// Nonzero value in the primary conductivity plane.
+    pub conductivity: u8,
+    /// Signed water pressure.
+    pub water_pressure: i16,
+    /// Signed sewage pressure.
+    pub sewage_pressure: i16,
+    /// Water pulse-group index.
+    pub water_pulse_group_index: u16,
+    /// Sewage pulse-group index.
+    pub sewage_pulse_group_index: u16,
+    /// Current water electrification flag.
+    pub water_electrified: bool,
+    /// Temporary water electrification flag.
+    pub water_temporary_electrified: bool,
+    /// Current sewage electrification flag.
+    pub sewage_electrified: bool,
+    /// Temporary sewage electrification flag.
+    pub sewage_temporary_electrified: bool,
+    /// Conductive pollution byte from inner version 23.
+    pub pollution: Option<u8>,
+}
+
+/// All serialized sparse fields for one active heating cell.
+///
+/// Heating fields exist from inner version 227 onward. `conductivity` must be
+/// nonzero. These values describe the saved fields; they do not imply that the
+/// cell is connected to a live heating network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeatingConductiveCellData {
+    /// Nonzero value in the heating conductivity plane.
+    pub conductivity: u8,
+    /// Signed heating pressure.
+    pub pressure: i16,
+    /// Heating pulse-group index.
+    pub pulse_group_index: u16,
+    /// Current heating electrification flag.
+    pub electrified: bool,
+    /// Temporary heating electrification flag.
+    pub temporary_electrified: bool,
+}
+
 /// Decoded reader fields from `WaterManager+Data`.
 ///
 /// Sparse cell columns use the corresponding conductivity plane's ascending
 /// cell-index order. Conductivity values can be changed while retaining the
-/// existing zero/nonzero cell topology; sparse values can be edited by cell
-/// index without changing that topology. Node arrays retain their full
+/// existing zero/nonzero cell topology, or cells can be inserted and removed
+/// by supplying or receiving every sparse field for that cell. Node arrays retain their full
 /// 32,768-entry size, with version-derived
 /// defaults in the legacy upper half. The complete source body remains
 /// available for exact unchanged writing. Pulse-group and pulse-unit records
@@ -559,6 +607,92 @@ impl WaterManagerData {
         self.format_version
     }
 
+    fn validate_primary_sparse_lengths(&self) -> Result<(), CrpError> {
+        let count = self.conductive_cells.len();
+        if self.conductivity.len() != CELL_COUNT {
+            return Err(invalid_cell_grid(
+                0,
+                "water conductivity grid has an invalid length",
+            ));
+        }
+        ensure_sparse_length(&self.water_pressure, count, 0, "water pressure")?;
+        ensure_sparse_length(&self.sewage_pressure, count, 0, "sewage pressure")?;
+        ensure_sparse_length(
+            &self.water_pulse_group_indexes,
+            count,
+            0,
+            "water pulse-group indexes",
+        )?;
+        ensure_sparse_length(
+            &self.sewage_pulse_group_indexes,
+            count,
+            0,
+            "sewage pulse-group indexes",
+        )?;
+        ensure_sparse_length(&self.water_electrified, count, 0, "water electrification")?;
+        ensure_sparse_length(
+            &self.water_temporary_electrified,
+            count,
+            0,
+            "temporary water electrification",
+        )?;
+        ensure_sparse_length(&self.sewage_electrified, count, 0, "sewage electrification")?;
+        ensure_sparse_length(
+            &self.sewage_temporary_electrified,
+            count,
+            0,
+            "temporary sewage electrification",
+        )?;
+        if self.conductive_pollution.is_some() != (self.format_version >= POLLUTION_VERSION) {
+            return Err(invalid_cell_grid(
+                0,
+                "conductive pollution fields do not match the inner-version-23 gate",
+            ));
+        }
+        if let Some(values) = self.conductive_pollution.as_deref() {
+            ensure_sparse_length(values, count, 0, "conductive pollution")?;
+        }
+        Ok(())
+    }
+
+    fn validate_heating_sparse_lengths(&self, cell: usize) -> Result<(), CrpError> {
+        if self.format_version < HEATING_VERSION {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity plane is absent before inner version 227",
+            ));
+        }
+        let Some(conductivity) = self.conductivity_heating.as_deref() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity plane is absent before inner version 227",
+            ));
+        };
+        if conductivity.len() != CELL_COUNT {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity grid has an invalid length",
+            ));
+        }
+        let count = self.heating_cells.len();
+        let (Some(pressure), Some(indexes), Some(electrified), Some(temporary)) = (
+            self.heating_pressure.as_deref(),
+            self.heating_pulse_group_indexes.as_deref(),
+            self.heating_electrified.as_deref(),
+            self.heating_temporary_electrified.as_deref(),
+        ) else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating sparse fields do not match the inner-version-227 gate",
+            ));
+        };
+        ensure_sparse_length(pressure, count, cell, "heating pressure")?;
+        ensure_sparse_length(indexes, count, cell, "heating pulse-group indexes")?;
+        ensure_sparse_length(electrified, count, cell, "heating electrification")?;
+        ensure_sparse_length(temporary, count, cell, "temporary heating electrification")?;
+        Ok(())
+    }
+
     /// Returns the full primary 65,536-cell conductivity plane.
     pub fn conductivity(&self) -> &[u8] {
         &self.conductivity
@@ -574,6 +708,186 @@ impl WaterManagerData {
             conductivity,
             "water conductivity",
         )
+    }
+
+    /// Adds an active primary conductive cell and inserts all its sparse
+    /// fields in ascending cell-index order.
+    ///
+    /// The conductivity value must be nonzero, and `pollution` must match the
+    /// inner-version-23 gate. Existing sparse fields are shifted together.
+    /// The separate `conductive_cell_count` scalar is left unchanged because
+    /// the format does not establish that it equals the number of active
+    /// conductivity cells. Returns an error for an out-of-range or already-active
+    /// cell, a zero conductivity value, a mismatched version-gated pollution
+    /// value, or inconsistent sparse columns; errors leave the editor unchanged.
+    pub fn insert_conductive_cell(
+        &mut self,
+        cell: usize,
+        state: WaterConductiveCellData,
+    ) -> Result<(), CrpError> {
+        if state.conductivity == 0 {
+            return Err(invalid_cell_grid(
+                cell,
+                "inserted water conductivity must be nonzero",
+            ));
+        }
+        if state.pollution.is_some() != (self.format_version >= POLLUTION_VERSION) {
+            return Err(invalid_cell_grid(
+                cell,
+                "conductive pollution value does not match the inner-version-23 gate",
+            ));
+        }
+        self.validate_primary_sparse_lengths()?;
+        let Some(current) = self.conductivity.get(cell) else {
+            return Err(invalid_cell_grid(
+                cell,
+                "water conductivity cell index is outside the grid",
+            ));
+        };
+        let position = match self.conductive_cells.binary_search(&cell) {
+            Ok(_) => {
+                return Err(invalid_cell_grid(
+                    cell,
+                    "water conductivity cell is already active",
+                ));
+            }
+            Err(position) => position,
+        };
+        if *current != 0 {
+            return Err(invalid_cell_grid(
+                cell,
+                "water conductivity grid and sparse cell index are inconsistent",
+            ));
+        }
+
+        let Some(conductivity) = self.conductivity.get_mut(cell) else {
+            return Err(invalid_cell_grid(
+                cell,
+                "water conductivity cell index is outside the grid",
+            ));
+        };
+        *conductivity = state.conductivity;
+        self.conductive_cells.insert(position, cell);
+        self.water_pressure.insert(position, state.water_pressure);
+        self.sewage_pressure.insert(position, state.sewage_pressure);
+        self.water_pulse_group_indexes
+            .insert(position, state.water_pulse_group_index);
+        self.sewage_pulse_group_indexes
+            .insert(position, state.sewage_pulse_group_index);
+        self.water_electrified
+            .insert(position, state.water_electrified);
+        self.water_temporary_electrified
+            .insert(position, state.water_temporary_electrified);
+        self.sewage_electrified
+            .insert(position, state.sewage_electrified);
+        self.sewage_temporary_electrified
+            .insert(position, state.sewage_temporary_electrified);
+        if let (Some(values), Some(pollution)) =
+            (self.conductive_pollution.as_mut(), state.pollution)
+        {
+            values.insert(position, pollution);
+        }
+        Ok(())
+    }
+
+    /// Removes an active primary conductive cell and returns all of its
+    /// serialized sparse fields, including its conductivity value. Returns an
+    /// error if the cell is out of range or inactive, or if sparse columns are
+    /// inconsistent; errors leave the editor unchanged.
+    pub fn remove_conductive_cell(
+        &mut self,
+        cell: usize,
+    ) -> Result<WaterConductiveCellData, CrpError> {
+        self.validate_primary_sparse_lengths()?;
+        let Some(conductivity) = self.conductivity.get(cell).copied() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "water conductivity cell index is outside the grid",
+            ));
+        };
+        let position = sparse_cell_position(&self.conductive_cells, cell, "water conductivity")?;
+        if conductivity == 0 {
+            return Err(invalid_cell_grid(
+                cell,
+                "water conductivity grid and sparse cell index are inconsistent",
+            ));
+        }
+        let state = WaterConductiveCellData {
+            conductivity,
+            water_pressure: sparse_value(&self.water_pressure, position, cell, "water pressure")?,
+            sewage_pressure: sparse_value(
+                &self.sewage_pressure,
+                position,
+                cell,
+                "sewage pressure",
+            )?,
+            water_pulse_group_index: sparse_value(
+                &self.water_pulse_group_indexes,
+                position,
+                cell,
+                "water pulse-group index",
+            )?,
+            sewage_pulse_group_index: sparse_value(
+                &self.sewage_pulse_group_indexes,
+                position,
+                cell,
+                "sewage pulse-group index",
+            )?,
+            water_electrified: sparse_value(
+                &self.water_electrified,
+                position,
+                cell,
+                "water electrification",
+            )?,
+            water_temporary_electrified: sparse_value(
+                &self.water_temporary_electrified,
+                position,
+                cell,
+                "temporary water electrification",
+            )?,
+            sewage_electrified: sparse_value(
+                &self.sewage_electrified,
+                position,
+                cell,
+                "sewage electrification",
+            )?,
+            sewage_temporary_electrified: sparse_value(
+                &self.sewage_temporary_electrified,
+                position,
+                cell,
+                "temporary sewage electrification",
+            )?,
+            pollution: match self.conductive_pollution.as_deref() {
+                Some(values) => Some(sparse_value(
+                    values,
+                    position,
+                    cell,
+                    "conductive pollution",
+                )?),
+                None => None,
+            },
+        };
+
+        let Some(conductivity) = self.conductivity.get_mut(cell) else {
+            return Err(invalid_cell_grid(
+                cell,
+                "water conductivity cell index is outside the grid",
+            ));
+        };
+        *conductivity = 0;
+        self.conductive_cells.remove(position);
+        self.water_pressure.remove(position);
+        self.sewage_pressure.remove(position);
+        self.water_pulse_group_indexes.remove(position);
+        self.sewage_pulse_group_indexes.remove(position);
+        self.water_electrified.remove(position);
+        self.water_temporary_electrified.remove(position);
+        self.sewage_electrified.remove(position);
+        self.sewage_temporary_electrified.remove(position);
+        if let Some(values) = self.conductive_pollution.as_mut() {
+            values.remove(position);
+        }
+        Ok(state)
     }
 
     /// Returns indexes of cells with nonzero primary conductivity.
@@ -600,6 +914,172 @@ impl WaterManagerData {
             ));
         };
         set_conductivity_value(values, cell, conductivity, "heating conductivity")
+    }
+
+    /// Adds an active heating cell and inserts all its sparse fields in
+    /// ascending cell-index order. Available from inner version 227. Returns
+    /// an error for earlier versions, an out-of-range or already-active cell,
+    /// zero conductivity, or inconsistent sparse columns; errors leave the
+    /// editor unchanged.
+    pub fn insert_heating_cell(
+        &mut self,
+        cell: usize,
+        state: HeatingConductiveCellData,
+    ) -> Result<(), CrpError> {
+        if state.conductivity == 0 {
+            return Err(invalid_cell_grid(
+                cell,
+                "inserted heating conductivity must be nonzero",
+            ));
+        }
+        self.validate_heating_sparse_lengths(cell)?;
+        let Some(values) = self.conductivity_heating.as_mut() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity plane is absent before inner version 227",
+            ));
+        };
+        let Some(current) = values.get(cell) else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity cell index is outside the grid",
+            ));
+        };
+        let position = match self.heating_cells.binary_search(&cell) {
+            Ok(_) => {
+                return Err(invalid_cell_grid(
+                    cell,
+                    "heating conductivity cell is already active",
+                ));
+            }
+            Err(position) => position,
+        };
+        if *current != 0 {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity grid and sparse cell index are inconsistent",
+            ));
+        }
+        let (Some(pressure), Some(indexes), Some(electrified), Some(temporary)) = (
+            self.heating_pressure.as_mut(),
+            self.heating_pulse_group_indexes.as_mut(),
+            self.heating_electrified.as_mut(),
+            self.heating_temporary_electrified.as_mut(),
+        ) else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating sparse fields do not match the inner-version-227 gate",
+            ));
+        };
+        let Some(conductivity) = values.get_mut(cell) else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity cell index is outside the grid",
+            ));
+        };
+        *conductivity = state.conductivity;
+        self.heating_cells.insert(position, cell);
+        pressure.insert(position, state.pressure);
+        indexes.insert(position, state.pulse_group_index);
+        electrified.insert(position, state.electrified);
+        temporary.insert(position, state.temporary_electrified);
+        Ok(())
+    }
+
+    /// Removes an active heating cell and returns all of its serialized sparse
+    /// fields, including its conductivity value. Available from inner version
+    /// 227. Returns an error if the version is earlier or the cell is out of
+    /// range or inactive, or if sparse columns are inconsistent; errors leave
+    /// the editor unchanged.
+    pub fn remove_heating_cell(
+        &mut self,
+        cell: usize,
+    ) -> Result<HeatingConductiveCellData, CrpError> {
+        self.validate_heating_sparse_lengths(cell)?;
+        let Some(conductivity) = self
+            .conductivity_heating
+            .as_ref()
+            .and_then(|values| values.get(cell))
+            .copied()
+        else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity cell index is outside the grid or heating is unavailable",
+            ));
+        };
+        let position = sparse_cell_position(&self.heating_cells, cell, "heating conductivity")?;
+        if conductivity == 0 {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity grid and sparse cell index are inconsistent",
+            ));
+        }
+        let (
+            Some(pressure_values),
+            Some(index_values),
+            Some(electrified_values),
+            Some(temporary_values),
+        ) = (
+            self.heating_pressure.as_deref(),
+            self.heating_pulse_group_indexes.as_deref(),
+            self.heating_electrified.as_deref(),
+            self.heating_temporary_electrified.as_deref(),
+        )
+        else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating sparse fields do not match the inner-version-227 gate",
+            ));
+        };
+        let state = HeatingConductiveCellData {
+            conductivity,
+            pressure: sparse_value(pressure_values, position, cell, "heating pressure")?,
+            pulse_group_index: sparse_value(
+                index_values,
+                position,
+                cell,
+                "heating pulse-group index",
+            )?,
+            electrified: sparse_value(
+                electrified_values,
+                position,
+                cell,
+                "heating electrification",
+            )?,
+            temporary_electrified: sparse_value(
+                temporary_values,
+                position,
+                cell,
+                "temporary heating electrification",
+            )?,
+        };
+        let Some(values) = self.conductivity_heating.as_mut() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity plane is absent before inner version 227",
+            ));
+        };
+        let Some(conductivity) = values.get_mut(cell) else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity cell index is outside the grid",
+            ));
+        };
+        *conductivity = 0;
+        self.heating_cells.remove(position);
+        if let Some(values) = self.heating_pressure.as_mut() {
+            values.remove(position);
+        }
+        if let Some(values) = self.heating_pulse_group_indexes.as_mut() {
+            values.remove(position);
+        }
+        if let Some(values) = self.heating_electrified.as_mut() {
+            values.remove(position);
+        }
+        if let Some(values) = self.heating_temporary_electrified.as_mut() {
+            values.remove(position);
+        }
+        Ok(state)
     }
 
     /// Returns indexes of cells with nonzero secondary conductivity.
@@ -1505,14 +1985,14 @@ impl WaterManagerData {
         self.original_body.clone()
     }
 
-    /// Encodes edited pulse records, node pulse-group indexes and pressures,
-    /// collect-pressure arrays, counters, and the continuation flag while
-    /// preserving all unedited bytes, including conductivity grids, guide
-    /// references, and the closing profiler reference. Changed UShort arrays
-    /// use the canonical UShort encoding, changed Byte arrays use literal
-    /// blocks, and changed Bool arrays use bit-packed literal blocks. Any of
-    /// these can change body length. Returns an error if a captured field range
-    /// is invalid.
+    /// Encodes edited conductivity grids and their sparse cell fields, pulse
+    /// records, node arrays, collect-pressure arrays, counters, and the
+    /// continuation flag while preserving all other bytes, including guide
+    /// references and the closing profiler reference. Re-encoded UShort arrays
+    /// use the canonical UShort encoding, Byte arrays use literal blocks, and
+    /// Bool arrays use bit-packed literal blocks. Topology edits and changed
+    /// arrays can resize the body. Returns an error if a captured field range
+    /// or sparse-column length is invalid.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.original_body.clone();
         encode_pulse_groups(
@@ -2235,6 +2715,36 @@ fn sparse_cell_position(cells: &[usize], cell: usize, field: &str) -> Result<usi
     })
 }
 
+fn ensure_sparse_length<T>(
+    values: &[T],
+    expected: usize,
+    cell: usize,
+    field: &str,
+) -> Result<(), CrpError> {
+    if values.len() == expected {
+        Ok(())
+    } else {
+        Err(invalid_cell_grid(
+            cell,
+            &format!("{field} length does not match its conductivity grid"),
+        ))
+    }
+}
+
+fn sparse_value<T: Copy>(
+    values: &[T],
+    position: usize,
+    cell: usize,
+    field: &str,
+) -> Result<T, CrpError> {
+    values.get(position).copied().ok_or_else(|| {
+        invalid_cell_grid(
+            cell,
+            &format!("{field} values are shorter than the conductivity grid"),
+        )
+    })
+}
+
 fn set_sparse_bool_cell(
     values: &mut [bool],
     cells: &[usize],
@@ -2328,12 +2838,8 @@ fn changed_ushort_array(
     let original = original_values.ok_or_else(|| {
         invalid_node_array(offset, &format!("{field} original values are missing"))
     })?;
-    if original.len() != count {
-        return Err(invalid_node_array(
-            offset,
-            &format!("{field} original prefix has an invalid length"),
-        ));
-    }
+    // A changed conductivity topology can legitimately change a sparse
+    // column's current length from the captured source length.
     if current == original {
         return Ok(None);
     }
@@ -2355,12 +2861,6 @@ fn changed_signed_ushort_array(
     let original = original_values.ok_or_else(|| {
         invalid_cell_grid(offset, &format!("{field} original values are missing"))
     })?;
-    if original.len() != count {
-        return Err(invalid_cell_grid(
-            offset,
-            &format!("{field} original prefix has an invalid length"),
-        ));
-    }
     if current == original {
         return Ok(None);
     }
@@ -2383,12 +2883,6 @@ fn changed_byte_array(
     let original = original_values.ok_or_else(|| {
         invalid_node_array(offset, &format!("{field} original values are missing"))
     })?;
-    if original.len() != count {
-        return Err(invalid_node_array(
-            offset,
-            &format!("{field} original prefix has an invalid length"),
-        ));
-    }
     if current == original {
         return Ok(None);
     }
@@ -2410,12 +2904,6 @@ fn changed_bool_array(
     let original = original_values.ok_or_else(|| {
         invalid_collect_pressure(offset, &format!("{field} original values are missing"))
     })?;
-    if original.len() != count {
-        return Err(invalid_collect_pressure(
-            offset,
-            &format!("{field} original prefix has an invalid length"),
-        ));
-    }
     if current == original {
         return Ok(None);
     }
@@ -2715,9 +3203,9 @@ fn read_end_profiler_reference(reader: &mut Reader<'_>) -> Result<(), CrpError> 
 mod tests {
     use super::{
         CELL_COUNT, COLLECT_PRESSURE_FIELD_LEN, FULL_NODE_COUNT_VERSION, HEATING_VERSION,
-        LEGACY_NODE_COUNT, NODE_COUNT, POLLUTION_VERSION, PULSE_GROUP_CAPACITY,
-        PULSE_GROUP_RECORD_LEN, PULSE_UNIT_CAPACITY, PULSE_UNIT_RECORD_LEN, WaterManagerData,
-        WaterPulseGroup, WaterPulseUnit,
+        HeatingConductiveCellData, LEGACY_NODE_COUNT, NODE_COUNT, POLLUTION_VERSION,
+        PULSE_GROUP_CAPACITY, PULSE_GROUP_RECORD_LEN, PULSE_UNIT_CAPACITY, PULSE_UNIT_RECORD_LEN,
+        WaterConductiveCellData, WaterManagerData, WaterPulseGroup, WaterPulseUnit,
     };
 
     fn append_repeat_zeroes(output: &mut Vec<u8>, mut count: usize) {
@@ -2938,6 +3426,17 @@ mod tests {
         bytes
     }
 
+    fn expected_ushort_literal_array(values: &[u16]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for chunk in values.chunks(64) {
+            bytes.push((chunk.len() - 1) as u8);
+            for value in chunk {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        bytes
+    }
+
     fn expected_ushort_array_with_two_nonzero_values(
         count: usize,
         first: u16,
@@ -3084,6 +3583,315 @@ mod tests {
 
         let mut before_heating = WaterManagerData::decode(226, &empty_body(226)).unwrap();
         assert!(before_heating.set_heating_conductivity(0, 1).is_err());
+    }
+
+    #[test]
+    fn inserting_and_removing_primary_conductive_cell_keeps_all_sparse_fields_aligned() {
+        let body = active_body(265);
+        let mut data = WaterManagerData::decode(265, &body).unwrap();
+        let state = WaterConductiveCellData {
+            conductivity: 0x40,
+            water_pressure: -4,
+            sewage_pressure: -5,
+            water_pulse_group_index: 0x1234,
+            sewage_pulse_group_index: 0x2345,
+            water_electrified: false,
+            water_temporary_electrified: true,
+            sewage_electrified: true,
+            sewage_temporary_electrified: false,
+            pollution: Some(0xa5),
+        };
+        let mut conductivity = vec![0; CELL_COUNT];
+        conductivity[1] = state.conductivity;
+        conductivity[2] = 1;
+        let mut expected = body.clone();
+        let mut replacements = vec![
+            (
+                data.conductivity_snapshot.range,
+                expected_literal_byte_array(&conductivity),
+            ),
+            (
+                data.water_pressure_snapshot.range,
+                expected_ushort_literal_array(&[state.water_pressure as u16, (-2_i16) as u16]),
+            ),
+            (
+                data.sewage_pressure_snapshot.range,
+                expected_ushort_literal_array(&[state.sewage_pressure as u16, 3]),
+            ),
+            (
+                data.water_pulse_group_indexes_snapshot.range,
+                expected_ushort_literal_array(&[state.water_pulse_group_index, 5]),
+            ),
+            (
+                data.sewage_pulse_group_indexes_snapshot.range,
+                expected_ushort_literal_array(&[state.sewage_pulse_group_index, 6]),
+            ),
+            (data.water_electrified_snapshot.range, vec![0, 0b10]),
+            (
+                data.water_temporary_electrified_snapshot.range,
+                vec![0, 0b01],
+            ),
+            (data.sewage_electrified_snapshot.range, vec![0, 0b01]),
+            (
+                data.sewage_temporary_electrified_snapshot.range,
+                vec![0, 0b10],
+            ),
+            (
+                data.conductive_pollution_snapshot.as_ref().unwrap().range,
+                vec![1, 0xa5, 9],
+            ),
+        ];
+        data.insert_conductive_cell(1, state).unwrap();
+        assert_eq!(data.conductive_cells(), [1, 2]);
+        assert_eq!(data.conductive_cell_count(), 32);
+        replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in replacements.into_iter().rev() {
+            expected.splice(start..end, replacement);
+        }
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = WaterManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.conductive_cells(), [1, 2]);
+        assert_eq!(decoded.conductivity()[1], 0x40);
+        assert_eq!(decoded.water_pressure(), [-4, -2]);
+        assert_eq!(decoded.sewage_pressure(), [-5, 3]);
+        assert_eq!(decoded.water_pulse_group_indexes(), [0x1234, 5]);
+        assert_eq!(decoded.sewage_pulse_group_indexes(), [0x2345, 6]);
+        assert_eq!(decoded.water_electrified(), [false, true]);
+        assert_eq!(decoded.water_temporary_electrified(), [true, false]);
+        assert_eq!(decoded.sewage_electrified(), [true, false]);
+        assert_eq!(decoded.sewage_temporary_electrified(), [false, true]);
+        assert_eq!(decoded.conductive_pollution(), Some([0xa5, 9].as_slice()));
+
+        assert_eq!(data.remove_conductive_cell(1).unwrap(), state);
+        assert_eq!(data.conductive_cells(), [2]);
+        assert_eq!(data.encode().unwrap(), body);
+
+        let last_cell = WaterConductiveCellData {
+            conductivity: 1,
+            water_pressure: -2,
+            sewage_pressure: 3,
+            water_pulse_group_index: 5,
+            sewage_pulse_group_index: 6,
+            water_electrified: true,
+            water_temporary_electrified: false,
+            sewage_electrified: false,
+            sewage_temporary_electrified: true,
+            pollution: Some(9),
+        };
+        assert_eq!(data.remove_conductive_cell(2).unwrap(), last_cell);
+        let mut empty_expected = body.clone();
+        let mut empty_replacements = vec![
+            (
+                data.conductivity_snapshot.range,
+                expected_literal_byte_array(&vec![0; CELL_COUNT]),
+            ),
+            (data.water_pressure_snapshot.range, vec![]),
+            (data.sewage_pressure_snapshot.range, vec![]),
+            (data.water_pulse_group_indexes_snapshot.range, vec![]),
+            (data.sewage_pulse_group_indexes_snapshot.range, vec![]),
+            (data.water_electrified_snapshot.range, vec![]),
+            (data.water_temporary_electrified_snapshot.range, vec![]),
+            (data.sewage_electrified_snapshot.range, vec![]),
+            (data.sewage_temporary_electrified_snapshot.range, vec![]),
+            (
+                data.conductive_pollution_snapshot.as_ref().unwrap().range,
+                vec![],
+            ),
+        ];
+        empty_replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in empty_replacements.into_iter().rev() {
+            empty_expected.splice(start..end, replacement);
+        }
+        assert_eq!(data.encode().unwrap(), empty_expected);
+        let empty = WaterManagerData::decode(265, &empty_expected).unwrap();
+        assert!(empty.conductive_cells().is_empty());
+        assert!(empty.water_pressure().is_empty());
+        assert!(empty.conductive_pollution().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inserting_and_removing_heating_cell_keeps_heating_sparse_fields_aligned() {
+        let body = active_body(227);
+        let mut data = WaterManagerData::decode(227, &body).unwrap();
+        let state = HeatingConductiveCellData {
+            conductivity: 0x66,
+            pressure: -11,
+            pulse_group_index: 0x9876,
+            electrified: false,
+            temporary_electrified: true,
+        };
+        let mut conductivity = vec![0; CELL_COUNT];
+        conductivity[3] = state.conductivity;
+        conductivity[4] = 1;
+        let mut expected = body.clone();
+        let mut replacements = vec![
+            (
+                data.conductivity_heating_snapshot.as_ref().unwrap().range,
+                expected_literal_byte_array(&conductivity),
+            ),
+            (
+                data.heating_pressure_snapshot.as_ref().unwrap().range,
+                expected_ushort_literal_array(&[state.pressure as u16, 4]),
+            ),
+            (
+                data.heating_pulse_group_indexes_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range,
+                expected_ushort_literal_array(&[state.pulse_group_index, 7]),
+            ),
+            (
+                data.heating_electrified_snapshot.as_ref().unwrap().range,
+                vec![0, 0b10],
+            ),
+            (
+                data.heating_temporary_electrified_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range,
+                vec![0, 0b01],
+            ),
+        ];
+        data.insert_heating_cell(3, state).unwrap();
+        assert_eq!(data.heating_cells(), [3, 4]);
+        replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in replacements.into_iter().rev() {
+            expected.splice(start..end, replacement);
+        }
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = WaterManagerData::decode(227, &encoded).unwrap();
+        assert_eq!(decoded.heating_cells(), [3, 4]);
+        assert_eq!(decoded.conductivity_heating().unwrap()[3], 0x66);
+        assert_eq!(decoded.heating_pressure(), Some([-11, 4].as_slice()));
+        assert_eq!(
+            decoded.heating_pulse_group_indexes(),
+            Some([0x9876, 7].as_slice())
+        );
+        assert_eq!(
+            decoded.heating_electrified(),
+            Some([false, true].as_slice())
+        );
+        assert_eq!(
+            decoded.heating_temporary_electrified(),
+            Some([true, false].as_slice())
+        );
+
+        assert_eq!(data.remove_heating_cell(3).unwrap(), state);
+        assert_eq!(data.heating_cells(), [4]);
+        assert_eq!(data.encode().unwrap(), body);
+        let last_cell = HeatingConductiveCellData {
+            conductivity: 1,
+            pressure: 4,
+            pulse_group_index: 7,
+            electrified: true,
+            temporary_electrified: false,
+        };
+        assert_eq!(data.remove_heating_cell(4).unwrap(), last_cell);
+        let mut empty_expected = body.clone();
+        let mut empty_replacements = vec![
+            (
+                data.conductivity_heating_snapshot.as_ref().unwrap().range,
+                expected_literal_byte_array(&vec![0; CELL_COUNT]),
+            ),
+            (
+                data.heating_pressure_snapshot.as_ref().unwrap().range,
+                vec![],
+            ),
+            (
+                data.heating_pulse_group_indexes_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range,
+                vec![],
+            ),
+            (
+                data.heating_electrified_snapshot.as_ref().unwrap().range,
+                vec![],
+            ),
+            (
+                data.heating_temporary_electrified_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range,
+                vec![],
+            ),
+        ];
+        empty_replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in empty_replacements.into_iter().rev() {
+            empty_expected.splice(start..end, replacement);
+        }
+        assert_eq!(data.encode().unwrap(), empty_expected);
+        let empty = WaterManagerData::decode(227, &empty_expected).unwrap();
+        assert!(empty.heating_cells().is_empty());
+        assert!(empty.heating_pressure().unwrap().is_empty());
+        let mut before_heating = WaterManagerData::decode(226, &empty_body(226)).unwrap();
+        assert!(before_heating.insert_heating_cell(0, state).is_err());
+    }
+
+    #[test]
+    fn primary_topology_edits_enforce_pollution_gate_and_active_state() {
+        let body_without_pollution = empty_body(22);
+        let mut before_pollution = WaterManagerData::decode(22, &body_without_pollution).unwrap();
+        let state = WaterConductiveCellData {
+            conductivity: 1,
+            water_pressure: 0,
+            sewage_pressure: 0,
+            water_pulse_group_index: 0,
+            sewage_pulse_group_index: 0,
+            water_electrified: false,
+            water_temporary_electrified: false,
+            sewage_electrified: false,
+            sewage_temporary_electrified: false,
+            pollution: None,
+        };
+        before_pollution.insert_conductive_cell(0, state).unwrap();
+        assert_eq!(before_pollution.conductive_cells(), [0]);
+        assert_eq!(before_pollution.conductive_pollution(), None);
+        assert_eq!(
+            WaterManagerData::decode(22, &before_pollution.encode().unwrap())
+                .unwrap()
+                .conductive_cells(),
+            [0]
+        );
+        assert_eq!(before_pollution.remove_conductive_cell(0).unwrap(), state);
+        assert_eq!(before_pollution.encode().unwrap(), body_without_pollution);
+        assert!(before_pollution.remove_conductive_cell(0).is_err());
+
+        let mut version_23 = WaterManagerData::decode(23, &empty_body(23)).unwrap();
+        assert!(version_23.insert_conductive_cell(0, state).is_err());
+        assert!(version_23.conductive_cells().is_empty());
+        let invalid_zero = WaterConductiveCellData {
+            conductivity: 0,
+            pollution: Some(0),
+            ..state
+        };
+        assert!(version_23.insert_conductive_cell(0, invalid_zero).is_err());
+        assert!(version_23.conductive_cells().is_empty());
+        let state_with_pollution = WaterConductiveCellData {
+            pollution: Some(0x7f),
+            ..state
+        };
+        version_23
+            .insert_conductive_cell(0, state_with_pollution)
+            .unwrap();
+        assert!(
+            version_23
+                .insert_conductive_cell(0, state_with_pollution)
+                .is_err()
+        );
+        assert!(
+            version_23
+                .insert_conductive_cell(CELL_COUNT, state_with_pollution)
+                .is_err()
+        );
+        assert!(version_23.remove_conductive_cell(1).is_err());
+        assert_eq!(version_23.conductive_cells(), [0]);
+        let decoded = WaterManagerData::decode(23, &version_23.encode().unwrap()).unwrap();
+        assert_eq!(decoded.conductive_cells(), [0]);
+        assert_eq!(decoded.conductive_pollution(), Some([0x7f].as_slice()));
+        assert!(version_23.remove_conductive_cell(CELL_COUNT).is_err());
     }
 
     #[test]

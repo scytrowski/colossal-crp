@@ -142,7 +142,10 @@ pub use vehicle_manager_data::{
     VehicleManagerSparseFieldsPrefix, VehicleManagerTailDataPrefix, VehicleParkedInstanceRecord,
     VehicleParkedRecordsPrefix, VehicleTargetPosition0,
 };
-pub use water_manager_data::{WaterManagerData, WaterPulseGroup, WaterPulseUnit};
+pub use water_manager_data::{
+    HeatingConductiveCellData, WaterConductiveCellData, WaterManagerData, WaterPulseGroup,
+    WaterPulseUnit,
+};
 pub use water_simulation_data::{
     WaterSimulationData, WaterSimulationEditor, WaterSource, WaterWave,
 };

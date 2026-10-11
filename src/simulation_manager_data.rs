@@ -2507,10 +2507,10 @@ impl SimulationManagerData {
         WaterManagerData::decode(self.format_version, bytes)
     }
 
-    /// Replaces edited WaterManager counters, pulse records, node-pressure
-    /// arrays, and versioned collect-pressure arrays. The body can change
-    /// length when a pressure array is re-encoded; other manager bytes and the
-    /// ZoneManager boundary are retained and checked.
+    /// Replaces edited WaterManager counters, conductive-cell fields, pulse
+    /// records, node-pressure arrays, and versioned collect-pressure arrays.
+    /// The body can change length when arrays are re-encoded; other manager
+    /// bytes and the ZoneManager boundary are retained and checked.
     pub fn replace_water_manager_data(
         &mut self,
         edited: &WaterManagerData,
@@ -12636,7 +12636,7 @@ mod manager_boundary_tests {
     use crate::net_manager_data::NetObjectHeader;
     use crate::{
         GuideInstanceBody, GuideTriggerBasePrefix, Package, SimulationMetaData, StatisticInt32Data,
-        StatisticInt64Data,
+        StatisticInt64Data, WaterConductiveCellData,
     };
     use std::fs::{self, File};
     use std::path::PathBuf;
@@ -14385,6 +14385,62 @@ mod manager_boundary_tests {
         manager.format_version += 1;
         assert!(manager.replace_water_manager_data(&edited).is_err());
         assert_eq!(manager.serialized_object_graph, replaced_graph);
+    }
+
+    #[test]
+    fn water_manager_topology_edit_resizes_body_and_preserves_zone_manager() {
+        let mut manager =
+            water_manager_with_next("ZoneManager+Data, Assembly-CSharp", "ZoneManager");
+        let original_graph = manager.serialized_object_graph.clone();
+        let mut edited = manager.decode_water_manager_data().unwrap();
+        edited
+            .insert_conductive_cell(
+                1,
+                WaterConductiveCellData {
+                    conductivity: 0x22,
+                    water_pressure: -3,
+                    sewage_pressure: 4,
+                    water_pulse_group_index: 0x1111,
+                    sewage_pulse_group_index: 0x2222,
+                    water_electrified: true,
+                    water_temporary_electrified: false,
+                    sewage_electrified: false,
+                    sewage_temporary_electrified: true,
+                    pollution: Some(0x33),
+                },
+            )
+            .unwrap();
+        let expected_body = edited.encode().unwrap();
+        assert_ne!(expected_body.len(), edited.encode_unchanged().len());
+
+        let next_tag = profiler_tag("ZoneManager");
+        let old_next_start = original_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        manager.replace_water_manager_data(&edited).unwrap();
+        let new_next_start = manager
+            .serialized_object_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        let body_start = profiler_tag("WaterManager").len();
+        assert!(new_next_start > old_next_start);
+        assert_eq!(
+            &manager.serialized_object_graph[body_start..new_next_start],
+            expected_body
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[new_next_start..],
+            &original_graph[old_next_start..]
+        );
+        let decoded = manager.decode_water_manager_data().unwrap();
+        assert_eq!(decoded.conductive_cells(), [1]);
+        assert_eq!(decoded.water_pressure(), [-3]);
+        assert_eq!(decoded.sewage_pressure(), [4]);
+        assert_eq!(decoded.water_pulse_group_indexes(), [0x1111]);
+        assert_eq!(decoded.sewage_pulse_group_indexes(), [0x2222]);
+        assert_eq!(decoded.conductive_pollution(), Some([0x33].as_slice()));
     }
 
     #[test]
