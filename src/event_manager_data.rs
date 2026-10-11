@@ -80,8 +80,8 @@ pub struct EventManagerTypeData {
 /// One schedule attached to an active EventManager route.
 ///
 /// Fields gated by inner version 121027 are `None` in earlier layouts. Names
-/// retain their source compact or wide encoding when edited through the route
-/// editor; changing a name must keep its serialized width and nullness.
+/// retain their source compact or wide encoding when possible and may change
+/// nullness or width through the route editor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerRouteSchedule {
     /// Schedule identifier serialized from inner version 121027.
@@ -206,10 +206,11 @@ pub struct EventManagerEventRecordsEditor {
 
 /// Editor for existing EventManager routes and their schedules.
 ///
-/// It changes only same-width scalar values for inner versions 121005–121030.
-/// Route count, slot indexes, flags, schedule counts, name nullness, and each
-/// schedule-name byte width are fixed. Schedule prefab indexes and other body
-/// bytes are preserved raw.
+/// It edits route scalar values and schedule names for inner versions
+/// 121005–121030. Route count, slot indexes, flags, and schedule counts are
+/// fixed. Schedule names keep their source compact or wide encoding when
+/// possible and can resize the manager body. Schedule prefab indexes and other
+/// body bytes are preserved raw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerRouteRecordsEditor {
     original: EventManagerReferenceData,
@@ -771,6 +772,7 @@ impl EventManagerRouteRecordsEditor {
             ));
         }
         let mut output = self.original.serialized_body.clone();
+        let mut edits = Vec::with_capacity(self.routes.len());
         for (((route, original_route), range), (name_ranges, compact_modes)) in self
             .routes
             .iter()
@@ -808,18 +810,10 @@ impl EventManagerRouteRecordsEditor {
                 &self.original.serialized_body,
                 range.start,
             )?;
-            if encoded.len() != range.len() {
-                return Err(invalid_event_route(
-                    range.start,
-                    "EventManager route edit changed its serialized width",
-                ));
-            }
-            output
-                .get_mut(range.clone())
-                .ok_or_else(|| {
-                    invalid_event_route(range.start, "EventManager route range exceeds body")
-                })?
-                .copy_from_slice(&encoded);
+            edits.push((range.clone(), encoded));
+        }
+        for (range, encoded) in edits.into_iter().rev() {
+            output.splice(range, encoded).for_each(drop);
         }
         Ok(output)
     }
@@ -911,12 +905,11 @@ fn encode_event_route(
             "route schedules are unavailable before version 121015",
         ));
     }
-    for (schedule_index, ((schedule, original_schedule), (name_range, compact_mode))) in route
+    for ((schedule, original_schedule), (name_range, compact_mode)) in route
         .schedules
         .iter()
         .zip(&original_route.schedules)
         .zip(name_ranges.iter().zip(compact_modes))
-        .enumerate()
     {
         let schedule_offset = name_range.start;
         match (format_version >= 121_027, schedule.schedule_id) {
@@ -944,35 +937,17 @@ fn encode_event_route(
             })?;
             output.extend_from_slice(raw_name);
         } else {
-            match (&original_schedule.name, &schedule.name, compact_mode) {
-                (Some(_), Some(name), Some(compact)) => {
-                    let name_start = output.len();
-                    write_unique_string_with_mode(&mut output, name, *compact)?;
-                    if output.len() - name_start != name_range.len() {
-                        return Err(invalid_event_route(
-                            schedule_offset,
-                            format!(
-                                "edited schedule name at route schedule {} changes its serialized width",
-                                schedule_index + 1
-                            ),
-                        ));
-                    }
+            match (&schedule.name, compact_mode) {
+                (None, _) => output.push(0xff),
+                (Some(name), Some(true))
+                    if name.chars().all(|character| u32::from(character) < 256) =>
+                {
+                    write_unique_string_with_mode(&mut output, name, true)?;
                 }
-                (None, None, None) => {
-                    let raw_name = source_body.get(name_range.clone()).ok_or_else(|| {
-                        invalid_event_route(
-                            schedule_offset,
-                            "null route schedule name exceeds source body",
-                        )
-                    })?;
-                    output.extend_from_slice(raw_name);
+                (Some(name), Some(false)) => {
+                    write_unique_string_with_mode(&mut output, name, false)?;
                 }
-                _ => {
-                    return Err(invalid_event_route(
-                        schedule_offset,
-                        "route schedule name nullness or source encoding cannot change",
-                    ));
-                }
+                (Some(name), _) => write_unique_string(&mut output, name)?,
             }
         }
         match (

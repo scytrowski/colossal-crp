@@ -2182,8 +2182,8 @@ impl SimulationManagerData {
     /// values are exposed when present. From version 120004 through 121005,
     /// nested race-event data follows unconditionally. From version 121006,
     /// the source bool and optional nested data are preserved. Legacy route
-    /// splines remain raw, while active event routes have a separate fixed-width
-    /// editor.
+    /// splines remain raw, while active event routes have a separate editor
+    /// for their fields and schedule names.
     /// Active records from version 121031 onward are rejected. The bounded
     /// manager body must match one unambiguous reader/writer candidate.
     pub fn decode_event_manager_event_records(
@@ -2307,9 +2307,11 @@ impl SimulationManagerData {
     /// Replaces existing EventManager route and schedule values in place.
     ///
     /// The editor must match this stream's version and exact source body.
-    /// Route count, slot indexes, activity flags, schedule counts, schedule
-    /// name nullness, name encodings, and serialized widths remain fixed. The
-    /// separate schedule-prefab scope and all surrounding bytes are preserved.
+    /// Route count, slot indexes, activity flags, and schedule counts remain
+    /// fixed. Schedule names preserve their source encoding when possible and
+    /// may resize the route records and manager body. A compact name switches
+    /// to wide encoding when its new value cannot fit compact form. The
+    /// separate schedule-prefab scope and other bytes are preserved.
     pub fn replace_event_manager_route_records(
         &mut self,
         edited: &EventManagerRouteRecordsEditor,
@@ -2333,31 +2335,31 @@ impl SimulationManagerData {
             ));
         }
         let replacement = edited.encode()?;
-        if replacement.len() != edited.original_body_bytes().len() {
+        let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
+        let original_body_end = body_start
+            .checked_add(edited.original_body_bytes().len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EventManager original route body end",
+            ))?;
+        if original_body_end != next_tag_start {
             return Err(invalid(
-                0,
-                "EventManager route edits must preserve the manager body length",
+                body_start,
+                "EventManager route source body does not reach the expected boundary",
             ));
         }
-        let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
-        let body_end =
+        let replacement_end =
             body_start
                 .checked_add(replacement.len())
                 .ok_or(CrpError::ArithmeticOverflow(
                     "EventManager route replacement end",
                 ))?;
-        if body_end != next_tag_start {
-            return Err(invalid(
-                body_start,
-                "EventManager route replacement does not reach the expected boundary",
-            ));
-        }
         let original = self
             .serialized_object_graph
-            .get(body_start..body_end)
+            .get(body_start..original_body_end)
             .ok_or_else(|| invalid(body_start, "EventManager source body exceeds graph"))?
             .to_vec();
-        self.serialized_object_graph[body_start..body_end].copy_from_slice(&replacement);
+        self.serialized_object_graph
+            .splice(body_start..original_body_end, replacement.iter().copied());
         let validation = self
             .decode_event_manager_reference_data_at(slot)
             .and_then(|decoded| {
@@ -2372,7 +2374,8 @@ impl SimulationManagerData {
                 Ok(())
             });
         if let Err(error) = validation {
-            self.serialized_object_graph[body_start..body_end].copy_from_slice(&original);
+            self.serialized_object_graph
+                .splice(body_start..replacement_end, original);
             return Err(invalid(
                 body_start,
                 format!("rewritten EventManager body failed validation: {error}"),
@@ -14700,7 +14703,7 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn event_manager_route_editor_changes_fixed_width_values_and_preserves_scope() {
+    fn event_manager_route_editor_changes_values_resizes_names_and_preserves_scope() {
         let version = 121_030;
         let mut body = vec![
             0x00, 0x00, // One event slot, no active events.
@@ -14773,28 +14776,12 @@ mod manager_boundary_tests {
         editor.routes_mut()[0].schedules[0].tier = 99;
         editor.routes_mut()[0].schedules[0].lap_count = 0xabcd;
         editor.routes_mut()[0].schedules[0].ticket_price = 0x1234;
-        editor.routes_mut()[0].schedules[0].name = Some("B".to_owned());
+        editor.routes_mut()[0].schedules[0].name = Some("Bigger".to_owned());
         editor.routes_mut()[0].schedules[0].flags = Some(0x4321);
         editor.routes_mut()[0].schedules[0].frequency = Some(0x55);
         editor.routes_mut()[0].schedules[0].start_day = Some(0x66);
         editor.routes_mut()[0].schedules[0].start_month = Some(0x77);
 
-        let mut invalid_editor = editor.clone();
-        invalid_editor.routes_mut()[0].schedules[0].name = Some("BB".to_owned());
-        assert!(
-            manager
-                .replace_event_manager_route_records(&invalid_editor)
-                .is_err()
-        );
-        assert_eq!(manager.serialized_object_graph(), original_graph);
-        let mut invalid_editor = editor.clone();
-        invalid_editor.routes_mut()[0].schedules[0].name = None;
-        assert!(
-            manager
-                .replace_event_manager_route_records(&invalid_editor)
-                .is_err()
-        );
-        assert_eq!(manager.serialized_object_graph(), original_graph);
         let mut invalid_editor = editor.clone();
         invalid_editor.routes_mut()[0]
             .schedules
@@ -14829,12 +14816,13 @@ mod manager_boundary_tests {
             0x00, 0x63, // Tier.
             0xab, 0xcd, // Laps.
             0x12, 0x34, // Ticket price.
-            0x80, 0x00, 0x01, 0xc2, // Compact name "B".
+            0x80, 0x00, 0x06, 0xc2, 0x27, 0xfe, 0x00, 0xfe, 0x0d, // Compact name "Bigger".
             0x43, 0x21, // Schedule flags.
             0x55, 0x66, 0x77, // Frequency, start day, start month.
         ];
         assert_eq!(
-            &manager.serialized_object_graph()[body_start + route_start..body_start + route_end],
+            &manager.serialized_object_graph()
+                [body_start + route_start..body_start + route_start + expected_route.len()],
             expected_route
         );
         assert_eq!(
@@ -14842,7 +14830,8 @@ mod manager_boundary_tests {
             &body[..route_start]
         );
         assert_eq!(
-            &manager.serialized_object_graph()[body_start + route_end..body_start + body.len()],
+            &manager.serialized_object_graph()
+                [body_start + route_start + expected_route.len()..body_start + body.len() + 5],
             &body[route_end..]
         );
         assert_eq!(
@@ -14859,6 +14848,56 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph(), rewritten_graph);
+        let mut wide_fallback_editor = manager.decode_event_manager_route_records().unwrap();
+        wide_fallback_editor.routes_mut()[0].schedules[0].name = Some("Ā".to_owned());
+        let old_end = manager.manager_body_boundary(0).unwrap().1;
+        let trailing_bytes = manager.serialized_object_graph()[old_end..].to_vec();
+        manager
+            .replace_event_manager_route_records(&wide_fallback_editor)
+            .unwrap();
+        let fallback_end = manager.manager_body_boundary(0).unwrap().1;
+        assert_eq!(old_end - fallback_end, 4);
+        assert_eq!(
+            &manager.serialized_object_graph()
+                [body_start + route_start + 43..body_start + route_start + 48],
+            [0x00, 0x00, 0x01, 0x00, 0x80]
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[fallback_end..],
+            trailing_bytes
+        );
+        assert_eq!(
+            manager
+                .decode_event_manager_route_records()
+                .unwrap()
+                .routes()[0]
+                .schedules[0]
+                .name
+                .as_deref(),
+            Some("Ā")
+        );
+        let mut shrink_editor = manager.decode_event_manager_route_records().unwrap();
+        shrink_editor.routes_mut()[0].schedules[0].name = None;
+        let wide_end = manager.manager_body_boundary(0).unwrap().1;
+        let trailing_bytes = manager.serialized_object_graph()[wide_end..].to_vec();
+        manager
+            .replace_event_manager_route_records(&shrink_editor)
+            .unwrap();
+        let new_end = manager.manager_body_boundary(0).unwrap().1;
+        assert_eq!(wide_end - new_end, 4);
+        assert_eq!(
+            &manager.serialized_object_graph()[new_end..],
+            trailing_bytes
+        );
+        assert_eq!(
+            manager
+                .decode_event_manager_route_records()
+                .unwrap()
+                .routes()[0]
+                .schedules[0]
+                .name,
+            None
+        );
         manager.format_version = 121_031;
         assert!(manager.decode_event_manager_route_records().is_err());
     }
@@ -14878,7 +14917,6 @@ mod manager_boundary_tests {
         body.extend_from_slice(&[0; 6]); // Tier, laps, and ticket price.
         body.extend_from_slice(&[0x00, 0x00, 0x01, 0xff, 0xc1]); // Wide name "A".
         body.extend_from_slice(&[0; 2 + 3]); // Schedule flags and remaining bytes.
-        let route_end = body.len();
         body.extend_from_slice(&[0; 4]); // Empty milestones and event-prefab scope.
         write_encoded_ushort_array(&mut body, &[0]);
         body.extend_from_slice(&[0; 2]); // Empty schedule-prefab name table.
@@ -14889,7 +14927,7 @@ mod manager_boundary_tests {
         let (mut manager, body_start) = manager_with_event_manager_body(version, &body);
         let mut editor = manager.decode_event_manager_route_records().unwrap();
         assert_eq!(editor.routes()[0].schedules[0].name.as_deref(), Some("A"));
-        editor.routes_mut()[0].schedules[0].name = Some("B".to_owned());
+        editor.routes_mut()[0].schedules[0].name = Some("Longer".to_owned());
         manager
             .replace_event_manager_route_records(&editor)
             .unwrap();
@@ -14901,11 +14939,13 @@ mod manager_boundary_tests {
             1, // Schedule count.
             0, 0, 0, 0, // Schedule ID.
             0, 0, 0, 0, 0, 0, // Tier, laps, price.
-            0x00, 0x00, 0x01, 0xff, 0xc2, // Wide name "B".
+            0x00, 0x00, 0x06, 0xff, 0xcc, 0x00, 0x23, 0xff, 0xff, 0xff, 0xf9, 0xff, 0xfe, 0x00,
+            0x0d, // Wide name "Longer".
             0, 0, 0, 0, 0, // Schedule fields.
         ];
         assert_eq!(
-            &manager.serialized_object_graph()[body_start + route_start..body_start + route_end],
+            &manager.serialized_object_graph()
+                [body_start + route_start..body_start + route_start + expected_route.len()],
             expected_route
         );
         assert_eq!(
@@ -14916,7 +14956,7 @@ mod manager_boundary_tests {
                 .schedules[0]
                 .name
                 .as_deref(),
-            Some("B")
+            Some("Longer")
         );
     }
 
