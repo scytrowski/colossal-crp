@@ -44,7 +44,7 @@ use crate::encoded_array::{
     EncodedLongArrayReader, read_encoded_byte_array, read_encoded_float_array,
     read_encoded_uint_array, read_encoded_ushort_array, skip_encoded_ushort_array,
     write_encoded_byte_array, write_encoded_float_array, write_encoded_long_array,
-    write_encoded_ushort_array,
+    write_encoded_uint_array_runs, write_encoded_ushort_array,
 };
 use crate::event_manager_data::{
     EventManagerEventRecordsEditor, EventManagerPrefabIndicesEditor, EventManagerReferenceData,
@@ -107,6 +107,7 @@ const MAX_SHARED_TYPES: usize = 65_024;
 const LOADING_PROFILER_END_TAG_BYTES: usize = 2;
 const MAX_TRAILING_HEADER_CANDIDATES: usize = 64;
 const TRANSPORT_MANAGER_SLOT: usize = 18;
+const TRANSPORT_MANAGER_LINE_FLAG_COUNT: usize = 255;
 const ECONOMY_INVESTMENT_FLAG_COUNT: usize = 254;
 const ECONOMY_MANAGER_LOAN_COUNT: usize = 3;
 const ECONOMY_MANAGER_CASH_VALUE_COUNT: usize = 4;
@@ -1476,11 +1477,13 @@ impl TransportManagerActiveLineEditor<'_> {
 ///
 /// Fields are exposed only where their inner DataSerializer version gates
 /// apply. Original bytes are retained for unchanged writing; semantic edits
-/// support active-line prefab indexes, version-gated active-line fields, shared
-/// line numbers, and passenger counters.
+/// support raw line flags that preserve slot activity, active-line prefab
+/// indexes, version-gated active-line fields, shared line numbers, and
+/// passenger counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerLineData {
     format_version: u32,
+    line_flags: Vec<u32>,
     active_line_prefab_indices: Vec<u16>,
     line_numbers: Option<Vec<u16>>,
     active_lines: Vec<TransportManagerLineRecord>,
@@ -1488,6 +1491,8 @@ pub struct TransportManagerLineData {
     serialized_line_numbers: Vec<u8>,
     serialized_global_passengers: Vec<u8>,
     serialized_body: Vec<u8>,
+    original_line_flags: Vec<u32>,
+    line_flags_range: Range<usize>,
     original_prefab_indices: Vec<u16>,
     prefab_index_range: Range<usize>,
     line_number_range: Option<Range<usize>>,
@@ -1498,6 +1503,11 @@ impl TransportManagerLineData {
     /// Returns the inner DataSerializer version.
     pub fn format_version(&self) -> u32 {
         self.format_version
+    }
+
+    /// Returns all 255 raw line flags in serialized slot order.
+    pub fn line_flags(&self) -> &[u32] {
+        &self.line_flags
     }
 
     /// Returns the version-gated shared line-number table.
@@ -1534,6 +1544,7 @@ impl TransportManagerLineData {
     pub fn into_editor(self) -> TransportManagerLineDataEditor {
         TransportManagerLineDataEditor {
             format_version: self.format_version,
+            line_flags: self.line_flags,
             active_line_prefab_indices: self.active_line_prefab_indices,
             line_numbers: self.line_numbers.clone(),
             original_line_numbers: self.line_numbers,
@@ -1541,6 +1552,8 @@ impl TransportManagerLineData {
             global_passengers: self.global_passengers.clone(),
             original_global_passengers: self.global_passengers,
             original_body: self.serialized_body,
+            original_line_flags: self.original_line_flags,
+            line_flags_range: self.line_flags_range,
             original_prefab_indices: self.original_prefab_indices,
             prefab_index_range: self.prefab_index_range,
             line_number_range: self.line_number_range,
@@ -1549,15 +1562,18 @@ impl TransportManagerLineData {
     }
 }
 
-/// Editor for TransportManager active-line prefab, line, and passenger data.
+/// Editor for TransportManager line flags, active-line prefab, line, and
+/// passenger data.
 ///
-/// This retains the original bounded manager body. Prefab-index edits and
-/// legacy vehicle names may resize serialized sections; line and passenger
-/// table counts remain fixed. Passenger counts must fit in the serialized
-/// 24-bit fields.
+/// This retains the original bounded manager body. Flag edits must preserve
+/// whether each line slot is active. Flag and prefab-index edits and legacy
+/// vehicle names may resize serialized sections; line and passenger table
+/// counts remain fixed. Passenger counts must fit in the serialized 24-bit
+/// fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerLineDataEditor {
     format_version: u32,
+    line_flags: Vec<u32>,
     active_line_prefab_indices: Vec<u16>,
     line_numbers: Option<Vec<u16>>,
     original_line_numbers: Option<Vec<u16>>,
@@ -1565,6 +1581,8 @@ pub struct TransportManagerLineDataEditor {
     global_passengers: Option<Vec<TransportPassengerRecord>>,
     original_global_passengers: Option<Vec<TransportPassengerRecord>>,
     original_body: Vec<u8>,
+    original_line_flags: Vec<u32>,
+    line_flags_range: Range<usize>,
     original_prefab_indices: Vec<u16>,
     prefab_index_range: Range<usize>,
     line_number_range: Option<Range<usize>>,
@@ -1575,6 +1593,36 @@ impl TransportManagerLineDataEditor {
     /// Returns the inner DataSerializer version.
     pub fn format_version(&self) -> u32 {
         self.format_version
+    }
+
+    /// Returns all 255 raw line flags in serialized slot order.
+    pub fn line_flags(&self) -> &[u32] {
+        &self.line_flags
+    }
+
+    /// Changes one raw flag without changing whether its slot has a line.
+    /// Flag bit meanings are not modeled.
+    pub fn set_line_flag(&mut self, line_slot: usize, value: u32) -> Result<(), CrpError> {
+        let original = self.original_line_flags.get(line_slot).ok_or_else(|| {
+            invalid(
+                line_slot,
+                "TransportManager line-flag slot is out of bounds",
+            )
+        })?;
+        if (*original == 0) != (value == 0) {
+            return Err(invalid(
+                line_slot,
+                "TransportManager line-flag edit cannot change the slot's active state",
+            ));
+        }
+        let flag = self.line_flags.get_mut(line_slot).ok_or_else(|| {
+            invalid(
+                line_slot,
+                "TransportManager line-flag slot is out of bounds",
+            )
+        })?;
+        *flag = value;
+        Ok(())
     }
 
     /// Returns the shared line numbers.
@@ -1648,18 +1696,29 @@ impl TransportManagerLineDataEditor {
         self.global_passengers.as_deref_mut()
     }
 
-    /// Writes the original bounded body with edited prefab indexes, line
-    /// records, line-number values, and passenger counters. Resized encoded
-    /// scopes and legacy vehicle names shift the
-    /// following bytes while preserving their contents, including the closing
-    /// profiler reference. Returns an error if an edit changes a table's
+    /// Writes the original bounded body with edited flags, prefab indexes,
+    /// line records, line-number values, and passenger counters. Resized
+    /// encoded scopes and legacy vehicle names shift following bytes while
+    /// preserving their contents, including the closing profiler reference.
+    /// Returns an error if an edit changes a line slot's active state or a table's
     /// length, changes passenger group counts, exceeds the 24-bit passenger
     /// limit, or would exceed the captured source ranges.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         if self.active_line_prefab_indices.len() != self.active_lines.len()
+            || self.line_flags.len() != TRANSPORT_MANAGER_LINE_FLAG_COUNT
+            || self.original_line_flags.len() != TRANSPORT_MANAGER_LINE_FLAG_COUNT
+            || self
+                .line_flags
+                .iter()
+                .zip(&self.original_line_flags)
+                .any(|(edited, original)| (*edited == 0) != (*original == 0))
+            || self.line_flags.iter().filter(|flag| **flag != 0).count() != self.active_lines.len()
+            || self.line_flags_range.start > self.line_flags_range.end
+            || self.line_flags_range.end > self.original_body.len()
             || self.original_prefab_indices.len() < self.active_line_prefab_indices.len()
             || self.prefab_index_range.start > self.prefab_index_range.end
             || self.prefab_index_range.end > self.original_body.len()
+            || self.line_flags_range.end > self.prefab_index_range.start
         {
             return Err(invalid(
                 0,
@@ -1845,6 +1904,11 @@ impl TransportManagerLineDataEditor {
             let mut encoded_prefab_indices = Vec::new();
             write_encoded_ushort_array(&mut encoded_prefab_indices, &prefab_indices);
             body.splice(self.prefab_index_range.clone(), encoded_prefab_indices);
+        }
+        if self.line_flags != self.original_line_flags {
+            let mut encoded_line_flags = Vec::new();
+            write_encoded_uint_array_runs(&mut encoded_line_flags, &self.line_flags);
+            body.splice(self.line_flags_range.clone(), encoded_line_flags);
         }
 
         Ok(body)
@@ -10968,8 +11032,8 @@ impl SimulationManagerData {
         Ok(self.decode_transport_manager_line_data()?.active_lines)
     }
 
-    /// Decodes active-line prefab indexes, line numbers, active-line records,
-    /// and global passenger data.
+    /// Decodes the raw line flags, active-line prefab indexes, line numbers,
+    /// active-line records, and global passenger data.
     ///
     /// The bounded manager body, including its reference tail and closing
     /// profiler tag, is checked before returning. Object headers and the
@@ -11000,6 +11064,7 @@ impl SimulationManagerData {
             .to_vec();
         Ok(TransportManagerLineData {
             format_version: self.format_version,
+            line_flags: fields.line_flags.clone(),
             active_line_prefab_indices: fields
                 .all_prefab_indices
                 .get(..fields.line_records.len())
@@ -11016,6 +11081,13 @@ impl SimulationManagerData {
             serialized_line_numbers: fields.serialized_line_numbers,
             serialized_global_passengers: fields.serialized_global_passengers,
             serialized_body,
+            original_line_flags: fields.line_flags,
+            line_flags_range: fields.line_flags_range.ok_or_else(|| {
+                invalid(
+                    body_range.start,
+                    "TransportManager line-flag range was not captured",
+                )
+            })?,
             original_prefab_indices: fields.all_prefab_indices,
             prefab_index_range: fields.prefab_index_range.ok_or_else(|| {
                 invalid(
@@ -11028,13 +11100,14 @@ impl SimulationManagerData {
         })
     }
 
-    /// Replaces TransportManager active-line prefab indexes, line records, line
-    /// numbers, and passenger tables.
+    /// Replaces TransportManager raw line flags, active-line prefab indexes,
+    /// line records, line numbers, and passenger tables.
     ///
     /// The editor must come from this manager's current bytes and version.
-    /// Prefab-index and legacy vehicle-name edits may resize the bounded manager
-    /// body and graph; all other manager bytes are preserved. Values that do not
-    /// fit the format's 24-bit passenger fields return an error.
+    /// Line-flag, prefab-index, and legacy vehicle-name edits may resize the
+    /// bounded manager body and graph; all other manager bytes are preserved.
+    /// Values that do not fit the format's 24-bit passenger fields return an
+    /// error.
     pub fn replace_transport_manager_line_data(
         &mut self,
         edited: &TransportManagerLineDataEditor,
@@ -11080,7 +11153,8 @@ impl SimulationManagerData {
                     CrpError::ArithmeticOverflow("rewritten TransportManager body end"),
                 )?;
                 let (validated_body_range, _) = self.transport_manager_body_range()?;
-                if decoded.line_numbers != edited.line_numbers
+                if decoded.line_flags != edited.line_flags
+                    || decoded.line_numbers != edited.line_numbers
                     || decoded.active_line_prefab_indices != edited.active_line_prefab_indices
                     || decoded.global_passengers != edited.global_passengers
                     || validated_body_range.start != body_range.start
@@ -14490,7 +14564,9 @@ fn decode_transport_manager_reference_body_with_milestones(
         ));
     }
     let mut reader = Reader::new(bytes);
-    let line_flags = read_encoded_uint_array(&mut reader, 255)?;
+    let line_flags_start = reader.offset();
+    let line_flags = read_encoded_uint_array(&mut reader, TRANSPORT_MANAGER_LINE_FLAG_COUNT)?;
+    let line_flags_range = capture_milestones.then_some(line_flags_start..reader.offset());
     let active_line_count = line_flags.iter().filter(|flag| **flag != 0).count();
     let milestone_count = if format_version >= 151 {
         usize::from(reader.read_u16_be()?)
@@ -14771,6 +14847,12 @@ fn decode_transport_manager_reference_body_with_milestones(
     });
     let selection_range = (format_version >= 114_001).then_some(selection_start..reader.offset());
     Ok(TransportManagerReferenceFields {
+        line_flags: if capture_milestones {
+            line_flags
+        } else {
+            Vec::new()
+        },
+        line_flags_range,
         milestone_object_headers,
         milestone_prefab_indices,
         all_prefab_indices,
@@ -14799,6 +14881,8 @@ fn decode_transport_manager_reference_body_with_milestones(
 
 #[derive(Debug)]
 struct TransportManagerReferenceFields {
+    line_flags: Vec<u32>,
+    line_flags_range: Option<Range<usize>>,
     milestone_object_headers: Vec<NetObjectHeader>,
     milestone_prefab_indices: Vec<u16>,
     all_prefab_indices: Vec<u16>,
@@ -15151,7 +15235,8 @@ mod manager_boundary_tests {
         EconomyInvestmentData, EconomyInvestmentPrefabAssignment, EconomyInvestmentPrefabTable,
         EconomyManagerBodyLayout, GUIDE_TRIGGER_BASE_PREFIX_LEN, ManagerObjectReference,
         QueuedDataObject, ResolvedObjectReference, SimulationManagerData,
-        TransportLineVehicleSelection, TransportManagerActiveLineEditor, TransportManagerMilestone,
+        TRANSPORT_MANAGER_LINE_FLAG_COUNT, TransportLineVehicleSelection,
+        TransportManagerActiveLineEditor, TransportManagerMilestone,
         TransportManagerMilestoneEditor, TransportManagerSelection,
         TransportManagerSharedStringValue, TransportManagerStringEncoding,
         TransportManagerTailReference, TransportManagerTailReferenceEditor,
@@ -20907,6 +20992,56 @@ mod manager_boundary_tests {
                 .active_line_prefab_indices(),
             [7]
         );
+    }
+
+    #[test]
+    fn transport_manager_raw_line_flag_edit_preserves_active_slots() {
+        let (body, _) = active_transport_manager_reference_body(112_004, 14, 4, 7);
+        let fields = decode_transport_manager_reference_body_with_milestones(
+            112_004, &body, None, None, true,
+        )
+        .unwrap();
+        let flags_range = fields.line_flags_range.clone().unwrap();
+        assert_eq!(flags_range, 0..14);
+        assert_eq!(fields.line_flags.len(), TRANSPORT_MANAGER_LINE_FLAG_COUNT);
+        assert_eq!(&fields.line_flags[..3], [1, 0, 0]);
+
+        let (mut manager, body_start) = manager_with_transport_body(112_004, &body);
+        let line_data = manager.decode_transport_manager_line_data().unwrap();
+        assert_eq!(line_data.line_flags(), fields.line_flags);
+        let mut editor = line_data.into_editor();
+        assert!(editor.set_line_flag(0, 0).is_err());
+        assert!(editor.set_line_flag(1, 1).is_err());
+        assert!(
+            editor
+                .set_line_flag(TRANSPORT_MANAGER_LINE_FLAG_COUNT, 1)
+                .is_err()
+        );
+        editor.set_line_flag(0, 2).unwrap();
+
+        let expected_flags = [
+            0x00, 0x00, 0x00, 0x00, 0x02, // Literal active flag.
+            0x00, 0x00, 0x00, 0x00, 0x00, // Literal zero resets the delta.
+            0x00, 0x00, 0x00, 0x00, 0x00, // Second zero begins the repeated run.
+            0xff, 0xfb, // 128 and 124 repeated zero flags.
+        ];
+        let mut expected_body = body.clone();
+        expected_body.splice(flags_range, expected_flags);
+        let mut expected_graph = manager.serialized_object_graph().to_vec();
+        expected_graph.splice(
+            body_start..body_start + body.len(),
+            expected_body.iter().copied(),
+        );
+        manager
+            .replace_transport_manager_line_data(&editor)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+
+        let rewritten = manager.decode_transport_manager_line_data().unwrap();
+        assert_eq!(rewritten.line_flags()[0], 2);
+        assert!(rewritten.line_flags()[1..].iter().all(|flag| *flag == 0));
+        assert_eq!(rewritten.active_lines().len(), 1);
+        assert_eq!(rewritten.active_line_prefab_indices(), [7]);
     }
 
     #[test]
