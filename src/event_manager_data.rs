@@ -10,16 +10,16 @@ use std::ops::Range;
 
 const MAX_EVENT_SLOTS: usize = u16::MAX as usize + 1;
 const FIRST_EVENT_RECORD_VERSION: u32 = 210;
-const LAST_SUPPORTED_EVENT_RECORD_VERSION: u32 = 254;
+const LAST_SUPPORTED_EVENT_RECORD_VERSION: u32 = 120_003;
 const CUSTOM_EVENT_SEED_FLAG: u32 = 1 << 10;
 
-/// One decoded active event from the legacy EventManager record layout.
+/// One decoded active event from the versioned EventManager record layout.
 ///
-/// This layout is supported for inner versions 210 through 254. Its four
+/// This layout is supported for inner versions 210 through 120003. Its four
 /// pre-245 color words are retained raw because their meaning is not
-/// established; version 245 stores the color as RGB bytes. Versioned expiry,
-/// ticket, next-building-event, and reward fields are exposed when present.
-/// Versions 255 and later add fields that are not decoded yet.
+/// established; version 245 stores the color as RGB bytes. Version-gated event
+/// values are exposed when present. Version 120004 adds nested race-event data,
+/// which is not decoded yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventManagerEventRecord {
     /// One-based event slot represented by this record.
@@ -28,6 +28,11 @@ pub struct EventManagerEventRecord {
     pub flags: u32,
     /// Event building index.
     pub building_index: u16,
+    /// Event creation frame serialized from inner version 112021.
+    pub created_frame: Option<u32>,
+    /// Raw IEEE-754 bits for the two toga-party start times from version 112029.
+    /// Storing bits preserves NaNs and other non-canonical float encodings.
+    pub toga_party_start_time_bits: Option<[u32; 2]>,
     /// Event start frame.
     pub start_frame: u32,
     /// Expiry frame serialized from inner version 246.
@@ -45,6 +50,14 @@ pub struct EventManagerEventRecord {
     pub reward_totals: Option<[u64; 2]>,
     /// Success and failure counts serialized from inner version 250.
     pub result_counts: Option<[u16; 2]>,
+    /// Ticket income and total serialized from inner version 255.
+    pub ticket_totals: Option<[u64; 2]>,
+    /// Popularity adjustment serialized in the versioned 108005–108999 and
+    /// 109005+ ranges.
+    pub popularity_delta: Option<i16>,
+    /// Raw security budget serialized in the versioned 108008–108999 and
+    /// 109008+ ranges.
+    pub security_budget: Option<u16>,
     /// Optional custom event seed selected by flag bit `0x400`.
     pub custom_seed: Option<u64>,
 }
@@ -72,8 +85,8 @@ pub struct EventManagerTailData {
 
 /// Supported fields decoded from a bounded `EventManager+Data` body.
 ///
-/// Active event records in versions 210–254 are decoded and retained. Later
-/// active-event layouts and active routes remain unsupported. Reader, writer,
+/// Active event records in versions 210–120003 are decoded and retained. Later
+/// race-event layouts and active routes remain unsupported. Reader, writer,
 /// and one corpus-observed counted-block candidate are boundary-checked. The
 /// counted block is retained as raw bytes because its meaning and type are
 /// unknown.
@@ -111,10 +124,10 @@ pub struct EventManagerTypeDataEditor {
     type_data: Vec<EventManagerTypeData>,
 }
 
-/// Editor for existing legacy active EventManager records.
+/// Editor for existing versioned active EventManager records.
 ///
 /// The record count, slot indexes, and activity flags are fixed. It edits only
-/// same-width scalar values for inner versions 210–254 and preserves the
+/// same-width scalar values for inner versions 210–120003 and preserves the
 /// surrounding EventManager body bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerEventRecordsEditor {
@@ -795,6 +808,14 @@ fn reject_active_flags(
     Ok(())
 }
 
+fn event_popularity_delta_present(format_version: u32) -> bool {
+    (108_005..109_000).contains(&format_version) || format_version >= 109_005
+}
+
+fn event_security_budget_present(format_version: u32) -> bool {
+    (108_008..109_000).contains(&format_version) || format_version >= 109_008
+}
+
 fn read_active_event_records(
     reader: &mut Reader<'_>,
     format_version: u32,
@@ -821,6 +842,16 @@ fn read_active_event_records(
             .map_err(|_| reader.invalid("EventManager event slot index exceeds u16"))?;
         let record_start = reader.offset();
         let building_index = reader.read_u16_be()?;
+        let created_frame = if format_version >= 112_021 {
+            Some(reader.read_u32_be()?)
+        } else {
+            None
+        };
+        let toga_party_start_time_bits = if format_version >= 112_029 {
+            Some([reader.read_u32_be()?, reader.read_u32_be()?])
+        } else {
+            None
+        };
         let start_frame = reader.read_u32_be()?;
         let expiry_frame = if format_version >= 246 {
             Some(reader.read_u32_be()?)
@@ -853,6 +884,11 @@ fn read_active_event_records(
                 None,
             )
         };
+        let ticket_totals = if format_version >= 255 {
+            Some([reader.read_u64_be()?, reader.read_u64_be()?])
+        } else {
+            None
+        };
         let reward_totals = if format_version >= 250 {
             Some([reader.read_u64_be()?, reader.read_u64_be()?])
         } else {
@@ -860,6 +896,16 @@ fn read_active_event_records(
         };
         let result_counts = if format_version >= 250 {
             Some([reader.read_u16_be()?, reader.read_u16_be()?])
+        } else {
+            None
+        };
+        let popularity_delta = if event_popularity_delta_present(format_version) {
+            Some(reader.read_i16_be()?)
+        } else {
+            None
+        };
+        let security_budget = if event_security_budget_present(format_version) {
+            Some(reader.read_u16_be()?)
         } else {
             None
         };
@@ -872,6 +918,8 @@ fn read_active_event_records(
             slot_index,
             flags,
             building_index,
+            created_frame,
+            toga_party_start_time_bits,
             start_frame,
             expiry_frame,
             ticket_price,
@@ -880,6 +928,9 @@ fn read_active_event_records(
             color_rgb,
             reward_totals,
             result_counts,
+            ticket_totals,
+            popularity_delta,
+            security_budget,
             custom_seed,
         });
         record_ranges.push(record_start..reader.offset());
@@ -1140,6 +1191,42 @@ fn encode_event_record(
 ) -> Result<Vec<u8>, CrpError> {
     let mut output = Vec::new();
     output.extend_from_slice(&record.building_index.to_be_bytes());
+    match (format_version >= 112_021, record.created_frame) {
+        (true, Some(frame)) => output.extend_from_slice(&frame.to_be_bytes()),
+        (false, None) => {}
+        (true, None) => {
+            return Err(invalid_event_record(
+                offset,
+                "version-112021-or-later event record requires a created frame",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_event_record(
+                offset,
+                "created frame is unavailable before version 112021",
+            ));
+        }
+    }
+    match (format_version >= 112_029, record.toga_party_start_time_bits) {
+        (true, Some(times)) => {
+            for bits in times {
+                output.extend_from_slice(&bits.to_be_bytes());
+            }
+        }
+        (false, None) => {}
+        (true, None) => {
+            return Err(invalid_event_record(
+                offset,
+                "version-112029-or-later event record requires both toga-party start times",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_event_record(
+                offset,
+                "toga-party start times are unavailable before version 112029",
+            ));
+        }
+    }
     output.extend_from_slice(&record.start_frame.to_be_bytes());
 
     match (format_version >= 246, record.expiry_frame) {
@@ -1217,6 +1304,26 @@ fn encode_event_record(
             ));
         }
     }
+    match (format_version >= 255, record.ticket_totals) {
+        (true, Some(totals)) => {
+            for total in totals {
+                output.extend_from_slice(&total.to_be_bytes());
+            }
+        }
+        (false, None) => {}
+        (true, None) => {
+            return Err(invalid_event_record(
+                offset,
+                "version-255-or-later event record requires ticket totals",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_event_record(
+                offset,
+                "ticket totals are unavailable before version 255",
+            ));
+        }
+    }
     match (
         format_version >= 250,
         record.reward_totals,
@@ -1241,6 +1348,44 @@ fn encode_event_record(
             return Err(invalid_event_record(
                 offset,
                 "reward totals and result counts are unavailable before version 250",
+            ));
+        }
+    }
+    match (
+        event_popularity_delta_present(format_version),
+        record.popularity_delta,
+    ) {
+        (true, Some(delta)) => output.extend_from_slice(&delta.to_be_bytes()),
+        (false, None) => {}
+        (true, None) => {
+            return Err(invalid_event_record(
+                offset,
+                "this version requires an event popularity delta",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_event_record(
+                offset,
+                "event popularity delta is unavailable at this version",
+            ));
+        }
+    }
+    match (
+        event_security_budget_present(format_version),
+        record.security_budget,
+    ) {
+        (true, Some(budget)) => output.extend_from_slice(&budget.to_be_bytes()),
+        (false, None) => {}
+        (true, None) => {
+            return Err(invalid_event_record(
+                offset,
+                "this version requires an event security budget",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_event_record(
+                offset,
+                "event security budget is unavailable at this version",
             ));
         }
     }
@@ -1305,6 +1450,13 @@ mod tests {
         ];
         bytes.extend_from_slice(&flags.to_be_bytes());
         bytes.extend_from_slice(&[0x12, 0x34]); // Building index.
+        if format_version >= 112_021 {
+            bytes.extend_from_slice(&0x0506_0708_u32.to_be_bytes()); // Created frame.
+        }
+        if format_version >= 112_029 {
+            bytes.extend_from_slice(&0x3f80_0000_u32.to_be_bytes()); // Toga start time 1.
+            bytes.extend_from_slice(&0xbf00_0000_u32.to_be_bytes()); // Toga start time 2.
+        }
         bytes.extend_from_slice(&0x0102_0304_u32.to_be_bytes()); // Start frame.
         if format_version >= 246 {
             bytes.extend_from_slice(&0x0506_0708_u32.to_be_bytes()); // Expiry frame.
@@ -1322,19 +1474,38 @@ mod tests {
                 bytes.extend_from_slice(&color_word.to_be_bytes());
             }
         }
+        if format_version >= 255 {
+            bytes.extend_from_slice(&0x2122_2324_2526_2728_u64.to_be_bytes()); // Ticket income.
+            bytes.extend_from_slice(&0x3132_3334_3536_3738_u64.to_be_bytes()); // Total ticket.
+        }
         if format_version >= 250 {
             bytes.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes()); // Reward money.
             bytes.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes()); // Total reward.
             bytes.extend_from_slice(&[0x21, 0x22, 0x23, 0x24]); // Success/failure counts.
         }
+        if (108_005..109_000).contains(&format_version) || format_version >= 109_005 {
+            bytes.extend_from_slice(&0x1234_i16.to_be_bytes()); // Popularity delta.
+        }
+        if (108_008..109_000).contains(&format_version) || format_version >= 109_008 {
+            bytes.extend_from_slice(&[0x56, 0x78]); // Security budget.
+        }
         if flags & (1 << 10) != 0 {
             bytes.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
         }
         bytes.extend_from_slice(&[0x00, 0x00]); // No unlock milestones.
+        if (108_002..109_000).contains(&format_version) {
+            bytes.extend_from_slice(&[0x00, 0x00]); // No modified event types.
+        }
         bytes.extend_from_slice(&[0x00, 0x00, 0x07]); // One event prefab index.
         bytes.extend_from_slice(&[0x00, 0x00]); // Empty prefab names.
         if format_version >= 253 {
             bytes.push(0xff); // Match-preparing reference.
+        }
+        if format_version >= 109_011 || (108_011..109_000).contains(&format_version) {
+            bytes.extend_from_slice(&[0xff, 0xff]); // Band references.
+        }
+        if format_version >= 109_003 || (108_003..109_000).contains(&format_version) {
+            bytes.extend_from_slice(&[0x34, 0x56]); // Band-popularity bonus.
         }
         bytes.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
         bytes
@@ -1734,7 +1905,7 @@ mod tests {
             0x00, 0x01, // Two event slots.
             0x00, 0x00, 0x00, 0x01, // One active event flag.
         ];
-        assert!(EventManagerReferenceData::decode_reader(255, &active_event).is_err());
+        assert!(EventManagerReferenceData::decode_reader(120_004, &active_event).is_err());
 
         let active_route = [
             0x00, 0x00, // One event slot.
@@ -1764,6 +1935,8 @@ mod tests {
                 slot_index: 1,
                 flags,
                 building_index: 0x1234,
+                created_frame: None,
+                toga_party_start_time_bits: None,
                 start_frame: 0x0102_0304,
                 expiry_frame: None,
                 ticket_price: None,
@@ -1772,6 +1945,9 @@ mod tests {
                 color_rgb: None,
                 reward_totals: None,
                 result_counts: None,
+                ticket_totals: None,
+                popularity_delta: None,
+                security_budget: None,
                 custom_seed: Some(0x0102_0304_0506_0708),
             }]
         );
@@ -1951,8 +2127,165 @@ mod tests {
             );
         }
         assert!(
-            EventManagerReferenceData::decode_reader(255, &one_active_event(255, flags)).is_err()
+            EventManagerReferenceData::decode_reader(120_004, &one_active_event(120_004, flags))
+                .is_err()
         );
+    }
+
+    #[test]
+    fn late_event_record_fields_follow_version_gates_through_120003() {
+        let flags = 0x0000_0401;
+        let expected_tickets = Some([0x2122_2324_2526_2728, 0x3132_3334_3536_3738]);
+        let expected_times = Some([0x3f80_0000, 0xbf00_0000]);
+        for (version, ticket_totals, popularity_delta, security_budget, created_frame, times) in [
+            (254, None, None, None, None, None),
+            (255, expected_tickets, None, None, None, None),
+            (108_004, expected_tickets, None, None, None, None),
+            (108_005, expected_tickets, Some(0x1234), None, None, None),
+            (
+                108_008,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                None,
+                None,
+            ),
+            (
+                108_999,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                None,
+                None,
+            ),
+            (109_000, expected_tickets, None, None, None, None),
+            (109_005, expected_tickets, Some(0x1234), None, None, None),
+            (
+                109_008,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                None,
+                None,
+            ),
+            (
+                112_020,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                None,
+                None,
+            ),
+            (
+                112_021,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                None,
+            ),
+            (
+                112_028,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                None,
+            ),
+            (
+                112_029,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                expected_times,
+            ),
+            (
+                120_003,
+                expected_tickets,
+                Some(0x1234),
+                Some(0x5678),
+                Some(0x0506_0708),
+                expected_times,
+            ),
+        ] {
+            let bytes = one_active_event(version, flags);
+            let (decoded, consumed) =
+                EventManagerReferenceData::decode_reader(version, &bytes).unwrap();
+            assert_eq!(consumed, bytes.len(), "version {version}");
+            let record = decoded.active_event_records[0];
+            assert_eq!(record.ticket_totals, ticket_totals, "version {version}");
+            assert_eq!(
+                record.popularity_delta, popularity_delta,
+                "version {version}"
+            );
+            assert_eq!(record.security_budget, security_budget, "version {version}");
+            assert_eq!(record.created_frame, created_frame, "version {version}");
+            assert_eq!(
+                record.toga_party_start_time_bits, times,
+                "version {version}"
+            );
+            assert_eq!(
+                decoded
+                    .clone()
+                    .into_event_records_editor()
+                    .encode()
+                    .unwrap(),
+                bytes,
+                "version {version}"
+            );
+
+            if version == 255 {
+                let (decoded, _) =
+                    EventManagerReferenceData::decode_reader(version, &bytes).unwrap();
+                let expected = [
+                    0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04,
+                    0x05, 0x06, 0x07, 0x08, 0x12, 0x34, 0x11, 0x22, 0x33, 0x21, 0x22, 0x23, 0x24,
+                    0x25, 0x26, 0x27, 0x28, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x01,
+                    0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+                    0x17, 0x18, 0x21, 0x22, 0x23, 0x24, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                    0x08, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0xff, 0x12, 0x34,
+                ];
+                assert_eq!(
+                    decoded.into_event_records_editor().encode().unwrap(),
+                    expected
+                );
+            }
+
+            if version == 112_029 {
+                let range = decoded.active_event_record_ranges[0].clone();
+                let expected_record = [
+                    0x12, 0x34, 0x05, 0x06, 0x07, 0x08, 0x3f, 0x80, 0x00, 0x00, 0xbf, 0x00, 0x00,
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x12, 0x34, 0x11, 0x22,
+                    0x33, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x31, 0x32, 0x33, 0x34,
+                    0x35, 0x36, 0x37, 0x38, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11,
+                    0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x21, 0x22, 0x23, 0x24, 0x12, 0x34,
+                    0x56, 0x78, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                ];
+                assert_eq!(&bytes[range], expected_record);
+                for end in 0..bytes.len() {
+                    assert!(
+                        EventManagerReferenceData::decode_reader(version, &bytes[..end]).is_err(),
+                        "truncated version-112029 active event at {end}"
+                    );
+                }
+            }
+
+            if version == 120_003 {
+                for end in 0..bytes.len() {
+                    assert!(
+                        EventManagerReferenceData::decode_reader(version, &bytes[..end]).is_err(),
+                        "truncated version-120003 active event at {end}"
+                    );
+                }
+            }
+        }
+
+        let bytes = one_active_event(255, flags);
+        let (decoded, _) = EventManagerReferenceData::decode_reader(255, &bytes).unwrap();
+        let mut editor = decoded.into_event_records_editor();
+        editor.records_mut()[0].ticket_totals = None;
+        assert!(editor.encode().is_err());
     }
 
     #[test]

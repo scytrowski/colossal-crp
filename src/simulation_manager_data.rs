@@ -2160,8 +2160,8 @@ impl SimulationManagerData {
     ///
     /// This table is available only when the bounded EventManager body matches
     /// one unambiguous supported reader/writer candidate. Legacy active-event
-    /// records from inner versions 210 through 254 are preserved unchanged;
-    /// later active-event layouts and active routes are unsupported.
+    /// records from inner versions 210 through 120003 are preserved unchanged;
+    /// later race-event layouts and active routes are unsupported.
     pub fn decode_event_manager_type_data(&self) -> Result<EventManagerTypeDataEditor, CrpError> {
         let managers = self
             .manager_objects
@@ -2173,14 +2173,14 @@ impl SimulationManagerData {
             .into_type_data_editor())
     }
 
-    /// Decodes active EventManager records for inner versions 210–254.
+    /// Decodes active EventManager records for inner versions 210–120003.
     ///
     /// Pre-245 color words are returned raw; version 245 records expose RGB
-    /// bytes. Version-gated expiry, ticket, next-building-event, and reward
-    /// values are exposed when present. Active records from version 255 onward
-    /// and active event routes are rejected because their complete layouts are
-    /// not yet supported. The bounded manager body must match one unambiguous
-    /// reader/writer candidate.
+    /// bytes. Version-gated event, ticket, reward, popularity, and security
+    /// values are exposed when present. Active records from version 120004
+    /// onward and active event routes are rejected because their complete
+    /// layouts are not yet supported. The bounded manager body must match one
+    /// unambiguous reader/writer candidate.
     pub fn decode_event_manager_event_records(
         &self,
     ) -> Result<EventManagerEventRecordsEditor, CrpError> {
@@ -14359,6 +14359,8 @@ mod manager_boundary_tests {
                 slot_index: 1,
                 flags: 0x0000_0401,
                 building_index: 0x1234,
+                created_frame: None,
+                toga_party_start_time_bits: None,
                 start_frame: 0x0102_0304,
                 expiry_frame: None,
                 ticket_price: None,
@@ -14367,6 +14369,9 @@ mod manager_boundary_tests {
                 color_rgb: None,
                 reward_totals: None,
                 result_counts: None,
+                ticket_totals: None,
+                popularity_delta: None,
+                security_budget: None,
                 custom_seed: Some(0x0102_0304_0506_0708),
             }]
         );
