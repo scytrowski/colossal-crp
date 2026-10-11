@@ -12,7 +12,8 @@ const FULL_TOTALS_VERSION: u32 = 147;
 /// The final and temporary local-resource arrays are flat, cell-major
 /// sequences. Each cell occupies `resource_slots_per_cell` values in those
 /// vectors. The five aggregate arrays retain their serialized positional
-/// order; the source body remains available for exact unchanged writing.
+/// order. Their serialized prefixes can be edited by index; local grids and
+/// every other source byte remain unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImmaterialResourceManagerData {
     format_version: u32,
@@ -24,6 +25,12 @@ pub struct ImmaterialResourceManagerData {
     total_temporary_multiplier: Vec<i64>,
     global_final: Vec<i32>,
     global_temporary: Vec<i32>,
+    aggregate_read_count: usize,
+    total_final_offset: usize,
+    total_temporary_offset: usize,
+    total_temporary_multiplier_offset: usize,
+    global_final_offset: Option<usize>,
+    global_temporary_offset: Option<usize>,
     original_body: Vec<u8>,
 }
 
@@ -50,12 +57,15 @@ impl ImmaterialResourceManagerData {
             17
         };
         let mut total_final = vec![0; resource_slots_per_cell];
+        let total_final_offset = reader.offset();
         read_i32_prefix(&mut reader, &mut total_final, aggregate_read_count)?;
 
         let mut total_temporary = vec![0; resource_slots_per_cell];
+        let total_temporary_offset = reader.offset();
         read_i32_prefix(&mut reader, &mut total_temporary, aggregate_read_count)?;
 
         let mut total_temporary_multiplier = vec![0_i64; resource_slots_per_cell];
+        let total_temporary_multiplier_offset = reader.offset();
         if format_version >= I32_MULTIPLIER_VERSION {
             for value in total_temporary_multiplier
                 .iter_mut()
@@ -74,10 +84,16 @@ impl ImmaterialResourceManagerData {
 
         let mut global_final = vec![0; resource_slots_per_cell];
         let mut global_temporary = vec![0; resource_slots_per_cell];
-        if format_version >= FULL_TOTALS_VERSION {
-            read_i32_prefix(&mut reader, &mut global_final, resource_slots_per_cell)?;
-            read_i32_prefix(&mut reader, &mut global_temporary, resource_slots_per_cell)?;
-        }
+        let (global_final_offset, global_temporary_offset) =
+            if format_version >= FULL_TOTALS_VERSION {
+                let global_final_offset = reader.offset();
+                read_i32_prefix(&mut reader, &mut global_final, resource_slots_per_cell)?;
+                let global_temporary_offset = reader.offset();
+                read_i32_prefix(&mut reader, &mut global_temporary, resource_slots_per_cell)?;
+                (Some(global_final_offset), Some(global_temporary_offset))
+            } else {
+                (None, None)
+            };
 
         if reader.remaining() != END_PROFILER_REFERENCE_LEN {
             return Err(reader.invalid(format!(
@@ -97,6 +113,12 @@ impl ImmaterialResourceManagerData {
             total_temporary_multiplier,
             global_final,
             global_temporary,
+            aggregate_read_count,
+            total_final_offset,
+            total_temporary_offset,
+            total_temporary_multiplier_offset,
+            global_final_offset,
+            global_temporary_offset,
             original_body: bytes.to_vec(),
         })
     }
@@ -127,16 +149,74 @@ impl ImmaterialResourceManagerData {
         &self.total_final
     }
 
+    /// Replaces one serialized total-final value.
+    ///
+    /// Versions below 147 serialize only the first 17 entries; indexes beyond
+    /// that stored prefix return an error even if the reader exposes defaults.
+    pub fn set_total_final(&mut self, index: usize, value: i32) -> Result<(), CrpError> {
+        require_stored_aggregate_index(
+            index,
+            self.aggregate_read_count,
+            self.total_final_offset,
+            4,
+            "total-final",
+        )?;
+        self.total_final[index] = value;
+        Ok(())
+    }
+
     /// Returns total-temporary values in resource-slot order. On versions
     /// below 147, entries after the first 17 are initialized to zero.
     pub fn total_temporary(&self) -> &[i32] {
         &self.total_temporary
     }
 
+    /// Replaces one serialized total-temporary value.
+    pub fn set_total_temporary(&mut self, index: usize, value: i32) -> Result<(), CrpError> {
+        require_stored_aggregate_index(
+            index,
+            self.aggregate_read_count,
+            self.total_temporary_offset,
+            4,
+            "total-temporary",
+        )?;
+        self.total_temporary[index] = value;
+        Ok(())
+    }
+
     /// Returns temporary multipliers as signed 64-bit values. Their on-disk
     /// width is four bytes before version 242 and eight bytes thereafter.
     pub fn total_temporary_multiplier(&self) -> &[i64] {
         &self.total_temporary_multiplier
+    }
+
+    /// Replaces one serialized temporary multiplier.
+    ///
+    /// Before inner version 242, the on-disk field is a signed `i32`; values
+    /// outside that range return an error instead of being truncated.
+    pub fn set_total_temporary_multiplier(
+        &mut self,
+        index: usize,
+        value: i64,
+    ) -> Result<(), CrpError> {
+        let width = self.multiplier_width_bytes();
+        require_stored_aggregate_index(
+            index,
+            self.aggregate_read_count,
+            self.total_temporary_multiplier_offset,
+            width,
+            "total-temporary multiplier",
+        )?;
+        let value_offset =
+            aggregate_element_offset(self.total_temporary_multiplier_offset, index, width)?;
+        if width == 4 && i32::try_from(value).is_err() {
+            return Err(invalid_aggregate_value(
+                value_offset,
+                "total-temporary multiplier does not fit its serialized i32 field",
+            ));
+        }
+        self.total_temporary_multiplier[index] = value;
+        Ok(())
     }
 
     /// Returns the serialized multiplier width in bytes.
@@ -154,10 +234,68 @@ impl ImmaterialResourceManagerData {
         &self.global_final
     }
 
+    /// Replaces one serialized global-final value.
+    ///
+    /// This field is present from inner version 147. Earlier versions return an
+    /// error because the reader synthesizes this array as zeroes.
+    pub fn set_global_final(&mut self, index: usize, value: i32) -> Result<(), CrpError> {
+        let end_offset = self
+            .original_body
+            .len()
+            .checked_sub(END_PROFILER_REFERENCE_LEN)
+            .ok_or_else(|| {
+                invalid_aggregate_value(0, "body lacks its closing profiler reference")
+            })?;
+        let offset = self.global_final_offset.ok_or_else(|| {
+            invalid_aggregate_value(
+                end_offset,
+                "global-final values are not serialized before inner version 147",
+            )
+        })?;
+        require_stored_aggregate_index(
+            index,
+            self.resource_slots_per_cell,
+            offset,
+            4,
+            "global-final",
+        )?;
+        self.global_final[index] = value;
+        Ok(())
+    }
+
     /// Returns global-temporary values in resource-slot order. Versions below
     /// 147 initialize this array to zero without reading it from the stream.
     pub fn global_temporary(&self) -> &[i32] {
         &self.global_temporary
+    }
+
+    /// Replaces one serialized global-temporary value.
+    ///
+    /// This field is present from inner version 147. Earlier versions return an
+    /// error because the reader synthesizes this array as zeroes.
+    pub fn set_global_temporary(&mut self, index: usize, value: i32) -> Result<(), CrpError> {
+        let end_offset = self
+            .original_body
+            .len()
+            .checked_sub(END_PROFILER_REFERENCE_LEN)
+            .ok_or_else(|| {
+                invalid_aggregate_value(0, "body lacks its closing profiler reference")
+            })?;
+        let offset = self.global_temporary_offset.ok_or_else(|| {
+            invalid_aggregate_value(
+                end_offset,
+                "global-temporary values are not serialized before inner version 147",
+            )
+        })?;
+        require_stored_aggregate_index(
+            index,
+            self.resource_slots_per_cell,
+            offset,
+            4,
+            "global-temporary",
+        )?;
+        self.global_temporary[index] = value;
+        Ok(())
     }
 
     /// Returns the complete source body unchanged, including the closing
@@ -165,6 +303,186 @@ impl ImmaterialResourceManagerData {
     pub fn encode_unchanged(&self) -> Vec<u8> {
         self.original_body.clone()
     }
+
+    /// Encodes the edited aggregate values into their existing fixed-width
+    /// fields while retaining the local grids and closing profiler reference.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let mut bytes = self.original_body.clone();
+        write_i32_values(
+            &mut bytes,
+            self.total_final_offset,
+            &self.total_final,
+            self.aggregate_read_count,
+            "total-final",
+        )?;
+        write_i32_values(
+            &mut bytes,
+            self.total_temporary_offset,
+            &self.total_temporary,
+            self.aggregate_read_count,
+            "total-temporary",
+        )?;
+        write_multiplier_values(
+            &mut bytes,
+            self.total_temporary_multiplier_offset,
+            &self.total_temporary_multiplier,
+            self.aggregate_read_count,
+            self.multiplier_width_bytes(),
+        )?;
+        if let (Some(global_final_offset), Some(global_temporary_offset)) =
+            (self.global_final_offset, self.global_temporary_offset)
+        {
+            write_i32_values(
+                &mut bytes,
+                global_final_offset,
+                &self.global_final,
+                self.resource_slots_per_cell,
+                "global-final",
+            )?;
+            write_i32_values(
+                &mut bytes,
+                global_temporary_offset,
+                &self.global_temporary,
+                self.resource_slots_per_cell,
+                "global-temporary",
+            )?;
+        }
+        Ok(bytes)
+    }
+}
+
+fn require_stored_aggregate_index(
+    index: usize,
+    count: usize,
+    offset: usize,
+    width: usize,
+    field: &'static str,
+) -> Result<(), CrpError> {
+    if index >= count {
+        let field_end = count
+            .checked_mul(width)
+            .and_then(|length| offset.checked_add(length))
+            .ok_or(CrpError::ArithmeticOverflow(
+                "ImmaterialResourceManager aggregate field end",
+            ))?;
+        return Err(invalid_aggregate_value(
+            field_end,
+            format!("{field} index {index} is outside the {count}-value serialized prefix"),
+        ));
+    }
+    Ok(())
+}
+
+fn aggregate_element_offset(base: usize, index: usize, width: usize) -> Result<usize, CrpError> {
+    index
+        .checked_mul(width)
+        .and_then(|delta| base.checked_add(delta))
+        .ok_or(CrpError::ArithmeticOverflow(
+            "ImmaterialResourceManager aggregate field offset",
+        ))
+}
+
+fn invalid_aggregate_value(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "ImmaterialResourceManager+Data".to_owned(),
+        offset,
+        reason: reason.into(),
+    }
+}
+
+fn write_i32_values(
+    bytes: &mut [u8],
+    offset: usize,
+    values: &[i32],
+    count: usize,
+    field: &'static str,
+) -> Result<(), CrpError> {
+    let values = values.get(..count).ok_or_else(|| {
+        invalid_aggregate_value(offset, format!("{field} value count is inconsistent"))
+    })?;
+    let byte_count = count.checked_mul(4).ok_or(CrpError::ArithmeticOverflow(
+        "ImmaterialResourceManager i32 aggregate size",
+    ))?;
+    let end = checked_aggregate_end(bytes, offset, byte_count, field)?;
+    let output = bytes
+        .get_mut(offset..end)
+        .ok_or_else(|| invalid_aggregate_value(offset, format!("{field} byte range is invalid")))?;
+    for (chunk, value) in output.chunks_exact_mut(4).zip(values) {
+        chunk.copy_from_slice(&value.to_be_bytes());
+    }
+    Ok(())
+}
+
+fn write_multiplier_values(
+    bytes: &mut [u8],
+    offset: usize,
+    values: &[i64],
+    count: usize,
+    width: usize,
+) -> Result<(), CrpError> {
+    let values = values.get(..count).ok_or_else(|| {
+        invalid_aggregate_value(
+            offset,
+            "total-temporary multiplier value count is inconsistent",
+        )
+    })?;
+    let byte_count = count
+        .checked_mul(width)
+        .ok_or(CrpError::ArithmeticOverflow(
+            "ImmaterialResourceManager multiplier aggregate size",
+        ))?;
+    let end = checked_aggregate_end(bytes, offset, byte_count, "total-temporary multiplier")?;
+    let output = bytes.get_mut(offset..end).ok_or_else(|| {
+        invalid_aggregate_value(offset, "total-temporary multiplier byte range is invalid")
+    })?;
+    if width == 8 {
+        for (chunk, value) in output.chunks_exact_mut(8).zip(values) {
+            chunk.copy_from_slice(&value.to_be_bytes());
+        }
+    } else if width == 4 {
+        for (index, (chunk, value)) in output.chunks_exact_mut(4).zip(values).enumerate() {
+            let value_offset = aggregate_element_offset(offset, index, width)?;
+            let value = i32::try_from(*value).map_err(|_| {
+                invalid_aggregate_value(
+                    value_offset,
+                    "total-temporary multiplier does not fit its serialized i32 field",
+                )
+            })?;
+            chunk.copy_from_slice(&value.to_be_bytes());
+        }
+    } else {
+        return Err(invalid_aggregate_value(
+            offset,
+            format!("unsupported temporary multiplier width {width}"),
+        ));
+    }
+    Ok(())
+}
+
+fn checked_aggregate_end(
+    bytes: &[u8],
+    offset: usize,
+    byte_count: usize,
+    field: &'static str,
+) -> Result<usize, CrpError> {
+    let end = offset
+        .checked_add(byte_count)
+        .ok_or(CrpError::ArithmeticOverflow(
+            "ImmaterialResourceManager aggregate end",
+        ))?;
+    let payload_end = bytes
+        .len()
+        .checked_sub(END_PROFILER_REFERENCE_LEN)
+        .ok_or_else(|| {
+            invalid_aggregate_value(offset, "body lacks its closing profiler reference")
+        })?;
+    if end > payload_end {
+        return Err(invalid_aggregate_value(
+            offset,
+            format!("{field} byte range overlaps the closing profiler reference"),
+        ));
+    }
+    Ok(end)
 }
 
 fn read_i32_prefix(
@@ -359,6 +677,78 @@ mod tests {
             assert_eq!(data.total_temporary_multiplier()[0], -300);
             assert_eq!(data.encode_unchanged(), body);
         }
+    }
+
+    #[test]
+    fn edits_current_aggregate_values_at_independently_expected_offsets() {
+        let body = synthetic_body(242, false);
+        let mut data = ImmaterialResourceManagerData::decode(242, &body).unwrap();
+        data.set_total_final(1, -0x0102_0304).unwrap();
+        data.set_total_temporary(2, 0x1122_3344).unwrap();
+        data.set_total_temporary_multiplier(3, -0x0102_0304_0506_0708)
+            .unwrap();
+        data.set_global_final(4, i32::MIN).unwrap();
+        data.set_global_temporary(5, i32::MAX).unwrap();
+
+        let local_array_bytes = 2 * (CELL_COUNT * 20 / 128);
+        let mut expected = body.clone();
+        let total_final_offset = local_array_bytes + 4;
+        let total_temporary_offset = local_array_bytes + 20 * 4 + 2 * 4;
+        let multiplier_offset = local_array_bytes + 20 * 4 * 2 + 3 * 8;
+        let global_final_offset = local_array_bytes + 20 * 4 * 2 + 20 * 8 + 4 * 4;
+        let global_temporary_offset = local_array_bytes + 20 * 4 * 2 + 20 * 8 + 20 * 4 + 5 * 4;
+        expected[total_final_offset..total_final_offset + 4]
+            .copy_from_slice(&(-0x0102_0304_i32).to_be_bytes());
+        expected[total_temporary_offset..total_temporary_offset + 4]
+            .copy_from_slice(&0x1122_3344_i32.to_be_bytes());
+        expected[multiplier_offset..multiplier_offset + 8]
+            .copy_from_slice(&(-0x0102_0304_0506_0708_i64).to_be_bytes());
+        expected[global_final_offset..global_final_offset + 4]
+            .copy_from_slice(&i32::MIN.to_be_bytes());
+        expected[global_temporary_offset..global_temporary_offset + 4]
+            .copy_from_slice(&i32::MAX.to_be_bytes());
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        assert_eq!(data.encode_unchanged(), body);
+        let decoded = ImmaterialResourceManagerData::decode(242, &encoded).unwrap();
+        assert_eq!(decoded.total_final()[1], -0x0102_0304);
+        assert_eq!(decoded.total_temporary()[2], 0x1122_3344);
+        assert_eq!(
+            decoded.total_temporary_multiplier()[3],
+            -0x0102_0304_0506_0708
+        );
+        assert_eq!(decoded.global_final()[4], i32::MIN);
+        assert_eq!(decoded.global_temporary()[5], i32::MAX);
+    }
+
+    #[test]
+    fn aggregate_editors_respect_legacy_counts_and_multiplier_width() {
+        let body = synthetic_body(146, false);
+        let mut data = ImmaterialResourceManagerData::decode(146, &body).unwrap();
+        data.set_total_final(16, -123).unwrap();
+        data.set_total_temporary(16, 456).unwrap();
+        data.set_total_temporary_multiplier(16, i64::from(i32::MIN))
+            .unwrap();
+        assert!(data.set_total_final(17, 1).is_err());
+        assert!(data.set_total_temporary(17, 1).is_err());
+        assert!(data.set_total_temporary_multiplier(17, 1).is_err());
+        assert!(
+            data.set_total_temporary_multiplier(0, i64::from(i32::MAX) + 1)
+                .is_err()
+        );
+        assert!(data.set_global_final(0, 1).is_err());
+        assert!(data.set_global_temporary(0, 1).is_err());
+
+        let encoded = data.encode().unwrap();
+        let decoded = ImmaterialResourceManagerData::decode(146, &encoded).unwrap();
+        assert_eq!(decoded.total_final()[16], -123);
+        assert_eq!(decoded.total_temporary()[16], 456);
+        assert_eq!(
+            decoded.total_temporary_multiplier()[16],
+            i64::from(i32::MIN)
+        );
+        assert_eq!(decoded.encode_unchanged(), encoded);
     }
 
     #[test]

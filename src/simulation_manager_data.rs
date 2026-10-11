@@ -2266,6 +2266,78 @@ impl SimulationManagerData {
         ImmaterialResourceManagerData::decode(self.format_version, bytes)
     }
 
+    /// Replaces ImmaterialResourceManager's serialized aggregate resource
+    /// values in place. Local resource grids and all other body bytes remain
+    /// unchanged.
+    pub fn replace_immaterial_resource_manager_data(
+        &mut self,
+        edited: &ImmaterialResourceManagerData,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                16,
+                "edited ImmaterialResourceManager version does not match this stream",
+            ));
+        }
+        let current = self.decode_immaterial_resource_manager_data()?;
+        if current.encode_unchanged() != edited.encode_unchanged() {
+            return Err(invalid(
+                16,
+                "ImmaterialResourceManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != edited.encode_unchanged().len() {
+            return Err(invalid(
+                16,
+                "ImmaterialResourceManager edits must preserve the decoded body length",
+            ));
+        }
+        let (body_start, next_tag_start) = self.manager_body_boundary(10)?;
+        let body_end =
+            body_start
+                .checked_add(replacement.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "ImmaterialResourceManager replacement end",
+                ))?;
+        if body_end != next_tag_start {
+            return Err(invalid(
+                body_end,
+                "ImmaterialResourceManager replacement no longer ends at the ElectricityManager boundary",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph
+            .get_mut(body_start..body_end)
+            .ok_or_else(|| {
+                invalid(
+                    body_start,
+                    "ImmaterialResourceManager replacement range is invalid",
+                )
+            })?
+            .copy_from_slice(&replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_immaterial_resource_manager_data()
+            .and_then(|decoded| {
+                if decoded.encode_unchanged() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten ImmaterialResourceManager body does not match the edited fields",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten ImmaterialResourceManager body failed validation: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Decodes ElectricityManager's conductivity plane, sparse conductive-cell
     /// fields, pulse records, and node-group array before WaterManager.
     /// Version-dependent array lengths and legacy fields follow the inner
@@ -13870,6 +13942,67 @@ mod manager_boundary_tests {
             "WaterManager",
         );
         assert!(wrong_tag.decode_immaterial_resource_manager_data().is_err());
+    }
+
+    #[test]
+    fn immaterial_resource_manager_replaces_only_aggregate_fields() {
+        let mut manager = immaterial_resource_manager_with_next(
+            "ElectricityManager+Data, Assembly-CSharp",
+            "ElectricityManager",
+        );
+        let original_graph = manager.serialized_object_graph.clone();
+        let stale_editor = manager.decode_immaterial_resource_manager_data().unwrap();
+        let mut edited = manager.decode_immaterial_resource_manager_data().unwrap();
+        edited.set_total_final(2, -33).unwrap();
+        edited.set_total_temporary_multiplier(3, -44).unwrap();
+        edited.set_global_final(4, 55).unwrap();
+        edited.set_global_temporary(5, -66).unwrap();
+        let expected_body = edited.encode().unwrap();
+
+        manager
+            .replace_immaterial_resource_manager_data(&edited)
+            .unwrap();
+
+        let body_start = profiler_tag("ImmaterialResourceManager").len();
+        let next_tag = profiler_tag("ElectricityManager");
+        let next_start = original_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        assert_eq!(manager.serialized_object_graph.len(), original_graph.len());
+        assert_eq!(
+            &manager.serialized_object_graph[..body_start],
+            &original_graph[..body_start]
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[body_start..next_start],
+            expected_body
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[next_start..],
+            &original_graph[next_start..]
+        );
+        let decoded = manager.decode_immaterial_resource_manager_data().unwrap();
+        assert_eq!(decoded.total_final()[2], -33);
+        assert_eq!(decoded.total_temporary_multiplier()[3], -44);
+        assert_eq!(decoded.global_final()[4], 55);
+        assert_eq!(decoded.global_temporary()[5], -66);
+
+        let replaced_graph = manager.serialized_object_graph.clone();
+        assert!(
+            manager
+                .replace_immaterial_resource_manager_data(&stale_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph, replaced_graph);
+
+        manager.format_version += 1;
+        assert!(
+            manager
+                .replace_immaterial_resource_manager_data(&edited)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph, replaced_graph);
     }
 
     #[test]
