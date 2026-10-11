@@ -18,6 +18,7 @@ use crate::VehicleLastFrameDataPrefix;
 use crate::VehicleLastFrameEditor;
 use crate::VehicleManagerData;
 use crate::VehicleManagerDataPrefix;
+use crate::VehicleManagerFlagsEditor;
 use crate::VehicleManagerPrefabEditor;
 use crate::VehicleManagerSparseFieldsEditor;
 use crate::VehicleManagerSparseFieldsPrefix;
@@ -5680,6 +5681,41 @@ impl SimulationManagerData {
         Ok((vehicles, graph_end))
     }
 
+    /// Decodes existing raw vehicle flags into an editor.
+    ///
+    /// The editor preserves zero/nonzero activity for each slot. Requires
+    /// VehicleManager at slot 17 and TransportManager at slot 18.
+    pub fn decode_vehicle_manager_flags_editor(
+        &self,
+    ) -> Result<VehicleManagerFlagsEditor, CrpError> {
+        let (prefix, _) = self.decode_vehicle_manager_prefix()?;
+        Ok(prefix.into_flags_editor())
+    }
+
+    /// Replaces raw active and parked vehicle flag values.
+    ///
+    /// Edits retain each slot's zero/nonzero activity state, so prefab
+    /// assignments and records remain aligned. Changed encoded scopes can
+    /// resize the prefix; the complete VehicleManager body and following
+    /// TransportManager boundary are checked after replacement.
+    pub fn replace_vehicle_manager_flags(
+        &mut self,
+        edited: &VehicleManagerFlagsEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                17,
+                "edited VehicleManager flag version does not match this stream",
+            ));
+        }
+        let replacement = edited.encode()?;
+        self.replace_vehicle_manager_prefix_bytes(
+            edited.original_bytes(),
+            replacement,
+            "VehicleManager flag edit",
+        )
+    }
+
     /// Decodes existing active and parked vehicle prefab assignments into an editor.
     ///
     /// Requires VehicleManager at slot 17 and TransportManager at slot 18;
@@ -5691,13 +5727,13 @@ impl SimulationManagerData {
         Ok(prefix.into_prefab_editor())
     }
 
-    /// Replaces existing active and parked vehicle prefab assignments.
+    /// Replaces active and parked vehicle prefab assignments and edited names.
     ///
-    /// Flags, assignment counts, prefab names, and other prefix bytes remain
-    /// unchanged. Canonical index encoding can change the prefix and manager
-    /// lengths; the complete VehicleManager body and following boundary are
-    /// checked after replacement. A version mismatch, stale editor source,
-    /// malformed body, or invalid following boundary returns an error.
+    /// Flag arrays and assignment counts remain unchanged. Changed names and
+    /// assignments can resize the prefix; the complete VehicleManager body and
+    /// following boundary are checked after replacement. A version mismatch,
+    /// stale editor source, malformed body, or invalid following boundary
+    /// returns an error.
     pub fn replace_vehicle_manager_prefabs(
         &mut self,
         edited: &VehicleManagerPrefabEditor,
@@ -5708,39 +5744,47 @@ impl SimulationManagerData {
                 "edited VehicleManager prefab version does not match this stream",
             ));
         }
+        let replacement = edited.encode()?;
+        self.replace_vehicle_manager_prefix_bytes(
+            edited.original_bytes(),
+            replacement,
+            "VehicleManager prefab edit",
+        )
+    }
+
+    fn replace_vehicle_manager_prefix_bytes(
+        &mut self,
+        original_prefix: &[u8],
+        replacement: Vec<u8>,
+        field: &str,
+    ) -> Result<(), CrpError> {
         let (vehicle_data, original_manager_end) = self.decode_vehicle_manager_data()?;
-        let original_prefix = vehicle_data.prefix().encode();
-        if original_prefix.as_slice() != edited.original_bytes() {
+        if vehicle_data.prefix().encode() != original_prefix {
             return Err(invalid(
                 17,
-                "VehicleManager prefix bytes do not match the prefab editor's source body",
+                format!("{field} source prefix does not match the current manager body"),
             ));
         }
-        let replacement = edited.encode()?;
         let (current_prefix, prefix_end) = self.decode_vehicle_manager_prefix()?;
         if current_prefix.encode() != original_prefix {
             return Err(invalid(
                 17,
-                "VehicleManager prefab prefix differs from its decoded source body",
+                format!("{field} source prefix differs from the decoded manager body"),
             ));
         }
-
         let (body_start, _) = self.manager_body_boundary(17)?;
-        let original_prefix_end =
-            body_start
-                .checked_add(original_prefix.len())
-                .ok_or(CrpError::ArithmeticOverflow(
-                    "VehicleManager prefab prefix end",
-                ))?;
+        let original_prefix_end = body_start
+            .checked_add(original_prefix.len())
+            .ok_or(CrpError::ArithmeticOverflow("VehicleManager prefix end"))?;
         if original_prefix_end != prefix_end
             || self
                 .serialized_object_graph
                 .get(body_start..original_prefix_end)
-                != Some(original_prefix.as_slice())
+                != Some(original_prefix)
         {
             return Err(invalid(
                 body_start,
-                "VehicleManager prefab prefix range differs from its decoded source bytes",
+                format!("{field} source byte range is invalid"),
             ));
         }
 
@@ -5748,29 +5792,29 @@ impl SimulationManagerData {
             .checked_sub(original_prefix.len())
             .and_then(|start| start.checked_add(replacement.len()))
             .ok_or(CrpError::ArithmeticOverflow(
-                "VehicleManager edited prefab boundary",
+                "VehicleManager edited prefix end",
             ))?;
         let mut candidate = self.serialized_object_graph.clone();
         candidate.splice(body_start..original_prefix_end, replacement.clone());
         let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
-        let validation = self
-            .decode_vehicle_manager_data()
-            .and_then(|(data, updated_manager_end)| {
-                if updated_manager_end != expected_manager_end
-                    || data.prefix().encode() != replacement
-                {
-                    return Err(invalid(
-                        body_start,
-                        "edited VehicleManager prefab assignments changed an unexpected manager boundary",
-                    ));
-                }
-                Ok(())
-            });
+        let validation =
+            self.decode_vehicle_manager_data()
+                .and_then(|(data, updated_manager_end)| {
+                    if updated_manager_end != expected_manager_end
+                        || data.prefix().encode() != replacement
+                    {
+                        return Err(invalid(
+                            body_start,
+                            format!("{field} changed an unexpected manager boundary"),
+                        ));
+                    }
+                    Ok(())
+                });
         if let Err(error) = validation {
             self.serialized_object_graph = original_graph;
             return Err(invalid(
                 body_start,
-                format!("edited VehicleManager prefab assignments failed validation: {error}"),
+                format!("{field} failed manager-boundary validation: {error}"),
             ));
         }
         Ok(())
@@ -20311,6 +20355,60 @@ mod manager_boundary_tests {
         assert_eq!(
             updated_manager_end,
             original_manager_end - original_sparse_len + replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_manager_end..],
+            original_suffix.as_slice()
+        );
+    }
+
+    #[test]
+    fn vehicle_flags_editor_preserves_vehicle_boundary_and_following_manager() {
+        let mut flags = vec![0_u32; 16_383];
+        flags[0] = 1;
+        let mut graph = profiler_tag("VehicleManager");
+        crate::encoded_array::write_encoded_uint_array_runs(&mut graph, &flags);
+        graph.extend_from_slice(&[0; 12]); // Version-29 position.
+        graph.extend_from_slice(&[0; 8]); // Version-29 scalar fields.
+        graph.extend_from_slice(&[0, 16]); // Closing profiler reference.
+        let transport_tag = profiler_tag("TransportManager");
+        graph.extend_from_slice(&transport_tag);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 29;
+        let mut manager_objects = vec![None; 19];
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[18] = Some(ManagerObjectReference {
+            object_id: 18,
+            type_name: "TransportManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (original, original_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(original.prefix().vehicle_flags()[0], 1);
+        let original_suffix = manager.serialized_object_graph()[original_manager_end..].to_vec();
+        let mut editor = manager.decode_vehicle_manager_flags_editor().unwrap();
+        editor.set_vehicle_flag_bits(0, 7).unwrap();
+        let replacement_len = editor.encode().unwrap().len();
+        manager.replace_vehicle_manager_flags(&editor).unwrap();
+
+        let (updated, updated_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(updated.prefix().vehicle_flags()[0], 7);
+        assert_eq!(
+            updated
+                .prefix()
+                .vehicle_flags()
+                .iter()
+                .filter(|value| **value != 0)
+                .count(),
+            1
+        );
+        assert_eq!(
+            updated_manager_end,
+            original_manager_end - original.prefix().encode().len() + replacement_len
         );
         assert_eq!(
             &manager.serialized_object_graph()[updated_manager_end..],

@@ -127,6 +127,39 @@ pub(crate) fn write_encoded_uint_array(output: &mut Vec<u8>, values: &[u32]) {
     }
 }
 
+/// Writes unsigned 32-bit arrays with repeat-delta runs and literal fallbacks.
+///
+/// This keeps long constant runs compact while preserving the UInt codec's
+/// state across consecutive arrays in one shared scope.
+pub(crate) fn write_encoded_uint_array_runs(output: &mut Vec<u8>, values: &[u32]) {
+    let mut previous_value = 0_u32;
+    let mut previous_delta = 0_i32;
+    let mut index = 0;
+    while index < values.len() {
+        let mut repeated_value = previous_value;
+        let mut repeat_count = 0;
+        while repeat_count < 128 && index + repeat_count < values.len() {
+            repeated_value = repeated_value.wrapping_add(previous_delta as u32);
+            if values[index + repeat_count] != repeated_value {
+                break;
+            }
+            repeat_count += 1;
+        }
+        if repeat_count > 0 {
+            output.push(0x7f + repeat_count as u8);
+            previous_value = repeated_value;
+            index += repeat_count;
+        } else {
+            let value = values[index];
+            output.push(0);
+            output.extend_from_slice(&value.to_be_bytes());
+            previous_delta = value.wrapping_sub(previous_value) as i32;
+            previous_value = value;
+            index += 1;
+        }
+    }
+}
+
 /// Writes unsigned 64-bit values as canonical EncodedArray literal blocks.
 pub(crate) fn write_encoded_ulong_array(output: &mut Vec<u8>, values: &[u64]) {
     for chunk in values.chunks(64) {
@@ -449,7 +482,7 @@ mod tests {
         read_encoded_byte_array, read_encoded_float_array, read_encoded_long_array,
         read_encoded_uint_array, read_encoded_ulong_array, read_encoded_ushort_array,
         skip_encoded_ushort_array, write_encoded_bool_array, write_encoded_float_array,
-        write_encoded_long_array,
+        write_encoded_long_array, write_encoded_uint_array_runs,
     };
     use crate::data_serializer::Reader;
 
@@ -514,6 +547,35 @@ mod tests {
             read_encoded_uint_array(&mut separate_scope, 1).unwrap(),
             [0]
         );
+    }
+
+    #[test]
+    fn uint_repeat_writer_round_trips_and_keeps_shared_scope_state() {
+        let values = [0, 1, 2, 3];
+        let mut bytes = Vec::new();
+        write_encoded_uint_array_runs(&mut bytes, &values);
+        assert_eq!(bytes, [0x80, 0, 0, 0, 0, 1, 0x81]);
+
+        let mut reader = Reader::new(&bytes);
+        let mut scope = EncodedUIntArrayReader::default();
+        assert_eq!(scope.read_array(&mut reader, 2).unwrap(), [0, 1]);
+        assert_eq!(scope.read_array(&mut reader, 2).unwrap(), [2, 3]);
+        assert_eq!(reader.offset(), bytes.len());
+    }
+
+    #[test]
+    fn uint_repeat_writer_keeps_long_zero_arrays_compact() {
+        let values = vec![0; 16_383];
+        let mut bytes = Vec::new();
+        write_encoded_uint_array_runs(&mut bytes, &values);
+        assert_eq!(bytes.len(), 128);
+
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            read_encoded_uint_array(&mut reader, values.len()).unwrap(),
+            values
+        );
+        assert_eq!(reader.offset(), bytes.len());
     }
 
     #[test]
