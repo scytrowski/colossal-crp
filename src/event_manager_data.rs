@@ -5,6 +5,33 @@ use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 use std::ops::Range;
 
 const MAX_EVENT_SLOTS: usize = u16::MAX as usize + 1;
+const FIRST_EVENT_RECORD_VERSION: u32 = 210;
+const LAST_SUPPORTED_LEGACY_EVENT_RECORD_VERSION: u32 = 245;
+const CUSTOM_EVENT_SEED_FLAG: u32 = 1 << 10;
+
+/// One decoded active event from the legacy EventManager record layout.
+///
+/// This layout is supported for inner versions 210 through 245. Its four
+/// pre-245 color words are retained raw because their meaning is not
+/// established; version 245 stores the color as RGB bytes. Later active-event
+/// layouts are not decoded yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventManagerEventRecord {
+    /// One-based event slot represented by this record.
+    pub slot_index: u16,
+    /// Raw event-slot flags; the `0x400` bit selects a custom seed value.
+    pub flags: u32,
+    /// Event building index.
+    pub building_index: u16,
+    /// Event start frame.
+    pub start_frame: u32,
+    /// Four pre-245 32-bit color values, retained without interpretation.
+    pub legacy_color_words: Option<[u32; 4]>,
+    /// RGB color bytes stored from version 245.
+    pub color_rgb: Option<[u8; 3]>,
+    /// Optional custom event seed selected by flag bit `0x400`.
+    pub custom_seed: Option<u64>,
+}
 
 /// One versioned popularity and ticket-price override for an event type.
 ///
@@ -18,15 +45,18 @@ pub struct EventManagerTypeData {
     pub ticket_price_offset: Option<u32>,
 }
 
-/// Object references extracted from an empty-record `EventManager+Data` body.
+/// Supported fields decoded from a bounded `EventManager+Data` body.
 ///
-/// Event and route records are currently unsupported. Reader, writer, and
-/// one corpus-observed counted-block candidate are boundary-checked. The
+/// Legacy event records in versions 210–245 are decoded and retained. Later
+/// active-event layouts and active routes remain unsupported. Reader, writer,
+/// and one corpus-observed counted-block candidate are boundary-checked. The
 /// counted block is retained as raw bytes because its meaning and type are
 /// unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EventManagerReferenceData {
     format_version: u32,
+    pub(crate) active_event_records: Vec<EventManagerEventRecord>,
+    active_event_record_ranges: Vec<Range<usize>>,
     pub(crate) object_headers: Vec<NetObjectHeader>,
     pub(crate) unidentified_counted_block: Option<UnidentifiedCountedBlock>,
     pub(crate) type_data: Vec<EventManagerTypeData>,
@@ -37,8 +67,8 @@ pub(crate) struct EventManagerReferenceData {
 
 /// Editor for the fixed-width EventManager type-data table.
 ///
-/// The table size and version-selected field widths remain unchanged. Event
-/// and route records, prefab assignments, and the unidentified counted block
+/// The table size and version-selected field widths remain unchanged. Legacy
+/// event-record bytes, prefab assignments, and the unidentified counted block
 /// are preserved as source bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerTypeDataEditor {
@@ -46,9 +76,21 @@ pub struct EventManagerTypeDataEditor {
     type_data: Vec<EventManagerTypeData>,
 }
 
+/// Editor for existing legacy active EventManager records.
+///
+/// The record count, slot indexes, and activity flags are fixed. It edits only
+/// same-width scalar values for inner versions 210–245 and preserves the
+/// surrounding EventManager body bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventManagerEventRecordsEditor {
+    original: EventManagerReferenceData,
+    records: Vec<EventManagerEventRecord>,
+}
+
 impl EventManagerReferenceData {
     pub(crate) fn equivalent_reference_layout(&self, other: &Self) -> bool {
-        self.object_headers == other.object_headers
+        self.active_event_records == other.active_event_records
+            && self.object_headers == other.object_headers
             && self.unidentified_counted_block == other.unidentified_counted_block
             && self.type_data == other.type_data
             && (self.type_data.is_empty()
@@ -59,6 +101,13 @@ impl EventManagerReferenceData {
     pub(crate) fn into_type_data_editor(self) -> EventManagerTypeDataEditor {
         EventManagerTypeDataEditor {
             type_data: self.type_data.clone(),
+            original: self,
+        }
+    }
+
+    pub(crate) fn into_event_records_editor(self) -> EventManagerEventRecordsEditor {
+        EventManagerEventRecordsEditor {
+            records: self.active_event_records.clone(),
             original: self,
         }
     }
@@ -102,7 +151,8 @@ impl EventManagerReferenceData {
         } else {
             read_encoded_uint_array(&mut reader, event_capacity - 1)?
         };
-        reject_active_flags(&reader, &event_flags, "event")?;
+        let (active_event_records, active_event_record_ranges) =
+            read_active_event_records(&mut reader, format_version, &event_flags)?;
 
         if format_version >= 121_005 {
             let route_capacity = read_capacity(&mut reader, "event route")?;
@@ -116,7 +166,12 @@ impl EventManagerReferenceData {
         } else {
             0
         };
-        skip_event_prefab_scope(&mut reader, 0, milestone_count, type_data_count)?;
+        skip_event_prefab_scope(
+            &mut reader,
+            active_event_records.len(),
+            milestone_count,
+            type_data_count,
+        )?;
 
         let mut object_headers = read_object_headers(&mut reader, milestone_count)?;
         let type_data_start = reader.offset();
@@ -149,6 +204,8 @@ impl EventManagerReferenceData {
         finish(
             &mut reader,
             format_version,
+            active_event_records,
+            active_event_record_ranges,
             object_headers,
             unidentified_counted_block,
             type_data,
@@ -191,6 +248,8 @@ impl EventManagerReferenceData {
         finish(
             &mut reader,
             format_version,
+            Vec::new(),
+            Vec::new(),
             object_headers,
             None,
             type_data,
@@ -254,6 +313,68 @@ impl EventManagerTypeDataEditor {
     }
 }
 
+impl EventManagerEventRecordsEditor {
+    /// Returns the inner DataSerializer version used for these records.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns existing records in ascending event-slot order.
+    pub fn records(&self) -> &[EventManagerEventRecord] {
+        &self.records
+    }
+
+    /// Returns mutable existing records without changing their slot topology.
+    pub fn records_mut(&mut self) -> &mut [EventManagerEventRecord] {
+        &mut self.records
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.records.len() != self.original.active_event_records.len()
+            || self.records.len() != self.original.active_event_record_ranges.len()
+        {
+            return Err(invalid_event_record(
+                0,
+                "EventManager event record count cannot change in this editor",
+            ));
+        }
+        let mut output = self.original.serialized_body.clone();
+        for ((record, original_record), range) in self
+            .records
+            .iter()
+            .zip(&self.original.active_event_records)
+            .zip(&self.original.active_event_record_ranges)
+        {
+            if record.slot_index != original_record.slot_index
+                || record.flags != original_record.flags
+            {
+                return Err(invalid_event_record(
+                    range.start,
+                    "EventManager event slot and activity flags cannot change in this editor",
+                ));
+            }
+            let encoded = encode_event_record(self.original.format_version, record, range.start)?;
+            if encoded.len() != range.len() {
+                return Err(invalid_event_record(
+                    range.start,
+                    "EventManager event edit changed its serialized width",
+                ));
+            }
+            output
+                .get_mut(range.clone())
+                .ok_or_else(|| {
+                    invalid_event_record(range.start, "EventManager record range exceeds body")
+                })?
+                .copy_from_slice(&encoded);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original.serialized_body
+    }
+}
+
 fn read_capacity(reader: &mut Reader<'_>, description: &str) -> Result<usize, CrpError> {
     usize::from(reader.read_u16_be()?)
         .checked_add(1)
@@ -269,6 +390,69 @@ fn reject_active_flags(
         return Err(reader.invalid(format!("active {description} records are unsupported")));
     }
     Ok(())
+}
+
+fn read_active_event_records(
+    reader: &mut Reader<'_>,
+    format_version: u32,
+    flags: &[u32],
+) -> Result<(Vec<EventManagerEventRecord>, Vec<Range<usize>>), CrpError> {
+    let active_count = flags.iter().filter(|flag| **flag != 0).count();
+    if active_count == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if !(FIRST_EVENT_RECORD_VERSION..=LAST_SUPPORTED_LEGACY_EVENT_RECORD_VERSION)
+        .contains(&format_version)
+    {
+        return Err(reader.invalid(format!(
+            "active EventManager records are unsupported at inner version {format_version}"
+        )));
+    }
+
+    let mut records = Vec::with_capacity(active_count);
+    let mut record_ranges = Vec::with_capacity(active_count);
+    for (slot, flags) in flags.iter().copied().enumerate() {
+        if flags == 0 {
+            continue;
+        }
+        let slot_index = u16::try_from(slot + 1)
+            .map_err(|_| reader.invalid("EventManager event slot index exceeds u16"))?;
+        let record_start = reader.offset();
+        let building_index = reader.read_u16_be()?;
+        let start_frame = reader.read_u32_be()?;
+        let (legacy_color_words, color_rgb) = if format_version >= 245 {
+            (
+                None,
+                Some([reader.read_u8()?, reader.read_u8()?, reader.read_u8()?]),
+            )
+        } else {
+            (
+                Some([
+                    reader.read_u32_be()?,
+                    reader.read_u32_be()?,
+                    reader.read_u32_be()?,
+                    reader.read_u32_be()?,
+                ]),
+                None,
+            )
+        };
+        let custom_seed = if flags & CUSTOM_EVENT_SEED_FLAG != 0 {
+            Some(reader.read_u64_be()?)
+        } else {
+            None
+        };
+        records.push(EventManagerEventRecord {
+            slot_index,
+            flags,
+            building_index,
+            start_frame,
+            legacy_color_words,
+            color_rgb,
+            custom_seed,
+        });
+        record_ranges.push(record_start..reader.offset());
+    }
+    Ok((records, record_ranges))
 }
 
 fn skip_event_prefab_scope(
@@ -411,6 +595,8 @@ fn read_reader_tail(
 fn finish(
     reader: &mut Reader<'_>,
     format_version: u32,
+    active_event_records: Vec<EventManagerEventRecord>,
+    active_event_record_ranges: Vec<Range<usize>>,
     object_headers: Vec<NetObjectHeader>,
     unidentified_counted_block: Option<UnidentifiedCountedBlock>,
     type_data: Vec<EventManagerTypeData>,
@@ -423,6 +609,8 @@ fn finish(
     Ok((
         EventManagerReferenceData {
             format_version,
+            active_event_records,
+            active_event_record_ranges,
             object_headers,
             unidentified_counted_block,
             type_data,
@@ -442,10 +630,97 @@ fn invalid_type_data(offset: usize, reason: impl Into<String>) -> CrpError {
     }
 }
 
+fn encode_event_record(
+    format_version: u32,
+    record: &EventManagerEventRecord,
+    offset: usize,
+) -> Result<Vec<u8>, CrpError> {
+    let mut output = Vec::with_capacity(if format_version >= 245 { 17 } else { 30 });
+    output.extend_from_slice(&record.building_index.to_be_bytes());
+    output.extend_from_slice(&record.start_frame.to_be_bytes());
+    match (
+        format_version >= 245,
+        record.legacy_color_words,
+        record.color_rgb,
+    ) {
+        (false, Some(words), None) => {
+            for word in words {
+                output.extend_from_slice(&word.to_be_bytes());
+            }
+        }
+        (true, None, Some(rgb)) => output.extend_from_slice(&rgb),
+        (true, _, _) => {
+            return Err(invalid_event_record(
+                offset,
+                "version-245 event record requires RGB bytes and no legacy color words",
+            ));
+        }
+        (false, _, _) => {
+            return Err(invalid_event_record(
+                offset,
+                "pre-245 event record requires four legacy color words and no RGB bytes",
+            ));
+        }
+    }
+    match (
+        record.flags & CUSTOM_EVENT_SEED_FLAG != 0,
+        record.custom_seed,
+    ) {
+        (true, Some(seed)) => output.extend_from_slice(&seed.to_be_bytes()),
+        (false, None) => {}
+        (true, None) => {
+            return Err(invalid_event_record(
+                offset,
+                "custom-seed flag requires an event seed value",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_event_record(
+                offset,
+                "event seed value is unavailable without the custom-seed flag",
+            ));
+        }
+    }
+    Ok(output)
+}
+
+fn invalid_event_record(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "EventManager+Data event record".to_owned(),
+        offset,
+        reason: reason.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EventManagerReferenceData, EventManagerTypeData};
+    use super::{EventManagerEventRecord, EventManagerReferenceData, EventManagerTypeData};
     use crate::net_manager_data::NetObjectHeader;
+
+    fn one_active_event(format_version: u32, flags: u32) -> Vec<u8> {
+        let mut bytes = vec![
+            0x00, 0x01, // Two event slots.
+            0x00, // One literal event flag follows.
+        ];
+        bytes.extend_from_slice(&flags.to_be_bytes());
+        bytes.extend_from_slice(&[0x12, 0x34]); // Building index.
+        bytes.extend_from_slice(&0x0102_0304_u32.to_be_bytes()); // Start frame.
+        if format_version >= 245 {
+            bytes.extend_from_slice(&[0x11, 0x22, 0x33]);
+        } else {
+            for color_word in [0x1111_1111_u32, 0x2222_2222, 0x3333_3333, 0x4444_4444] {
+                bytes.extend_from_slice(&color_word.to_be_bytes());
+            }
+        }
+        if flags & (1 << 10) != 0 {
+            bytes.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
+        }
+        bytes.extend_from_slice(&[0x00, 0x00]); // No unlock milestones.
+        bytes.extend_from_slice(&[0x00, 0x00, 0x07]); // One event prefab index.
+        bytes.extend_from_slice(&[0x00, 0x00]); // Empty prefab names.
+        bytes.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
+        bytes
+    }
 
     fn empty_reader_layout(version: u32) -> Vec<u8> {
         let mut bytes = vec![0x00, 0x00]; // One event slot; its flag array is empty.
@@ -720,5 +995,76 @@ mod tests {
                 "{end}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_event_records_decode_in_flag_order_and_preserve_raw_values() {
+        let flags = 0x0000_0401;
+        let bytes = one_active_event(244, flags);
+        let (decoded, consumed) = EventManagerReferenceData::decode_reader(244, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            decoded.active_event_records,
+            [EventManagerEventRecord {
+                slot_index: 1,
+                flags,
+                building_index: 0x1234,
+                start_frame: 0x0102_0304,
+                legacy_color_words: Some([0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444,]),
+                color_rgb: None,
+                custom_seed: Some(0x0102_0304_0506_0708),
+            }]
+        );
+
+        let mut editor = decoded.into_event_records_editor();
+        editor.records_mut()[0].building_index = 0xabcd;
+        editor.records_mut()[0].start_frame = 0x0102_0305;
+        editor.records_mut()[0].legacy_color_words =
+            Some([0xaabb_ccdd, 0x2222_2222, 0x3333_3333, 0x4444_4444]);
+        editor.records_mut()[0].custom_seed = Some(0x1122_3344_5566_7788);
+        let expected = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0xab, 0xcd, 0x01, 0x02, 0x03, 0x05, 0xaa,
+            0xbb, 0xcc, 0xdd, 0x22, 0x22, 0x22, 0x22, 0x33, 0x33, 0x33, 0x33, 0x44, 0x44, 0x44,
+            0x44, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x00, 0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x12, 0x34,
+        ];
+        assert_eq!(editor.encode().unwrap(), expected);
+
+        editor.records_mut()[0].flags ^= 1 << 10;
+        assert!(editor.encode().is_err());
+
+        for end in 0..bytes.len() {
+            assert!(
+                EventManagerReferenceData::decode_reader(244, &bytes[..end]).is_err(),
+                "truncated legacy event body at {end}"
+            );
+        }
+        assert!(EventManagerReferenceData::decode_reader(246, &bytes).is_err());
+        assert!(EventManagerReferenceData::decode_reader(209, &bytes).is_err());
+    }
+
+    #[test]
+    fn event_record_color_changes_to_rgb_at_version_245() {
+        let flags = 0x0000_0401;
+        let bytes = one_active_event(245, flags);
+        let (decoded, consumed) = EventManagerReferenceData::decode_reader(245, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.active_event_records[0].legacy_color_words, None);
+        assert_eq!(
+            decoded.active_event_records[0].color_rgb,
+            Some([0x11, 0x22, 0x33])
+        );
+        assert_eq!(
+            decoded.active_event_records[0].custom_seed,
+            Some(0x0102_0304_0506_0708)
+        );
+        let mut editor = decoded.into_event_records_editor();
+        editor.records_mut()[0].color_rgb = Some([0xaa, 0xbb, 0xcc]);
+        let expected = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04, 0xaa,
+            0xbb, 0xcc, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x12, 0x34,
+        ];
+        assert_eq!(editor.encode().unwrap(), expected);
     }
 }

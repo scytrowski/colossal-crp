@@ -83,7 +83,10 @@ pub use electricity_manager_data::{
     ElectricityConductiveCellData, ElectricityManagerData, ElectricityPulseGroup,
     ElectricityPulseUnit,
 };
-pub use event_manager_data::{EventManagerTypeData, EventManagerTypeDataEditor};
+pub use event_manager_data::{
+    EventManagerEventRecord, EventManagerEventRecordsEditor, EventManagerTypeData,
+    EventManagerTypeDataEditor,
+};
 pub use game_area_data::{GameAreaManagerData, GameAreaManagerEditor, SavedCameraView};
 pub use guide_data::{
     GuideInstanceBody, GuideInstanceEditor, GuideTriggerBaseEditor, GuideTriggerBasePrefix,

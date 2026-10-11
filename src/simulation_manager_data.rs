@@ -46,7 +46,9 @@ use crate::encoded_array::{
     write_encoded_byte_array, write_encoded_float_array, write_encoded_long_array,
     write_encoded_ushort_array,
 };
-use crate::event_manager_data::{EventManagerReferenceData, EventManagerTypeDataEditor};
+use crate::event_manager_data::{
+    EventManagerEventRecordsEditor, EventManagerReferenceData, EventManagerTypeDataEditor,
+};
 use crate::guide_data::{
     GUIDE_INSTANCE_BODY_LEN, GUIDE_TRIGGER_BASE_PREFIX_LEN, GuideInstanceBody, GuideInstanceEditor,
     GuideTriggerBaseEditor, GuideTriggerBasePrefix,
@@ -2156,8 +2158,9 @@ impl SimulationManagerData {
     /// Decodes EventManager's versioned popularity and ticket-price type table.
     ///
     /// This table is available only when the bounded EventManager body matches
-    /// one unambiguous empty-event and empty-route reader/writer candidate.
-    /// Active event and route records remain unsupported.
+    /// one unambiguous supported reader/writer candidate. Legacy active-event
+    /// records from inner versions 210 through 245 are preserved unchanged;
+    /// later active-event layouts and active routes are unsupported.
     pub fn decode_event_manager_type_data(&self) -> Result<EventManagerTypeDataEditor, CrpError> {
         let managers = self
             .manager_objects
@@ -2167,6 +2170,101 @@ impl SimulationManagerData {
         Ok(self
             .decode_event_manager_reference_data_at(slot)?
             .into_type_data_editor())
+    }
+
+    /// Decodes legacy active EventManager records for inner versions 210–245.
+    ///
+    /// Pre-245 color words are returned raw; version 245 records expose RGB
+    /// bytes. Active records in later layouts and active event routes are
+    /// rejected because their complete field layouts are not yet supported.
+    /// The bounded manager body must match one unambiguous reader/writer
+    /// candidate.
+    pub fn decode_event_manager_event_records(
+        &self,
+    ) -> Result<EventManagerEventRecordsEditor, CrpError> {
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "EventManager+Data")?;
+        Ok(self
+            .decode_event_manager_reference_data_at(slot)?
+            .into_event_records_editor())
+    }
+
+    /// Replaces existing legacy EventManager event-record values in place.
+    ///
+    /// The editor must match this stream's version and exact source body.
+    /// Record count, slot indexes, flags, and record widths cannot change.
+    pub fn replace_event_manager_event_records(
+        &mut self,
+        edited: &EventManagerEventRecordsEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited EventManager version does not match this stream",
+            ));
+        }
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "EventManager+Data")?;
+        let current = self.decode_event_manager_reference_data_at(slot)?;
+        if current.serialized_body.as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                0,
+                "EventManager bytes do not match the event editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != edited.original_body_bytes().len() {
+            return Err(invalid(
+                0,
+                "EventManager event-record edits must preserve the manager body length",
+            ));
+        }
+        let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
+        let body_end =
+            body_start
+                .checked_add(replacement.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "EventManager event replacement end",
+                ))?;
+        if body_end != next_tag_start {
+            return Err(invalid(
+                body_start,
+                "EventManager event-record replacement does not reach the expected boundary",
+            ));
+        }
+        let original = self
+            .serialized_object_graph
+            .get(body_start..body_end)
+            .ok_or_else(|| invalid(body_start, "EventManager source body exceeds graph"))?
+            .to_vec();
+        self.serialized_object_graph[body_start..body_end].copy_from_slice(&replacement);
+        let validation = self
+            .decode_event_manager_reference_data_at(slot)
+            .and_then(|decoded| {
+                if decoded.serialized_body != replacement
+                    || decoded.active_event_records != edited.records()
+                {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten EventManager event records failed validation",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph[body_start..body_end].copy_from_slice(&original);
+            return Err(invalid(
+                body_start,
+                format!("rewritten EventManager body failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Replaces existing EventManager type-data values without changing the
@@ -13969,6 +14067,81 @@ mod manager_boundary_tests {
         assert!(
             manager
                 .replace_event_manager_type_data(&stale_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+    }
+
+    #[test]
+    fn event_manager_exposes_boundary_checked_legacy_active_records() {
+        let mut body = vec![
+            0x00, 0x01, // Two event slots.
+            0x00, // One literal event flag follows.
+            0x00, 0x00, 0x04, 0x01, // Active event with custom-seed flag.
+            0x12, 0x34, // Building index.
+            0x01, 0x02, 0x03, 0x04, // Start frame.
+        ];
+        for color_word in [0x1111_1111_u32, 0x2222_2222, 0x3333_3333, 0x4444_4444] {
+            body.extend_from_slice(&color_word.to_be_bytes());
+        }
+        body.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x00]); // No unlock milestones.
+        body.extend_from_slice(&[0x00, 0x00, 0x07]); // One event prefab index.
+        body.extend_from_slice(&[0x00, 0x00]); // Empty prefab names.
+        body.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
+
+        let (mut manager, body_start) = manager_with_event_manager_body(244, &body);
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let mut editor = manager.decode_event_manager_event_records().unwrap();
+        assert_eq!(
+            editor.records(),
+            [crate::EventManagerEventRecord {
+                slot_index: 1,
+                flags: 0x0000_0401,
+                building_index: 0x1234,
+                start_frame: 0x0102_0304,
+                legacy_color_words: Some([0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444,]),
+                color_rgb: None,
+                custom_seed: Some(0x0102_0304_0506_0708),
+            }]
+        );
+        let stale_editor = editor.clone();
+        editor.records_mut()[0].building_index = 0xbeef;
+        let mut invalid_editor = editor.clone();
+        invalid_editor.records_mut()[0].flags ^= 0x400;
+        assert!(
+            manager
+                .replace_event_manager_event_records(&invalid_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), original_graph);
+
+        manager
+            .replace_event_manager_event_records(&editor)
+            .unwrap();
+        let expected_body = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x11,
+            0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22, 0x33, 0x33, 0x33, 0x33, 0x44, 0x44, 0x44,
+            0x44, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x12, 0x34,
+        ];
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start..body_start + body.len()],
+            expected_body
+        );
+        let mut expected_graph = original_graph;
+        expected_graph[body_start..body_start + body.len()].copy_from_slice(&expected_body);
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+        assert_eq!(
+            manager
+                .decode_event_manager_event_records()
+                .unwrap()
+                .records(),
+            editor.records()
+        );
+        assert!(
+            manager
+                .replace_event_manager_event_records(&stale_editor)
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph(), expected_graph);
