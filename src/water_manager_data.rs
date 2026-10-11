@@ -63,9 +63,10 @@ pub struct WaterPulseUnit {
 /// Decoded reader fields from `WaterManager+Data`.
 ///
 /// Sparse cell columns use the corresponding conductivity plane's ascending
-/// cell-index order. Existing sparse electrification flags and conductive
-/// pollution values can be edited without changing the conductivity planes.
-/// Node arrays retain their full 32,768-entry size, with version-derived
+/// cell-index order. Conductivity values can be changed while retaining the
+/// existing zero/nonzero cell topology; sparse values can be edited by cell
+/// index without changing that topology. Node arrays retain their full
+/// 32,768-entry size, with version-derived
 /// defaults in the legacy upper half. The complete source body remains
 /// available for exact unchanged writing. Pulse-group and pulse-unit records
 /// and the scalar tail can be edited in place. Sparse, closest-segment, node,
@@ -78,8 +79,10 @@ pub struct WaterPulseUnit {
 pub struct WaterManagerData {
     format_version: u32,
     conductivity: Vec<u8>,
+    conductivity_snapshot: EncodedArraySnapshot<u8>,
     conductive_cells: Vec<usize>,
     conductivity_heating: Option<Vec<u8>>,
+    conductivity_heating_snapshot: Option<EncodedArraySnapshot<u8>>,
     heating_cells: Vec<usize>,
     water_pressure: Vec<i16>,
     water_pressure_snapshot: EncodedArraySnapshot<i16>,
@@ -183,13 +186,16 @@ impl WaterManagerData {
     /// writing.
     pub fn decode(format_version: u32, bytes: &[u8]) -> Result<Self, CrpError> {
         let mut reader = Reader::new(bytes);
-        let conductivity = read_encoded_byte_array(&mut reader, CELL_COUNT)?;
+        let (conductivity, conductivity_snapshot) =
+            read_captured_byte_array(&mut reader, CELL_COUNT)?;
         let conductive_cells = indexes_with_nonzero_values(&conductivity);
-        let conductivity_heating = if format_version >= HEATING_VERSION {
-            Some(read_encoded_byte_array(&mut reader, CELL_COUNT)?)
-        } else {
-            None
-        };
+        let (conductivity_heating, conductivity_heating_snapshot) =
+            if format_version >= HEATING_VERSION {
+                let (values, snapshot) = read_captured_byte_array(&mut reader, CELL_COUNT)?;
+                (Some(values), Some(snapshot))
+            } else {
+                (None, None)
+            };
         let heating_cells = conductivity_heating
             .as_deref()
             .map(indexes_with_nonzero_values)
@@ -439,8 +445,10 @@ impl WaterManagerData {
         Ok(Self {
             format_version,
             conductivity,
+            conductivity_snapshot,
             conductive_cells,
             conductivity_heating,
+            conductivity_heating_snapshot,
             heating_cells,
             water_pressure,
             water_pressure_snapshot,
@@ -556,6 +564,18 @@ impl WaterManagerData {
         &self.conductivity
     }
 
+    /// Replaces a conductivity value without changing whether its cell is
+    /// active. The value must stay zero for an inactive cell and nonzero for an
+    /// active cell so the sparse columns retain their current mapping.
+    pub fn set_conductivity(&mut self, cell: usize, conductivity: u8) -> Result<(), CrpError> {
+        set_conductivity_value(
+            &mut self.conductivity,
+            cell,
+            conductivity,
+            "water conductivity",
+        )
+    }
+
     /// Returns indexes of cells with nonzero primary conductivity.
     pub fn conductive_cells(&self) -> &[usize] {
         &self.conductive_cells
@@ -564,6 +584,22 @@ impl WaterManagerData {
     /// Returns the secondary conductivity plane from version 227.
     pub fn conductivity_heating(&self) -> Option<&[u8]> {
         self.conductivity_heating.as_deref()
+    }
+
+    /// Replaces a heating conductivity value from inner version 227 without
+    /// changing whether its cell is active.
+    pub fn set_heating_conductivity(
+        &mut self,
+        cell: usize,
+        conductivity: u8,
+    ) -> Result<(), CrpError> {
+        let Some(values) = self.conductivity_heating.as_mut() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating conductivity plane is absent before inner version 227",
+            ));
+        };
+        set_conductivity_value(values, cell, conductivity, "heating conductivity")
     }
 
     /// Returns indexes of cells with nonzero secondary conductivity.
@@ -1567,6 +1603,42 @@ impl WaterManagerData {
             .copy_from_slice(&[u8::from(self.can_continue)]);
         let stored_node_count = stored_node_count(self.format_version);
         let mut replacements = Vec::new();
+        if let Some(encoded) = changed_byte_array(
+            &self.conductivity,
+            Some(&self.conductivity_snapshot.values),
+            CELL_COUNT,
+            self.conductivity_snapshot.range.0,
+            "water conductivity",
+        )? {
+            replacements.push((
+                self.conductivity_snapshot.range.0,
+                self.conductivity_snapshot.range.1,
+                encoded,
+            ));
+        }
+        match (
+            self.conductivity_heating.as_deref(),
+            self.conductivity_heating_snapshot.as_ref(),
+        ) {
+            (Some(values), Some(snapshot)) => {
+                if let Some(encoded) = changed_byte_array(
+                    values,
+                    Some(&snapshot.values),
+                    CELL_COUNT,
+                    snapshot.range.0,
+                    "heating conductivity",
+                )? {
+                    replacements.push((snapshot.range.0, snapshot.range.1, encoded));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid_cell_grid(
+                    self.scalar_fields_offset,
+                    "heating conductivity fields do not match the version gate",
+                ));
+            }
+        }
         for (values, snapshot, field) in [
             (
                 &self.water_pressure,
@@ -2127,6 +2199,30 @@ fn set_grid_ushort_value(
         ));
     };
     *target = value;
+    Ok(())
+}
+
+fn set_conductivity_value(
+    values: &mut [u8],
+    cell: usize,
+    conductivity: u8,
+    field: &str,
+) -> Result<(), CrpError> {
+    let Some(target) = values.get_mut(cell) else {
+        return Err(invalid_cell_grid(
+            cell,
+            &format!("{field} cell index is outside the grid"),
+        ));
+    };
+    if (*target == 0) != (conductivity == 0) {
+        return Err(invalid_cell_grid(
+            cell,
+            &format!(
+                "{field} edits must preserve whether the cell is active to retain sparse field alignment"
+            ),
+        ));
+    }
+    *target = conductivity;
     Ok(())
 }
 
@@ -2833,6 +2929,15 @@ mod tests {
         [group[0], group[1], node[0], node[1], unit.x, unit.z]
     }
 
+    fn expected_literal_byte_array(values: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for chunk in values.chunks(128) {
+            bytes.push((chunk.len() - 1) as u8);
+            bytes.extend_from_slice(chunk);
+        }
+        bytes
+    }
+
     fn expected_ushort_array_with_two_nonzero_values(
         count: usize,
         first: u16,
@@ -2935,6 +3040,50 @@ mod tests {
         assert_eq!(data.conductive_cell_count(), 32);
         assert_eq!(data.guide_references().len(), 2);
         assert_eq!(data.encode_unchanged(), body);
+    }
+
+    #[test]
+    fn conductivity_edits_preserve_sparse_cell_topology() {
+        let body = active_body(265);
+        let mut data = WaterManagerData::decode(265, &body).unwrap();
+        assert_eq!(data.encode().unwrap(), body);
+        let mut water_values = vec![0; CELL_COUNT];
+        water_values[2] = 0x44;
+        let mut heating_values = vec![0; CELL_COUNT];
+        heating_values[4] = 0x55;
+        let mut expected = body.clone();
+        let mut replacements = vec![
+            (
+                data.conductivity_snapshot.range,
+                expected_literal_byte_array(&water_values),
+            ),
+            (
+                data.conductivity_heating_snapshot.as_ref().unwrap().range,
+                expected_literal_byte_array(&heating_values),
+            ),
+        ];
+        data.set_conductivity(2, 0x44).unwrap();
+        data.set_heating_conductivity(4, 0x55).unwrap();
+        replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in replacements.into_iter().rev() {
+            expected.splice(start..end, replacement);
+        }
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = WaterManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.conductive_cells(), [2]);
+        assert_eq!(decoded.heating_cells(), [4]);
+        assert_eq!(decoded.conductivity()[2], 0x44);
+        assert_eq!(decoded.conductivity_heating().unwrap()[4], 0x55);
+        assert!(data.set_conductivity(2, 0).is_err());
+        assert!(data.set_conductivity(3, 1).is_err());
+        assert!(data.set_conductivity(CELL_COUNT, 0).is_err());
+        assert!(data.set_heating_conductivity(4, 0).is_err());
+        assert!(data.set_heating_conductivity(5, 1).is_err());
+
+        let mut before_heating = WaterManagerData::decode(226, &empty_body(226)).unwrap();
+        assert!(before_heating.set_heating_conductivity(0, 1).is_err());
     }
 
     #[test]
