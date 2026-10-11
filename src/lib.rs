@@ -84,8 +84,8 @@ pub use electricity_manager_data::{
     ElectricityPulseUnit,
 };
 pub use event_manager_data::{
-    EventManagerEventRecord, EventManagerEventRecordsEditor, EventManagerTailData,
-    EventManagerTailEditor, EventManagerTypeData, EventManagerTypeDataEditor,
+    EventManagerEventRecord, EventManagerEventRecordsEditor, EventManagerPrefabIndicesEditor,
+    EventManagerTailData, EventManagerTailEditor, EventManagerTypeData, EventManagerTypeDataEditor,
 };
 pub use game_area_data::{GameAreaManagerData, GameAreaManagerEditor, SavedCameraView};
 pub use guide_data::{

@@ -1,6 +1,8 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::{read_encoded_uint_array, skip_encoded_ushort_array};
+use crate::encoded_array::{
+    read_encoded_uint_array, read_encoded_ushort_array, write_encoded_ushort_array,
+};
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 use std::ops::Range;
 
@@ -69,6 +71,10 @@ pub(crate) struct EventManagerReferenceData {
     pub(crate) object_headers: Vec<NetObjectHeader>,
     pub(crate) unidentified_counted_block: Option<UnidentifiedCountedBlock>,
     pub(crate) type_data: Vec<EventManagerTypeData>,
+    pub(crate) prefab_indexes: Vec<u16>,
+    prefab_index_group_counts: [usize; 3],
+    prefab_scope_range: Range<usize>,
+    prefab_names_range: Range<usize>,
     pub(crate) tail_data: EventManagerTailData,
     type_data_has_ticket_price: bool,
     type_data_range: Range<usize>,
@@ -109,12 +115,26 @@ pub struct EventManagerTailEditor {
     tail_data: EventManagerTailData,
 }
 
+/// Editor for existing EventManager event, milestone, and type-data indexes.
+///
+/// All indexes share one encoded UShort scope. A changed scope is written with
+/// the crate's canonical UShort encoding and can change the manager body size;
+/// the unique-string name table is preserved byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventManagerPrefabIndicesEditor {
+    original: EventManagerReferenceData,
+    event_indexes: Vec<u16>,
+    milestone_indexes: Vec<u16>,
+    type_data_indexes: Vec<u16>,
+}
+
 impl EventManagerReferenceData {
     pub(crate) fn equivalent_reference_layout(&self, other: &Self) -> bool {
         self.active_event_records == other.active_event_records
             && self.object_headers == other.object_headers
             && self.unidentified_counted_block == other.unidentified_counted_block
             && self.type_data == other.type_data
+            && self.prefab_indexes == other.prefab_indexes
             && (self.type_data.is_empty()
                 || (self.type_data_range == other.type_data_range
                     && self.type_data_has_ticket_price == other.type_data_has_ticket_price))
@@ -140,6 +160,21 @@ impl EventManagerReferenceData {
             original: self,
         }
     }
+
+    pub(crate) fn into_prefab_indices_editor(self) -> EventManagerPrefabIndicesEditor {
+        let [event_count, milestone_count, type_data_count] = self.prefab_index_group_counts;
+        let event_indexes = self.prefab_indexes[..event_count].to_vec();
+        let milestone_end = event_count + milestone_count;
+        let milestone_indexes = self.prefab_indexes[event_count..milestone_end].to_vec();
+        let type_data_indexes =
+            self.prefab_indexes[milestone_end..milestone_end + type_data_count].to_vec();
+        EventManagerPrefabIndicesEditor {
+            original: self,
+            event_indexes,
+            milestone_indexes,
+            type_data_indexes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +182,12 @@ pub(crate) struct UnidentifiedCountedBlock {
     pub(crate) count: u16,
     pub(crate) raw_headers: Vec<u8>,
     pub(crate) contains_only_null_headers: bool,
+}
+
+struct EventPrefabScope {
+    indexes: Vec<u16>,
+    scope_range: Range<usize>,
+    names_range: Range<usize>,
 }
 
 impl EventManagerReferenceData {
@@ -195,7 +236,9 @@ impl EventManagerReferenceData {
         } else {
             0
         };
-        skip_event_prefab_scope(
+        let prefab_index_group_counts =
+            [active_event_records.len(), milestone_count, type_data_count];
+        let prefab_scope = read_event_prefab_scope(
             &mut reader,
             active_event_records.len(),
             milestone_count,
@@ -209,7 +252,7 @@ impl EventManagerReferenceData {
         let type_data_range = type_data_start..reader.offset();
 
         if format_version >= 121_015 {
-            skip_event_prefab_scope(&mut reader, 0, 0, 0)?;
+            read_event_prefab_scope(&mut reader, 0, 0, 0)?;
         }
         let unidentified_counted_block = if counted_reference_block {
             let count = reader.read_u16_be()?;
@@ -241,6 +284,8 @@ impl EventManagerReferenceData {
             type_data,
             type_data_has_ticket_price,
             type_data_range,
+            prefab_scope,
+            prefab_index_group_counts,
             tail_data,
             band_popularity_bonus_range,
             event_schedule_count_range,
@@ -263,7 +308,9 @@ impl EventManagerReferenceData {
 
         let milestone_count = usize::from(reader.read_u16_be()?);
         let type_data_count = usize::from(reader.read_u16_be()?);
-        skip_event_prefab_scope(&mut reader, 0, milestone_count, type_data_count)?;
+        let prefab_index_group_counts = [0, milestone_count, type_data_count];
+        let prefab_scope =
+            read_event_prefab_scope(&mut reader, 0, milestone_count, type_data_count)?;
 
         let mut object_headers = read_object_headers(&mut reader, milestone_count)?;
         let type_data_start = reader.offset();
@@ -272,7 +319,7 @@ impl EventManagerReferenceData {
         let type_data_range = type_data_start..reader.offset();
 
         // The current writer opens the schedule-prefab scope at every version.
-        skip_event_prefab_scope(&mut reader, 0, 0, 0)?;
+        read_event_prefab_scope(&mut reader, 0, 0, 0)?;
         object_headers.push(read_net_object_header(&mut reader)?);
         object_headers.push(read_net_object_header(&mut reader)?);
         object_headers.push(read_net_object_header(&mut reader)?);
@@ -292,6 +339,8 @@ impl EventManagerReferenceData {
             type_data,
             type_data_has_ticket_price,
             type_data_range,
+            prefab_scope,
+            prefab_index_group_counts,
             EventManagerTailData {
                 band_popularity_bonus: Some(band_popularity_bonus),
                 event_schedule_count: Some(event_schedule_count),
@@ -498,6 +547,84 @@ impl EventManagerTailEditor {
     }
 }
 
+impl EventManagerPrefabIndicesEditor {
+    /// Returns the inner DataSerializer version used for the prefab scope.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns existing active-event prefab indexes in event-slot order.
+    pub fn event_indexes(&self) -> &[u16] {
+        &self.event_indexes
+    }
+
+    /// Returns mutable active-event prefab indexes without changing their count.
+    pub fn event_indexes_mut(&mut self) -> &mut [u16] {
+        &mut self.event_indexes
+    }
+
+    /// Returns existing milestone prefab indexes in serialized order.
+    pub fn milestone_indexes(&self) -> &[u16] {
+        &self.milestone_indexes
+    }
+
+    /// Returns mutable milestone prefab indexes without changing their count.
+    pub fn milestone_indexes_mut(&mut self) -> &mut [u16] {
+        &mut self.milestone_indexes
+    }
+
+    /// Returns existing event-type prefab indexes in serialized order.
+    pub fn type_data_indexes(&self) -> &[u16] {
+        &self.type_data_indexes
+    }
+
+    /// Returns mutable event-type prefab indexes without changing their count.
+    pub fn type_data_indexes_mut(&mut self) -> &mut [u16] {
+        &mut self.type_data_indexes
+    }
+
+    pub(crate) fn all_indexes(&self) -> Vec<u16> {
+        let mut indexes = Vec::with_capacity(self.original.prefab_indexes.len());
+        indexes.extend_from_slice(&self.event_indexes);
+        indexes.extend_from_slice(&self.milestone_indexes);
+        indexes.extend_from_slice(&self.type_data_indexes);
+        indexes
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let indexes = self.all_indexes();
+        if indexes.len() != self.original.prefab_indexes.len()
+            || indexes != self.original.prefab_indexes
+        {
+            let mut encoded_indexes = Vec::new();
+            write_encoded_ushort_array(&mut encoded_indexes, &indexes);
+            let names = self
+                .original
+                .serialized_body
+                .get(self.original.prefab_names_range.clone())
+                .ok_or_else(|| {
+                    invalid_event_prefabs(
+                        self.original.prefab_names_range.start,
+                        "EventManager prefab-name table exceeds body",
+                    )
+                })?;
+            let mut replacement_scope = encoded_indexes;
+            replacement_scope.extend_from_slice(names);
+            let mut output = self.original.serialized_body.clone();
+            output
+                .splice(self.original.prefab_scope_range.clone(), replacement_scope)
+                .for_each(drop);
+            Ok(output)
+        } else {
+            Ok(self.original.serialized_body.clone())
+        }
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original.serialized_body
+    }
+}
+
 fn read_capacity(reader: &mut Reader<'_>, description: &str) -> Result<usize, CrpError> {
     usize::from(reader.read_u16_be()?)
         .checked_add(1)
@@ -578,20 +705,28 @@ fn read_active_event_records(
     Ok((records, record_ranges))
 }
 
-fn skip_event_prefab_scope(
+fn read_event_prefab_scope(
     reader: &mut Reader<'_>,
     active_event_count: usize,
     milestone_count: usize,
     type_data_count: usize,
-) -> Result<(), CrpError> {
+) -> Result<EventPrefabScope, CrpError> {
     let index_count = active_event_count
         .checked_add(milestone_count)
         .and_then(|count| count.checked_add(type_data_count))
         .ok_or(CrpError::ArithmeticOverflow(
             "EventManager prefab index count",
         ))?;
-    skip_encoded_ushort_array(reader, index_count)?;
-    skip_prefab_names(reader)
+    let scope_start = reader.offset();
+    let indexes = read_encoded_ushort_array(reader, index_count)?;
+    let names_start = reader.offset();
+    skip_prefab_names(reader)?;
+    let scope_end = reader.offset();
+    Ok(EventPrefabScope {
+        indexes,
+        scope_range: scope_start..scope_end,
+        names_range: names_start..scope_end,
+    })
 }
 
 fn skip_prefab_names(reader: &mut Reader<'_>) -> Result<(), CrpError> {
@@ -748,6 +883,8 @@ fn finish(
     type_data: Vec<EventManagerTypeData>,
     type_data_has_ticket_price: bool,
     type_data_range: Range<usize>,
+    prefab_scope: EventPrefabScope,
+    prefab_index_group_counts: [usize; 3],
     tail_data: EventManagerTailData,
     band_popularity_bonus_range: Option<Range<usize>>,
     event_schedule_count_range: Option<Range<usize>>,
@@ -763,6 +900,10 @@ fn finish(
             object_headers,
             unidentified_counted_block,
             type_data,
+            prefab_indexes: prefab_scope.indexes,
+            prefab_index_group_counts,
+            prefab_scope_range: prefab_scope.scope_range,
+            prefab_names_range: prefab_scope.names_range,
             tail_data,
             type_data_has_ticket_price,
             type_data_range,
@@ -847,6 +988,14 @@ fn invalid_event_record(offset: usize, reason: impl Into<String>) -> CrpError {
 fn invalid_event_tail(offset: usize, reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "EventManager+Data tail".to_owned(),
+        offset,
+        reason: reason.into(),
+    }
+}
+
+fn invalid_event_prefabs(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "EventManager+Data prefab indexes".to_owned(),
         offset,
         reason: reason.into(),
     }
@@ -1103,6 +1252,83 @@ mod tests {
             0xff, 0xff, 0x00, 0x09, 0x12, 0x34,
         ];
         assert_eq!(editor.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn prefab_index_editor_splits_groups_and_preserves_name_table_bytes() {
+        let mut bytes = vec![
+            0x00, 0x00, // One event slot; no active events.
+            0x00, 0x00, // No unlock milestones.
+            0x00, 0x04, // Four modified event types.
+            0x03, 0x00, 0x0a, 0x00, 0x14, 0x00, 0x1e, 0x00, 0x28, // Four literal indexes.
+        ];
+        let names_start = bytes.len();
+        bytes.extend_from_slice(&[0x00, 0x01]); // One unique prefab name.
+        crate::data_serializer::write_unique_string(&mut bytes, "EventPrefab")
+            .expect("short test name is encodable");
+        let names_end = bytes.len();
+        for (popularity, price) in [(-1_i8, 1_u32), (2, 2), (3, 3), (4, 4)] {
+            bytes.push(popularity as u8);
+            bytes.extend_from_slice(&price.to_be_bytes()[1..]);
+        }
+        bytes.push(0xff); // Match-preparing reference.
+        bytes.extend_from_slice(&[0x00, 0x09]); // Band-popularity bonus.
+        bytes.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
+
+        let (decoded, consumed) =
+            EventManagerReferenceData::decode_reader(108_004, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        let mut editor = decoded.into_prefab_indices_editor();
+        assert!(editor.event_indexes().is_empty());
+        assert!(editor.milestone_indexes().is_empty());
+        assert_eq!(editor.type_data_indexes(), [10, 20, 30, 40]);
+        editor
+            .type_data_indexes_mut()
+            .copy_from_slice(&[1, 2, 3, 4]);
+
+        let mut expected = vec![
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x04, // Counts are unchanged.
+            0x00, 0x00, 0x01, 0x82, // Canonical literal followed by three repeated deltas.
+        ];
+        expected.extend_from_slice(&bytes[names_start..names_end]);
+        expected.extend_from_slice(&bytes[names_end..]);
+        assert_eq!(editor.encode().unwrap(), expected);
+        assert!(expected.len() < bytes.len());
+
+        let (rewritten, rewritten_len) =
+            EventManagerReferenceData::decode_reader(108_004, &expected).unwrap();
+        assert_eq!(rewritten_len, expected.len());
+        assert_eq!(rewritten.prefab_indexes, [1, 2, 3, 4]);
+        assert_eq!(
+            &expected[6 + 4..6 + 4 + (names_end - names_start)],
+            &bytes[names_start..names_end]
+        );
+
+        for end in 0..bytes.len() {
+            assert!(
+                EventManagerReferenceData::decode_reader(108_004, &bytes[..end]).is_err(),
+                "truncated prefab-index body at {end}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefab_index_editor_keeps_active_event_group_separate() {
+        let bytes = one_active_event(244, 1);
+        let (decoded, consumed) = EventManagerReferenceData::decode_reader(244, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        let mut editor = decoded.into_prefab_indices_editor();
+        assert_eq!(editor.event_indexes(), [7]);
+        assert!(editor.milestone_indexes().is_empty());
+        assert!(editor.type_data_indexes().is_empty());
+        editor.event_indexes_mut()[0] = 0x1234;
+
+        let mut expected = bytes.clone();
+        let scope_start = expected.len() - 7;
+        expected[scope_start..scope_start + 3].copy_from_slice(&[0x00, 0x12, 0x34]);
+        assert_eq!(editor.encode().unwrap(), expected);
+        let (rewritten, _) = EventManagerReferenceData::decode_reader(244, &expected).unwrap();
+        assert_eq!(rewritten.prefab_indexes, [0x1234]);
     }
 
     #[test]

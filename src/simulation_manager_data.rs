@@ -47,8 +47,8 @@ use crate::encoded_array::{
     write_encoded_ushort_array,
 };
 use crate::event_manager_data::{
-    EventManagerEventRecordsEditor, EventManagerReferenceData, EventManagerTailEditor,
-    EventManagerTypeDataEditor,
+    EventManagerEventRecordsEditor, EventManagerPrefabIndicesEditor, EventManagerReferenceData,
+    EventManagerTailEditor, EventManagerTypeDataEditor,
 };
 use crate::guide_data::{
     GUIDE_INSTANCE_BODY_LEN, GUIDE_TRIGGER_BASE_PREFIX_LEN, GuideInstanceBody, GuideInstanceEditor,
@@ -2410,6 +2410,102 @@ impl SimulationManagerData {
             });
         if let Err(error) = validation {
             self.serialized_object_graph[body_start..body_end].copy_from_slice(&original);
+            return Err(invalid(
+                body_start,
+                format!("rewritten EventManager body failed validation: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Decodes the shared EventManager event, milestone, and type-data prefab indexes.
+    ///
+    /// The three groups occupy one encoded UShort array. Active routes remain
+    /// unsupported; this editor preserves their related schedule scope and all
+    /// other body bytes without interpreting them.
+    pub fn decode_event_manager_prefab_indices(
+        &self,
+    ) -> Result<EventManagerPrefabIndicesEditor, CrpError> {
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "EventManager+Data")?;
+        Ok(self
+            .decode_event_manager_reference_data_at(slot)?
+            .into_prefab_indices_editor())
+    }
+
+    /// Replaces existing EventManager prefab indexes and resizes the encoded scope as needed.
+    ///
+    /// The editor must match this stream's version and exact source body. Index
+    /// counts and group order remain fixed; prefab-name bytes, later body fields,
+    /// and the following manager tag are preserved byte-for-byte.
+    pub fn replace_event_manager_prefab_indices(
+        &mut self,
+        edited: &EventManagerPrefabIndicesEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited EventManager version does not match this stream",
+            ));
+        }
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "EventManager+Data")?;
+        let current = self.decode_event_manager_reference_data_at(slot)?;
+        if current.serialized_body.as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                0,
+                "EventManager bytes do not match the prefab-index editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
+        let replacement_end =
+            body_start
+                .checked_add(replacement.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "EventManager replacement prefab body end",
+                ))?;
+        let original_body_end = body_start
+            .checked_add(edited.original_body_bytes().len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "EventManager original prefab body end",
+            ))?;
+        if original_body_end != next_tag_start {
+            return Err(invalid(
+                body_start,
+                "EventManager prefab-index source body does not reach the expected boundary",
+            ));
+        }
+        let original = self
+            .serialized_object_graph
+            .get(body_start..original_body_end)
+            .ok_or_else(|| invalid(body_start, "EventManager source body exceeds graph"))?
+            .to_vec();
+        self.serialized_object_graph
+            .splice(body_start..original_body_end, replacement.iter().copied());
+
+        let validation = self
+            .decode_event_manager_reference_data_at(slot)
+            .and_then(|decoded| {
+                if decoded.serialized_body != replacement
+                    || decoded.prefab_indexes != edited.all_indexes()
+                {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten EventManager prefab indexes failed validation",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph
+                .splice(body_start..replacement_end, original);
             return Err(invalid(
                 body_start,
                 format!("rewritten EventManager body failed validation: {error}"),
@@ -14153,6 +14249,84 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph(), expected_graph);
+    }
+
+    #[test]
+    fn event_manager_prefab_index_replacement_resizes_scope_and_preserves_following_manager() {
+        let mut body = vec![
+            0x00, 0x00, // One event slot; no active events.
+            0x00, 0x02, // Two unlock milestones.
+            0x00, 0x04, // Four modified event types.
+            0x05, 0x00, 0x0a, 0x00, 0x14, 0x00, 0x1e, 0x00, 0x28, 0x00, 0x32, 0x00,
+            0x3c,
+            // Six indexes in one literal block.
+        ];
+        let names_start = body.len();
+        body.extend_from_slice(&[0x00, 0x01]); // One unique prefab name.
+        write_unique_string(&mut body, "EventPrefab").expect("short test name is encodable");
+        let names_end = body.len();
+        body.extend_from_slice(&[0xff, 0xff]); // Two null milestone references.
+        for (popularity, price) in [(-1_i8, 1_u32), (2, 2), (3, 3), (4, 4)] {
+            body.push(popularity as u8);
+            body.extend_from_slice(&price.to_be_bytes()[1..]);
+        }
+        body.push(0xff); // Match-preparing reference.
+        body.extend_from_slice(&[0x00, 0x09]); // Band-popularity bonus.
+        body.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
+
+        let (mut manager, body_start) = manager_with_event_manager_body(108_004, &body);
+        manager
+            .serialized_object_graph
+            .extend_from_slice(b"following manager payload");
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let original_body_end = body_start + body.len();
+        let following_manager = original_graph[original_body_end..].to_vec();
+        let mut editor = manager.decode_event_manager_prefab_indices().unwrap();
+        assert!(editor.event_indexes().is_empty());
+        assert_eq!(editor.milestone_indexes(), [10, 20]);
+        assert_eq!(editor.type_data_indexes(), [30, 40, 50, 60]);
+        let stale_editor = editor.clone();
+        editor.milestone_indexes_mut().copy_from_slice(&[1, 2]);
+        editor
+            .type_data_indexes_mut()
+            .copy_from_slice(&[3, 4, 5, 6]);
+
+        let mut expected_body = body[..6].to_vec();
+        expected_body.extend_from_slice(&[0x00, 0x00, 0x01, 0x84]);
+        expected_body.extend_from_slice(&body[names_start..]);
+        let new_body_end = body_start + expected_body.len();
+        let original_boundary = manager.manager_body_boundary(0).unwrap().1;
+        assert_eq!(original_boundary, original_body_end);
+
+        manager
+            .replace_event_manager_prefab_indices(&editor)
+            .unwrap();
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start..new_body_end],
+            expected_body
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[new_body_end..],
+            following_manager
+        );
+        assert_eq!(manager.manager_body_boundary(0).unwrap().1, new_body_end);
+        let rewritten = manager.decode_event_manager_prefab_indices().unwrap();
+        assert_eq!(rewritten.event_indexes(), []);
+        assert_eq!(rewritten.milestone_indexes(), [1, 2]);
+        assert_eq!(rewritten.type_data_indexes(), [3, 4, 5, 6]);
+        assert_eq!(
+            &manager.serialized_object_graph()
+                [body_start + 6 + 4..body_start + 6 + 4 + (names_end - names_start)],
+            &body[names_start..names_end]
+        );
+
+        let updated_graph = manager.serialized_object_graph().to_vec();
+        assert!(
+            manager
+                .replace_event_manager_prefab_indices(&stale_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), updated_graph);
     }
 
     #[test]
