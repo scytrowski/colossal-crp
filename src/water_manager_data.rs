@@ -55,10 +55,12 @@ pub struct WaterPulseUnit {
 /// Sparse cell columns use the corresponding conductivity plane's ascending
 /// cell-index order. Node arrays retain their full 32,768-entry size, with
 /// version-derived defaults in the legacy upper half. The complete source body
-/// remains available for exact unchanged writing; editing water state is not
-/// supported by this type. The inner serializer version controls the 23, 73,
-/// 94, 202, 227, and 270–272 gates. Corpus samples cover versions 194–118011;
-/// active network values and gates 270–272 have synthetic coverage only.
+/// remains available for exact unchanged writing. The processed-cell count,
+/// conductive-cell count, and continuation flag can be edited in place; all
+/// other fields remain byte-identical. The inner serializer version controls
+/// the 23, 73, 94, 202, 227, and 270–272 gates. Corpus samples cover versions
+/// 194–118011; active network values and gates 270–272 have synthetic coverage
+/// only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaterManagerData {
     format_version: u32,
@@ -102,6 +104,7 @@ pub struct WaterManagerData {
     processed_cell_count: i32,
     conductive_cell_count: i32,
     can_continue: bool,
+    scalar_fields_offset: usize,
     guide_references: Vec<NetObjectHeader>,
     original_body: Vec<u8>,
 }
@@ -247,6 +250,7 @@ impl WaterManagerData {
                 .copy_from_slice(&read_encoded_ushort_array(&mut reader, stored_node_count)?);
         }
 
+        let scalar_fields_offset = reader.offset();
         let processed_cell_count = reader.read_i32_be()?;
         let conductive_cell_count = reader.read_i32_be()?;
         let can_continue = reader.read_u8()? != 0;
@@ -301,6 +305,7 @@ impl WaterManagerData {
             processed_cell_count,
             conductive_cell_count,
             can_continue,
+            scalar_fields_offset,
             guide_references,
             original_body: bytes.to_vec(),
         })
@@ -511,6 +516,24 @@ impl WaterManagerData {
         self.can_continue
     }
 
+    /// Replaces the stored processed-cell counter without changing the body
+    /// length.
+    pub fn set_processed_cell_count(&mut self, value: i32) {
+        self.processed_cell_count = value;
+    }
+
+    /// Replaces the stored conductive-cell counter without changing the body
+    /// length.
+    pub fn set_conductive_cell_count(&mut self, value: i32) {
+        self.conductive_cell_count = value;
+    }
+
+    /// Replaces the serialized continuation flag without changing the body
+    /// length.
+    pub fn set_can_continue(&mut self, value: bool) {
+        self.can_continue = value;
+    }
+
     /// Returns the two guide headers from version 94, without resolving them.
     pub fn guide_references(&self) -> &[NetObjectHeader] {
         &self.guide_references
@@ -525,6 +548,63 @@ impl WaterManagerData {
     /// the closing profiler reference.
     pub fn encode_unchanged(&self) -> Vec<u8> {
         self.original_body.clone()
+    }
+
+    /// Encodes edited counters and the continuation flag while preserving all
+    /// other bytes, including any guide references and the closing profiler
+    /// reference. Returns an error if the captured scalar field range is
+    /// invalid.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let mut bytes = self.original_body.clone();
+        let processed_end =
+            self.scalar_fields_offset
+                .checked_add(4)
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "WaterManager processed-cell counter end",
+                ))?;
+        let conductive_end = processed_end
+            .checked_add(4)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "WaterManager conductive-cell counter end",
+            ))?;
+        let flag_end = conductive_end
+            .checked_add(1)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "WaterManager continuation flag end",
+            ))?;
+        let closing_start = bytes.len().checked_sub(END_PROFILER_REFERENCE_LEN);
+        if closing_start.is_none_or(|closing_start| flag_end > closing_start) {
+            return Err(CrpError::InvalidAssetPayload {
+                name: "WaterManager+Data".to_owned(),
+                offset: self.scalar_fields_offset,
+                reason: "scalar fields do not end before the closing profiler reference".to_owned(),
+            });
+        }
+        bytes
+            .get_mut(self.scalar_fields_offset..processed_end)
+            .ok_or_else(|| CrpError::InvalidAssetPayload {
+                name: "WaterManager+Data".to_owned(),
+                offset: self.scalar_fields_offset,
+                reason: "processed-cell counter range is invalid".to_owned(),
+            })?
+            .copy_from_slice(&self.processed_cell_count.to_be_bytes());
+        bytes
+            .get_mut(processed_end..conductive_end)
+            .ok_or_else(|| CrpError::InvalidAssetPayload {
+                name: "WaterManager+Data".to_owned(),
+                offset: processed_end,
+                reason: "conductive-cell counter range is invalid".to_owned(),
+            })?
+            .copy_from_slice(&self.conductive_cell_count.to_be_bytes());
+        bytes
+            .get_mut(conductive_end..flag_end)
+            .ok_or_else(|| CrpError::InvalidAssetPayload {
+                name: "WaterManager+Data".to_owned(),
+                offset: conductive_end,
+                reason: "continuation flag range is invalid".to_owned(),
+            })?
+            .copy_from_slice(&[u8::from(self.can_continue)]);
+        Ok(bytes)
     }
 }
 
@@ -906,6 +986,37 @@ mod tests {
         assert_eq!(data.conductive_cell_count(), 32);
         assert_eq!(data.guide_references().len(), 2);
         assert_eq!(data.encode_unchanged(), body);
+    }
+
+    #[test]
+    fn scalar_edits_patch_only_big_endian_tail_fields() {
+        for version in [93, 94, 265] {
+            let body = empty_body(version);
+            let mut data = WaterManagerData::decode(version, &body).unwrap();
+            data.set_processed_cell_count(-17);
+            data.set_conductive_cell_count(0x1234_5678);
+            data.set_can_continue(false);
+
+            let encoded = data.encode().unwrap();
+            let scalar_tail_len = if version >= 94 { 13 } else { 11 };
+            let scalar_start = body.len() - scalar_tail_len;
+            assert_eq!(encoded.len(), body.len());
+            assert_eq!(
+                &encoded[scalar_start..scalar_start + 4],
+                &(-17_i32).to_be_bytes()
+            );
+            assert_eq!(
+                &encoded[scalar_start + 4..scalar_start + 8],
+                &0x1234_5678_i32.to_be_bytes()
+            );
+            assert_eq!(encoded[scalar_start + 8], 0);
+            assert_eq!(&encoded[..scalar_start], &body[..scalar_start]);
+            assert_eq!(&encoded[scalar_start + 9..], &body[scalar_start + 9..]);
+            let decoded = WaterManagerData::decode(version, &encoded).unwrap();
+            assert_eq!(decoded.processed_cell_count(), -17);
+            assert_eq!(decoded.conductive_cell_count(), 0x1234_5678);
+            assert!(!decoded.can_continue());
+        }
     }
 
     #[test]
