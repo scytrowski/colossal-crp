@@ -1,5 +1,7 @@
 use crate::CrpError;
-use crate::data_serializer::Reader;
+use crate::data_serializer::{
+    COMPACT_STRING_FLAG, Reader, write_unique_string, write_unique_string_with_mode,
+};
 use crate::encoded_array::{
     EncodedUIntArrayReader, read_encoded_byte_array, read_encoded_ushort_array,
     write_encoded_byte_array, write_encoded_ushort_array,
@@ -43,21 +45,23 @@ pub struct VehicleManagerDataPrefix {
     parked_vehicle_prefab_indices: Option<Vec<u16>>,
     prefab_indices_range: Option<Range<usize>>,
     prefab_names: Option<Vec<Option<String>>>,
+    prefab_name_ranges: Option<Vec<Range<usize>>>,
+    prefab_name_compact: Option<Vec<Option<bool>>>,
     serialized_prefix: Vec<u8>,
 }
 
 /// Editor for existing active and parked vehicle prefab assignments.
 ///
-/// Flags, active record counts, and the prefab-name table remain fixed. The
-/// encoded assignments are rewritten canonically only when a value changes.
-/// Setters return errors for unavailable fields or indexes outside the active
-/// assignment arrays; encoding returns an error if source ranges or counts do
-/// not match the decoded prefix.
+/// Flags, active record counts, and the prefab-name table size remain fixed.
+/// Changed assignments are rewritten canonically; changed names replace only
+/// their own string bytes. Setters return errors for unavailable fields or
+/// out-of-range indexes; encoding validates source ranges and counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VehicleManagerPrefabEditor {
     original: VehicleManagerDataPrefix,
     vehicle_prefab_indices: Option<Vec<u16>>,
     parked_vehicle_prefab_indices: Option<Vec<u16>>,
+    prefab_names: Option<Vec<Option<String>>>,
 }
 
 impl VehicleManagerDataPrefix {
@@ -94,6 +98,8 @@ impl VehicleManagerDataPrefix {
             parked_vehicle_prefab_indices,
             prefab_indices_range,
             prefab_names,
+            prefab_name_ranges,
+            prefab_name_compact,
         ) = if format_version >= PREFAB_COLLECTION_VERSION {
             let active_vehicle_count = vehicle_flags.iter().filter(|flags| **flags != 0).count();
             let active_parked_count = parked_vehicle_flags
@@ -109,15 +115,17 @@ impl VehicleManagerDataPrefix {
             let indices = read_encoded_ushort_array(&mut reader, total_count)?;
             let indices_end = reader.offset();
             let (vehicle_indices, parked_indices) = indices.split_at(active_vehicle_count);
-            let names = read_prefab_names(&mut reader)?;
+            let (names, name_ranges, name_compact) = read_prefab_names(&mut reader)?;
             (
                 Some(vehicle_indices.to_vec()),
                 Some(parked_indices.to_vec()),
                 Some(indices_start..indices_end),
                 Some(names),
+                Some(name_ranges),
+                Some(name_compact),
             )
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None, None)
         };
 
         let consumed = reader.offset();
@@ -131,6 +139,8 @@ impl VehicleManagerDataPrefix {
                 parked_vehicle_prefab_indices,
                 prefab_indices_range,
                 prefab_names,
+                prefab_name_ranges,
+                prefab_name_compact,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -194,6 +204,7 @@ impl VehicleManagerDataPrefix {
         VehicleManagerPrefabEditor {
             vehicle_prefab_indices: self.vehicle_prefab_indices.clone(),
             parked_vehicle_prefab_indices: self.parked_vehicle_prefab_indices.clone(),
+            prefab_names: self.prefab_names.clone(),
             original: self,
         }
     }
@@ -304,63 +315,157 @@ impl VehicleManagerPrefabEditor {
         )
     }
 
-    /// Returns the unchanged prefab-name table in its original order.
+    /// Returns the prefab-name table, preserving null names, from version 30.
     pub fn prefab_names(&self) -> Option<&[Option<String>]> {
-        self.original.prefab_names()
+        self.prefab_names.as_deref()
     }
 
-    /// Writes the original prefix with edited assignments.
+    /// Replaces an existing prefab-name entry without changing the table size.
     ///
-    /// If no index changes, the original prefix bytes are returned exactly.
-    /// Otherwise only the combined index array is canonically encoded; the
-    /// flags and name-table bytes retain their original representation.
+    /// The source compact or wide encoding is retained when possible. A
+    /// compact source is widened if the new text contains characters outside
+    /// its byte range. A formerly null entry uses the compact form when it can
+    /// represent the new text.
+    pub fn set_prefab_name(&mut self, index: usize, value: Option<String>) -> Result<(), CrpError> {
+        let names = self
+            .prefab_names
+            .as_mut()
+            .ok_or_else(|| invalid(0, "VehicleManager prefab-name table is unavailable"))?;
+        let name = names
+            .get_mut(index)
+            .ok_or_else(|| invalid(index, "VehicleManager prefab-name index is out of range"))?;
+        *name = value;
+        Ok(())
+    }
+
+    /// Writes the original prefix with edited assignments or names.
+    ///
+    /// An unchanged editor returns the exact source bytes. Changed assignments
+    /// are canonically encoded; each changed name replaces only its own string
+    /// bytes. Flags, unchanged names, and the name-table count retain their
+    /// original representation.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         if self.vehicle_prefab_indices == self.original.vehicle_prefab_indices
             && self.parked_vehicle_prefab_indices == self.original.parked_vehicle_prefab_indices
+            && self.prefab_names == self.original.prefab_names
         {
             return Ok(self.original.serialized_prefix.clone());
         }
 
-        let vehicle_indices = self.vehicle_prefab_indices.as_ref().ok_or_else(|| {
-            invalid(
-                0,
-                "active-vehicle prefab assignments are absent before inner version 30",
-            )
-        })?;
-        let parked_indices = self
-            .parked_vehicle_prefab_indices
-            .as_ref()
-            .ok_or_else(|| invalid(0, "parked-vehicle prefab assignment field is unavailable"))?;
-        if self.original.vehicle_prefab_indices.as_ref().map(Vec::len)
-            != Some(vehicle_indices.len())
-            || self
-                .original
-                .parked_vehicle_prefab_indices
-                .as_ref()
-                .map(Vec::len)
-                != Some(parked_indices.len())
-        {
-            return Err(invalid(0, "vehicle prefab assignment counts changed"));
-        }
+        let mut replacements = Vec::new();
+        let assignments_changed = self.vehicle_prefab_indices
+            != self.original.vehicle_prefab_indices
+            || self.parked_vehicle_prefab_indices != self.original.parked_vehicle_prefab_indices;
+        if assignments_changed {
+            let vehicle_indices = self.vehicle_prefab_indices.as_ref().ok_or_else(|| {
+                invalid(
+                    0,
+                    "active-vehicle prefab assignments are absent before inner version 30",
+                )
+            })?;
+            let parked_indices = self.parked_vehicle_prefab_indices.as_ref().ok_or_else(|| {
+                invalid(0, "parked-vehicle prefab assignment field is unavailable")
+            })?;
+            if self.original.vehicle_prefab_indices.as_ref().map(Vec::len)
+                != Some(vehicle_indices.len())
+                || self
+                    .original
+                    .parked_vehicle_prefab_indices
+                    .as_ref()
+                    .map(Vec::len)
+                    != Some(parked_indices.len())
+            {
+                return Err(invalid(0, "vehicle prefab assignment counts changed"));
+            }
 
-        let range =
-            self.original.prefab_indices_range.as_ref().ok_or_else(|| {
+            let range = self.original.prefab_indices_range.as_ref().ok_or_else(|| {
                 invalid(0, "VehicleManager prefab index byte range is unavailable")
             })?;
-        if range.start > range.end || range.end > self.original.serialized_prefix.len() {
-            return Err(invalid(
-                range.start,
-                "VehicleManager prefab index range is invalid",
-            ));
+            validate_replacement_range(
+                range,
+                self.original.serialized_prefix.len(),
+                "VehicleManager prefab index",
+            )?;
+            let mut indices = Vec::with_capacity(vehicle_indices.len() + parked_indices.len());
+            indices.extend_from_slice(vehicle_indices);
+            indices.extend_from_slice(parked_indices);
+            let mut encoded_indices = Vec::new();
+            write_encoded_ushort_array(&mut encoded_indices, &indices);
+            replacements.push((range.clone(), encoded_indices));
         }
-        let mut indices = Vec::with_capacity(vehicle_indices.len() + parked_indices.len());
-        indices.extend_from_slice(vehicle_indices);
-        indices.extend_from_slice(parked_indices);
-        let mut encoded_indices = Vec::new();
-        write_encoded_ushort_array(&mut encoded_indices, &indices);
 
-        let mut bytes = self.original.serialized_prefix.clone();
-        bytes.splice(range.clone(), encoded_indices);
+        if self.prefab_names != self.original.prefab_names {
+            let names = self
+                .prefab_names
+                .as_ref()
+                .ok_or_else(|| invalid(0, "VehicleManager prefab-name table is unavailable"))?;
+            let original_names = self
+                .original
+                .prefab_names
+                .as_ref()
+                .ok_or_else(|| invalid(0, "VehicleManager prefab-name table is unavailable"))?;
+            let ranges = self.original.prefab_name_ranges.as_ref().ok_or_else(|| {
+                invalid(0, "VehicleManager prefab-name byte ranges are unavailable")
+            })?;
+            let compact_modes = self.original.prefab_name_compact.as_ref().ok_or_else(|| {
+                invalid(
+                    0,
+                    "VehicleManager prefab-name encoding modes are unavailable",
+                )
+            })?;
+            if names.len() != original_names.len()
+                || ranges.len() != original_names.len()
+                || compact_modes.len() != original_names.len()
+            {
+                return Err(invalid(0, "VehicleManager prefab-name counts changed"));
+            }
+            for (index, (name, original_name)) in names.iter().zip(original_names).enumerate() {
+                if name == original_name {
+                    continue;
+                }
+                let range = &ranges[index];
+                validate_replacement_range(
+                    range,
+                    self.original.serialized_prefix.len(),
+                    "VehicleManager prefab name",
+                )?;
+                let mut encoded_name = Vec::new();
+                match name {
+                    None => encoded_name.push(0xff),
+                    Some(value) => {
+                        let can_keep_compact =
+                            value.chars().all(|character| u32::from(character) < 256);
+                        match compact_modes[index] {
+                            Some(true) if can_keep_compact => {
+                                write_unique_string_with_mode(&mut encoded_name, value, true)?;
+                            }
+                            Some(false) => {
+                                write_unique_string_with_mode(&mut encoded_name, value, false)?;
+                            }
+                            _ => write_unique_string(&mut encoded_name, value)?,
+                        }
+                    }
+                }
+                replacements.push((range.clone(), encoded_name));
+            }
+        }
+
+        replacements.sort_by_key(|(range, _)| range.start);
+        let source = &self.original.serialized_prefix;
+        let mut bytes = Vec::with_capacity(source.len());
+        let mut cursor = 0;
+        for (range, encoded) in replacements {
+            if range.start < cursor {
+                return Err(invalid(
+                    range.start,
+                    "VehicleManager edited byte ranges overlap",
+                ));
+            }
+            bytes.extend_from_slice(&source[cursor..range.start]);
+            bytes.extend_from_slice(&encoded);
+            cursor = range.end;
+        }
+        bytes.extend_from_slice(&source[cursor..]);
         Ok(bytes)
     }
 
@@ -1855,6 +1960,20 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
     }
 }
 
+fn validate_replacement_range(
+    range: &Range<usize>,
+    source_len: usize,
+    field: &str,
+) -> Result<(), CrpError> {
+    if range.start > range.end || range.end > source_len {
+        return Err(invalid(
+            range.start,
+            format!("{field} byte range is invalid"),
+        ));
+    }
+    Ok(())
+}
+
 fn read_vector<const N: usize>(reader: &mut Reader<'_>) -> Result<[u32; N], CrpError> {
     let mut values = [0_u32; N];
     for value in &mut values {
@@ -1863,13 +1982,34 @@ fn read_vector<const N: usize>(reader: &mut Reader<'_>) -> Result<[u32; N], CrpE
     Ok(values)
 }
 
-fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, CrpError> {
+fn read_prefab_names(
+    reader: &mut Reader<'_>,
+) -> Result<(Vec<Option<String>>, Vec<Range<usize>>, Vec<Option<bool>>), CrpError> {
     let count = usize::from(reader.read_u16_be()?);
     let mut names = Vec::with_capacity(count);
+    let mut ranges = Vec::with_capacity(count);
+    let mut compact_modes = Vec::with_capacity(count);
     for _ in 0..count {
-        names.push(reader.read_unique_string()?);
+        let start = reader.offset();
+        let name = reader.read_unique_string()?;
+        let end = reader.offset();
+        let compact = if name.is_some() {
+            let raw = reader
+                .consumed_bytes()
+                .get(start..end)
+                .ok_or_else(|| invalid(start, "VehicleManager prefab-name range is invalid"))?;
+            let first = *raw
+                .first()
+                .ok_or_else(|| invalid(start, "VehicleManager prefab name is empty"))?;
+            Some((u32::from(first) << 16) & COMPACT_STRING_FLAG != 0)
+        } else {
+            None
+        };
+        names.push(name);
+        ranges.push(start..end);
+        compact_modes.push(compact);
     }
-    Ok(names)
+    Ok((names, ranges, compact_modes))
 }
 
 #[cfg(test)]
@@ -1930,6 +2070,8 @@ mod tests {
             parked_vehicle_prefab_indices: None,
             prefab_indices_range: None,
             prefab_names: None,
+            prefab_name_ranges: None,
+            prefab_name_compact: None,
             serialized_prefix: Vec::new(),
         }
     }
@@ -2253,7 +2395,52 @@ mod tests {
         let mut editor = prefix_with_active_slots(29, 1).into_prefab_editor();
         assert!(editor.set_vehicle_prefab_index(0, 1).is_err());
         assert!(editor.set_parked_vehicle_prefab_index(0, 1).is_err());
+        assert!(editor.set_prefab_name(0, Some("Car".to_owned())).is_err());
         assert_eq!(editor.encode().unwrap(), []);
+    }
+
+    #[test]
+    fn vehicle_prefab_editor_updates_names_and_preserves_unchanged_encoding() {
+        let mut bytes = empty_prefix(29);
+        bytes.extend_from_slice(&[0, 3]); // three name entries, no assignments
+        bytes.push(0xff); // null
+        bytes.extend_from_slice(&[0x80, 0, 1, 0xc1]); // compact "A"
+        bytes.extend_from_slice(&[0, 0, 1, 0x03, 0x29]); // wide "Ω"
+
+        let (decoded, consumed) = VehicleManagerDataPrefix::decode_prefix(30, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            decoded.prefab_names(),
+            Some([None, Some("A".to_owned()), Some("Ω".to_owned())].as_slice())
+        );
+        let mut editor = decoded.into_prefab_editor();
+        assert_eq!(editor.encode().unwrap(), bytes);
+        editor.set_prefab_name(0, Some("XY".to_owned())).unwrap();
+        editor.set_prefab_name(1, Some("B".to_owned())).unwrap();
+        editor.set_prefab_name(2, Some("Δ".to_owned())).unwrap();
+        assert!(editor.set_prefab_name(3, None).is_err());
+
+        let mut expected = empty_prefix(29);
+        expected.extend_from_slice(&[0, 3]);
+        expected.extend_from_slice(&[0x80, 0, 2, 0xd8, 1]); // compact "XY"
+        expected.extend_from_slice(&[0x80, 0, 1, 0xc2]); // compact "B"
+        expected.extend_from_slice(&[0, 0, 1, 0x03, 0x14]); // wide "Δ"
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+
+        let (updated, updated_len) = VehicleManagerDataPrefix::decode_prefix(30, &encoded).unwrap();
+        assert_eq!(updated_len, encoded.len());
+        assert_eq!(
+            updated.prefab_names(),
+            Some(
+                [
+                    Some("XY".to_owned()),
+                    Some("B".to_owned()),
+                    Some("Δ".to_owned())
+                ]
+                .as_slice()
+            )
+        );
     }
 
     #[test]

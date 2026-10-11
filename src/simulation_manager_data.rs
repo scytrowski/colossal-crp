@@ -20362,7 +20362,15 @@ mod manager_boundary_tests {
         for (index, value) in [1, 2, 3, 4, 5].into_iter().enumerate() {
             editor.set_vehicle_prefab_index(index, value).unwrap();
         }
-        assert_eq!(editor.prefab_names(), Some(original_names.as_slice()));
+        editor
+            .set_prefab_name(1, Some("Sedan XL".to_owned()))
+            .unwrap();
+        assert_eq!(editor.prefab_names().unwrap()[0], original_names[0]);
+        assert_eq!(
+            editor.prefab_names().unwrap()[1].as_deref(),
+            Some("Sedan XL")
+        );
+        assert_eq!(editor.prefab_names().unwrap()[2..], original_names[2..]);
         let replacement = editor.encode().unwrap();
         assert!(replacement.len() < original_prefix.len());
 
@@ -20372,9 +20380,11 @@ mod manager_boundary_tests {
             updated.prefix().vehicle_prefab_indices(),
             Some([1, 2, 3, 4, 5].as_slice())
         );
+        let mut expected_names = original_names;
+        expected_names[1] = Some("Sedan XL".to_owned());
         assert_eq!(
             updated.prefix().prefab_names(),
-            Some(original_names.as_slice())
+            Some(expected_names.as_slice())
         );
         assert_eq!(
             updated_manager_end,
