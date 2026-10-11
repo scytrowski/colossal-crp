@@ -347,6 +347,138 @@ impl ElectricityManagerData {
         Ok(())
     }
 
+    /// Replaces all serialized values for an existing conductive cell without
+    /// changing its active-cell position or the conductive-cell counter.
+    /// Version-gated raw values are required and validated. Errors leave the
+    /// data unchanged.
+    pub fn set_conductive_cell_data(
+        &mut self,
+        cell: usize,
+        state: ElectricityConductiveCellData,
+    ) -> Result<(), CrpError> {
+        if state.conductivity == 0 {
+            return Err(invalid(
+                cell,
+                "an existing electricity cell must retain nonzero conductivity",
+            ));
+        }
+        self.validate_sparse_lengths(cell)?;
+        validate_cell_version_fields(self.format_version, cell, state)?;
+        let Some(current_conductivity) = self.conductivity.get(cell).copied() else {
+            return Err(invalid(
+                cell,
+                "electricity conductivity cell index is outside the grid",
+            ));
+        };
+        let position = self.conductive_cells.binary_search(&cell).map_err(|_| {
+            invalid(
+                cell,
+                "electricity conductivity cell is absent from its conductivity grid",
+            )
+        })?;
+        if current_conductivity == 0 {
+            return Err(invalid(
+                cell,
+                "electricity conductivity grid and sparse cell index are inconsistent",
+            ));
+        }
+
+        let Some(conductivity) = self.conductivity.get_mut(cell) else {
+            return Err(invalid(
+                cell,
+                "electricity conductivity cell index is outside the grid",
+            ));
+        };
+        let Some(current_charge) = self.current_charge.get_mut(position) else {
+            return Err(invalid(
+                cell,
+                "current-charge values are shorter than the grid",
+            ));
+        };
+        let Some(extra_charge) = self.extra_charge.get_mut(position) else {
+            return Err(invalid(
+                cell,
+                "extra-charge values are shorter than the grid",
+            ));
+        };
+        let Some(pulse_group_index) = self.pulse_group_indexes.get_mut(position) else {
+            return Err(invalid(
+                cell,
+                "pulse-group indexes are shorter than the grid",
+            ));
+        };
+        let Some(electrified) = self.electrified.get_mut(position) else {
+            return Err(invalid(
+                cell,
+                "electrified values are shorter than the grid",
+            ));
+        };
+        let Some(temporary_electrified) = self.temporary_electrified.get_mut(position) else {
+            return Err(invalid(
+                cell,
+                "temporary-electrified values are shorter than the grid",
+            ));
+        };
+        let legacy_temporary_byte = match self.legacy_temporary_electrified_bytes.as_mut() {
+            Some(values) => Some(values.get_mut(position).ok_or_else(|| {
+                invalid(
+                    cell,
+                    "legacy temporary-electrification bytes are shorter than the grid",
+                )
+            })?),
+            None => None,
+        };
+        let version_75_compatibility_value = match self.version_75_compatibility_values.as_mut() {
+            Some(values) => Some(values.get_mut(position).ok_or_else(|| {
+                invalid(
+                    cell,
+                    "version-75 compatibility values are shorter than the grid",
+                )
+            })?),
+            None => None,
+        };
+        let legacy_temporary_byte = match (
+            legacy_temporary_byte,
+            state.legacy_temporary_electrified_byte,
+        ) {
+            (Some(target), Some(value)) => Some((target, value)),
+            (None, None) => None,
+            _ => {
+                return Err(invalid(
+                    cell,
+                    "legacy temporary-electrification byte does not match the version gate",
+                ));
+            }
+        };
+        let version_75_compatibility_value = match (
+            version_75_compatibility_value,
+            state.version_75_compatibility_value,
+        ) {
+            (Some(target), Some(value)) => Some((target, value)),
+            (None, None) => None,
+            _ => {
+                return Err(invalid(
+                    cell,
+                    "version-75 compatibility value does not match the exact version gate",
+                ));
+            }
+        };
+
+        *conductivity = state.conductivity;
+        *current_charge = state.current_charge;
+        *extra_charge = state.extra_charge;
+        *pulse_group_index = state.pulse_group_index;
+        *electrified = state.electrified;
+        *temporary_electrified = state.temporary_electrified;
+        if let Some((target, value)) = legacy_temporary_byte {
+            *target = value;
+        }
+        if let Some((target, value)) = version_75_compatibility_value {
+            *target = value;
+        }
+        Ok(())
+    }
+
     /// Inserts an active electricity cell and all of its sparse values in
     /// ascending cell-index order. Versions 8–75 require the raw temporary
     /// electrification byte, and version 75 also requires its compatibility
@@ -1559,6 +1691,161 @@ mod tests {
 
         assert!(data.set_conductivity(5, 0).is_err());
         assert!(data.set_conductivity(CELL_COUNT, 1).is_err());
+        assert_eq!(data.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn edits_existing_conductive_cell_fields_with_exact_sparse_bytes() {
+        let body = active_current_body();
+        let mut data = ElectricityManagerData::decode(117_000, &body).unwrap();
+        let state = ElectricityConductiveCellData {
+            conductivity: 0x22,
+            current_charge: -2,
+            extra_charge: 0xabcd,
+            pulse_group_index: 0xbeef,
+            electrified: false,
+            temporary_electrified: true,
+            legacy_temporary_electrified_byte: None,
+            version_75_compatibility_value: None,
+        };
+        let mut conductivity = vec![0; CELL_COUNT];
+        conductivity[5] = state.conductivity;
+        conductivity[10] = 2;
+        let mut replacements = vec![
+            (data.conductivity_snapshot.range.clone(), {
+                let mut encoded = Vec::new();
+                append_literal_byte_array(&mut encoded, &conductivity);
+                encoded
+            }),
+            (data.current_charge_snapshot.range.clone(), {
+                let mut encoded = Vec::new();
+                append_ushort_literal_array(&mut encoded, &[0xfffe, 0x1234]);
+                encoded
+            }),
+            (data.extra_charge_snapshot.range.clone(), {
+                let mut encoded = Vec::new();
+                append_ushort_literal_array(&mut encoded, &[0xabcd, 4]);
+                encoded
+            }),
+            (data.pulse_group_indexes_snapshot.range.clone(), {
+                let mut encoded = Vec::new();
+                append_ushort_literal_array(&mut encoded, &[0xbeef, 8]);
+                encoded
+            }),
+            (data.electrified_snapshot.range.clone(), vec![0, 0]),
+            (
+                data.temporary_electrified_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range
+                    .clone(),
+                vec![0, 3],
+            ),
+        ];
+
+        data.set_conductive_cell_data(5, state).unwrap();
+
+        assert_eq!(data.conductive_cells(), [5, 10]);
+        assert_eq!(data.conductive_cell_count(), 18);
+        replacements.sort_by_key(|(range, _)| range.start);
+        let mut expected = body.clone();
+        for (range, encoded) in replacements.into_iter().rev() {
+            expected.splice(range, encoded);
+        }
+        assert_eq!(data.encode().unwrap(), expected);
+        let decoded = ElectricityManagerData::decode(117_000, &expected).unwrap();
+        assert_eq!(decoded.current_charge(), [-2, 0x1234]);
+        assert_eq!(decoded.extra_charge(), [0xabcd, 4]);
+        assert_eq!(decoded.pulse_group_indexes(), [0xbeef, 8]);
+        assert_eq!(decoded.electrified(), [false, false]);
+        assert_eq!(decoded.temporary_electrified(), [true, true]);
+
+        let invalid_state = ElectricityConductiveCellData {
+            conductivity: 0,
+            ..state
+        };
+        assert!(data.set_conductive_cell_data(5, invalid_state).is_err());
+        assert!(data.set_conductive_cell_data(3, state).is_err());
+        assert_eq!(data.encode().unwrap(), expected);
+        assert_eq!(data.remove_conductive_cell(5).unwrap(), state);
+    }
+
+    #[test]
+    fn edits_existing_version_75_cell_and_retains_both_raw_columns() {
+        let body = active_version_75_body();
+        let mut data = ElectricityManagerData::decode(75, &body).unwrap();
+        let state = ElectricityConductiveCellData {
+            conductivity: 0x42,
+            current_charge: -6,
+            extra_charge: 0x5566,
+            pulse_group_index: 0x7788,
+            electrified: true,
+            temporary_electrified: true,
+            legacy_temporary_electrified_byte: Some(1),
+            version_75_compatibility_value: Some(0x3344),
+        };
+        let mut conductivity = vec![0; CELL_COUNT];
+        conductivity[7] = state.conductivity;
+        let mut replacements = vec![
+            (data.conductivity_snapshot.range.clone(), {
+                let mut encoded = Vec::new();
+                append_literal_byte_array(&mut encoded, &conductivity);
+                encoded
+            }),
+            (
+                data.current_charge_snapshot.range.clone(),
+                vec![0, 0xff, 0xfa],
+            ),
+            (
+                data.extra_charge_snapshot.range.clone(),
+                vec![0, 0x55, 0x66],
+            ),
+            (
+                data.pulse_group_indexes_snapshot.range.clone(),
+                vec![0, 0x77, 0x88],
+            ),
+            (
+                data.version_75_compatibility_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range
+                    .clone(),
+                vec![0, 0x33, 0x44],
+            ),
+            (
+                data.legacy_temporary_electrified_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range
+                    .clone(),
+                vec![0, 1],
+            ),
+        ];
+
+        data.set_conductive_cell_data(7, state).unwrap();
+
+        replacements.sort_by_key(|(range, _)| range.start);
+        let mut expected = body.clone();
+        for (range, encoded) in replacements.into_iter().rev() {
+            expected.splice(range, encoded);
+        }
+        assert_eq!(data.encode().unwrap(), expected);
+        let decoded = ElectricityManagerData::decode(75, &expected).unwrap();
+        assert_eq!(
+            decoded.legacy_temporary_electrified_bytes(),
+            Some([1].as_slice())
+        );
+        assert_eq!(
+            decoded.version_75_compatibility_values(),
+            Some([0x3344].as_slice())
+        );
+        assert_eq!(decoded.temporary_electrified(), [true]);
+        assert_eq!(data.conductive_cells(), [7]);
+        let invalid_state = ElectricityConductiveCellData {
+            legacy_temporary_electrified_byte: None,
+            ..state
+        };
+        assert!(data.set_conductive_cell_data(7, invalid_state).is_err());
         assert_eq!(data.encode().unwrap(), expected);
     }
 
