@@ -38,7 +38,7 @@ use crate::data_serializer::{
     COMPACT_STRING_FLAG, DataSerializerStream, Reader, write_nullable_unique_string, write_u24_be,
     write_unique_string, write_unique_string_with_mode,
 };
-use crate::disaster_manager_data::DisasterManagerReferenceData;
+use crate::disaster_manager_data::{DisasterManagerData, DisasterManagerEditor};
 use crate::electricity_manager_data::ElectricityManagerData;
 use crate::encoded_array::{
     EncodedLongArrayReader, read_encoded_byte_array, read_encoded_float_array,
@@ -46,7 +46,7 @@ use crate::encoded_array::{
     write_encoded_byte_array, write_encoded_float_array, write_encoded_long_array,
     write_encoded_ushort_array,
 };
-use crate::event_manager_data::EventManagerReferenceData;
+use crate::event_manager_data::{EventManagerReferenceData, EventManagerTypeDataEditor};
 use crate::guide_data::{
     GUIDE_INSTANCE_BODY_LEN, GUIDE_TRIGGER_BASE_PREFIX_LEN, GuideInstanceBody, GuideInstanceEditor,
     GuideTriggerBaseEditor, GuideTriggerBasePrefix,
@@ -2150,6 +2150,192 @@ impl SimulationManagerData {
         }
         self.serialized_object_graph[field_range].copy_from_slice(&replacement);
         self.decode_info_manager_data()?;
+        Ok(())
+    }
+
+    /// Decodes EventManager's versioned popularity and ticket-price type table.
+    ///
+    /// This table is available only when the bounded EventManager body matches
+    /// one unambiguous empty-event and empty-route reader/writer candidate.
+    /// Active event and route records remain unsupported.
+    pub fn decode_event_manager_type_data(&self) -> Result<EventManagerTypeDataEditor, CrpError> {
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "EventManager+Data")?;
+        Ok(self
+            .decode_event_manager_reference_data_at(slot)?
+            .into_type_data_editor())
+    }
+
+    /// Replaces existing EventManager type-data values without changing the
+    /// manager's byte length or its adjacent manager boundary.
+    pub fn replace_event_manager_type_data(
+        &mut self,
+        edited: &EventManagerTypeDataEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited EventManager version does not match this stream",
+            ));
+        }
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "EventManager+Data")?;
+        let current = self.decode_event_manager_reference_data_at(slot)?;
+        if current.serialized_body.as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                0,
+                "EventManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != edited.original_body_bytes().len() {
+            return Err(invalid(
+                0,
+                "EventManager type-data edits must preserve the manager body length",
+            ));
+        }
+        let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
+        let body_end = body_start
+            .checked_add(replacement.len())
+            .ok_or(CrpError::ArithmeticOverflow("EventManager replacement end"))?;
+        if body_end != next_tag_start {
+            return Err(invalid(
+                body_start,
+                "EventManager type-data replacement does not reach the expected boundary",
+            ));
+        }
+        let original = self
+            .serialized_object_graph
+            .get(body_start..body_end)
+            .ok_or_else(|| invalid(body_start, "EventManager source body exceeds graph"))?
+            .to_vec();
+        self.serialized_object_graph[body_start..body_end].copy_from_slice(&replacement);
+        let validation = self
+            .decode_event_manager_reference_data_at(slot)
+            .and_then(|decoded| {
+                if decoded.serialized_body != replacement || decoded.type_data != edited.entries() {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten EventManager type-data table failed validation",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph[body_start..body_end].copy_from_slice(&original);
+            return Err(invalid(
+                body_start,
+                format!("rewritten EventManager body failed validation: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Decodes active and empty DisasterManager records from the bounded
+    /// `DisasterManager+Data` body.
+    ///
+    /// The manager boundary is checked against the following profiler tag.
+    /// Active-record fields follow the inspected reader gates; the available
+    /// map corpus contains no active disaster records.
+    pub fn decode_disaster_manager_data(&self) -> Result<DisasterManagerData, CrpError> {
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "DisasterManager+Data")?;
+        let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
+        let bytes = self
+            .serialized_object_graph
+            .get(body_start..next_tag_start)
+            .ok_or_else(|| invalid(body_start, "DisasterManager body range is invalid"))?;
+        let (data, consumed) = DisasterManagerData::decode(self.format_version, bytes)?;
+        if consumed != bytes.len() {
+            return Err(invalid(
+                body_start + consumed,
+                "DisasterManager fields do not end at the following manager tag",
+            ));
+        }
+        Ok(data)
+    }
+
+    /// Decodes active DisasterManager records into a fixed-layout editor.
+    pub fn decode_disaster_manager_editor(&self) -> Result<DisasterManagerEditor, CrpError> {
+        Ok(self.decode_disaster_manager_data()?.into_editor())
+    }
+
+    /// Replaces existing DisasterManager record values while preserving the
+    /// manager's byte length, references, and following manager boundary.
+    pub fn replace_disaster_manager_data(
+        &mut self,
+        edited: &DisasterManagerEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited DisasterManager version does not match this stream",
+            ));
+        }
+        let current = self.decode_disaster_manager_data()?;
+        if current.encode_unchanged().as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                0,
+                "DisasterManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if replacement.len() != edited.original_body_bytes().len() {
+            return Err(invalid(
+                0,
+                "DisasterManager edits must preserve the manager body length",
+            ));
+        }
+        let managers = self
+            .manager_objects
+            .as_deref()
+            .ok_or_else(|| invalid(0, "manager object array is null"))?;
+        let slot = unique_manager_slot(Some(managers), "DisasterManager+Data")?;
+        let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
+        let body_end =
+            body_start
+                .checked_add(replacement.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "DisasterManager replacement end",
+                ))?;
+        if body_end != next_tag_start {
+            return Err(invalid(
+                body_start,
+                "DisasterManager replacement does not reach the expected manager boundary",
+            ));
+        }
+
+        let original = self
+            .serialized_object_graph
+            .get(body_start..body_end)
+            .ok_or_else(|| invalid(body_start, "DisasterManager source body exceeds graph"))?
+            .to_vec();
+        self.serialized_object_graph[body_start..body_end].copy_from_slice(&replacement);
+        let validation = self.decode_disaster_manager_data().and_then(|decoded| {
+            if decoded.encode_unchanged() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten DisasterManager bytes failed exact body validation",
+                ));
+            }
+            Ok(())
+        });
+        if let Err(error) = validation {
+            self.serialized_object_graph[body_start..body_end].copy_from_slice(&original);
+            return Err(invalid(
+                body_start,
+                format!("rewritten DisasterManager body failed validation: {error}"),
+            ));
+        }
         Ok(())
     }
 
@@ -8205,23 +8391,8 @@ impl SimulationManagerData {
                     )?;
                 }
                 "DisasterManager+Data" => {
-                    let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
-                    let bytes = self
-                        .serialized_object_graph
-                        .get(body_start..next_tag_start)
-                        .ok_or_else(|| {
-                            invalid(body_start, "DisasterManager body range is invalid")
-                        })?;
-                    let (data, consumed) =
-                        DisasterManagerReferenceData::decode(self.format_version, bytes)?;
-                    if consumed != bytes.len() {
-                        return Err(invalid(
-                            body_start + consumed,
-                            "DisasterManager fields do not end at the following manager tag",
-                        ));
-                    }
                     register_reference_headers(
-                        &data.object_headers,
+                        self.decode_disaster_manager_data()?.object_headers(),
                         &mut prefix.object_table,
                         &mut prefix.queued_objects,
                     )?;
@@ -8387,6 +8558,15 @@ impl SimulationManagerData {
         &self,
         slot: usize,
     ) -> Result<Vec<NetObjectHeader>, CrpError> {
+        Ok(self
+            .decode_event_manager_reference_data_at(slot)?
+            .object_headers)
+    }
+
+    fn decode_event_manager_reference_data_at(
+        &self,
+        slot: usize,
+    ) -> Result<EventManagerReferenceData, CrpError> {
         let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
         let bytes = self
             .serialized_object_graph
@@ -8407,11 +8587,17 @@ impl SimulationManagerData {
                     bytes,
                 ),
             ),
-            ("writer", EventManagerReferenceData::decode_writer(bytes)),
+            (
+                "writer",
+                EventManagerReferenceData::decode_writer(self.format_version, bytes),
+            ),
         ] {
             match result {
                 Ok((data, consumed)) if consumed == bytes.len() => {
-                    if !candidates.iter().any(|(_, existing)| *existing == data) {
+                    if !candidates
+                        .iter()
+                        .any(|(_, existing)| existing.equivalent_reference_layout(&data))
+                    {
                         candidates.push((layout, data));
                     }
                 }
@@ -8435,7 +8621,7 @@ impl SimulationManagerData {
                         "EventManager has non-null entries in an unidentified counted block; its object-table effects are unknown",
                     ));
                 }
-                Ok(data.object_headers.clone())
+                Ok(data.clone())
             }
             [] => Err(invalid(
                 body_start,
@@ -13495,6 +13681,29 @@ mod manager_boundary_tests {
         (manager, body_start)
     }
 
+    fn manager_with_event_manager_body(
+        format_version: u32,
+        body: &[u8],
+    ) -> (SimulationManagerData, usize) {
+        let mut graph = profiler_tag("EventManager");
+        let body_start = graph.len();
+        graph.extend_from_slice(body);
+        graph.extend(profiler_tag("DisasterManager"));
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = format_version;
+        manager.manager_objects = Some(vec![
+            Some(ManagerObjectReference {
+                object_id: 0,
+                type_name: "EventManager+Data, Assembly-CSharp".to_owned(),
+            }),
+            Some(ManagerObjectReference {
+                object_id: 1,
+                type_name: "DisasterManager+Data, Assembly-CSharp".to_owned(),
+            }),
+        ]);
+        (manager, body_start)
+    }
+
     fn append_zero_encoded_long_array(output: &mut Vec<u8>, mut count: usize) {
         while count > 0 {
             let run = count.min(128);
@@ -13707,6 +13916,62 @@ mod manager_boundary_tests {
         let graph_after_edit = manager.serialized_object_graph().to_vec();
         assert!(manager.replace_game_area(&editor).is_err());
         assert_eq!(manager.serialized_object_graph(), graph_after_edit);
+    }
+
+    #[test]
+    fn event_manager_type_data_replacement_preserves_boundary_and_rejects_stale_editor() {
+        let body = [
+            0x00, 0x00, // One event slot.
+            0x00, 0x00, // No unlock milestones.
+            0x00, 0x01, // One modified type.
+            0x00, 0x12, 0x34, // One prefab index.
+            0x00, 0x00, // Empty prefab names.
+            0xfd, 0x01, 0x02, 0x03, // Popularity -3 and raw ticket value 0x010203.
+            0xff, // Match-preparing reference.
+            0x00, 0x09, // Popularity bonus.
+            0x12, 0x34, // Profiler end index.
+        ];
+        let (mut manager, body_start) = manager_with_event_manager_body(108_004, &body);
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let mut editor = manager.decode_event_manager_type_data().unwrap();
+        assert_eq!(editor.format_version(), 108_004);
+        assert_eq!(editor.entries()[0].popularity_offset, -3);
+        assert_eq!(editor.entries()[0].ticket_price_offset, Some(0x010203));
+        let stale_editor = editor.clone();
+
+        editor.entries_mut()[0].popularity_offset = -7;
+        editor.entries_mut()[0].ticket_price_offset = Some(0x00ff_ffff);
+        let mut invalid_editor = editor.clone();
+        invalid_editor.entries_mut()[0].ticket_price_offset = Some(0x0100_0000);
+        assert!(
+            manager
+                .replace_event_manager_type_data(&invalid_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), original_graph);
+
+        manager.replace_event_manager_type_data(&editor).unwrap();
+        let expected_body = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x12, 0x34, 0x00, 0x00, 0xf9, 0xff, 0xff,
+            0xff, 0xff, 0x00, 0x09, 0x12, 0x34,
+        ];
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start..body_start + body.len()],
+            expected_body
+        );
+        let mut expected_graph = original_graph;
+        expected_graph[body_start..body_start + body.len()].copy_from_slice(&expected_body);
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+        assert_eq!(
+            manager.decode_event_manager_type_data().unwrap().entries(),
+            editor.entries()
+        );
+        assert!(
+            manager
+                .replace_event_manager_type_data(&stale_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
     }
 
     #[test]
@@ -14466,6 +14731,36 @@ mod manager_boundary_tests {
         manager
     }
 
+    fn disaster_manager_with_active_record() -> SimulationManagerData {
+        let mut graph = profiler_tag("DisasterManager");
+        graph.extend_from_slice(&[
+            0x00, 0x01, // Two slots including reserved slot zero.
+            0x00, 0x00, 0x00, 0x00, 0x01, // One active disaster flag.
+            0x00, 0x00, // No unlock milestones.
+            0x00, 0x00, // No last-spawn frames.
+            0x00, 0x00, // No warning guides.
+            0x00, 0x00, 0x00, 0x00, 0x00, // One prefab index; no names.
+        ]);
+        graph.extend_from_slice(&[0; 63]); // One version-301 active record.
+        graph.extend_from_slice(&[0x12, 0x34]); // Random-disaster cooldown.
+        graph.extend_from_slice(&[0xab, 0xcd]); // Closing profiler reference.
+        graph.extend(profiler_tag("InfoManager"));
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 301;
+        manager.manager_objects = Some(vec![
+            Some(ManagerObjectReference {
+                object_id: 1,
+                type_name: "DisasterManager+Data, Assembly-CSharp".to_owned(),
+            }),
+            Some(ManagerObjectReference {
+                object_id: 2,
+                type_name: "InfoManager+Data, Assembly-CSharp".to_owned(),
+            }),
+        ]);
+        manager
+    }
+
     fn audio_manager_with_next(next_tag_name: &str) -> SimulationManagerData {
         let mut graph = profiler_tag("AudioManager");
         graph.extend_from_slice(&[
@@ -14787,6 +15082,37 @@ mod manager_boundary_tests {
                 original_tail
             );
         }
+    }
+
+    #[test]
+    fn disaster_manager_editor_replaces_active_fields_and_rejects_stale_source() {
+        let mut manager = disaster_manager_with_active_record();
+        let original_graph = manager.serialized_object_graph().to_vec();
+        let tail_start = original_graph.len() - profiler_tag("InfoManager").len();
+        let original_tail = original_graph[tail_start - 4..].to_vec();
+        let mut stale_editor = manager.decode_disaster_manager_editor().unwrap();
+        let mut edited = manager.decode_disaster_manager_editor().unwrap();
+        assert_eq!(edited.records()[0].slot_index, 1);
+        edited.records_mut()[0].intensity = Some(99);
+        edited.records_mut()[0].casualty_count = Some(17);
+
+        manager.replace_disaster_manager_data(&edited).unwrap();
+        let decoded = manager.decode_disaster_manager_data().unwrap();
+        assert_eq!(decoded.records()[0].intensity, Some(99));
+        assert_eq!(decoded.records()[0].casualty_count, Some(17));
+        assert_eq!(
+            &manager.serialized_object_graph()[tail_start - 4..],
+            original_tail
+        );
+
+        let rewritten_graph = manager.serialized_object_graph().to_vec();
+        stale_editor.records_mut()[0].intensity = Some(1);
+        assert!(
+            manager
+                .replace_disaster_manager_data(&stale_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), rewritten_graph);
     }
 
     #[test]

@@ -64,6 +64,7 @@ pub use citizen_manager_data::{
     CitizenUnitDataPrefix, CitizenUnitRecord,
 };
 pub use data_serializer::DataSerializerStream;
+pub use disaster_manager_data::{DisasterManagerData, DisasterManagerEditor, DisasterRecord};
 pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictAirportData, DistrictAirportEditor,
     DistrictCampusData, DistrictCampusSportsData, DistrictCampusSportsEditor,
@@ -82,6 +83,7 @@ pub use electricity_manager_data::{
     ElectricityConductiveCellData, ElectricityManagerData, ElectricityPulseGroup,
     ElectricityPulseUnit,
 };
+pub use event_manager_data::{EventManagerTypeData, EventManagerTypeDataEditor};
 pub use game_area_data::{GameAreaManagerData, GameAreaManagerEditor, SavedCameraView};
 pub use guide_data::{
     GuideInstanceBody, GuideInstanceEditor, GuideTriggerBaseEditor, GuideTriggerBasePrefix,
