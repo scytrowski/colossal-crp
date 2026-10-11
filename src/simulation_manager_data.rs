@@ -18,6 +18,7 @@ use crate::VehicleLastFrameDataPrefix;
 use crate::VehicleLastFrameEditor;
 use crate::VehicleManagerData;
 use crate::VehicleManagerDataPrefix;
+use crate::VehicleManagerSparseFieldsEditor;
 use crate::VehicleManagerSparseFieldsPrefix;
 use crate::VehicleManagerTailDataPrefix;
 use crate::VehicleParkedRecordsEditor;
@@ -6174,6 +6175,97 @@ impl SimulationManagerData {
                 "VehicleManager sparse-column end",
             ))?;
         Ok((columns, graph_end))
+    }
+
+    /// Decodes the existing sparse active-vehicle columns into an editor.
+    pub fn decode_vehicle_manager_sparse_fields_editor(
+        &self,
+    ) -> Result<VehicleManagerSparseFieldsEditor, CrpError> {
+        let (columns, _) = self.decode_vehicle_manager_sparse_columns()?;
+        Ok(columns.into_editor())
+    }
+
+    /// Replaces active-vehicle gate, race, and water-source sparse columns.
+    ///
+    /// The active vehicle count stays fixed. Canonical array encoding can
+    /// change the section and manager body lengths; the VehicleManager body,
+    /// closing reference, and following TransportManager boundary are checked
+    /// after replacement.
+    pub fn replace_vehicle_manager_sparse_fields(
+        &mut self,
+        edited: &VehicleManagerSparseFieldsEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                17,
+                "edited VehicleManager sparse-field version does not match this stream",
+            ));
+        }
+        let (vehicle_data, original_manager_end) = self.decode_vehicle_manager_data()?;
+        let (current, sparse_end) = self.decode_vehicle_manager_sparse_columns()?;
+        if current.encode().as_slice() != edited.original_bytes()
+            || vehicle_data.sparse_columns().encode() != current.encode()
+        {
+            return Err(invalid(
+                17,
+                "VehicleManager sparse-column bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode();
+        let (_, sparse_start) = self.decode_vehicle_manager_prefix()?;
+        if sparse_start > sparse_end {
+            return Err(invalid(
+                sparse_start,
+                "VehicleManager sparse-column range is reversed",
+            ));
+        }
+        let original_sparse = self
+            .serialized_object_graph
+            .get(sparse_start..sparse_end)
+            .ok_or_else(|| {
+                invalid(
+                    sparse_start,
+                    "VehicleManager sparse-column range exceeds manager graph",
+                )
+            })?;
+        if original_sparse != current.encode() {
+            return Err(invalid(
+                sparse_start,
+                "VehicleManager sparse-column range differs from its decoded source bytes",
+            ));
+        }
+
+        let removed_len = sparse_end - sparse_start;
+        let expected_manager_end = original_manager_end
+            .checked_sub(removed_len)
+            .and_then(|start| start.checked_add(replacement.len()))
+            .ok_or(CrpError::ArithmeticOverflow(
+                "VehicleManager edited sparse-column boundary",
+            ))?;
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(sparse_start..sparse_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        let validation = self
+            .decode_vehicle_manager_data()
+            .and_then(|(data, updated_manager_end)| {
+                if updated_manager_end != expected_manager_end
+                    || data.sparse_columns().encode() != replacement
+                {
+                    return Err(invalid(
+                        sparse_start,
+                        "edited VehicleManager sparse columns changed an unexpected manager boundary",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                sparse_start,
+                format!("edited VehicleManager sparse columns failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes active VehicleManager last-frame vectors and target positions.
@@ -19969,6 +20061,76 @@ mod manager_boundary_tests {
         let (tail, tail_end) = manager.decode_vehicle_manager_tail().unwrap();
         assert_eq!(tail.traffic_flow_totals(), None);
         assert_eq!(tail_end, data_end);
+    }
+
+    #[test]
+    fn vehicle_sparse_fields_editor_resizes_body_and_preserves_following_bytes() {
+        let mut graph = profiler_tag("VehicleManager");
+        let mut vehicle_flags = vec![0_u32; 16_383];
+        vehicle_flags[..4].fill(1);
+        write_encoded_uint_array(&mut graph, &vehicle_flags);
+        write_encoded_ushort_array(&mut graph, &vec![0; 32_767]);
+        write_encoded_ushort_array(&mut graph, &[0, 1, 2, 3]); // active prefab indexes
+        graph.extend_from_slice(&[0, 0]); // no prefab names
+
+        write_encoded_byte_array(&mut graph, &[1, 2, 3, 4]); // gate indexes
+        write_encoded_ushort_array(&mut graph, &[4, 3, 2, 1]); // water-source indexes
+        for _ in 0..4 {
+            graph.extend_from_slice(&[0; 29 * 4]); // last-frame vectors and targets
+            graph.extend_from_slice(&[0; 22]); // scalar and reference fields
+        }
+        graph.extend_from_slice(&[0, 16]); // closing profiler reference
+        let transport_tag = profiler_tag("TransportManager");
+        graph.extend_from_slice(&transport_tag);
+
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 273;
+        let mut manager_objects = vec![None; 19];
+        manager_objects[17] = Some(ManagerObjectReference {
+            object_id: 17,
+            type_name: "VehicleManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager_objects[18] = Some(ManagerObjectReference {
+            object_id: 18,
+            type_name: "TransportManager+Data, Assembly-CSharp".to_owned(),
+        });
+        manager.manager_objects = Some(manager_objects);
+
+        let (original, original_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(
+            original.sparse_columns().water_sources(),
+            Some([4, 3, 2, 1].as_slice())
+        );
+        let (_, sparse_start) = manager.decode_vehicle_manager_prefix().unwrap();
+        let (_, sparse_end) = manager.decode_vehicle_manager_sparse_columns().unwrap();
+        let original_sparse_len = sparse_end - sparse_start;
+        let original_suffix = manager.serialized_object_graph()[original_manager_end..].to_vec();
+
+        let mut editor = manager
+            .decode_vehicle_manager_sparse_fields_editor()
+            .unwrap();
+        for (index, value) in [10, 20, 30, 40].into_iter().enumerate() {
+            editor.set_water_source(index, value).unwrap();
+        }
+        let replacement = editor.encode();
+        assert!(replacement.len() < original_sparse_len);
+        manager
+            .replace_vehicle_manager_sparse_fields(&editor)
+            .unwrap();
+
+        let (updated, updated_manager_end) = manager.decode_vehicle_manager_data().unwrap();
+        assert_eq!(
+            updated.sparse_columns().water_sources(),
+            Some([10, 20, 30, 40].as_slice())
+        );
+        assert_eq!(
+            updated_manager_end,
+            original_manager_end - original_sparse_len + replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_manager_end..],
+            original_suffix.as_slice()
+        );
     }
 
     #[test]

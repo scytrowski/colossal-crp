@@ -2,6 +2,7 @@ use crate::CrpError;
 use crate::data_serializer::Reader;
 use crate::encoded_array::{
     EncodedUIntArrayReader, read_encoded_byte_array, read_encoded_ushort_array,
+    write_encoded_byte_array, write_encoded_ushort_array,
 };
 
 const VEHICLE_FLAG_COUNT: usize = 16_383;
@@ -237,6 +238,23 @@ pub struct VehicleManagerSparseFieldsPrefix {
     serialized_prefix: Vec<u8>,
 }
 
+/// Editor for version-gated sparse columns of existing active vehicles.
+///
+/// It retains the active vehicle count and field gates. Setters return errors
+/// when a field is absent at the source version or an index is out of range.
+/// An unchanged editor retains the original encoded bytes; changing any value
+/// canonically re-encodes the complete sparse section while retaining the
+/// other decoded values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleManagerSparseFieldsEditor {
+    original: VehicleManagerSparseFieldsPrefix,
+    gate_indices: Option<Vec<u8>>,
+    race_teams: Option<Vec<u16>>,
+    race_teammates: Option<Vec<u8>>,
+    racer_indices: Option<Vec<u8>>,
+    water_sources: Option<Vec<u16>>,
+}
+
 impl VehicleManagerSparseFieldsPrefix {
     /// Returns the inner DataSerializer version.
     pub fn format_version(&self) -> u32 {
@@ -281,6 +299,21 @@ impl VehicleManagerSparseFieldsPrefix {
     /// Writes the original known sparse-column bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Creates an editor for the existing sparse active-vehicle columns.
+    ///
+    /// The active count and version gates stay fixed. Encoding an unchanged
+    /// editor returns the original bytes; edits re-encode all sparse columns.
+    pub fn into_editor(self) -> VehicleManagerSparseFieldsEditor {
+        VehicleManagerSparseFieldsEditor {
+            gate_indices: self.gate_indices.clone(),
+            race_teams: self.race_teams.clone(),
+            race_teammates: self.race_teammates.clone(),
+            racer_indices: self.racer_indices.clone(),
+            water_sources: self.water_sources.clone(),
+            original: self,
+        }
     }
 
     /// Decodes the last-frame vectors and target positions for each active vehicle.
@@ -348,6 +381,128 @@ impl VehicleManagerSparseFieldsPrefix {
             consumed,
         ))
     }
+}
+
+impl VehicleManagerSparseFieldsEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns the number of existing active vehicle entries.
+    pub fn active_vehicle_count(&self) -> usize {
+        self.original.active_vehicle_count
+    }
+
+    /// Returns current gate indexes from inner version 182.
+    pub fn gate_indices(&self) -> Option<&[u8]> {
+        self.gate_indices.as_deref()
+    }
+
+    /// Changes the gate index for one existing active vehicle (version 182+).
+    pub fn set_gate_index(&mut self, index: usize, value: u8) -> Result<(), CrpError> {
+        set_sparse_value(&mut self.gate_indices, index, value, "gate index")
+    }
+
+    /// Returns current race-team indexes from inner version 121008.
+    pub fn race_teams(&self) -> Option<&[u16]> {
+        self.race_teams.as_deref()
+    }
+
+    /// Changes the race-team index for one existing active vehicle (version 121008+).
+    pub fn set_race_team(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        set_sparse_value(&mut self.race_teams, index, value, "race-team index")
+    }
+
+    /// Returns current race-teammate values from inner version 121012.
+    pub fn race_teammates(&self) -> Option<&[u8]> {
+        self.race_teammates.as_deref()
+    }
+
+    /// Changes the race-teammate value for one existing active vehicle (version 121012+).
+    pub fn set_race_teammate(&mut self, index: usize, value: u8) -> Result<(), CrpError> {
+        set_sparse_value(&mut self.race_teammates, index, value, "race teammate")
+    }
+
+    /// Returns current racer indexes from inner version 121012.
+    pub fn racer_indices(&self) -> Option<&[u8]> {
+        self.racer_indices.as_deref()
+    }
+
+    /// Changes the racer index for one existing active vehicle (version 121012+).
+    pub fn set_racer_index(&mut self, index: usize, value: u8) -> Result<(), CrpError> {
+        set_sparse_value(&mut self.racer_indices, index, value, "racer index")
+    }
+
+    /// Returns current water-source indexes from inner version 273.
+    pub fn water_sources(&self) -> Option<&[u16]> {
+        self.water_sources.as_deref()
+    }
+
+    /// Changes the water-source index for one existing active vehicle (version 273+).
+    pub fn set_water_source(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        set_sparse_value(&mut self.water_sources, index, value, "water-source index")
+    }
+
+    /// Writes all sparse columns in their versioned field order.
+    ///
+    /// If no values changed, the source encoding is returned byte-for-byte.
+    /// Otherwise all sparse columns are encoded canonically and the byte
+    /// length can change.
+    pub fn encode(&self) -> Vec<u8> {
+        let unchanged = self.gate_indices == self.original.gate_indices
+            && self.race_teams == self.original.race_teams
+            && self.race_teammates == self.original.race_teammates
+            && self.racer_indices == self.original.racer_indices
+            && self.water_sources == self.original.water_sources;
+        if unchanged {
+            return self.original.serialized_prefix.clone();
+        }
+
+        let mut bytes = Vec::new();
+        if let Some(values) = &self.gate_indices {
+            write_encoded_byte_array(&mut bytes, values);
+        }
+        if let Some(values) = &self.race_teams {
+            write_encoded_ushort_array(&mut bytes, values);
+        }
+        if let Some(values) = &self.race_teammates {
+            write_encoded_byte_array(&mut bytes, values);
+        }
+        if let Some(values) = &self.racer_indices {
+            write_encoded_byte_array(&mut bytes, values);
+        }
+        if let Some(values) = &self.water_sources {
+            write_encoded_ushort_array(&mut bytes, values);
+        }
+        bytes
+    }
+
+    pub(crate) fn original_bytes(&self) -> &[u8] {
+        &self.original.serialized_prefix
+    }
+}
+
+fn set_sparse_value<T: Copy>(
+    values: &mut Option<Vec<T>>,
+    index: usize,
+    value: T,
+    field: &'static str,
+) -> Result<(), CrpError> {
+    let Some(values) = values.as_mut() else {
+        return Err(invalid(
+            index,
+            format!("VehicleManager {field} is not serialized at this version"),
+        ));
+    };
+    let slot = values.get_mut(index).ok_or_else(|| {
+        invalid(
+            index,
+            format!("VehicleManager {field} index {index} is out of range"),
+        )
+    })?;
+    *slot = value;
+    Ok(())
 }
 
 /// The serialized representation of `m_targetPos0` for one vehicle.
@@ -1524,6 +1679,68 @@ mod tests {
             water_sources: None,
             serialized_prefix: Vec::new(),
         }
+    }
+
+    #[test]
+    fn vehicle_sparse_fields_editor_rewrites_versioned_columns_canonically() {
+        let prefix = prefix_with_active_slots(121_012, 4);
+        let source = [
+            0x03, 1, 2, 3, 4, // gate indexes
+            0x03, 0, 4, 0, 3, 0, 2, 0, 1, // race-team indexes
+            0x03, 4, 3, 2, 1, // race teammates
+            0x03, 4, 3, 2, 1, // racer indexes
+            0x03, 0, 4, 0, 3, 0, 2, 0, 1, // water-source indexes
+        ];
+        let (decoded, consumed) = prefix.decode_sparse_columns(&source).unwrap();
+        assert_eq!(consumed, source.len());
+        assert_eq!(decoded.active_vehicle_count(), 4);
+        assert_eq!(decoded.gate_indices(), Some([1, 2, 3, 4].as_slice()));
+        assert_eq!(decoded.race_teams(), Some([4, 3, 2, 1].as_slice()));
+        assert_eq!(decoded.race_teammates(), Some([4, 3, 2, 1].as_slice()));
+        assert_eq!(decoded.racer_indices(), Some([4, 3, 2, 1].as_slice()));
+        assert_eq!(decoded.water_sources(), Some([4, 3, 2, 1].as_slice()));
+
+        let mut editor = decoded.into_editor();
+        assert_eq!(editor.encode(), source);
+        editor.set_gate_index(0, 9).unwrap();
+        for (index, value) in [1, 2, 3, 4].into_iter().enumerate() {
+            editor.set_race_team(index, value).unwrap();
+        }
+        for (index, value) in [5, 6, 7, 8].into_iter().enumerate() {
+            editor.set_race_teammate(index, value).unwrap();
+        }
+        for (index, value) in [9, 10, 11, 12].into_iter().enumerate() {
+            editor.set_racer_index(index, value).unwrap();
+        }
+        for (index, value) in [10, 20, 30, 40].into_iter().enumerate() {
+            editor.set_water_source(index, value).unwrap();
+        }
+
+        let expected = [
+            0x03, 9, 2, 3, 4, // gate indexes
+            0x00, 0, 1, 0x82, // one race-team literal and three repeated deltas
+            0x03, 5, 6, 7, 8, // race teammates
+            0x03, 9, 10, 11, 12, // racer indexes
+            0x00, 0, 10, 0x82, // one water-source literal and three repeated deltas
+        ];
+        assert_eq!(editor.encode(), expected);
+        assert!(editor.encode().len() < source.len());
+        assert!(editor.set_gate_index(4, 1).is_err());
+        assert_eq!(editor.gate_indices(), Some([9, 2, 3, 4].as_slice()));
+    }
+
+    #[test]
+    fn vehicle_sparse_fields_editor_rejects_fields_before_version_gates() {
+        let prefix = prefix_with_active_slots(181, 1);
+        let (decoded, consumed) = prefix.decode_sparse_columns(&[]).unwrap();
+        assert_eq!(consumed, 0);
+        let mut editor = decoded.into_editor();
+        assert!(editor.set_gate_index(0, 1).is_err());
+        assert!(editor.set_race_team(0, 1).is_err());
+        assert!(editor.set_race_teammate(0, 1).is_err());
+        assert!(editor.set_racer_index(0, 1).is_err());
+        assert!(editor.set_water_source(0, 1).is_err());
+        assert_eq!(editor.encode(), []);
     }
 
     fn last_frame_prefix_with_count(
