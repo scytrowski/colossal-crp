@@ -1359,9 +1359,10 @@ impl TransportPassengerRecord {
     }
 }
 
-/// Decoded values from one active TransportManager line record.
+/// One decoded or explicitly constructed TransportManager active-line record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerLineRecord {
+    format_version: u32,
     line_number: Option<u16>,
     stop_count: u16,
     color: Option<[u8; 3]>,
@@ -1380,6 +1381,119 @@ pub struct TransportManagerLineRecord {
 }
 
 impl TransportManagerLineRecord {
+    /// Creates a zero-valued active-line record for a supported inner version.
+    ///
+    /// Version-gated scalar fields and passenger groups start at zero. The
+    /// legacy numeric vehicle selection starts at index zero, and the legacy
+    /// nullable name starts as null. Editors that copy an existing record can
+    /// use that record's values instead.
+    pub fn new(format_version: u32) -> Result<Self, CrpError> {
+        if !(164..=115_999).contains(&format_version) {
+            return Err(invalid(
+                0,
+                "new TransportManager line records require inner versions 164–115999",
+            ));
+        }
+        let line_number = (format_version >= 153).then_some(0_u16);
+        let stop_count = 0_u16;
+        let color = (format_version >= 121).then_some([0; 3]);
+        let building = (format_version >= 288).then_some(0_u16);
+        let budget = (format_version >= 314).then_some(0_u16);
+        let total_length_bits = (format_version >= 314).then_some(0_u32);
+        let average_interval = (format_version >= 320).then_some(0_u8);
+        let ticket_price = (format_version >= 110_023).then_some(0_u16);
+        let passengers = (format_version >= 122).then(|| TransportPassengerRecord {
+            groups: vec![
+                TransportPassengerCounts {
+                    temporary: 0,
+                    final_count: 0,
+                    average: 0,
+                };
+                if format_version >= 176 { 8 } else { 7 }
+            ],
+        });
+        let legacy_vehicle_selection = if (112_004..112_022).contains(&format_version) {
+            Some(TransportLineVehicleSelection::Index(0))
+        } else if (112_022..114_001).contains(&format_version) {
+            Some(TransportLineVehicleSelection::Name(None))
+        } else {
+            None
+        };
+
+        let mut serialized_bytes = Vec::new();
+        if let Some(value) = line_number {
+            serialized_bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        serialized_bytes.extend_from_slice(&stop_count.to_be_bytes());
+        if let Some(value) = color {
+            serialized_bytes.extend_from_slice(&value);
+        }
+        if let Some(value) = building {
+            serialized_bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        if let (Some(budget), Some(total_length_bits)) = (budget, total_length_bits) {
+            serialized_bytes.extend_from_slice(&budget.to_be_bytes());
+            serialized_bytes.extend_from_slice(&total_length_bits.to_be_bytes());
+        }
+        if let Some(value) = average_interval {
+            serialized_bytes.push(value);
+        }
+        if let Some(value) = ticket_price {
+            serialized_bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        let passengers_range = passengers.as_ref().map(|record| {
+            let start = serialized_bytes.len();
+            for _ in record.groups() {
+                serialized_bytes.extend_from_slice(&[0; 9]);
+            }
+            start..serialized_bytes.len()
+        });
+        let legacy_vehicle_selection_range = if let Some(selection) = &legacy_vehicle_selection {
+            let start = serialized_bytes.len();
+            match selection {
+                TransportLineVehicleSelection::Index(value) => {
+                    serialized_bytes.extend_from_slice(&value.to_be_bytes());
+                }
+                TransportLineVehicleSelection::Name(None) => serialized_bytes.push(0xff),
+                TransportLineVehicleSelection::Name(Some(value)) => {
+                    write_unique_string(&mut serialized_bytes, value)?;
+                }
+            }
+            Some(start..serialized_bytes.len())
+        } else {
+            None
+        };
+        let serialized_len = serialized_bytes.len();
+        Ok(Self {
+            format_version,
+            line_number,
+            stop_count,
+            color,
+            building,
+            budget,
+            total_length_bits,
+            average_interval,
+            ticket_price,
+            passengers,
+            legacy_vehicle_selection,
+            legacy_vehicle_selection_range,
+            legacy_vehicle_selection_encoding_override: None,
+            serialized_bytes,
+            serialized_range: 0..serialized_len,
+            passengers_range,
+        })
+    }
+
+    /// Returns the inner DataSerializer version this record follows.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns a mutable editor for this record's version-gated fields.
+    pub fn edit(&mut self) -> TransportManagerActiveLineEditor<'_> {
+        TransportManagerActiveLineEditor { record: self }
+    }
+
     /// Returns the per-line number from version 153.
     pub fn line_number(&self) -> Option<u16> {
         self.line_number
@@ -1756,7 +1870,8 @@ impl TransportManagerActiveLineEditor<'_> {
 /// apply. Original bytes are retained for unchanged writing; semantic edits
 /// support raw line flags that preserve slot activity, active-line prefab
 /// indexes, version-gated active-line fields, shared line numbers, and
-/// passenger counters.
+/// passenger counters. Lines can be inserted with a version-matched record or
+/// removed together with their flag and prefab assignment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerLineData {
     format_version: u32,
@@ -1767,6 +1882,7 @@ pub struct TransportManagerLineData {
     prefab_name_compact: Vec<Option<bool>>,
     line_numbers: Option<Vec<u16>>,
     active_lines: Vec<TransportManagerLineRecord>,
+    line_record_section_range: Range<usize>,
     global_passengers: Option<Vec<TransportPassengerRecord>>,
     serialized_line_numbers: Vec<u8>,
     serialized_global_passengers: Vec<u8>,
@@ -1827,14 +1943,13 @@ impl TransportManagerLineData {
 
     /// Creates an editor for active-line fields, line numbers, and passengers.
     pub fn into_editor(self) -> TransportManagerLineDataEditor {
-        let source_active_line_slots = self
+        let active_line_slots = self
             .original_line_flags
             .iter()
             .enumerate()
             .filter_map(|(line_slot, flag)| (*flag != 0).then_some(line_slot))
             .collect::<Vec<_>>();
-        let active_line_source_indices = (0..self.active_lines.len()).collect();
-        let original_active_lines = self.active_lines.clone();
+        let original_active_line_count = self.active_lines.len();
         TransportManagerLineDataEditor {
             format_version: self.format_version,
             line_flags: self.line_flags,
@@ -1846,9 +1961,9 @@ impl TransportManagerLineData {
             line_numbers: self.line_numbers.clone(),
             original_line_numbers: self.line_numbers,
             active_lines: self.active_lines,
-            active_line_source_indices,
-            original_active_lines,
-            source_active_line_slots,
+            active_line_slots,
+            original_active_line_count,
+            line_record_section_range: self.line_record_section_range,
             global_passengers: self.global_passengers.clone(),
             original_global_passengers: self.global_passengers,
             original_body: self.serialized_body,
@@ -1866,10 +1981,10 @@ impl TransportManagerLineData {
 /// passenger data.
 ///
 /// This retains the original bounded manager body. Raw flag edits preserve
-/// each line slot's active state; removing a line clears its slot and removes
-/// its record and prefab assignment. Flag, prefab-index, prefab-name, and
-/// legacy vehicle-name edits may resize serialized sections. Passenger counts
-/// must fit in the serialized 24-bit fields.
+/// each line slot's active state; inserting or removing a line updates its
+/// flag, record, and prefab assignment together. Flag, prefab-index,
+/// prefab-name, and legacy vehicle-name edits may resize serialized sections.
+/// Passenger counts must fit in the serialized 24-bit fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerLineDataEditor {
     format_version: u32,
@@ -1882,9 +1997,9 @@ pub struct TransportManagerLineDataEditor {
     line_numbers: Option<Vec<u16>>,
     original_line_numbers: Option<Vec<u16>>,
     active_lines: Vec<TransportManagerLineRecord>,
-    active_line_source_indices: Vec<usize>,
-    original_active_lines: Vec<TransportManagerLineRecord>,
-    source_active_line_slots: Vec<usize>,
+    active_line_slots: Vec<usize>,
+    original_active_line_count: usize,
+    line_record_section_range: Range<usize>,
     global_passengers: Option<Vec<TransportPassengerRecord>>,
     original_global_passengers: Option<Vec<TransportPassengerRecord>>,
     original_body: Vec<u8>,
@@ -2001,13 +2116,77 @@ impl TransportManagerLineDataEditor {
         })
     }
 
-    /// Removes an active line, clears its source flag slot, and returns its
+    /// Inserts a new active line in line-slot order.
+    ///
+    /// The caller supplies a nonzero raw flag, a prefab index, and a line
+    /// record following this editor's inner version. The name table and
+    /// fixed global line-number and passenger tables are left to the caller.
+    pub fn insert_active_line(
+        &mut self,
+        line_slot: usize,
+        line_flag: u32,
+        prefab_index: u16,
+        record: TransportManagerLineRecord,
+    ) -> Result<(), CrpError> {
+        if line_flag == 0 {
+            return Err(invalid(
+                line_slot,
+                "an inserted TransportManager line requires a nonzero raw flag",
+            ));
+        }
+        if record.format_version != self.format_version {
+            return Err(invalid(
+                line_slot,
+                "TransportManager line record uses a different DataSerializer version",
+            ));
+        }
+        if self.active_lines.len() >= TRANSPORT_MANAGER_LINE_FLAG_COUNT
+            || self.active_lines.len() != self.active_line_slots.len()
+            || self.active_lines.len() != self.active_line_prefab_indices.len()
+        {
+            return Err(invalid(
+                line_slot,
+                "TransportManager active-line editor has inconsistent counts or is full",
+            ));
+        }
+        let current_flag = self.line_flags.get(line_slot).ok_or_else(|| {
+            invalid(
+                line_slot,
+                "TransportManager line-flag slot is out of bounds",
+            )
+        })?;
+        if *current_flag != 0 {
+            return Err(invalid(
+                line_slot,
+                "TransportManager line-flag slot is already active",
+            ));
+        }
+        if self.active_line_slots.binary_search(&line_slot).is_ok() {
+            return Err(invalid(
+                line_slot,
+                "TransportManager line-flag slot already has an active record",
+            ));
+        }
+        record.encode_with_passenger_edits()?;
+
+        let insert_index = self
+            .active_line_slots
+            .partition_point(|slot| *slot < line_slot);
+        self.line_flags[line_slot] = line_flag;
+        self.active_line_slots.insert(insert_index, line_slot);
+        self.active_line_prefab_indices
+            .insert(insert_index, prefab_index);
+        self.active_lines.insert(insert_index, record);
+        Ok(())
+    }
+
+    /// Removes an active line, clears its flag slot, and returns its
     /// decoded record. Its prefab assignment is removed at the same position.
     pub fn remove_active_line(
         &mut self,
         active_line_index: usize,
     ) -> Result<TransportManagerLineRecord, CrpError> {
-        if self.active_line_source_indices.len() != self.active_lines.len()
+        if self.active_line_slots.len() != self.active_lines.len()
             || self.active_line_prefab_indices.len() != self.active_lines.len()
         {
             return Err(invalid(
@@ -2015,8 +2194,8 @@ impl TransportManagerLineDataEditor {
                 "TransportManager active-line editor has inconsistent entry counts",
             ));
         }
-        let source_index = *self
-            .active_line_source_indices
+        let line_slot = *self
+            .active_line_slots
             .get(active_line_index)
             .ok_or_else(|| {
                 invalid(
@@ -2024,19 +2203,10 @@ impl TransportManagerLineDataEditor {
                     "TransportManager active-line index is out of bounds",
                 )
             })?;
-        let line_slot = *self
-            .source_active_line_slots
-            .get(source_index)
-            .ok_or_else(|| {
-                invalid(
-                    source_index,
-                    "source TransportManager active-line slot was not captured",
-                )
-            })?;
         let flag = self.line_flags.get(line_slot).ok_or_else(|| {
             invalid(
                 line_slot,
-                "source TransportManager active-line flag is out of bounds",
+                "TransportManager active-line flag is out of bounds",
             )
         })?;
         if *flag == 0 {
@@ -2047,7 +2217,7 @@ impl TransportManagerLineDataEditor {
         }
 
         self.line_flags[line_slot] = 0;
-        self.active_line_source_indices.remove(active_line_index);
+        self.active_line_slots.remove(active_line_index);
         self.active_line_prefab_indices.remove(active_line_index);
         Ok(self.active_lines.remove(active_line_index))
     }
@@ -2074,37 +2244,39 @@ impl TransportManagerLineDataEditor {
         self.global_passengers.as_deref_mut()
     }
 
-    /// Writes the edited bounded body. Removing a line resizes the active-line
-    /// records and combined prefab-index scope; legacy vehicle names and other
-    /// encoded scopes can also resize while preserving following bytes.
+    /// Writes the edited bounded body. Adding or removing a line resizes the
+    /// active-line records and combined prefab-index scope; legacy vehicle
+    /// names and other encoded scopes can also resize while preserving later
+    /// bytes.
     /// Returns an error if flags disagree with retained records, a fixed table
     /// changes length, passenger groups change, a passenger count exceeds the
     /// 24-bit limit, or captured source ranges are invalid.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
-        let source_line_count = self.original_active_lines.len();
         if self.active_line_prefab_indices.len() != self.active_lines.len()
-            || self.active_line_source_indices.len() != self.active_lines.len()
-            || self.source_active_line_slots.len() != source_line_count
+            || self.active_line_slots.len() != self.active_lines.len()
+            || self.active_lines.len() > TRANSPORT_MANAGER_LINE_FLAG_COUNT
             || self.prefab_names.len() != self.original_prefab_names.len()
             || self.prefab_name_ranges.len() != self.original_prefab_names.len()
             || self.prefab_name_compact.len() != self.original_prefab_names.len()
             || self.line_flags.len() != TRANSPORT_MANAGER_LINE_FLAG_COUNT
-            || self.original_line_flags.len() != TRANSPORT_MANAGER_LINE_FLAG_COUNT
             || self
-                .active_line_source_indices
+                .active_line_slots
                 .windows(2)
-                .any(|indices| indices[0] >= indices[1])
+                .any(|slots| slots[0] >= slots[1])
             || self
-                .active_line_source_indices
+                .active_line_slots
                 .iter()
-                .any(|source_index| *source_index >= source_line_count)
-            || self.original_prefab_indices.len() < source_line_count
+                .any(|line_slot| *line_slot >= TRANSPORT_MANAGER_LINE_FLAG_COUNT)
+            || self.original_prefab_indices.len() < self.original_active_line_count
             || self.line_flags.iter().filter(|flag| **flag != 0).count() != self.active_lines.len()
+            || self.line_record_section_range.start > self.line_record_section_range.end
+            || self.line_record_section_range.end > self.original_body.len()
             || self.line_flags_range.start > self.line_flags_range.end
             || self.line_flags_range.end > self.original_body.len()
             || self.prefab_index_range.start > self.prefab_index_range.end
             || self.prefab_index_range.end > self.original_body.len()
             || self.line_flags_range.end > self.prefab_index_range.start
+            || self.prefab_index_range.end > self.line_record_section_range.start
         {
             return Err(invalid(
                 0,
@@ -2112,84 +2284,51 @@ impl TransportManagerLineDataEditor {
             ));
         }
         let mut expected_active_slots = vec![false; TRANSPORT_MANAGER_LINE_FLAG_COUNT];
-        for source_slot in &self.source_active_line_slots {
-            let Some(active) = expected_active_slots.get_mut(*source_slot) else {
+        for line_slot in &self.active_line_slots {
+            let Some(active) = expected_active_slots.get_mut(*line_slot) else {
                 return Err(invalid(
-                    *source_slot,
-                    "source TransportManager active-line slot is out of bounds",
+                    *line_slot,
+                    "TransportManager active-line slot is out of bounds",
                 ));
             };
             if *active {
                 return Err(invalid(
-                    *source_slot,
-                    "source TransportManager active-line slots are duplicated",
+                    *line_slot,
+                    "TransportManager active-line slots are duplicated",
                 ));
             }
             *active = true;
         }
-        let mut retained_slots = vec![false; TRANSPORT_MANAGER_LINE_FLAG_COUNT];
-        for source_index in &self.active_line_source_indices {
-            let source_slot = self.source_active_line_slots[*source_index];
-            retained_slots[source_slot] = true;
-        }
         if self
-            .original_line_flags
+            .line_flags
             .iter()
             .zip(&expected_active_slots)
             .any(|(flag, expected)| (*flag != 0) != *expected)
-            || self
-                .line_flags
-                .iter()
-                .zip(&retained_slots)
-                .any(|(flag, retained)| (*flag != 0) != *retained)
         {
             return Err(invalid(
                 0,
-                "TransportManager line flags do not match the retained active-line records",
+                "TransportManager line flags do not match the active-line records",
             ));
         }
         let mut body = self.original_body.clone();
         let mut line_growth = 0_usize;
         let mut line_shrinkage = 0_usize;
-        let mut next_line_start = self.original_body.len();
-        let mut edited_lines_by_source = vec![None; source_line_count];
-        for (line, source_index) in self
-            .active_lines
-            .iter()
-            .zip(&self.active_line_source_indices)
-        {
-            edited_lines_by_source[*source_index] = Some(line);
-        }
-        for (source_index, source_line) in self.original_active_lines.iter().enumerate().rev() {
-            let range = source_line.serialized_range.clone();
-            if range.start > range.end
-                || range.end > self.original_body.len()
-                || range.end > next_line_start
-            {
+        let mut encoded_lines = Vec::new();
+        for line in &self.active_lines {
+            if line.format_version != self.format_version {
                 return Err(invalid(
-                    range.start,
-                    "source active-line ranges overlap or exceed the source body",
+                    0,
+                    "TransportManager line record uses a different DataSerializer version",
                 ));
             }
-            let encoded = if let Some(line) = edited_lines_by_source[source_index] {
-                line.encode_with_passenger_edits()?
-            } else {
-                Vec::new()
-            };
-            if encoded.len() >= range.len() {
-                line_growth = line_growth.checked_add(encoded.len() - range.len()).ok_or(
-                    CrpError::ArithmeticOverflow("TransportManager active-line growth"),
-                )?;
-            } else {
-                line_shrinkage = line_shrinkage
-                    .checked_add(range.len() - encoded.len())
-                    .ok_or(CrpError::ArithmeticOverflow(
-                        "TransportManager active-line shrinkage",
-                    ))?;
-            }
-            body.splice(range.clone(), encoded);
-            next_line_start = range.start;
+            encoded_lines.extend_from_slice(&line.encode_with_passenger_edits()?);
         }
+        if encoded_lines.len() >= self.line_record_section_range.len() {
+            line_growth = encoded_lines.len() - self.line_record_section_range.len();
+        } else {
+            line_shrinkage = self.line_record_section_range.len() - encoded_lines.len();
+        }
+        body.splice(self.line_record_section_range.clone(), encoded_lines);
 
         if let Some(numbers) = &self.line_numbers {
             let range = self.line_number_range.as_ref().ok_or_else(|| {
@@ -2367,13 +2506,14 @@ impl TransportManagerLineDataEditor {
         let mut prefab_indices = Vec::with_capacity(
             self.active_line_prefab_indices
                 .len()
-                .checked_add(self.original_prefab_indices.len() - source_line_count)
+                .checked_add(self.original_prefab_indices.len() - self.original_active_line_count)
                 .ok_or(CrpError::ArithmeticOverflow(
                     "TransportManager combined prefab-index count",
                 ))?,
         );
         prefab_indices.extend_from_slice(&self.active_line_prefab_indices);
-        prefab_indices.extend_from_slice(&self.original_prefab_indices[source_line_count..]);
+        prefab_indices
+            .extend_from_slice(&self.original_prefab_indices[self.original_active_line_count..]);
         if prefab_indices != self.original_prefab_indices {
             let mut encoded_prefab_indices = Vec::new();
             write_encoded_ushort_array(&mut encoded_prefab_indices, &prefab_indices);
@@ -11628,6 +11768,12 @@ impl SimulationManagerData {
             prefab_name_compact: fields.prefab_name_compact,
             line_numbers: fields.line_numbers,
             active_lines: fields.line_records,
+            line_record_section_range: fields.line_record_section_range.ok_or_else(|| {
+                invalid(
+                    body_range.start,
+                    "TransportManager active-line record range was not captured",
+                )
+            })?,
             global_passengers: fields.global_passengers,
             serialized_line_numbers: fields.serialized_line_numbers,
             serialized_global_passengers: fields.serialized_global_passengers,
@@ -15052,6 +15198,7 @@ fn decode_transport_manager_line_record(
         None
     };
     Ok(TransportManagerLineRecord {
+        format_version,
         line_number,
         stop_count,
         color,
@@ -15223,6 +15370,7 @@ fn decode_transport_manager_reference_body_with_milestones(
             .ok_or(CrpError::ArithmeticOverflow(
                 "TransportManager passenger record length",
             ))?;
+    let line_records_start = reader.offset();
     let mut line_records = Vec::with_capacity(active_line_count);
     for _ in 0..active_line_count {
         line_records.push(decode_transport_manager_line_record(
@@ -15230,6 +15378,8 @@ fn decode_transport_manager_reference_body_with_milestones(
             &mut reader,
         )?);
     }
+    let line_record_section_range =
+        capture_milestones.then_some(line_records_start..reader.offset());
     let (global_passengers, serialized_global_passengers, global_passenger_range) =
         if format_version >= 122 {
             let passenger_record_count = line_number_count;
@@ -15462,6 +15612,7 @@ fn decode_transport_manager_reference_body_with_milestones(
         line_numbers,
         line_number_range,
         line_records,
+        line_record_section_range,
         global_passengers,
         global_passenger_range,
         serialized_line_numbers,
@@ -15498,6 +15649,7 @@ struct TransportManagerReferenceFields {
     line_numbers: Option<Vec<u16>>,
     line_number_range: Option<Range<usize>>,
     line_records: Vec<TransportManagerLineRecord>,
+    line_record_section_range: Option<Range<usize>>,
     global_passengers: Option<Vec<TransportPassengerRecord>>,
     global_passenger_range: Option<Range<usize>>,
     serialized_line_numbers: Vec<u8>,
@@ -15836,7 +15988,7 @@ mod manager_boundary_tests {
         EconomyManagerBodyLayout, GUIDE_TRIGGER_BASE_PREFIX_LEN, LOADING_PROFILER_END_TAG_BYTES,
         ManagerObjectReference, QueuedDataObject, ResolvedObjectReference, SimulationManagerData,
         TRANSPORT_MANAGER_LINE_FLAG_COUNT, TransportLineVehicleSelection,
-        TransportManagerActiveLineEditor, TransportManagerMilestone,
+        TransportManagerActiveLineEditor, TransportManagerLineRecord, TransportManagerMilestone,
         TransportManagerMilestoneEditor, TransportManagerSelection,
         TransportManagerSharedStringValue, TransportManagerStringEncoding,
         TransportManagerTailReference, TransportManagerTailReferenceEditor,
@@ -21933,6 +22085,165 @@ mod manager_boundary_tests {
         assert_eq!(rewritten.active_lines()[0].stop_count(), 0x3344);
         assert_eq!(rewritten.line_flags()[0], 0);
         assert_eq!(rewritten.line_flags()[1], 1);
+    }
+
+    #[test]
+    fn transport_manager_active_line_insertion_resizes_records_and_prefab_scope() {
+        let version = 112_004;
+        let (source_body, _) = active_transport_manager_reference_body(version, 14, 1, 7);
+        let source_fields = decode_transport_manager_reference_body_with_milestones(
+            version,
+            &source_body,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let mut body = source_body;
+        body.splice(
+            source_fields.line_record_section_range.unwrap(),
+            std::iter::empty(),
+        );
+        body.splice(
+            source_fields.prefab_index_range.unwrap(),
+            [0x00, 0x00, 0x08],
+        );
+        body.splice(source_fields.line_flags_range.unwrap(), [0xff, 0xfe]);
+        let fields = decode_transport_manager_reference_body_with_milestones(
+            version, &body, None, None, true,
+        )
+        .unwrap();
+        assert!(fields.line_records.is_empty());
+        assert_eq!(fields.all_prefab_indices, [8]);
+        let flags_range = fields.line_flags_range.clone().unwrap();
+        let prefab_range = fields.prefab_index_range.clone().unwrap();
+        let record_section_range = fields.line_record_section_range.clone().unwrap();
+        let original_line_bytes = body[record_section_range.clone()].to_vec();
+
+        let (mut manager, body_start) = manager_with_transport_body(version, &body);
+        let mut editor = manager
+            .decode_transport_manager_line_data()
+            .unwrap()
+            .into_editor();
+        assert!(editor.active_lines().is_empty());
+        let mut new_line = TransportManagerLineRecord::new(version).unwrap();
+        {
+            let mut fields = new_line.edit();
+            *fields.line_number_mut().unwrap() = 0x4444;
+            *fields.stop_count_mut() = 6;
+        }
+        let mut expected_new_line = vec![0x44, 0x44, 0x00, 0x06];
+        expected_new_line.extend_from_slice(&[0; 88]);
+        assert_eq!(
+            new_line.encode_with_passenger_edits().unwrap(),
+            expected_new_line
+        );
+
+        assert!(
+            editor
+                .insert_active_line(3, 0, 42, new_line.clone())
+                .is_err()
+        );
+        assert!(
+            editor
+                .insert_active_line(255, 2, 42, new_line.clone())
+                .is_err()
+        );
+        assert!(TransportManagerLineRecord::new(116_020).is_err());
+
+        editor.insert_active_line(3, 2, 42, new_line).unwrap();
+        assert!(
+            editor
+                .insert_active_line(3, 4, 43, TransportManagerLineRecord::new(version).unwrap(),)
+                .is_err()
+        );
+        assert_eq!(editor.active_line_prefab_indices(), [42]);
+        assert_eq!(editor.line_flags()[3], 2);
+
+        let mut expected_body = body.clone();
+        let mut expected_lines = original_line_bytes;
+        expected_lines.extend_from_slice(&expected_new_line);
+        expected_body.splice(record_section_range, expected_lines);
+        expected_body.splice(prefab_range, [0x01, 0x00, 0x2a, 0x00, 0x08]);
+        let mut expected_flags = Vec::new();
+        let mut flags = vec![0_u32; TRANSPORT_MANAGER_LINE_FLAG_COUNT];
+        flags[3] = 2;
+        write_encoded_uint_array_runs(&mut expected_flags, &flags);
+        expected_body.splice(flags_range, expected_flags);
+        let mut expected_encoded_body = expected_body.clone();
+        expected_encoded_body.extend_from_slice(&[0, 0]);
+        assert_eq!(editor.encode().unwrap(), expected_encoded_body);
+
+        manager
+            .replace_transport_manager_line_data(&editor)
+            .unwrap();
+        let rewritten = manager.decode_transport_manager_line_data().unwrap();
+        assert_eq!(rewritten.line_flags()[0], 0);
+        assert_eq!(rewritten.line_flags()[3], 2);
+        assert_eq!(rewritten.active_line_prefab_indices(), [42]);
+        assert_eq!(rewritten.active_lines().len(), 1);
+        assert_eq!(rewritten.active_lines()[0].line_number(), Some(0x4444));
+        assert_eq!(rewritten.active_lines()[0].stop_count(), 6);
+        let rewritten_fields = decode_transport_manager_reference_body_with_milestones(
+            version,
+            &expected_body,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(rewritten_fields.all_prefab_indices, [42, 8]);
+        assert_eq!(rewritten_fields.milestone_prefab_indices, [8]);
+        assert_eq!(
+            &manager.serialized_object_graph()
+                [body_start + expected_body.len()..body_start + expected_body.len() + 2],
+            &[0, 0]
+        );
+    }
+
+    #[test]
+    fn transport_manager_new_line_records_follow_version_gates() {
+        for (version, expected_len, expected_group_count, expected_legacy) in [
+            (164, 70, 7, None),
+            (176, 79, 8, None),
+            (
+                112_004,
+                92,
+                8,
+                Some(TransportLineVehicleSelection::Index(0)),
+            ),
+            (
+                112_022,
+                91,
+                8,
+                Some(TransportLineVehicleSelection::Name(None)),
+            ),
+            (114_001, 90, 8, None),
+        ] {
+            let record = TransportManagerLineRecord::new(version).unwrap();
+            let bytes = record.encode_unchanged();
+            assert_eq!(bytes.len(), expected_len);
+            if version == 112_022 {
+                assert_eq!(bytes.last(), Some(&0xff));
+            } else {
+                assert!(bytes.iter().all(|byte| *byte == 0));
+            }
+
+            let mut reader = Reader::new(&bytes);
+            let decoded =
+                super::decode_transport_manager_line_record(version, &mut reader).unwrap();
+            assert_eq!(reader.remaining(), 0);
+            assert_eq!(decoded.line_number(), Some(0));
+            assert_eq!(decoded.stop_count(), 0);
+            assert_eq!(
+                decoded
+                    .passengers()
+                    .map(|passengers| passengers.groups().len()),
+                (version >= 122).then_some(expected_group_count)
+            );
+            assert_eq!(decoded.legacy_vehicle_selection(), expected_legacy.as_ref());
+        }
+        assert!(TransportManagerLineRecord::new(116_020).is_err());
     }
 
     #[test]
