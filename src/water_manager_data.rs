@@ -24,6 +24,12 @@ const COLLECT_WATER_USHORT_VERSION: u32 = 271;
 const COLLECT_SEWAGE_USHORT_VERSION: u32 = 272;
 const END_PROFILER_REFERENCE_LEN: usize = 2;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EncodedArraySnapshot<T> {
+    range: (usize, usize),
+    values: Vec<T>,
+}
+
 /// One active water, sewage, or heating pulse group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaterPulseGroup {
@@ -57,12 +63,14 @@ pub struct WaterPulseUnit {
 /// Decoded reader fields from `WaterManager+Data`.
 ///
 /// Sparse cell columns use the corresponding conductivity plane's ascending
-/// cell-index order. Node arrays retain their full 32,768-entry size, with
-/// version-derived defaults in the legacy upper half. The complete source body
-/// remains available for exact unchanged writing. Pulse-group and pulse-unit
-/// records and the scalar tail can be edited in place. Closest-segment,
-/// node, and collect-pressure arrays re-encode only when changed and can resize
-/// the body; all other bytes remain unchanged. The inner serializer version
+/// cell-index order. Existing sparse electrification flags and conductive
+/// pollution values can be edited without changing the conductivity planes.
+/// Node arrays retain their full 32,768-entry size, with version-derived
+/// defaults in the legacy upper half. The complete source body remains
+/// available for exact unchanged writing. Pulse-group and pulse-unit records
+/// and the scalar tail can be edited in place. Sparse, closest-segment, node,
+/// and collect-pressure arrays re-encode only when changed and can resize the
+/// body; all other bytes remain unchanged. The inner serializer version
 /// controls the 23, 73, 94, 202, 227, and 270–272 gates. Corpus samples cover
 /// versions 194–118011; active network values and gates 270–272 have synthetic
 /// coverage only.
@@ -86,12 +94,19 @@ pub struct WaterManagerData {
     closest_heating_segments_range: Option<(usize, usize)>,
     original_closest_heating_segments: Option<Vec<u16>>,
     water_electrified: Vec<bool>,
+    water_electrified_snapshot: EncodedArraySnapshot<bool>,
     water_temporary_electrified: Vec<bool>,
+    water_temporary_electrified_snapshot: EncodedArraySnapshot<bool>,
     sewage_electrified: Vec<bool>,
+    sewage_electrified_snapshot: EncodedArraySnapshot<bool>,
     sewage_temporary_electrified: Vec<bool>,
+    sewage_temporary_electrified_snapshot: EncodedArraySnapshot<bool>,
     heating_electrified: Option<Vec<bool>>,
+    heating_electrified_snapshot: Option<EncodedArraySnapshot<bool>>,
     heating_temporary_electrified: Option<Vec<bool>>,
+    heating_temporary_electrified_snapshot: Option<EncodedArraySnapshot<bool>>,
     conductive_pollution: Option<Vec<u8>>,
+    conductive_pollution_snapshot: Option<EncodedArraySnapshot<u8>>,
     water_pulse_groups: Vec<WaterPulseGroup>,
     water_pulse_groups_offset: usize,
     water_pulse_units: Vec<WaterPulseUnit>,
@@ -214,29 +229,40 @@ impl WaterManagerData {
             (None, None, None)
         };
 
-        let water_electrified = read_encoded_bool_array(&mut reader, conductive_cells.len())?;
-        let water_temporary_electrified =
-            read_encoded_bool_array(&mut reader, conductive_cells.len())?;
-        let sewage_electrified = read_encoded_bool_array(&mut reader, conductive_cells.len())?;
-        let sewage_temporary_electrified =
-            read_encoded_bool_array(&mut reader, conductive_cells.len())?;
-        let heating_electrified = if format_version >= HEATING_VERSION {
-            Some(read_encoded_bool_array(&mut reader, heating_cells.len())?)
+        let (water_electrified, water_electrified_snapshot) =
+            read_captured_bool_array(&mut reader, conductive_cells.len())?;
+        let (water_temporary_electrified, water_temporary_electrified_snapshot) =
+            read_captured_bool_array(&mut reader, conductive_cells.len())?;
+        let (sewage_electrified, sewage_electrified_snapshot) =
+            read_captured_bool_array(&mut reader, conductive_cells.len())?;
+        let (sewage_temporary_electrified, sewage_temporary_electrified_snapshot) =
+            read_captured_bool_array(&mut reader, conductive_cells.len())?;
+        let (
+            heating_electrified,
+            heating_electrified_snapshot,
+            heating_temporary_electrified,
+            heating_temporary_electrified_snapshot,
+        ) = if format_version >= HEATING_VERSION {
+            let (electrified, electrified_snapshot) =
+                read_captured_bool_array(&mut reader, heating_cells.len())?;
+            let (temporary, temporary_snapshot) =
+                read_captured_bool_array(&mut reader, heating_cells.len())?;
+            (
+                Some(electrified),
+                Some(electrified_snapshot),
+                Some(temporary),
+                Some(temporary_snapshot),
+            )
         } else {
-            None
+            (None, None, None, None)
         };
-        let heating_temporary_electrified = if format_version >= HEATING_VERSION {
-            Some(read_encoded_bool_array(&mut reader, heating_cells.len())?)
+        let (conductive_pollution, conductive_pollution_snapshot) = if format_version
+            >= POLLUTION_VERSION
+        {
+            let (values, snapshot) = read_captured_byte_array(&mut reader, conductive_cells.len())?;
+            (Some(values), Some(snapshot))
         } else {
-            None
-        };
-        let conductive_pollution = if format_version >= POLLUTION_VERSION {
-            Some(read_encoded_byte_array(
-                &mut reader,
-                conductive_cells.len(),
-            )?)
-        } else {
-            None
+            (None, None)
         };
 
         let (water_pulse_groups, water_pulse_groups_offset) =
@@ -416,12 +442,19 @@ impl WaterManagerData {
             closest_heating_segments_range,
             original_closest_heating_segments,
             water_electrified,
+            water_electrified_snapshot,
             water_temporary_electrified,
+            water_temporary_electrified_snapshot,
             sewage_electrified,
+            sewage_electrified_snapshot,
             sewage_temporary_electrified,
+            sewage_temporary_electrified_snapshot,
             heating_electrified,
+            heating_electrified_snapshot,
             heating_temporary_electrified,
+            heating_temporary_electrified_snapshot,
             conductive_pollution,
+            conductive_pollution_snapshot,
             water_pulse_groups,
             water_pulse_groups_offset,
             water_pulse_units,
@@ -590,9 +623,41 @@ impl WaterManagerData {
         &self.water_electrified
     }
 
+    /// Replaces one water electrification flag by its cell index. The cell
+    /// must already be present in the conductivity plane.
+    pub fn set_water_electrified(
+        &mut self,
+        cell: usize,
+        electrified: bool,
+    ) -> Result<(), CrpError> {
+        set_sparse_bool_cell(
+            &mut self.water_electrified,
+            &self.conductive_cells,
+            cell,
+            electrified,
+            "water electrification",
+        )
+    }
+
     /// Returns sparse temporary water electrification flags.
     pub fn water_temporary_electrified(&self) -> &[bool] {
         &self.water_temporary_electrified
+    }
+
+    /// Replaces one temporary water electrification flag by its cell index.
+    /// The cell must already be present in the conductivity plane.
+    pub fn set_water_temporary_electrified(
+        &mut self,
+        cell: usize,
+        electrified: bool,
+    ) -> Result<(), CrpError> {
+        set_sparse_bool_cell(
+            &mut self.water_temporary_electrified,
+            &self.conductive_cells,
+            cell,
+            electrified,
+            "temporary water electrification",
+        )
     }
 
     /// Returns sparse current sewage electrification flags.
@@ -600,9 +665,41 @@ impl WaterManagerData {
         &self.sewage_electrified
     }
 
+    /// Replaces one sewage electrification flag by its cell index. The cell
+    /// must already be present in the conductivity plane.
+    pub fn set_sewage_electrified(
+        &mut self,
+        cell: usize,
+        electrified: bool,
+    ) -> Result<(), CrpError> {
+        set_sparse_bool_cell(
+            &mut self.sewage_electrified,
+            &self.conductive_cells,
+            cell,
+            electrified,
+            "sewage electrification",
+        )
+    }
+
     /// Returns sparse temporary sewage electrification flags.
     pub fn sewage_temporary_electrified(&self) -> &[bool] {
         &self.sewage_temporary_electrified
+    }
+
+    /// Replaces one temporary sewage electrification flag by its cell index.
+    /// The cell must already be present in the conductivity plane.
+    pub fn set_sewage_temporary_electrified(
+        &mut self,
+        cell: usize,
+        electrified: bool,
+    ) -> Result<(), CrpError> {
+        set_sparse_bool_cell(
+            &mut self.sewage_temporary_electrified,
+            &self.conductive_cells,
+            cell,
+            electrified,
+            "temporary sewage electrification",
+        )
     }
 
     /// Returns sparse heating electrification flags from version 227.
@@ -610,14 +707,77 @@ impl WaterManagerData {
         self.heating_electrified.as_deref()
     }
 
+    /// Replaces one heating electrification flag by its cell index from inner
+    /// version 227. The cell must already be present in the heating plane.
+    pub fn set_heating_electrified(
+        &mut self,
+        cell: usize,
+        electrified: bool,
+    ) -> Result<(), CrpError> {
+        let Some(values) = self.heating_electrified.as_mut() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "heating electrification values are absent before inner version 227",
+            ));
+        };
+        set_sparse_bool_cell(
+            values,
+            &self.heating_cells,
+            cell,
+            electrified,
+            "heating electrification",
+        )
+    }
+
     /// Returns sparse temporary heating electrification flags from version 227.
     pub fn heating_temporary_electrified(&self) -> Option<&[bool]> {
         self.heating_temporary_electrified.as_deref()
     }
 
+    /// Replaces one temporary heating electrification flag by its cell index
+    /// from inner version 227. The cell must already be present in the heating
+    /// plane.
+    pub fn set_heating_temporary_electrified(
+        &mut self,
+        cell: usize,
+        electrified: bool,
+    ) -> Result<(), CrpError> {
+        let Some(values) = self.heating_temporary_electrified.as_mut() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "temporary heating electrification values are absent before inner version 227",
+            ));
+        };
+        set_sparse_bool_cell(
+            values,
+            &self.heating_cells,
+            cell,
+            electrified,
+            "temporary heating electrification",
+        )
+    }
+
     /// Returns sparse pollution bytes from version 23.
     pub fn conductive_pollution(&self) -> Option<&[u8]> {
         self.conductive_pollution.as_deref()
+    }
+
+    /// Replaces one conductive pollution value by its cell index from inner
+    /// version 23. The cell must already be present in the conductivity plane.
+    pub fn set_conductive_pollution(&mut self, cell: usize, pollution: u8) -> Result<(), CrpError> {
+        let Some(values) = self.conductive_pollution.as_mut() else {
+            return Err(invalid_cell_grid(
+                cell,
+                "conductive pollution values are absent before inner version 23",
+            ));
+        };
+        set_sparse_byte_cell(
+            values,
+            &self.conductive_cells,
+            cell,
+            pollution,
+            "conductive pollution",
+        )
     }
 
     /// Returns active water pulse groups in serialized order.
@@ -1500,6 +1660,107 @@ impl WaterManagerData {
                 ));
             }
         }
+        for (values, snapshot, field) in [
+            (
+                &self.water_electrified,
+                &self.water_electrified_snapshot,
+                "water electrification",
+            ),
+            (
+                &self.water_temporary_electrified,
+                &self.water_temporary_electrified_snapshot,
+                "temporary water electrification",
+            ),
+            (
+                &self.sewage_electrified,
+                &self.sewage_electrified_snapshot,
+                "sewage electrification",
+            ),
+            (
+                &self.sewage_temporary_electrified,
+                &self.sewage_temporary_electrified_snapshot,
+                "temporary sewage electrification",
+            ),
+        ] {
+            if let Some(encoded) = changed_bool_array(
+                values,
+                Some(&snapshot.values),
+                self.conductive_cells.len(),
+                snapshot.range.0,
+                field,
+            )? {
+                replacements.push((snapshot.range.0, snapshot.range.1, encoded));
+            }
+        }
+        match (
+            self.heating_electrified.as_deref(),
+            self.heating_electrified_snapshot.as_ref(),
+        ) {
+            (Some(values), Some(snapshot)) => {
+                if let Some(encoded) = changed_bool_array(
+                    values,
+                    Some(&snapshot.values),
+                    self.heating_cells.len(),
+                    snapshot.range.0,
+                    "heating electrification",
+                )? {
+                    replacements.push((snapshot.range.0, snapshot.range.1, encoded));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid_cell_grid(
+                    self.scalar_fields_offset,
+                    "heating electrification fields do not match the version gate",
+                ));
+            }
+        }
+        match (
+            self.heating_temporary_electrified.as_deref(),
+            self.heating_temporary_electrified_snapshot.as_ref(),
+        ) {
+            (Some(values), Some(snapshot)) => {
+                if let Some(encoded) = changed_bool_array(
+                    values,
+                    Some(&snapshot.values),
+                    self.heating_cells.len(),
+                    snapshot.range.0,
+                    "temporary heating electrification",
+                )? {
+                    replacements.push((snapshot.range.0, snapshot.range.1, encoded));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid_cell_grid(
+                    self.scalar_fields_offset,
+                    "temporary heating electrification fields do not match the version gate",
+                ));
+            }
+        }
+        match (
+            self.conductive_pollution.as_deref(),
+            self.conductive_pollution_snapshot.as_ref(),
+        ) {
+            (Some(values), Some(snapshot)) => {
+                if let Some(encoded) = changed_byte_array(
+                    values,
+                    Some(&snapshot.values),
+                    self.conductive_cells.len(),
+                    snapshot.range.0,
+                    "conductive pollution",
+                )? {
+                    replacements.push((snapshot.range.0, snapshot.range.1, encoded));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid_cell_grid(
+                    self.scalar_fields_offset,
+                    "conductive pollution fields do not match the version gate",
+                ));
+            }
+        }
         match (
             self.collect_water_pressure_selector_range,
             self.collect_water_pressure_selector.as_deref(),
@@ -1662,6 +1923,51 @@ fn set_grid_ushort_value(
         return Err(invalid_cell_grid(
             cell,
             &format!("{field} decoded grid is truncated"),
+        ));
+    };
+    *target = value;
+    Ok(())
+}
+
+fn sparse_cell_position(cells: &[usize], cell: usize, field: &str) -> Result<usize, CrpError> {
+    cells.binary_search(&cell).map_err(|_| {
+        invalid_cell_grid(
+            cell,
+            &format!("{field} cell is absent from its conductivity grid"),
+        )
+    })
+}
+
+fn set_sparse_bool_cell(
+    values: &mut [bool],
+    cells: &[usize],
+    cell: usize,
+    value: bool,
+    field: &str,
+) -> Result<(), CrpError> {
+    let index = sparse_cell_position(cells, cell, field)?;
+    let Some(target) = values.get_mut(index) else {
+        return Err(invalid_cell_grid(
+            cell,
+            &format!("{field} values are shorter than the conductivity grid"),
+        ));
+    };
+    *target = value;
+    Ok(())
+}
+
+fn set_sparse_byte_cell(
+    values: &mut [u8],
+    cells: &[usize],
+    cell: usize,
+    value: u8,
+    field: &str,
+) -> Result<(), CrpError> {
+    let index = sparse_cell_position(cells, cell, field)?;
+    let Some(target) = values.get_mut(index) else {
+        return Err(invalid_cell_grid(
+            cell,
+            &format!("{field} values are shorter than the conductivity grid"),
         ));
     };
     *target = value;
@@ -1887,6 +2193,38 @@ fn read_node_byte_array(
     let mut values = vec![default; NODE_COUNT];
     values[..stored_count].copy_from_slice(&read_encoded_byte_array(reader, stored_count)?);
     Ok(values)
+}
+
+fn read_captured_bool_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<(Vec<bool>, EncodedArraySnapshot<bool>), CrpError> {
+    let start = reader.offset();
+    let values = read_encoded_bool_array(reader, count)?;
+    let end = reader.offset();
+    Ok((
+        values.clone(),
+        EncodedArraySnapshot {
+            range: (start, end),
+            values,
+        },
+    ))
+}
+
+fn read_captured_byte_array(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<(Vec<u8>, EncodedArraySnapshot<u8>), CrpError> {
+    let start = reader.offset();
+    let values = read_encoded_byte_array(reader, count)?;
+    let end = reader.offset();
+    Ok((
+        values.clone(),
+        EncodedArraySnapshot {
+            range: (start, end),
+            values,
+        },
+    ))
 }
 
 fn read_pulse_groups(
@@ -2300,6 +2638,65 @@ mod tests {
         assert_eq!(data.conductive_cell_count(), 32);
         assert_eq!(data.guide_references().len(), 2);
         assert_eq!(data.encode_unchanged(), body);
+    }
+
+    #[test]
+    fn sparse_electrification_and_pollution_edits_preserve_active_cell_order() {
+        let body = active_body(265);
+        let mut data = WaterManagerData::decode(265, &body).unwrap();
+        let mut expected = body.clone();
+        let mut replacements = vec![
+            (data.water_electrified_snapshot.range, vec![0, 0]),
+            (data.water_temporary_electrified_snapshot.range, vec![0, 1]),
+            (data.sewage_electrified_snapshot.range, vec![0, 1]),
+            (data.sewage_temporary_electrified_snapshot.range, vec![0, 0]),
+            (
+                data.heating_electrified_snapshot.as_ref().unwrap().range,
+                vec![0, 0],
+            ),
+            (
+                data.heating_temporary_electrified_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .range,
+                vec![0, 1],
+            ),
+            (
+                data.conductive_pollution_snapshot.as_ref().unwrap().range,
+                vec![0, 0xa5],
+            ),
+        ];
+        data.set_water_electrified(2, false).unwrap();
+        data.set_water_temporary_electrified(2, true).unwrap();
+        data.set_sewage_electrified(2, true).unwrap();
+        data.set_sewage_temporary_electrified(2, false).unwrap();
+        data.set_heating_electrified(4, false).unwrap();
+        data.set_heating_temporary_electrified(4, true).unwrap();
+        data.set_conductive_pollution(2, 0xa5).unwrap();
+        replacements.sort_by_key(|((start, _), _)| *start);
+        for ((start, end), replacement) in replacements.into_iter().rev() {
+            expected.splice(start..end, replacement);
+        }
+
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = WaterManagerData::decode(265, &encoded).unwrap();
+        assert_eq!(decoded.water_electrified(), [false]);
+        assert_eq!(decoded.water_temporary_electrified(), [true]);
+        assert_eq!(decoded.sewage_electrified(), [true]);
+        assert_eq!(decoded.sewage_temporary_electrified(), [false]);
+        assert_eq!(decoded.heating_electrified(), Some([false].as_slice()));
+        assert_eq!(
+            decoded.heating_temporary_electrified(),
+            Some([true].as_slice())
+        );
+        assert_eq!(decoded.conductive_pollution(), Some([0xa5].as_slice()));
+        assert!(data.set_water_electrified(3, true).is_err());
+
+        let mut before_heating = WaterManagerData::decode(226, &empty_body(226)).unwrap();
+        assert!(before_heating.set_heating_electrified(0, true).is_err());
+        let mut before_pollution = WaterManagerData::decode(22, &empty_body(22)).unwrap();
+        assert!(before_pollution.set_conductive_pollution(0, 1).is_err());
     }
 
     #[test]
