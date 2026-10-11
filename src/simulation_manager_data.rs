@@ -1486,6 +1486,8 @@ pub struct TransportManagerLineData {
     line_flags: Vec<u32>,
     active_line_prefab_indices: Vec<u16>,
     prefab_names: Vec<Option<String>>,
+    prefab_name_ranges: Vec<Range<usize>>,
+    prefab_name_compact: Vec<Option<bool>>,
     line_numbers: Option<Vec<u16>>,
     active_lines: Vec<TransportManagerLineRecord>,
     global_passengers: Option<Vec<TransportPassengerRecord>>,
@@ -1552,7 +1554,10 @@ impl TransportManagerLineData {
             format_version: self.format_version,
             line_flags: self.line_flags,
             active_line_prefab_indices: self.active_line_prefab_indices,
+            original_prefab_names: self.prefab_names.clone(),
             prefab_names: self.prefab_names,
+            prefab_name_ranges: self.prefab_name_ranges,
+            prefab_name_compact: self.prefab_name_compact,
             line_numbers: self.line_numbers.clone(),
             original_line_numbers: self.line_numbers,
             active_lines: self.active_lines,
@@ -1573,16 +1578,19 @@ impl TransportManagerLineData {
 /// passenger data.
 ///
 /// This retains the original bounded manager body. Flag edits must preserve
-/// whether each line slot is active. Flag and prefab-index edits and legacy
-/// vehicle names may resize serialized sections; line and passenger table
-/// counts remain fixed. Passenger counts must fit in the serialized 24-bit
-/// fields.
+/// each line slot's active state. Flag, prefab-index, prefab-name, and legacy
+/// vehicle-name edits may resize serialized sections; line and passenger
+/// table counts remain fixed. Passenger counts must fit in the serialized
+/// 24-bit fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerLineDataEditor {
     format_version: u32,
     line_flags: Vec<u32>,
     active_line_prefab_indices: Vec<u16>,
     prefab_names: Vec<Option<String>>,
+    original_prefab_names: Vec<Option<String>>,
+    prefab_name_ranges: Vec<Range<usize>>,
+    prefab_name_compact: Vec<Option<bool>>,
     line_numbers: Option<Vec<u16>>,
     original_line_numbers: Option<Vec<u16>>,
     active_lines: Vec<TransportManagerLineRecord>,
@@ -1646,6 +1654,21 @@ impl TransportManagerLineDataEditor {
     /// Returns names from the TransportInfo prefab table in serialized order.
     pub fn prefab_names(&self) -> &[Option<String>] {
         &self.prefab_names
+    }
+
+    /// Replaces a prefab-name entry without changing the table size.
+    ///
+    /// Existing compact or wide encoding is retained when possible. A compact
+    /// source is widened for unrepresentable characters; a formerly null
+    /// entry uses the default encoding for the new string. Null and empty
+    /// names remain distinct.
+    pub fn set_prefab_name(&mut self, index: usize, value: Option<String>) -> Result<(), CrpError> {
+        let name = self
+            .prefab_names
+            .get_mut(index)
+            .ok_or_else(|| invalid(index, "TransportManager prefab-name index is out of bounds"))?;
+        *name = value;
+        Ok(())
     }
 
     /// Changes the prefab index assigned to an active line.
@@ -1718,6 +1741,9 @@ impl TransportManagerLineDataEditor {
     /// limit, or would exceed the captured source ranges.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         if self.active_line_prefab_indices.len() != self.active_lines.len()
+            || self.prefab_names.len() != self.original_prefab_names.len()
+            || self.prefab_name_ranges.len() != self.original_prefab_names.len()
+            || self.prefab_name_compact.len() != self.original_prefab_names.len()
             || self.line_flags.len() != TRANSPORT_MANAGER_LINE_FLAG_COUNT
             || self.original_line_flags.len() != TRANSPORT_MANAGER_LINE_FLAG_COUNT
             || self
@@ -1908,6 +1934,38 @@ impl TransportManagerLineDataEditor {
                     }
                 }
             }
+        }
+
+        for index in (0..self.prefab_names.len()).rev() {
+            let name = &self.prefab_names[index];
+            if name == &self.original_prefab_names[index] {
+                continue;
+            }
+            let range = &self.prefab_name_ranges[index];
+            if range.start > range.end || range.end > self.original_body.len() {
+                return Err(invalid(
+                    range.start,
+                    "TransportManager prefab-name range exceeds source body",
+                ));
+            }
+            let mut encoded_name = Vec::new();
+            match name {
+                None => encoded_name.push(0xff),
+                Some(value) => {
+                    let can_keep_compact =
+                        value.chars().all(|character| u32::from(character) < 256);
+                    match self.prefab_name_compact[index] {
+                        Some(true) if can_keep_compact => {
+                            write_unique_string_with_mode(&mut encoded_name, value, true)?;
+                        }
+                        Some(false) => {
+                            write_unique_string_with_mode(&mut encoded_name, value, false)?;
+                        }
+                        _ => write_unique_string(&mut encoded_name, value)?,
+                    }
+                }
+            }
+            body.splice(range.clone(), encoded_name);
         }
 
         let mut prefab_indices = self.original_prefab_indices.clone();
@@ -11089,6 +11147,8 @@ impl SimulationManagerData {
                 })?
                 .to_vec(),
             prefab_names: fields.prefab_names,
+            prefab_name_ranges: fields.prefab_name_ranges,
+            prefab_name_compact: fields.prefab_name_compact,
             line_numbers: fields.line_numbers,
             active_lines: fields.line_records,
             global_passengers: fields.global_passengers,
@@ -11170,6 +11230,7 @@ impl SimulationManagerData {
                 if decoded.line_flags != edited.line_flags
                     || decoded.line_numbers != edited.line_numbers
                     || decoded.active_line_prefab_indices != edited.active_line_prefab_indices
+                    || decoded.prefab_names != edited.prefab_names
                     || decoded.global_passengers != edited.global_passengers
                     || validated_body_range.start != body_range.start
                     || validated_body_range.end != expected_body_end
@@ -14609,13 +14670,32 @@ fn decode_transport_manager_reference_body_with_milestones(
 
     let prefab_name_count = usize::from(reader.read_u16_be()?);
     let mut prefab_names = Vec::new();
+    let mut prefab_name_ranges = Vec::new();
+    let mut prefab_name_compact = Vec::new();
     if capture_milestones {
         prefab_names.reserve(prefab_name_count);
+        prefab_name_ranges.reserve(prefab_name_count);
+        prefab_name_compact.reserve(prefab_name_count);
     }
     for _ in 0..prefab_name_count {
+        let start = reader.offset();
         let name = reader.read_unique_string()?;
         if capture_milestones {
+            let end = reader.offset();
+            let compact = if name.is_some() {
+                let raw = reader.consumed_bytes().get(start..end).ok_or_else(|| {
+                    reader.invalid("TransportManager prefab-name range is invalid")
+                })?;
+                let first = *raw.first().ok_or_else(|| {
+                    reader.invalid("TransportManager prefab name has no encoded bytes")
+                })?;
+                Some((u32::from(first) << 16) & COMPACT_STRING_FLAG != 0)
+            } else {
+                None
+            };
             prefab_names.push(name);
+            prefab_name_ranges.push(start..end);
+            prefab_name_compact.push(compact);
         }
     }
     if milestone_count > reader.remaining() {
@@ -14875,6 +14955,8 @@ fn decode_transport_manager_reference_body_with_milestones(
         },
         line_flags_range,
         prefab_names,
+        prefab_name_ranges,
+        prefab_name_compact,
         milestone_object_headers,
         milestone_prefab_indices,
         all_prefab_indices,
@@ -14906,6 +14988,8 @@ struct TransportManagerReferenceFields {
     line_flags: Vec<u32>,
     line_flags_range: Option<Range<usize>>,
     prefab_names: Vec<Option<String>>,
+    prefab_name_ranges: Vec<Range<usize>>,
+    prefab_name_compact: Vec<Option<bool>>,
     milestone_object_headers: Vec<NetObjectHeader>,
     milestone_prefab_indices: Vec<u16>,
     all_prefab_indices: Vec<u16>,
@@ -21068,30 +21152,83 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn transport_manager_line_data_exposes_and_preserves_prefab_names() {
+    fn transport_manager_line_data_edits_prefab_names_and_preserves_encodings() {
         let (mut body, _) = active_transport_manager_reference_body(112_004, 14, 0, 7);
         let fields = decode_transport_manager_reference_body_with_milestones(
             112_004, &body, None, None, true,
         )
         .unwrap();
-        let name_count_offset = fields.prefab_index_range.unwrap().end;
-        let mut name_table = 3_u16.to_be_bytes().to_vec();
+        let name_count_offset = fields.prefab_index_range.as_ref().unwrap().end;
+        let mut name_table = 4_u16.to_be_bytes().to_vec();
         name_table.push(0xff); // Null unique string.
         write_unique_string(&mut name_table, "").unwrap();
         write_unique_string(&mut name_table, "Metro").unwrap();
+        write_unique_string_with_mode(&mut name_table, "Wide", false).unwrap();
         body.splice(name_count_offset..name_count_offset + 2, name_table);
+        let fields = decode_transport_manager_reference_body_with_milestones(
+            112_004, &body, None, None, true,
+        )
+        .unwrap();
+        let name_ranges = fields.prefab_name_ranges.clone();
+        assert_eq!(
+            fields.prefab_name_compact,
+            [None, Some(true), Some(true), Some(false)]
+        );
 
-        let (mut manager, _) = manager_with_transport_body(112_004, &body);
+        let (mut manager, body_start) = manager_with_transport_body(112_004, &body);
         let original_graph = manager.serialized_object_graph().to_vec();
         let line_data = manager.decode_transport_manager_line_data().unwrap();
-        let expected_names = [None, Some(String::new()), Some("Metro".to_owned())];
+        let expected_names = [
+            None,
+            Some(String::new()),
+            Some("Metro".to_owned()),
+            Some("Wide".to_owned()),
+        ];
         assert_eq!(line_data.prefab_names(), expected_names);
-        let editor = line_data.into_editor();
+        let mut editor = line_data.into_editor();
         assert_eq!(editor.prefab_names(), expected_names);
+        assert!(editor.set_prefab_name(4, None).is_err());
+        editor.set_prefab_name(0, Some("Bus".to_owned())).unwrap();
+        editor
+            .set_prefab_name(2, Some("Train Engine".to_owned()))
+            .unwrap();
+        editor.set_prefab_name(3, Some("Bus".to_owned())).unwrap();
+
+        let mut expected_graph = original_graph;
+        let wide_bus_start = body_start + name_ranges[3].start;
+        expected_graph.splice(
+            wide_bus_start..body_start + name_ranges[3].end,
+            [0x00, 0x00, 0x03, 0xff, 0xc2, 0x00, 0x33, 0xff, 0xfe],
+        );
+        let train_engine_start = body_start + name_ranges[2].start;
+        expected_graph.splice(
+            train_engine_start..body_start + name_ranges[2].end,
+            [
+                0x80, 0x00, 0x0c, 0xd4, 0x1e, 0xef, 0x08, 0x05, 0xb2, 0x25, 0x29, 0xf9, 0x02, 0x05,
+                0xf7,
+            ],
+        );
+        let bus_start = body_start + name_ranges[0].start;
+        expected_graph.splice(
+            bus_start..body_start + name_ranges[0].end,
+            [0x80, 0x00, 0x03, 0xc2, 0x33, 0xfe],
+        );
         manager
             .replace_transport_manager_line_data(&editor)
             .unwrap();
-        assert_eq!(manager.serialized_object_graph(), original_graph);
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+        assert_eq!(
+            manager
+                .decode_transport_manager_line_data()
+                .unwrap()
+                .prefab_names(),
+            [
+                Some("Bus".to_owned()),
+                Some(String::new()),
+                Some("Train Engine".to_owned()),
+                Some("Bus".to_owned())
+            ]
+        );
     }
 
     #[test]
