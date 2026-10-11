@@ -742,6 +742,15 @@ pub enum TransportManagerSharedStringValue {
     },
 }
 
+/// DataSerializer encoding mode for a TransportManager selection string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportManagerStringEncoding {
+    /// Store one byte per character; supported characters must be below U+0100.
+    Compact,
+    /// Store UTF-16 code units using the wide delta encoding.
+    Wide,
+}
+
 /// One key and shared-string value in the TransportManager selection table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerSelection {
@@ -1515,6 +1524,7 @@ impl TransportManagerSelectionPrefix {
             .into_iter()
             .map(|selection| selection.value)
             .collect();
+        let entry_count = keys.len();
         TransportManagerSelectionEditor {
             format_version: self.format_version,
             keys,
@@ -1524,6 +1534,7 @@ impl TransportManagerSelectionPrefix {
             key_ranges: self.key_ranges,
             new_string_ranges: self.new_string_ranges,
             new_string_indexes: self.new_string_indexes,
+            new_string_encoding_overrides: vec![None; entry_count],
             existing_index_ranges: self.existing_index_ranges,
             available_shared_string_counts: self.available_shared_string_counts,
             shared_string_values: self.shared_string_values,
@@ -1534,9 +1545,10 @@ impl TransportManagerSelectionPrefix {
 /// Editor for signed keys in the TransportManager vehicle-selection table.
 ///
 /// The table is rewritten in the manager graph. String markers and compact or
-/// wide encoding modes are retained. Entries can be appended when they use an
-/// already declared shared string, and the last entry can be removed when it
-/// only references an existing string. Newly declared strings can change
+/// wide encoding modes are retained by default; callers can explicitly select
+/// an encoding for a replacement string. Entries can be appended when they use
+/// an already declared shared string, and the last entry can be removed when
+/// it only references an existing string. Newly declared strings can change
 /// serialized width, and existing entries can redirect only to prior indexes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportManagerSelectionEditor {
@@ -1548,6 +1560,7 @@ pub struct TransportManagerSelectionEditor {
     key_ranges: Vec<Range<usize>>,
     new_string_ranges: Vec<Option<Range<usize>>>,
     new_string_indexes: Vec<Option<u16>>,
+    new_string_encoding_overrides: Vec<Option<TransportManagerStringEncoding>>,
     existing_index_ranges: Vec<Option<Range<usize>>>,
     available_shared_string_counts: Vec<usize>,
     shared_string_values: Vec<Option<String>>,
@@ -1629,6 +1642,7 @@ impl TransportManagerSelectionEditor {
         self.key_ranges.push(entry_start..key_end);
         self.new_string_ranges.push(None);
         self.new_string_indexes.push(None);
+        self.new_string_encoding_overrides.push(None);
         self.existing_index_ranges.push(Some(key_end..entry_end));
         self.available_shared_string_counts
             .push(self.shared_string_values.len());
@@ -1689,6 +1703,7 @@ impl TransportManagerSelectionEditor {
         self.key_ranges.pop();
         self.new_string_ranges.pop();
         self.new_string_indexes.pop();
+        self.new_string_encoding_overrides.pop();
         self.existing_index_ranges.pop();
         self.available_shared_string_counts.pop();
         self.write_entry_count()?;
@@ -1727,10 +1742,44 @@ impl TransportManagerSelectionEditor {
         entry_index: usize,
         value: Option<String>,
     ) -> Result<(), CrpError> {
+        self.set_new_string_value_inner(entry_index, value, None)
+    }
+
+    /// Changes a new shared string and explicitly selects its byte encoding.
+    ///
+    /// `Compact` accepts only characters below U+0100; `Wide` uses the
+    /// DataSerializer UTF-16 delta representation. This may resize the table
+    /// and the TransportManager graph. Later references to this shared-string
+    /// index resolve to the replacement value.
+    pub fn set_new_string_value_with_encoding(
+        &mut self,
+        entry_index: usize,
+        value: String,
+        encoding: TransportManagerStringEncoding,
+    ) -> Result<(), CrpError> {
+        self.set_new_string_value_inner(entry_index, Some(value), Some(encoding))
+    }
+
+    fn set_new_string_value_inner(
+        &mut self,
+        entry_index: usize,
+        value: Option<String>,
+        encoding_override: Option<TransportManagerStringEncoding>,
+    ) -> Result<(), CrpError> {
         if entry_index >= self.values.len() {
             return Err(invalid(
                 entry_index,
                 "TransportManager selection entry index is out of bounds",
+            ));
+        }
+        if self
+            .new_string_encoding_overrides
+            .get(entry_index)
+            .is_none()
+        {
+            return Err(invalid(
+                entry_index,
+                "TransportManager string encoding slot is missing",
             ));
         }
         let string_index = self
@@ -1781,6 +1830,16 @@ impl TransportManagerSelectionEditor {
                 *resolved_value = replacement_value.clone();
             }
         }
+        let encoding_slot = self
+            .new_string_encoding_overrides
+            .get_mut(entry_index)
+            .ok_or_else(|| {
+                invalid(
+                    entry_index,
+                    "TransportManager string encoding slot is missing",
+                )
+            })?;
+        *encoding_slot = encoding_override;
         Ok(())
     }
 
@@ -1838,14 +1897,15 @@ impl TransportManagerSelectionEditor {
         }
     }
 
-    /// Writes edited keys, string values, and indexes into the original table
-    /// bytes without changing entry count or compact/wide encoding modes.
+    /// Writes edited keys, string values, and indexes into the working table
+    /// bytes. Explicit string encoding overrides are applied to their values.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         if self.format_version < 114_001
             || self.keys.len() != self.key_ranges.len()
             || self.values.len() != self.keys.len()
             || self.new_string_ranges.len() != self.keys.len()
             || self.new_string_indexes.len() != self.keys.len()
+            || self.new_string_encoding_overrides.len() != self.keys.len()
             || self.existing_index_ranges.len() != self.keys.len()
             || self.available_shared_string_counts.len() != self.keys.len()
         {
@@ -1892,7 +1952,20 @@ impl TransportManagerSelectionEditor {
                             "TransportManager new-string range exceeds source table",
                         )
                     })?;
-                    let encoded = encode_selection_unique_string(value.as_deref(), original)?;
+                    let encoding_override = *self
+                        .new_string_encoding_overrides
+                        .get(entry_index)
+                        .ok_or_else(|| {
+                            invalid(
+                                entry_index,
+                                "TransportManager string encoding slot is missing",
+                            )
+                        })?;
+                    let encoded = encode_selection_unique_string(
+                        value.as_deref(),
+                        original,
+                        encoding_override,
+                    )?;
                     new_string_edits.push((range.clone(), encoded));
                 }
                 (
@@ -1943,6 +2016,7 @@ impl TransportManagerSelectionEditor {
 fn encode_selection_unique_string(
     value: Option<&str>,
     original: &[u8],
+    encoding_override: Option<TransportManagerStringEncoding>,
 ) -> Result<Vec<u8>, CrpError> {
     match value {
         None => {
@@ -1950,24 +2024,32 @@ fn encode_selection_unique_string(
             write_nullable_unique_string(&mut encoded, None)?;
             Ok(encoded)
         }
-        Some(value) => match original {
-            [0xff] => {
+        Some(value) => match encoding_override {
+            Some(encoding) => {
                 let mut encoded = Vec::new();
-                write_unique_string(&mut encoded, value)?;
-                Ok(encoded)
-            }
-            [first, second, third, ..] => {
-                let encoded_length =
-                    (u32::from(*first) << 16) | (u32::from(*second) << 8) | u32::from(*third);
-                let compact = encoded_length & COMPACT_STRING_FLAG != 0;
-                let mut encoded = Vec::new();
+                let compact = encoding == TransportManagerStringEncoding::Compact;
                 write_unique_string_with_mode(&mut encoded, value, compact)?;
                 Ok(encoded)
             }
-            _ => Err(invalid(
-                0,
-                "TransportManager selection string has an invalid source encoding",
-            )),
+            None => match original {
+                [0xff] => {
+                    let mut encoded = Vec::new();
+                    write_unique_string(&mut encoded, value)?;
+                    Ok(encoded)
+                }
+                [first, second, third, ..] => {
+                    let encoded_length =
+                        u32::from(*first) << 16 | u32::from(*second) << 8 | u32::from(*third);
+                    let compact = encoded_length & COMPACT_STRING_FLAG != 0;
+                    let mut encoded = Vec::new();
+                    write_unique_string_with_mode(&mut encoded, value, compact)?;
+                    Ok(encoded)
+                }
+                _ => Err(invalid(
+                    0,
+                    "TransportManager selection string has an invalid source encoding",
+                )),
+            },
         },
     }
 }
@@ -14141,8 +14223,9 @@ mod manager_boundary_tests {
         QueuedDataObject, ResolvedObjectReference, SimulationManagerData,
         TransportLineVehicleSelection, TransportManagerActiveLineEditor, TransportManagerMilestone,
         TransportManagerMilestoneEditor, TransportManagerSelection,
-        TransportManagerSharedStringValue, decode_economy_manager_body_layout,
-        decode_economy_manager_budget_editor, decode_economy_manager_income_expense_editor,
+        TransportManagerSharedStringValue, TransportManagerStringEncoding,
+        decode_economy_manager_body_layout, decode_economy_manager_budget_editor,
+        decode_economy_manager_income_expense_editor,
         decode_economy_manager_income_expense_editor_with_layout,
         decode_economy_manager_investment_editor,
         decode_economy_manager_investment_flags_from_body,
@@ -18266,7 +18349,7 @@ mod manager_boundary_tests {
                 .replace_transport_manager_selection_prefix(&editor)
                 .is_err()
         );
-        let mut wrong_encoding = selection_after.into_editor();
+        let mut wrong_encoding = selection_after.clone().into_editor();
         wrong_encoding
             .set_new_string_value(0, Some("B€".to_owned()))
             .unwrap();
@@ -18275,6 +18358,101 @@ mod manager_boundary_tests {
                 .replace_transport_manager_selection_prefix(&wrong_encoding)
                 .is_err()
         );
+        assert_eq!(manager.serialized_object_graph(), expected_graph);
+
+        let mut invalid_compact = selection_after.clone().into_editor();
+        invalid_compact
+            .set_new_string_value_with_encoding(
+                0,
+                "B€".to_owned(),
+                TransportManagerStringEncoding::Compact,
+            )
+            .unwrap();
+        assert!(invalid_compact.encode().is_err());
+
+        let mut wide_editor = selection_after.into_editor();
+        wide_editor
+            .set_new_string_value_with_encoding(
+                0,
+                "B€".to_owned(),
+                TransportManagerStringEncoding::Wide,
+            )
+            .unwrap();
+        let wide_table = [
+            0x00, 0x02, 0x12, 0x34, 0xfe, 0x00, 0x00, 0x02, 0xff, 0xc2, 0x20, 0x6a, 0x00, 0x08,
+            0x00, 0x01,
+        ];
+        assert_eq!(wide_editor.encode().unwrap(), wide_table);
+        let (source_body_range, _) = manager.transport_manager_body_range().unwrap();
+        let source_body = manager
+            .serialized_object_graph()
+            .get(source_body_range.clone())
+            .unwrap();
+        let source_fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            source_body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let source_table_range = source_fields.selection_range.unwrap();
+        let wide_start = source_body_range
+            .start
+            .checked_add(source_table_range.start)
+            .unwrap();
+        let wide_end = source_body_range
+            .start
+            .checked_add(source_table_range.end)
+            .unwrap();
+        let mut expected_wide_graph = expected_graph.clone();
+        expected_wide_graph.splice(wide_start..wide_end, wide_table.iter().copied());
+        manager
+            .replace_transport_manager_selection_prefix(&wide_editor)
+            .unwrap();
+        assert_eq!(
+            manager.serialized_object_graph(),
+            expected_wide_graph.as_slice()
+        );
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            expected_graph.len() + 1
+        );
+
+        let (wide_body_range, _) = manager.transport_manager_body_range().unwrap();
+        let wide_body = manager
+            .serialized_object_graph()
+            .get(wide_body_range)
+            .unwrap();
+        let wide_fields = decode_transport_manager_reference_body(
+            manager.format_version,
+            wide_body,
+            None,
+            Some(&mut vec![Some("Train".to_owned())]),
+        )
+        .unwrap();
+        let wide_selection = wide_fields.selection_prefix.unwrap();
+        assert_eq!(
+            wide_selection.selections()[0].value,
+            TransportManagerSharedStringValue::New(Some("B€".to_owned()))
+        );
+        assert_eq!(
+            wide_selection.selections()[1].value,
+            TransportManagerSharedStringValue::Existing {
+                index: 1,
+                value: Some("B€".to_owned()),
+            }
+        );
+        let mut compact_editor = wide_selection.into_editor();
+        compact_editor
+            .set_new_string_value_with_encoding(
+                0,
+                "Car".to_owned(),
+                TransportManagerStringEncoding::Compact,
+            )
+            .unwrap();
+        manager
+            .replace_transport_manager_selection_prefix(&compact_editor)
+            .unwrap();
         assert_eq!(manager.serialized_object_graph(), expected_graph);
 
         let (current_body_range, _) = manager.transport_manager_body_range().unwrap();

@@ -128,8 +128,8 @@ pub use simulation_manager_data::{
     TransportLineVehicleSelection, TransportManagerActiveLineEditor, TransportManagerLineData,
     TransportManagerLineDataEditor, TransportManagerLineRecord, TransportManagerMilestone,
     TransportManagerMilestoneEditor, TransportManagerSelection, TransportManagerSelectionEditor,
-    TransportManagerSelectionPrefix, TransportManagerSharedStringValue, TransportPassengerCounts,
-    TransportPassengerRecord,
+    TransportManagerSelectionPrefix, TransportManagerSharedStringValue,
+    TransportManagerStringEncoding, TransportPassengerCounts, TransportPassengerRecord,
 };
 pub use simulation_metadata::{ModOverride, SimulationMetaData};
 pub use statistics_manager_data::{
