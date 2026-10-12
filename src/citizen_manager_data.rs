@@ -1414,6 +1414,7 @@ pub struct CitizenInstanceDataPrefix {
     format_version: u32,
     instance_flags: Option<Vec<u32>>,
     active_instances: Vec<CitizenInstanceSlot>,
+    prefab_indices_range: Option<Range<usize>>,
     prefab_names: Option<Vec<Option<String>>>,
     prefab_name_ranges: Option<Vec<Range<usize>>>,
     serialized_prefix: Vec<u8>,
@@ -1449,6 +1450,7 @@ impl CitizenInstanceDataPrefix {
                     format_version,
                     instance_flags: None,
                     active_instances: Vec::new(),
+                    prefab_indices_range: None,
                     prefab_names: None,
                     prefab_name_ranges: None,
                     serialized_prefix: Vec::new(),
@@ -1459,7 +1461,9 @@ impl CitizenInstanceDataPrefix {
 
         let instance_flags = read_encoded_uint_array(&mut reader, flag_count)?;
         let active_count = instance_flags.iter().filter(|flags| **flags != 0).count();
+        let prefab_indices_start = reader.offset();
         let prefab_indices = read_encoded_ushort_array(&mut reader, active_count)?;
+        let prefab_indices_range = prefab_indices_start..reader.offset();
         let name_count = usize::from(reader.read_u16_be()?);
         let mut prefab_names = Vec::with_capacity(name_count);
         let mut prefab_name_ranges = Vec::with_capacity(name_count);
@@ -1493,6 +1497,7 @@ impl CitizenInstanceDataPrefix {
                 format_version,
                 instance_flags: Some(instance_flags),
                 active_instances,
+                prefab_indices_range: Some(prefab_indices_range),
                 prefab_names: Some(prefab_names),
                 prefab_name_ranges: Some(prefab_name_ranges),
                 serialized_prefix: bytes[..consumed].to_vec(),
@@ -1519,6 +1524,83 @@ impl CitizenInstanceDataPrefix {
     /// Returns the BuildingInfo prefab names, preserving null entries.
     pub fn prefab_names(&self) -> Option<&[Option<String>]> {
         self.prefab_names.as_deref()
+    }
+
+    /// Replaces one active instance's BuildingInfo prefab index.
+    ///
+    /// `active_index` is zero-based in ascending instance-slot order. The
+    /// complete index array is canonically re-encoded, which can resize this
+    /// prefix and shifts the following name table.
+    pub fn set_prefab_index(&mut self, active_index: usize, value: u16) -> Result<(), CrpError> {
+        let current = self
+            .active_instances
+            .get(active_index)
+            .ok_or_else(|| invalid(active_index, "CitizenInstance prefab index is out of range"))?;
+        if current.prefab_index == value {
+            return Ok(());
+        }
+        let range = self.prefab_indices_range.clone().ok_or_else(|| {
+            invalid(
+                active_index,
+                "CitizenInstance prefab indexes are unavailable before version 44",
+            )
+        })?;
+        if range.start > range.end || range.end > self.serialized_prefix.len() {
+            return Err(invalid(
+                range.start,
+                "CitizenInstance prefab-index range is invalid",
+            ));
+        }
+        let mut active_instances = self.active_instances.clone();
+        active_instances[active_index].prefab_index = value;
+        let indices = active_instances
+            .iter()
+            .map(|instance| instance.prefab_index)
+            .collect::<Vec<_>>();
+        let mut encoded = Vec::new();
+        write_encoded_ushort_array(&mut encoded, &indices);
+        let old_len = range.len();
+        let new_len = encoded.len();
+        let name_ranges = self
+            .prefab_name_ranges
+            .as_ref()
+            .ok_or_else(|| {
+                invalid(
+                    range.start,
+                    "CitizenInstance prefab-name ranges are missing",
+                )
+            })?
+            .iter()
+            .map(|name_range| {
+                Ok(shift_offset(
+                    name_range.start,
+                    old_len,
+                    new_len,
+                    range.end,
+                    "CitizenInstance prefab-name range",
+                )?
+                    ..shift_offset(
+                        name_range.end,
+                        old_len,
+                        new_len,
+                        range.end,
+                        "CitizenInstance prefab-name range",
+                    )?)
+            })
+            .collect::<Result<Vec<_>, CrpError>>()?;
+        let new_end = range
+            .start
+            .checked_add(new_len)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "CitizenInstance prefab-index range end",
+            ))?;
+
+        self.serialized_prefix
+            .splice(range.start..range.end, encoded);
+        self.prefab_indices_range = Some(range.start..new_end);
+        self.prefab_name_ranges = Some(name_ranges);
+        self.active_instances = active_instances;
+        Ok(())
     }
 
     /// Replaces one existing BuildingInfo prefab name without changing the
@@ -2065,7 +2147,14 @@ impl CitizenManagerData {
         prefix: CitizenInstanceDataPrefix,
     ) -> Result<(), CrpError> {
         if prefix.format_version != self.format_version
-            || prefix.active_instances != self.instance_prefix.active_instances
+            || prefix.active_instances.len() != self.instance_prefix.active_instances.len()
+            || prefix
+                .active_instances
+                .iter()
+                .zip(&self.instance_prefix.active_instances)
+                .any(|(edited, original)| {
+                    edited.index != original.index || edited.flags != original.flags
+                })
         {
             return Err(invalid(
                 0,
@@ -2124,6 +2213,9 @@ impl CitizenManagerData {
         )?;
         let mut active_instances = self.active_instances.clone();
         shift_active_instance_offsets(&mut active_instances, old_boundary, new_boundary)?;
+        for (record, slot) in active_instances.iter_mut().zip(&prefix.active_instances) {
+            record.prefab_index = slot.prefab_index;
+        }
 
         self.instance_prefix = prefix;
         self.original_body = new_body;
@@ -2155,6 +2247,21 @@ impl CitizenManagerData {
     ) -> Result<(), CrpError> {
         let mut prefix = self.instance_prefix.clone();
         prefix.set_prefab_name(index, value)?;
+        self.replace_instance_prefix(prefix)
+    }
+
+    /// Replaces one active CitizenInstance's BuildingInfo prefab index.
+    ///
+    /// The index array is canonically re-encoded and may resize the body; the
+    /// manager replacement method validates the updated TransferManager
+    /// boundary.
+    pub fn set_instance_prefab_index(
+        &mut self,
+        active_index: usize,
+        value: u16,
+    ) -> Result<(), CrpError> {
+        let mut prefix = self.instance_prefix.clone();
+        prefix.set_prefab_index(active_index, value)?;
         self.replace_instance_prefix(prefix)
     }
 
@@ -3755,6 +3862,37 @@ mod tests {
         );
         assert_eq!(decoded.active_instances()[0].prefab_index(), 1);
         assert_eq!(decoded.active_instances()[1].prefab_index(), 0);
+    }
+
+    #[test]
+    fn instance_prefab_index_edits_reencode_only_the_index_array() {
+        let mut bytes = uint_array(&[1, 1, 1]);
+        bytes.extend_from_slice(&ushort_array(&[10, 20, 30]));
+        bytes.extend_from_slice(&[0, 2, 0xff, 0x80, 0, 1, 0xc1]);
+        let (mut decoded, consumed) =
+            CitizenInstanceDataPrefix::decode_prefix_with_count(44, Some(3), &bytes)
+                .expect("active instance prefab table");
+        assert_eq!(consumed, bytes.len());
+        let index_range = decoded.prefab_indices_range.clone().unwrap();
+
+        decoded.set_prefab_index(0, 0).unwrap();
+        decoded.set_prefab_index(1, 0).unwrap();
+        decoded.set_prefab_index(2, 0).unwrap();
+
+        let mut expected = bytes;
+        expected.splice(index_range, [0x82]);
+        assert_eq!(decoded.encode(), expected);
+        assert!(
+            decoded
+                .active_instances()
+                .iter()
+                .all(|instance| instance.prefab_index() == 0)
+        );
+        assert_eq!(
+            decoded.prefab_names(),
+            Some([None, Some("A".to_owned())].as_slice())
+        );
+        assert!(decoded.set_prefab_index(3, 1).is_err());
     }
 
     #[test]

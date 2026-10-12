@@ -8432,8 +8432,8 @@ impl SimulationManagerData {
         Ok(())
     }
 
-    /// Replaces the CitizenInstance flag and BuildingInfo prefab-name prefix
-    /// at slot 7, allowing changed names to resize the CitizenManager body.
+    /// Replaces the CitizenInstance flags and BuildingInfo prefab prefix at
+    /// slot 7, allowing changed assignments or names to resize the body.
     ///
     /// The edited data must come from this stream, preserve active instance
     /// slots and all bytes outside that prefix, and use this inner version.
@@ -8453,8 +8453,15 @@ impl SimulationManagerData {
         expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
 
         let (current, manager_end) = self.decode_citizen_manager_data()?;
-        if edited.instance_prefix().active_instances()
-            != current.instance_prefix().active_instances()
+        let edited_slots = edited.instance_prefix().active_instances();
+        let current_slots = current.instance_prefix().active_instances();
+        if edited_slots.len() != current_slots.len()
+            || edited_slots
+                .iter()
+                .zip(current_slots)
+                .any(|(edited, current)| {
+                    edited.index() != current.index() || edited.flags() != current.flags()
+                })
         {
             return Err(invalid(
                 0,
@@ -27567,6 +27574,26 @@ mod manager_boundary_tests {
             old_boundary_suffix
         );
         assert!(manager.serialized_object_graph()[renamed_end..].starts_with(&transfer_tag));
+
+        let mut assignment_edited = renamed.clone();
+        assignment_edited
+            .set_instance_prefab_index(0, 0x1234)
+            .unwrap();
+        manager
+            .replace_citizen_manager_instance_prefix(&assignment_edited)
+            .unwrap();
+        let (assigned, assigned_end) = manager.decode_citizen_manager_data().unwrap();
+        assert_eq!(assigned_end, renamed_end);
+        assert_eq!(
+            assigned.instance_prefix().active_instances()[0].prefab_index(),
+            0x1234
+        );
+        assert_eq!(assigned.active_instances()[0].prefab_index(), 0x1234);
+        assert_eq!(assigned.encode(), assignment_edited.encode());
+        assert_eq!(
+            &manager.serialized_object_graph()[assigned_end..],
+            old_boundary_suffix
+        );
     }
 
     #[test]
