@@ -1,7 +1,10 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::{read_encoded_uint_array, read_encoded_ushort_array};
+use crate::encoded_array::{
+    read_encoded_uint_array, read_encoded_ushort_array, write_encoded_uint_array_runs,
+};
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
+use std::ops::Range;
 
 const MIN_SUPPORTED_VERSION: u32 = 164;
 const PLAY_POSITION_VERSION: u32 = 281;
@@ -47,12 +50,14 @@ pub struct AudioManagerData {
     format_version: u32,
     radio_channel_capacity: u32,
     channel_flags: Vec<u32>,
+    channel_flags_range: Range<usize>,
     channel_prefab_indices: Vec<u16>,
     channel_prefab_names: Vec<Option<String>>,
     radio_channels: Vec<AudioRadioChannel>,
     channel_record_offsets: Vec<usize>,
     radio_content_capacity: u32,
     content_flags: Vec<u32>,
+    content_flags_range: Range<usize>,
     content_prefab_indices: Vec<u16>,
     content_prefab_names: Vec<Option<String>>,
     unlock_milestone_prefab_indices: Vec<u16>,
@@ -78,7 +83,9 @@ impl AudioManagerData {
         let radio_content_capacity = u32::from(reader.read_u16_be()?) + 1;
         let channel_flag_count = usize::try_from(radio_channel_capacity - 1)
             .map_err(|_| CrpError::ArithmeticOverflow("AudioManager channel flag count"))?;
+        let channel_flags_start = reader.offset();
         let channel_flags = read_encoded_uint_array(&mut reader, channel_flag_count)?;
+        let channel_flags_range = channel_flags_start..reader.offset();
         let channel_count = channel_flags.iter().filter(|flags| **flags != 0).count();
         let channel_prefab_indices = read_encoded_ushort_array(&mut reader, channel_count)?;
         let channel_prefab_names = read_prefab_names(&mut reader)?;
@@ -112,7 +119,9 @@ impl AudioManagerData {
 
         let content_flag_count = usize::try_from(radio_content_capacity - 1)
             .map_err(|_| CrpError::ArithmeticOverflow("AudioManager content flag count"))?;
+        let content_flags_start = reader.offset();
         let content_flags = read_encoded_uint_array(&mut reader, content_flag_count)?;
+        let content_flags_range = content_flags_start..reader.offset();
         let content_count = content_flags.iter().filter(|flags| **flags != 0).count();
         let unlock_milestone_count = usize::from(reader.read_u16_be()?);
         let content_prefab_index_count = content_count.checked_add(unlock_milestone_count).ok_or(
@@ -154,12 +163,14 @@ impl AudioManagerData {
                 format_version,
                 radio_channel_capacity,
                 channel_flags,
+                channel_flags_range,
                 channel_prefab_indices,
                 channel_prefab_names,
                 radio_channels,
                 channel_record_offsets,
                 radio_content_capacity,
                 content_flags,
+                content_flags_range,
                 content_prefab_indices,
                 content_prefab_names,
                 unlock_milestone_prefab_indices,
@@ -247,10 +258,10 @@ impl AudioManagerData {
         self.serialized_prefix.len()
     }
 
-    /// Creates an editor for fixed-width fields in existing channels and content.
+    /// Creates an editor for existing channel and content flags and records.
     ///
-    /// Active-slot counts and prefab assignments stay fixed, so edits preserve
-    /// the manager body length and every name-table and reference byte.
+    /// Flag edits preserve each slot's active state. They can change encoded
+    /// array lengths; record counts and prefab assignments stay fixed.
     pub fn into_editor(self) -> AudioManagerEditor {
         AudioManagerEditor::from(self)
     }
@@ -264,14 +275,18 @@ impl AudioManagerData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioManagerEditor {
     original: AudioManagerData,
+    channel_flags: Vec<u32>,
     radio_channels: Vec<AudioRadioChannel>,
+    content_flags: Vec<u32>,
     radio_contents: Vec<AudioRadioContent>,
 }
 
 impl From<AudioManagerData> for AudioManagerEditor {
     fn from(original: AudioManagerData) -> Self {
         Self {
+            channel_flags: original.channel_flags.clone(),
             radio_channels: original.radio_channels.clone(),
+            content_flags: original.content_flags.clone(),
             radio_contents: original.radio_contents.clone(),
             original,
         }
@@ -282,6 +297,31 @@ impl AudioManagerEditor {
     /// Returns the inner DataSerializer version used for the source fields.
     pub fn format_version(&self) -> u32 {
         self.original.format_version
+    }
+
+    /// Returns channel flag values in serialized slot order. Their bit
+    /// meanings are not modeled.
+    pub fn channel_flags(&self) -> &[u32] {
+        &self.channel_flags
+    }
+
+    /// Replaces raw flag bits for one serialized radio-channel slot.
+    ///
+    /// `index` is zero-based, so zero represents serialized slot one. The
+    /// value must preserve whether the slot has an active channel record.
+    pub fn set_channel_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        let current = *self
+            .channel_flags
+            .get(index)
+            .ok_or_else(|| invalid(index, "radio-channel flag index is out of range"))?;
+        if (current == 0) != (value == 0) {
+            return Err(invalid(
+                index,
+                "radio-channel flag edits must preserve the slot's active state",
+            ));
+        }
+        self.channel_flags[index] = value;
+        Ok(())
     }
 
     /// Returns the existing radio channels in serialized slot order.
@@ -301,6 +341,31 @@ impl AudioManagerEditor {
         &self.radio_contents
     }
 
+    /// Returns radio-content flag values in serialized slot order. Their bit
+    /// meanings are not modeled.
+    pub fn content_flags(&self) -> &[u32] {
+        &self.content_flags
+    }
+
+    /// Replaces raw flag bits for one serialized radio-content slot.
+    ///
+    /// `index` is zero-based, so zero represents serialized slot one. The
+    /// value must preserve whether the slot has an active content record.
+    pub fn set_content_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        let current = *self
+            .content_flags
+            .get(index)
+            .ok_or_else(|| invalid(index, "radio-content flag index is out of range"))?;
+        if (current == 0) != (value == 0) {
+            return Err(invalid(
+                index,
+                "radio-content flag edits must preserve the slot's active state",
+            ));
+        }
+        self.content_flags[index] = value;
+        Ok(())
+    }
+
     /// Returns mutable access to existing radio contents.
     ///
     /// Slot indices and prefab assignments must remain unchanged when encoded.
@@ -308,18 +373,46 @@ impl AudioManagerEditor {
         &mut self.radio_contents
     }
 
-    /// Encodes the edited records into a copy of their original AudioManager bytes.
+    /// Encodes edited flags and records into a copy of their original AudioManager bytes.
     ///
-    /// The output has the original length. Any attempt to change active slots,
-    /// prefab assignments, or the version-selected play-position presence is
-    /// rejected.
+    /// Flag arrays are canonically re-encoded only when changed and can resize
+    /// the output. Any attempt to change active slots, prefab assignments, or
+    /// the version-selected play-position presence is rejected.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
-        if self.radio_channels.len() != self.original.radio_channels.len()
+        if self.channel_flags.len() != self.original.channel_flags.len()
+            || self.content_flags.len() != self.original.content_flags.len()
+            || self.radio_channels.len() != self.original.radio_channels.len()
             || self.radio_channels.len() != self.original.channel_record_offsets.len()
             || self.radio_contents.len() != self.original.radio_contents.len()
             || self.radio_contents.len() != self.original.content_cooldown_offsets.len()
         {
             return Err(invalid(0, "AudioManager active record count changed"));
+        }
+        for (index, (edited, original)) in self
+            .channel_flags
+            .iter()
+            .zip(&self.original.channel_flags)
+            .enumerate()
+        {
+            if (*edited == 0) != (*original == 0) {
+                return Err(invalid(
+                    index,
+                    "radio-channel flag edits must preserve the slot's active state",
+                ));
+            }
+        }
+        for (index, (edited, original)) in self
+            .content_flags
+            .iter()
+            .zip(&self.original.content_flags)
+            .enumerate()
+        {
+            if (*edited == 0) != (*original == 0) {
+                return Err(invalid(
+                    index,
+                    "radio-content flag edits must preserve the slot's active state",
+                ));
+            }
         }
 
         let mut bytes = self.original.serialized_prefix.clone();
@@ -381,12 +474,37 @@ impl AudioManagerEditor {
             }
             write_u16_at(&mut bytes, *offset, edited.cooldown)?;
         }
+
+        if self.content_flags != self.original.content_flags {
+            let range = self.original.content_flags_range.clone();
+            validate_flag_range(&bytes, &range)?;
+            let mut encoded = Vec::new();
+            write_encoded_uint_array_runs(&mut encoded, &self.content_flags);
+            bytes.splice(range, encoded);
+        }
+        if self.channel_flags != self.original.channel_flags {
+            let range = self.original.channel_flags_range.clone();
+            validate_flag_range(&bytes, &range)?;
+            let mut encoded = Vec::new();
+            write_encoded_uint_array_runs(&mut encoded, &self.channel_flags);
+            bytes.splice(range, encoded);
+        }
         Ok(bytes)
     }
 
     pub(crate) fn original_prefix(&self) -> &[u8] {
         &self.original.serialized_prefix
     }
+}
+
+fn validate_flag_range(bytes: &[u8], range: &Range<usize>) -> Result<(), CrpError> {
+    if range.start > range.end || range.end > bytes.len() {
+        return Err(invalid(
+            range.start,
+            "AudioManager encoded flag range exceeds its original bytes",
+        ));
+    }
+    Ok(())
 }
 
 fn write_u16_at(bytes: &mut [u8], offset: usize, value: u16) -> Result<(), CrpError> {
@@ -532,6 +650,38 @@ mod tests {
         expected[32..40].copy_from_slice(&[0, 12, 0, 13, 14, 15, 0x12, 0x34]);
         expected[81..83].copy_from_slice(&[0x56, 0x78]);
         assert_eq!(editor.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn editor_reencodes_flags_without_changing_slot_activity() {
+        let bytes = one_channel_one_content_body(281);
+        let (decoded, _) = AudioManagerData::decode_prefix(281, &bytes).unwrap();
+        let mut editor = decoded.into_editor();
+        assert_eq!(editor.channel_flags(), [0, 1, 0]);
+        assert_eq!(editor.content_flags(), [0, 1]);
+
+        assert!(editor.set_channel_flag_bits(1, 0).is_err());
+        assert!(editor.set_content_flag_bits(1, 0).is_err());
+        assert!(editor.set_channel_flag_bits(3, 1).is_err());
+        assert!(editor.set_content_flag_bits(2, 1).is_err());
+        editor.set_channel_flag_bits(1, 3).unwrap();
+        editor.set_content_flag_bits(1, 3).unwrap();
+
+        let mut expected = bytes[..4].to_vec();
+        expected.extend_from_slice(&[0x80, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0]);
+        expected.extend_from_slice(&bytes[17..40]);
+        expected.extend_from_slice(&[0x80, 0, 0, 0, 0, 3]);
+        expected.extend_from_slice(&bytes[49..]);
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+        assert!(encoded.len() < bytes.len());
+
+        let (decoded, consumed) = AudioManagerData::decode_prefix(281, &encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.channel_flags(), [0, 3, 0]);
+        assert_eq!(decoded.content_flags(), [0, 3]);
+        assert_eq!(decoded.radio_channels()[0].slot_index, 2);
+        assert_eq!(decoded.radio_contents()[0].slot_index, 2);
     }
 
     #[test]

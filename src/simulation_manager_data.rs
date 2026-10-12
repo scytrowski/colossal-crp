@@ -4372,11 +4372,11 @@ impl SimulationManagerData {
         Ok(data)
     }
 
-    /// Replaces fixed-width channel playback and content cooldown fields.
+    /// Replaces existing channel/content flags and fixed-width record fields.
     ///
     /// The editor must come from this manager graph and preserve its active
-    /// slots and prefab assignments. The replacement keeps the body length,
-    /// profiler references, and adjacent manager bytes fixed.
+    /// slots and prefab assignments. Changed flag arrays can resize the body;
+    /// the following manager boundary is checked after replacement.
     pub fn replace_audio_manager_data(
         &mut self,
         edited: &AudioManagerEditor,
@@ -4399,15 +4399,9 @@ impl SimulationManagerData {
             ));
         }
         let replacement = edited.encode()?;
-        if replacement.len() != field_range.len() {
-            return Err(invalid(
-                field_range.start,
-                "AudioManager replacement must preserve the original field length",
-            ));
-        }
 
         let mut candidate = self.serialized_object_graph.clone();
-        candidate[field_range.clone()].copy_from_slice(&replacement);
+        candidate.splice(field_range.clone(), replacement);
         let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
         if let Err(error) = self.decode_audio_manager_data() {
             self.serialized_object_graph = original_graph;
@@ -18129,6 +18123,39 @@ mod manager_boundary_tests {
         manager
     }
 
+    fn audio_manager_with_three_channel_slots() -> SimulationManagerData {
+        let body = [
+            0x00, 0x03, // Four channel slots including reserved slot zero.
+            0x00, 0x00, // One content slot including reserved slot zero.
+            0x02, // Three channel flags as one literal run.
+            0x00, 0x00, 0x00, 0x00, // Channel slot 1: inactive.
+            0x00, 0x00, 0x00, 0x00, // Channel slot 2: inactive.
+            0x00, 0x00, 0x00, 0x01, // Channel slot 3: active.
+            0x00, 0x00, 0x00, // One channel prefab index, zero.
+            0x00, 0x00, // Empty channel prefab-name table.
+            0x00, 0x01, 0x00, 0x02, 0x03, 0x04, 0x00, 0x05, // Channel state.
+            0x00, 0x00, // No unlock milestones.
+            0x00, 0x00, // Empty content prefab-name table.
+        ];
+        let mut graph = profiler_tag("AudioManager");
+        graph.extend_from_slice(&body);
+        graph.extend_from_slice(&[0x12, 0x34]);
+        graph.extend(profiler_tag("StatisticsManager"));
+        let mut manager = manager_with_graph(graph);
+        manager.format_version = 293;
+        manager.manager_objects = Some(vec![
+            Some(ManagerObjectReference {
+                object_id: 1,
+                type_name: "AudioManager+Data, Assembly-CSharp".to_owned(),
+            }),
+            Some(ManagerObjectReference {
+                object_id: 2,
+                type_name: "StatisticsManager+Data, Assembly-CSharp".to_owned(),
+            }),
+        ]);
+        manager
+    }
+
     fn transfer_manager_with_noncanonical_counts() -> SimulationManagerData {
         let mut graph = profiler_tag("TransferManager");
         graph.extend_from_slice(&vec![0; 128 * 8]);
@@ -18519,6 +18546,36 @@ mod manager_boundary_tests {
         let stale_editor = stale.decode_audio_manager_data().unwrap().into_editor();
         stale.serialized_object_graph[body_start + 14] ^= 1;
         assert!(stale.replace_audio_manager_data(&stale_editor).is_err());
+    }
+
+    #[test]
+    fn audio_manager_flag_edits_resize_the_body_and_preserve_following_bytes() {
+        let mut manager = audio_manager_with_three_channel_slots();
+        let tag_len = profiler_tag("AudioManager").len();
+        let original_body = manager.decode_audio_manager_data().unwrap().encoded_len();
+        let following_start = tag_len + original_body;
+        let following_bytes = manager.serialized_object_graph[following_start..].to_vec();
+        let original_graph_len = manager.serialized_object_graph.len();
+
+        let mut edited = manager.decode_audio_manager_data().unwrap().into_editor();
+        assert_eq!(edited.channel_flags(), [0, 0, 1]);
+        assert!(edited.set_channel_flag_bits(2, 0).is_err());
+        edited.set_channel_flag_bits(2, 3).unwrap();
+        let replacement = edited.encode().unwrap();
+        assert_eq!(replacement.len(), original_body - 7);
+
+        manager.replace_audio_manager_data(&edited).unwrap();
+        assert_eq!(
+            manager.serialized_object_graph.len(),
+            original_graph_len - 7
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[tag_len + replacement.len()..],
+            following_bytes
+        );
+        let decoded = manager.decode_audio_manager_data().unwrap();
+        assert_eq!(decoded.channel_flags(), [0, 0, 3]);
+        assert_eq!(decoded.radio_channels()[0].slot_index, 3);
     }
 
     #[test]
