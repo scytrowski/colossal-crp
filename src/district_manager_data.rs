@@ -2025,15 +2025,18 @@ impl DistrictCampusYearReportEditor<'_> {
         Ok(())
     }
 
-    /// Replaces the five trophy flags from inner version 112014.
+    /// Replaces the five trophy flags from inner version 112014. Unchanged
+    /// values retain their source encoding; changed values use canonical bytes.
     pub fn set_trophies(&mut self, value: [bool; 5]) -> Result<(), CrpError> {
-        let mut encoded = Vec::new();
-        write_encoded_bool_array(&mut encoded, &value);
-        self.replace_encoded_field(
-            self.report.field_offsets.trophies,
-            encoded,
-            "campus report trophies array",
-        )?;
+        let range =
+            self.report.field_offsets.trophies.ok_or_else(|| {
+                invalid_district_manager(0, "campus report trophies array is absent")
+            })?;
+        if self.report.trophies != Some(value) {
+            let mut encoded = Vec::new();
+            write_encoded_bool_array(&mut encoded, &value);
+            self.replace_encoded_field(Some(range), encoded, "campus report trophies array")?;
+        }
         self.report.trophies = Some(value);
         Ok(())
     }
@@ -2356,15 +2359,19 @@ impl DistrictCampusSportsEditor<'_> {
         Ok(())
     }
 
-    /// Replaces the five away-match flags from inner version 112014.
+    /// Replaces the five away-match flags from inner version 112014. Unchanged
+    /// values retain their source encoding; changed values use canonical bytes.
     pub fn set_away_matches_done(&mut self, value: [bool; 5]) -> Result<(), CrpError> {
-        let mut encoded = Vec::new();
-        write_encoded_bool_array(&mut encoded, &value);
-        self.replace_encoded_array(
-            self.data.field_offsets.away_matches_array,
-            encoded,
-            "away-match array",
-        )?;
+        let range = self
+            .data
+            .field_offsets
+            .away_matches_array
+            .ok_or_else(|| invalid_district_manager(0, "away-match array is absent"))?;
+        if self.data.away_matches_done != Some(value) {
+            let mut encoded = Vec::new();
+            write_encoded_bool_array(&mut encoded, &value);
+            self.replace_encoded_array(Some(range), encoded, "away-match array")?;
+        }
         self.data.away_matches_done = Some(value);
         Ok(())
     }
@@ -6186,6 +6193,19 @@ mod tests {
             .set_is_main_campus(false)
             .unwrap();
         assert_eq!(unchanged_bool_editor.encode(), noncanonical_campus_record);
+
+        let mut unchanged_encoded_bool_editor = parks[0].clone().into_editor();
+        unchanged_encoded_bool_editor
+            .campus_year_report_mut(0)
+            .unwrap()
+            .set_trophies([false; 5])
+            .unwrap();
+        unchanged_encoded_bool_editor
+            .campus_sports_mut()
+            .unwrap()
+            .set_away_matches_done([false; 5])
+            .unwrap();
+        assert_eq!(unchanged_encoded_bool_editor.encode(), record);
 
         let mut fixed_field_editor = parks[0].clone().into_editor();
         fixed_field_editor
