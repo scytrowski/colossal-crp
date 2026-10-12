@@ -3811,7 +3811,9 @@ impl SimulationManagerData {
     /// the supplied DLL's current, unconditionally written event layout.
     ///
     /// The editor must match this stream's version and exact source body.
-    /// Record count, slot indexes, flags, and record widths cannot change.
+    /// Record count, slot indexes, activity, custom-seed presence, and record
+    /// widths cannot change. Edited event-flag arrays must retain their source
+    /// encoded width.
     pub fn replace_event_manager_event_records(
         &mut self,
         edited: &EventManagerEventRecordsEditor,
@@ -17114,6 +17116,10 @@ mod manager_boundary_tests {
         );
         let stale_editor = editor.clone();
         editor.records_mut()[0].building_index = 0xbeef;
+        assert!(editor.set_event_flag_bits(0, 0).is_err());
+        assert!(editor.set_event_flag_bits(0, 0x0000_0003).is_err());
+        assert!(editor.set_event_flag_bits(1, 0x0000_0403).is_err());
+        editor.set_event_flag_bits(0, 0x0000_0403).unwrap();
         let mut invalid_editor = editor.clone();
         invalid_editor.records_mut()[0].flags ^= 0x400;
         assert!(
@@ -17127,7 +17133,7 @@ mod manager_boundary_tests {
             .replace_event_manager_event_records(&editor)
             .unwrap();
         let expected_body = [
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x11,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x03, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x11,
             0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22, 0x33, 0x33, 0x33, 0x33, 0x44, 0x44, 0x44,
             0x44, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x00, 0x07,
             0x00, 0x00, 0x12, 0x34,

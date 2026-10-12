@@ -3,7 +3,8 @@ use crate::data_serializer::{
     COMPACT_STRING_FLAG, Reader, write_unique_string, write_unique_string_with_mode,
 };
 use crate::encoded_array::{
-    read_encoded_uint_array, read_encoded_ushort_array, write_encoded_ushort_array,
+    read_encoded_uint_array, read_encoded_ushort_array, write_encoded_uint_array,
+    write_encoded_ushort_array,
 };
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 use std::ops::Range;
@@ -293,6 +294,8 @@ pub struct EventManagerTailData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EventManagerReferenceData {
     format_version: u32,
+    event_flags: Vec<u32>,
+    event_flags_range: Option<Range<usize>>,
     pub(crate) active_event_records: Vec<EventManagerEventRecord>,
     active_event_record_ranges: Vec<Range<usize>>,
     active_event_race_data_ranges: Vec<Option<Range<usize>>>,
@@ -335,7 +338,8 @@ pub struct EventManagerTypeDataEditor {
 
 /// Editor for existing versioned active EventManager records.
 ///
-/// The record count, slot indexes, and activity flags are fixed. It edits
+/// The record count, slot indexes, activity pattern, and custom-seed presence
+/// are fixed. It edits raw event-flag bits within those constraints and
 /// same-width scalar values for inner versions 210–121034, including selected
 /// `RaceEventData` fields, opaque fixed-size arrays, and racer-name contents
 /// that retain their source encoding and width. Other nested race-event bytes
@@ -622,11 +626,14 @@ impl EventManagerReferenceData {
     ) -> Result<(Self, usize), CrpError> {
         let mut reader = Reader::new(bytes);
         let event_capacity = read_capacity(&mut reader, "event")?;
-        let event_flags = if format_version < 254 && event_capacity == MAX_EVENT_SLOTS {
-            Vec::new()
-        } else {
-            read_encoded_uint_array(&mut reader, event_capacity - 1)?
-        };
+        let event_flags_start = reader.offset();
+        let (event_flags, event_flags_range) =
+            if format_version < 254 && event_capacity == MAX_EVENT_SLOTS {
+                (Vec::new(), None)
+            } else {
+                let flags = read_encoded_uint_array(&mut reader, event_capacity - 1)?;
+                (flags, Some(event_flags_start..reader.offset()))
+            };
         let (
             active_event_records,
             active_event_record_ranges,
@@ -704,6 +711,8 @@ impl EventManagerReferenceData {
         finish(
             &mut reader,
             format_version,
+            event_flags,
+            event_flags_range,
             active_event_records,
             active_event_record_ranges,
             active_event_race_data_ranges,
@@ -735,8 +744,10 @@ impl EventManagerReferenceData {
     ) -> Result<(Self, usize), CrpError> {
         let mut reader = Reader::new(bytes);
         let event_capacity = read_capacity(&mut reader, "event")?;
+        let event_flags_start = reader.offset();
         let event_flags = read_encoded_uint_array(&mut reader, event_capacity - 1)?;
         reject_active_flags(&reader, &event_flags, "event")?;
+        let event_flags_range = Some(event_flags_start..reader.offset());
 
         let route_capacity = read_capacity(&mut reader, "event route")?;
         let route_flags = read_encoded_uint_array(&mut reader, route_capacity - 1)?;
@@ -768,6 +779,8 @@ impl EventManagerReferenceData {
         finish(
             &mut reader,
             format_version,
+            event_flags,
+            event_flags_range,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -866,6 +879,49 @@ impl EventManagerEventRecordsEditor {
         &mut self.records
     }
 
+    /// Replaces raw bits in one active event flag while preserving its slot
+    /// activity and the `0x400` custom-seed presence bit.
+    ///
+    /// The index is zero-based among active event records in ascending slot
+    /// order. The encoded flag array must retain its original byte width.
+    pub fn set_event_flag_bits(&mut self, record_index: usize, value: u32) -> Result<(), CrpError> {
+        let original = self
+            .original
+            .active_event_records
+            .get(record_index)
+            .ok_or_else(|| {
+                invalid_event_record(record_index, "event record index is out of range")
+            })?;
+        let range = self
+            .original
+            .active_event_record_ranges
+            .get(record_index)
+            .ok_or_else(|| {
+                invalid_event_record(
+                    record_index,
+                    "event record range is missing from the source",
+                )
+            })?;
+        if (original.flags == 0) != (value == 0) {
+            return Err(invalid_event_record(
+                range.start,
+                "EventManager flag edits must preserve the slot's active state",
+            ));
+        }
+        if (original.flags ^ value) & CUSTOM_EVENT_SEED_FLAG != 0 {
+            return Err(invalid_event_record(
+                range.start,
+                "EventManager flag edits must preserve custom-seed presence",
+            ));
+        }
+        let record = self
+            .records
+            .get_mut(record_index)
+            .ok_or_else(|| invalid_event_record(record_index, "edited event record is missing"))?;
+        record.flags = value;
+        Ok(())
+    }
+
     /// Returns decoded race-event scalar values aligned with `records`.
     ///
     /// Entries are `None` when the record has no nested race-event block.
@@ -890,6 +946,7 @@ impl EventManagerEventRecordsEditor {
             ));
         }
         let mut output = self.original.serialized_body.clone();
+        let mut event_flags = self.original.event_flags.clone();
         for (record_index, ((record, original_record), range)) in self
             .records
             .iter()
@@ -898,13 +955,24 @@ impl EventManagerEventRecordsEditor {
             .enumerate()
         {
             if record.slot_index != original_record.slot_index
-                || record.flags != original_record.flags
+                || (record.flags == 0) != (original_record.flags == 0)
+                || (record.flags ^ original_record.flags) & CUSTOM_EVENT_SEED_FLAG != 0
             {
                 return Err(invalid_event_record(
                     range.start,
-                    "EventManager event slot and activity flags cannot change in this editor",
+                    "EventManager slot activity and custom-seed presence cannot change in this editor",
                 ));
             }
+            let flag_index = usize::from(record.slot_index).checked_sub(1).ok_or(
+                CrpError::ArithmeticOverflow("EventManager event slot index"),
+            )?;
+            let source_flag = event_flags.get_mut(flag_index).ok_or_else(|| {
+                invalid_event_record(
+                    range.start,
+                    "EventManager event flag is absent from the source array",
+                )
+            })?;
+            *source_flag = record.flags;
             let mut encoded =
                 encode_event_record(self.original.format_version, record, range.start)?;
             if let Some(presence_byte) = self
@@ -946,6 +1014,26 @@ impl EventManagerEventRecordsEditor {
                     invalid_event_record(range.start, "EventManager record range exceeds body")
                 })?
                 .copy_from_slice(&encoded);
+        }
+
+        if event_flags != self.original.event_flags {
+            let range = self.original.event_flags_range.as_ref().ok_or_else(|| {
+                invalid_event_record(0, "EventManager event flag array is absent from the source")
+            })?;
+            let mut encoded_flags = Vec::new();
+            write_encoded_uint_array(&mut encoded_flags, &event_flags);
+            if encoded_flags.len() != range.len() {
+                return Err(invalid_event_record(
+                    range.start,
+                    "EventManager flag edit changes the encoded array width",
+                ));
+            }
+            output
+                .get_mut(range.clone())
+                .ok_or_else(|| {
+                    invalid_event_record(range.start, "EventManager flag range exceeds body")
+                })?
+                .copy_from_slice(&encoded_flags);
         }
 
         for (record_index, ((edited, race_range), field_ranges)) in self
@@ -2922,6 +3010,8 @@ fn read_reader_tail(
 fn finish(
     reader: &mut Reader<'_>,
     format_version: u32,
+    event_flags: Vec<u32>,
+    event_flags_range: Option<Range<usize>>,
     active_event_records: Vec<EventManagerEventRecord>,
     active_event_record_ranges: Vec<Range<usize>>,
     active_event_race_data_ranges: Vec<Option<Range<usize>>>,
@@ -2950,6 +3040,8 @@ fn finish(
     Ok((
         EventManagerReferenceData {
             format_version,
+            event_flags,
+            event_flags_range,
             active_event_records,
             active_event_record_ranges,
             active_event_race_data_ranges,
@@ -3647,6 +3739,42 @@ mod tests {
             serialized_race_data,
         );
         bytes
+    }
+
+    #[test]
+    fn event_flag_edits_reject_encoded_array_width_changes() {
+        let one_record = one_active_event(244, 1);
+        let (decoded, _) = EventManagerReferenceData::decode_reader(244, &one_record).unwrap();
+        let record_range = decoded.active_event_record_ranges[0].clone();
+        let record_bytes = &one_record[record_range];
+
+        let mut bytes = vec![0x00, 0x04]; // Five event slots.
+        // Values 1, 2, 3, 4: two literal deltas, then two repeats.
+        bytes.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x81,
+        ]);
+        for _ in 0..4 {
+            bytes.extend_from_slice(record_bytes);
+        }
+        bytes.extend_from_slice(&[0x00, 0x00]); // No unlock milestones.
+        crate::encoded_array::write_encoded_ushort_array(&mut bytes, &[7, 7, 7, 7]);
+        bytes.extend_from_slice(&[0x00, 0x00]); // Empty prefab names.
+        bytes.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
+
+        let (decoded, consumed) = EventManagerReferenceData::decode_reader(244, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            decoded
+                .active_event_records
+                .iter()
+                .map(|record| record.flags)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+
+        let mut editor = decoded.into_event_records_editor();
+        editor.set_event_flag_bits(0, 5).unwrap();
+        assert!(editor.encode().is_err());
     }
 
     fn empty_reader_layout(version: u32) -> Vec<u8> {
