@@ -73,8 +73,8 @@ use crate::unlock_manager_data::{UnlockManagerReferences, UnlockManagerReference
 use crate::water_manager_data::WaterManagerData;
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
-    BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlagsPrefix,
-    BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
+    BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlagsEditor,
+    BuildingFlagsPrefix, BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingMonumentEffectsEditor,
     BuildingMonumentEffectsPrefix, BuildingPopulationPrefix, BuildingPrefabPrefix,
     BuildingProblemEditor, BuildingProblemPrefix, BuildingRaceTeamReferencesEditor,
@@ -9381,6 +9381,68 @@ impl SimulationManagerData {
             BuildingFlagsPrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
         reader.read_bytes(used)?;
         Ok((data, reader.offset()))
+    }
+
+    /// Replaces BuildingManager's primary and secondary flag arrays.
+    ///
+    /// The editor must come from this graph and preserve primary slot activity.
+    /// Changed arrays can resize the prefix. The following prefab table is
+    /// decoded again before accepting the edit, and failures leave the graph
+    /// unchanged.
+    pub fn replace_building_flags_prefix(
+        &mut self,
+        edited: &BuildingFlagsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited BuildingManager flags version does not match this stream",
+            ));
+        }
+        let (original, graph_end) = self.decode_building_flags_prefix(save_app_version)?;
+        let original_bytes = original.encode();
+        let body_start =
+            graph_end
+                .checked_sub(original_bytes.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager flag prefix start",
+                ))?;
+        if original_bytes.as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager flag bytes do not match the editor's source",
+            ));
+        }
+        if graph_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager flag prefix extends past manager graph",
+            ));
+        }
+        let replacement = edited.encode()?;
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(body_start..graph_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        let validation = (|| {
+            let (decoded, _) = self.decode_building_flags_prefix(save_app_version)?;
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten BuildingManager flags do not match the editor",
+                ));
+            }
+            self.decode_building_prefabs_prefix(save_app_version)?;
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten BuildingManager flags failed boundary validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes BuildingManager flags, counts, and the prefab index/name table.

@@ -3575,6 +3575,10 @@ impl BuildingFlagsEditor {
         }
         Ok(bytes)
     }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original.serialized_prefix
+    }
 }
 
 fn validate_building_flag_range(bytes: &[u8], range: &Range<usize>) -> Result<(), CrpError> {

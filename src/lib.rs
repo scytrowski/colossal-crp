@@ -5599,6 +5599,63 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads the local CCMP2 Desert Map 1 game map from data/maps"]
+    fn building_flags_replacement_resizes_and_preserves_the_manager_suffix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CCMP2 Desert Map 1.crp");
+        let mut file = File::open(&path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("Desert Map 1 has no type-52 asset"))?;
+        let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let mut manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 116_020);
+
+        let (flags, graph_end) = manager.decode_building_flags_prefix(metadata.save_app_version)?;
+        let original = flags.encode();
+        let suffix = manager.serialized_object_graph()[graph_end..].to_vec();
+        assert_eq!(
+            flags
+                .building_flags()
+                .iter()
+                .filter(|flag| flag.flags != 0)
+                .count(),
+            189
+        );
+        let mut editor = flags.into_editor();
+        editor.set_secondary_flag_bits(0, 7)?;
+        let replacement = editor.encode()?;
+        let mut stale_editor = editor.clone();
+        assert_ne!(replacement.len(), original.len());
+        manager.replace_building_flags_prefix(&editor, metadata.save_app_version)?;
+
+        let (updated, updated_end) =
+            manager.decode_building_flags_prefix(metadata.save_app_version)?;
+        assert_eq!(updated.building_flags()[0].flags2, 7);
+        assert_eq!(updated_end, graph_end - original.len() + replacement.len());
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_end..],
+            suffix.as_slice()
+        );
+        let (prefabs, _) = manager.decode_building_prefabs_prefix(metadata.save_app_version)?;
+        assert_eq!(prefabs.building_indices().len(), 189);
+
+        let edited_graph = manager.serialized_object_graph().to_vec();
+        stale_editor.set_secondary_flag_bits(0, 9)?;
+        assert!(
+            manager
+                .replace_building_flags_prefix(&stale_editor, metadata.save_app_version)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), edited_graph);
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "reads the local NorthEurope2FINAL sample from data/maps"]
     fn validates_north_europe_transport_shared_strings() -> Result<(), Box<dyn std::error::Error>> {
         let path =
