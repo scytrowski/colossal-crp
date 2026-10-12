@@ -89,11 +89,12 @@ use crate::{
 use crate::{
     NetFencePrefabEditor, NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor,
     NetInfoPrefabPrefix, NetLanePrefix, NetManagerTailEditor, NetManagerTailPrefix,
-    NetNodeCountersEditor, NetNodeCountersPrefix, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
-    NetNodeRecordsPrefix, NetSegmentCoverageEditor, NetSegmentCoveragePrefix,
-    NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlagsPrefix,
-    NetSegmentProblemsPrefix, NetSegmentRecordsEditor, NetSegmentRecordsPrefix,
-    NetSegmentTrafficLightsPrefix, NetTreePrefabEditor, NetTreePrefabPrefix,
+    NetNodeCountersEditor, NetNodeCountersPrefix, NetNodeFlagsEditor, NetNodeFlagsPrefix,
+    NetNodeProblemsPrefix, NetNodeRecordsPrefix, NetSegmentCoverageEditor,
+    NetSegmentCoveragePrefix, NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix,
+    NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsEditor,
+    NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix, NetTreePrefabEditor,
+    NetTreePrefabPrefix,
 };
 use crate::{PathManagerData, PathManagerEditor};
 use crate::{WeatherManagerData, WeatherManagerEditor};
@@ -5824,13 +5825,94 @@ impl SimulationManagerData {
     /// Decodes NetManager's node flags after its lane section. The returned
     /// graph offset is before node problem arrays and other opaque fields.
     pub fn decode_net_node_flags_prefix(&self) -> Result<(NetNodeFlagsPrefix, usize), CrpError> {
+        let (data, _, end) = self.decode_net_node_flags_with_range()?;
+        Ok((data, end))
+    }
+
+    fn decode_net_node_flags_with_range(
+        &self,
+    ) -> Result<(NetNodeFlagsPrefix, usize, usize), CrpError> {
         let (_, lane_end) = self.decode_net_lane_prefix()?;
-        let mut reader = Reader::new(&self.serialized_object_graph);
-        reader.read_bytes(lane_end)?;
-        let (data, body_length) =
-            NetNodeFlagsPrefix::decode_prefix(self.format_version, reader.remaining_bytes())?;
-        reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        let body = self
+            .serialized_object_graph
+            .get(lane_end..)
+            .ok_or_else(|| invalid(lane_end, "NetManager node-flag start is out of range"))?;
+        let (data, body_length) = NetNodeFlagsPrefix::decode_prefix(self.format_version, body)?;
+        let body_end = lane_end
+            .checked_add(body_length)
+            .ok_or(CrpError::ArithmeticOverflow("NetManager node-flag end"))?;
+        Ok((data, lane_end, body_end))
+    }
+
+    /// Decodes NetManager node flags into an editor.
+    pub fn decode_net_node_flags_editor(&self) -> Result<NetNodeFlagsEditor, CrpError> {
+        let (flags, _, _) = self.decode_net_node_flags_with_range()?;
+        Ok(flags.into_editor())
+    }
+
+    /// Replaces NetManager's primary and version-gated secondary node flags.
+    ///
+    /// The primary zero/nonzero pattern must stay fixed because node problems,
+    /// counters, and records are stored only for active nodes. The optional
+    /// save-app version selects the legacy node-problem layout during boundary
+    /// validation for inner versions 221–114999.
+    pub fn replace_net_node_flags(
+        &mut self,
+        edited: &NetNodeFlagsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                5,
+                "edited NetManager node-flag version does not match this stream",
+            ));
+        }
+        let (current, body_start, body_end) = self.decode_net_node_flags_with_range()?;
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager node-flag bytes do not match the editor's source prefix",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager node-flag prefix range is inconsistent",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self.decode_net_node_flags_with_range().and_then(
+            |(decoded, actual_start, actual_end)| {
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager node flags do not match the editor",
+                    ));
+                }
+                let expected_end = body_start
+                    .checked_add(replacement.len())
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager node-flag end"))?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager node flags have an unexpected boundary",
+                    ));
+                }
+                self.decode_net_node_problems_prefix(save_app_version)?;
+                Ok(())
+            },
+        );
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager node flags failed boundary validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes node problem bits after node flags. The save-app version from
@@ -17611,6 +17693,62 @@ mod manager_boundary_tests {
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_net_lane_prefix(&editor).is_err());
         assert_eq!(manager.serialized_object_graph, updated_graph);
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_flag_editor_reencodes_and_preserves_following_problem_data()
+    -> Result<(), crate::CrpError> {
+        let path_fixture = include_bytes!("../tests/fixtures/path-manager-body-v116020-desert.bin");
+        let (mut manager, _) = synthetic_path_manager(path_fixture);
+        let lane_flags = vec![0_u16; 262_143];
+        let mut lane_prefix = Vec::new();
+        write_encoded_ushort_array(&mut lane_prefix, &lane_flags);
+        manager
+            .serialized_object_graph
+            .extend_from_slice(&lane_prefix);
+
+        let mut node_flags = vec![0_u32; 32_767];
+        node_flags[0] = 1;
+        let original_flag_start = manager.serialized_object_graph.len();
+        write_encoded_uint_array_runs(&mut manager.serialized_object_graph, &node_flags);
+        let original_flag_end = manager.serialized_object_graph.len();
+        write_encoded_uint_array(&mut manager.serialized_object_graph, &[0]);
+        manager
+            .serialized_object_graph
+            .extend_from_slice(&[0xaa, 0xbb]);
+
+        let (original, decoded_flag_end) = manager.decode_net_node_flags_prefix()?;
+        assert_eq!(decoded_flag_end, original_flag_end);
+        let following_problem_data = manager.serialized_object_graph[decoded_flag_end..].to_vec();
+        let mut editor = manager.decode_net_node_flags_editor()?;
+        editor.set_primary_flag_bits(0, 0x1234_5678)?;
+        let replacement = editor.encode()?;
+        assert!(replacement.len() > original.encode().len());
+
+        manager.replace_net_node_flags(&editor, Some(0))?;
+        let (updated, updated_flag_end) = manager.decode_net_node_flags_prefix()?;
+        assert_eq!(updated.node_flags()[0].flags, 0x1234_5678);
+        assert_eq!(
+            updated
+                .node_flags()
+                .iter()
+                .filter(|node| node.flags != 0)
+                .count(),
+            1
+        );
+        assert_eq!(updated_flag_end, original_flag_start + replacement.len());
+        assert_eq!(
+            &manager.serialized_object_graph[updated_flag_end..],
+            following_problem_data
+        );
+        let (problems, _) = manager.decode_net_node_problems_prefix(Some(0))?;
+        assert_eq!(problems.problems().len(), 1);
+        assert_eq!(problems.problems()[0].index, 1);
+
+        let edited_graph = manager.serialized_object_graph.clone();
+        assert!(manager.replace_net_node_flags(&editor, Some(0)).is_err());
+        assert_eq!(manager.serialized_object_graph, edited_graph);
         Ok(())
     }
 

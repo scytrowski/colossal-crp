@@ -108,15 +108,15 @@ pub use net_manager_data::{
     NetFencePrefabEditor, NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor,
     NetInfoPrefabPrefix, NetLane, NetLaneEditor, NetLanePrefix, NetManagerTailEditor,
     NetManagerTailPrefix, NetNodeCounter, NetNodeCountersEditor, NetNodeCountersPrefix,
-    NetNodeFlag, NetNodeFlagsPrefix, NetNodeInstanceGuideBody, NetNodeInstanceGuideEditor,
-    NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord, NetNodeRecordsEditor,
-    NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage, NetSegmentCoverageEditor,
-    NetSegmentCoveragePrefix, NetSegmentEnvironment, NetSegmentEnvironmentEditor,
-    NetSegmentEnvironmentPrefix, NetSegmentFlag, NetSegmentFlagsEditor, NetSegmentFlagsPrefix,
-    NetSegmentProblem, NetSegmentProblemsEditor, NetSegmentProblemsPrefix, NetSegmentRecord,
-    NetSegmentRecordsEditor, NetSegmentRecordsPrefix, NetSegmentTrafficLight,
-    NetSegmentTrafficLightsEditor, NetSegmentTrafficLightsPrefix, NetTreePrefabEditor,
-    NetTreePrefabPrefix,
+    NetNodeFlag, NetNodeFlagsEditor, NetNodeFlagsPrefix, NetNodeInstanceGuideBody,
+    NetNodeInstanceGuideEditor, NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord,
+    NetNodeRecordsEditor, NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage,
+    NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironment,
+    NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlag,
+    NetSegmentFlagsEditor, NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsEditor,
+    NetSegmentProblemsPrefix, NetSegmentRecord, NetSegmentRecordsEditor, NetSegmentRecordsPrefix,
+    NetSegmentTrafficLight, NetSegmentTrafficLightsEditor, NetSegmentTrafficLightsPrefix,
+    NetTreePrefabEditor, NetTreePrefabPrefix,
 };
 pub use path_manager_data::{PathManagerData, PathManagerEditor, PathPosition, PathUnit};
 pub use prop_manager_data::{PropManagerDataPrefix, PropManagerEditor};
@@ -5713,6 +5713,76 @@ mod tests {
         assert!(
             manager
                 .replace_building_flags_prefix(&stale_editor, metadata.save_app_version)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), edited_graph);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads the local CCMP2 Desert Map 1 game map from data/maps"]
+    fn net_node_flag_replacement_preserves_active_records_and_suffix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CCMP2 Desert Map 1.crp");
+        let mut file = File::open(&path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("Desert Map 1 has no type-52 asset"))?;
+        let (metadata, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let mut manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 116_020);
+
+        let (prefix, original_end) = manager.decode_net_node_flags_prefix()?;
+        let original = prefix.encode();
+        let suffix = manager.serialized_object_graph()[original_end..].to_vec();
+        let active_index = prefix
+            .node_flags()
+            .iter()
+            .position(|node| node.flags != 0)
+            .ok_or_else(|| std::io::Error::other("Desert Map 1 has no active node"))?;
+        let original_active_count = prefix
+            .node_flags()
+            .iter()
+            .filter(|node| node.flags != 0)
+            .count();
+        let mut editor = prefix.into_editor();
+        let old_flags = editor.primary_flags()[active_index];
+        editor.set_primary_flag_bits(active_index, old_flags ^ 1)?;
+        let replacement = editor.encode()?;
+        assert_ne!(replacement, original);
+
+        manager.replace_net_node_flags(&editor, metadata.save_app_version)?;
+        let (updated, updated_end) = manager.decode_net_node_flags_prefix()?;
+        assert_ne!(updated.node_flags()[active_index].flags, old_flags);
+        assert_eq!(
+            updated
+                .node_flags()
+                .iter()
+                .filter(|node| node.flags != 0)
+                .count(),
+            original_active_count
+        );
+        assert_eq!(
+            updated_end,
+            original_end - original.len() + replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_end..],
+            suffix.as_slice()
+        );
+        manager.decode_net_node_problems_prefix(metadata.save_app_version)?;
+        manager.decode_net_node_counters_prefix(metadata.save_app_version)?;
+        manager.decode_net_node_records_prefix(metadata.save_app_version)?;
+        manager.decode_net_segment_flags_prefix(metadata.save_app_version)?;
+
+        let edited_graph = manager.serialized_object_graph().to_vec();
+        assert!(
+            manager
+                .replace_net_node_flags(&editor, metadata.save_app_version)
                 .is_err()
         );
         assert_eq!(manager.serialized_object_graph(), edited_graph);

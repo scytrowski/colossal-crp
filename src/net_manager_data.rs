@@ -13,6 +13,7 @@ const LANE_COUNT: usize = 262_144;
 const NODE_COUNT: usize = 32_768;
 const SEGMENT_COUNT: usize = 36_864;
 const LEGACY_SEGMENT_COUNT: usize = 32_768;
+const LEGACY_NODE_FLAG_COUNT: usize = 16_383;
 const TWO_NODE_FLAGS_VERSION: u32 = 115_018;
 const FULL_NODE_COUNT_VERSION: u32 = 202;
 const FULL_SEGMENT_COUNT_VERSION: u32 = 222;
@@ -107,6 +108,20 @@ pub struct NetNodeFlagsPrefix {
     format_version: u32,
     node_flags: Vec<NetNodeFlag>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for primary and version-gated secondary NetManager node flags.
+///
+/// The primary zero/nonzero pattern stays fixed because later node data is
+/// stored only for active nodes. Secondary flags do not select node records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeFlagsEditor {
+    format_version: u32,
+    primary_flags: Vec<u32>,
+    secondary_flags: Option<Vec<u32>>,
+    original_primary_flags: Vec<u32>,
+    original_secondary_flags: Option<Vec<u32>>,
+    original_prefix: Vec<u8>,
 }
 
 /// Problem bits for one node with nonzero primary flags.
@@ -959,7 +974,7 @@ impl NetNodeFlagsPrefix {
         }
         let mut reader = Reader::new(bytes);
         let node_count = if format_version < FULL_NODE_COUNT_VERSION {
-            16_383
+            LEGACY_NODE_FLAG_COUNT
         } else {
             NODE_COUNT - 1
         };
@@ -1018,6 +1033,145 @@ impl NetNodeFlagsPrefix {
     /// Writes the original encoded node-flag bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit its serialized node-flag arrays.
+    pub fn into_editor(self) -> NetNodeFlagsEditor {
+        let primary_count = if self.format_version < FULL_NODE_COUNT_VERSION {
+            LEGACY_NODE_FLAG_COUNT
+        } else {
+            NODE_COUNT - 1
+        };
+        let primary_flags = self.node_flags[..primary_count]
+            .iter()
+            .map(|node| node.flags)
+            .collect::<Vec<_>>();
+        let secondary_flags = (self.format_version >= TWO_NODE_FLAGS_VERSION).then(|| {
+            self.node_flags
+                .iter()
+                .map(|node| node.flags2)
+                .collect::<Vec<_>>()
+        });
+        NetNodeFlagsEditor {
+            format_version: self.format_version,
+            original_primary_flags: primary_flags.clone(),
+            original_secondary_flags: secondary_flags.clone(),
+            primary_flags,
+            secondary_flags,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetNodeFlagsEditor {
+    /// Returns the inner DataSerializer version associated with this prefix.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns primary flags for positions serialized by this version.
+    pub fn primary_flags(&self) -> &[u32] {
+        &self.primary_flags
+    }
+
+    /// Changes raw primary flag bits while preserving the node's active state.
+    /// Index zero represents serialized node slot one.
+    pub fn set_primary_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        let current = *self
+            .primary_flags
+            .get(index)
+            .ok_or_else(|| invalid(index, "NetManager primary node-flag index is out of range"))?;
+        if (current == 0) != (value == 0) {
+            return Err(invalid(
+                index,
+                "NetManager primary node-flag edits must preserve the active-node pattern",
+            ));
+        }
+        self.primary_flags[index] = value;
+        Ok(())
+    }
+
+    /// Returns secondary flags from inner version 115018 onward.
+    pub fn secondary_flags(&self) -> Option<&[u32]> {
+        self.secondary_flags.as_deref()
+    }
+
+    /// Changes a secondary flag value from inner version 115018 onward.
+    /// These values do not determine the active-node record count.
+    pub fn set_secondary_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        let flags = self.secondary_flags.as_mut().ok_or_else(|| {
+            invalid(
+                0,
+                "NetManager secondary node flags are absent before inner version 115018",
+            )
+        })?;
+        let flag = flags.get_mut(index).ok_or_else(|| {
+            invalid(
+                index,
+                "NetManager secondary node-flag index is out of range",
+            )
+        })?;
+        *flag = value;
+        Ok(())
+    }
+
+    /// Encodes changed flag arrays while retaining all source bytes when unchanged.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let primary_count = if self.format_version < FULL_NODE_COUNT_VERSION {
+            LEGACY_NODE_FLAG_COUNT
+        } else {
+            NODE_COUNT - 1
+        };
+        let secondary_count =
+            (self.format_version >= TWO_NODE_FLAGS_VERSION).then_some(NODE_COUNT - 1);
+        if self.primary_flags.len() != primary_count
+            || self.secondary_flags.as_ref().map(Vec::len) != secondary_count
+        {
+            return Err(invalid(
+                0,
+                "edited node-flag counts do not match the version",
+            ));
+        }
+        if self
+            .primary_flags
+            .iter()
+            .zip(&self.original_primary_flags)
+            .any(|(edited, original)| (edited == &0) != (original == &0))
+        {
+            return Err(invalid(
+                0,
+                "primary node-flag edits must preserve the active-node pattern",
+            ));
+        }
+        if self.primary_flags == self.original_primary_flags
+            && self.secondary_flags == self.original_secondary_flags
+        {
+            return Ok(self.original_prefix.clone());
+        }
+
+        if let Some(secondary_flags) = &self.secondary_flags {
+            let mut interleaved = Vec::with_capacity(
+                self.primary_flags
+                    .len()
+                    .checked_mul(2)
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager node flag count"))?,
+            );
+            for (primary, secondary) in self.primary_flags.iter().zip(secondary_flags) {
+                interleaved.push(*primary);
+                interleaved.push(*secondary);
+            }
+            let mut output = Vec::new();
+            write_encoded_uint_array(&mut output, &interleaved);
+            Ok(output)
+        } else {
+            let mut output = Vec::new();
+            write_encoded_uint_array(&mut output, &self.primary_flags);
+            Ok(output)
+        }
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 
@@ -4207,6 +4361,91 @@ mod net_object_header_tests {
                 .encode_canonical()
                 .expect("largest non-reserved shared-type index encodes"),
             [0xfe, 0xfd, 0xff]
+        );
+    }
+}
+
+#[cfg(test)]
+mod net_node_flag_editor_tests {
+    use super::{FULL_NODE_COUNT_VERSION, LEGACY_NODE_FLAG_COUNT, NODE_COUNT, NetNodeFlagsPrefix};
+    use crate::CrpError;
+
+    fn expected_uint_literals(values: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for chunk in values.chunks(64) {
+            bytes.push((chunk.len() - 1) as u8);
+            for value in chunk {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn node_flag_editor_obeys_version_gates_and_primary_activity() {
+        let mut legacy_flags = vec![0; LEGACY_NODE_FLAG_COUNT];
+        legacy_flags[0] = 1;
+        legacy_flags[LEGACY_NODE_FLAG_COUNT - 1] = 2;
+        let legacy_source = expected_uint_literals(&legacy_flags);
+        let (legacy, consumed) = NetNodeFlagsPrefix::decode_prefix(164, &legacy_source).unwrap();
+        assert_eq!(consumed, legacy_source.len());
+        assert_eq!(legacy.node_flags().len(), NODE_COUNT - 1);
+        assert_eq!(legacy.node_flags()[LEGACY_NODE_FLAG_COUNT].flags, 0);
+        let mut editor = legacy.into_editor();
+        assert!(editor.secondary_flags().is_none());
+        assert!(matches!(
+            editor.set_secondary_flag_bits(0, 1),
+            Err(CrpError::InvalidAssetPayload { .. })
+        ));
+        assert!(editor.set_primary_flag_bits(0, 0).is_err());
+        assert!(
+            editor
+                .set_primary_flag_bits(LEGACY_NODE_FLAG_COUNT, 1)
+                .is_err()
+        );
+        editor.set_primary_flag_bits(0, 3).unwrap();
+        editor
+            .set_primary_flag_bits(LEGACY_NODE_FLAG_COUNT - 1, 4)
+            .unwrap();
+        legacy_flags[0] = 3;
+        legacy_flags[LEGACY_NODE_FLAG_COUNT - 1] = 4;
+        let expected = expected_uint_literals(&legacy_flags);
+        assert_eq!(editor.encode().unwrap(), expected);
+
+        let full_flags = vec![0; NODE_COUNT - 1];
+        let full_source = expected_uint_literals(&full_flags);
+        let (full, consumed) =
+            NetNodeFlagsPrefix::decode_prefix(FULL_NODE_COUNT_VERSION, &full_source).unwrap();
+        assert_eq!(consumed, full_source.len());
+        let full_editor = full.into_editor();
+        assert_eq!(full_editor.primary_flags().len(), NODE_COUNT - 1);
+        assert!(full_editor.secondary_flags().is_none());
+        assert_eq!(full_editor.encode().unwrap(), full_source);
+
+        let mut primary_flags = vec![0; NODE_COUNT - 1];
+        primary_flags[0] = 1;
+        let mut secondary_flags = vec![0; NODE_COUNT - 1];
+        let mut interleaved = Vec::with_capacity((NODE_COUNT - 1) * 2);
+        for (primary, secondary) in primary_flags.iter().zip(&secondary_flags) {
+            interleaved.extend_from_slice(&[*primary, *secondary]);
+        }
+        let source = expected_uint_literals(&interleaved);
+        let (paired, consumed) = NetNodeFlagsPrefix::decode_prefix(115_018, &source).unwrap();
+        assert_eq!(consumed, source.len());
+        let mut editor = paired.into_editor();
+        assert_eq!(editor.secondary_flags().unwrap().len(), NODE_COUNT - 1);
+        assert!(editor.set_primary_flag_bits(1, 1).is_err());
+        editor.set_primary_flag_bits(0, 3).unwrap();
+        editor.set_secondary_flag_bits(0, 7).unwrap();
+        primary_flags[0] = 3;
+        secondary_flags[0] = 7;
+        interleaved.clear();
+        for (primary, secondary) in primary_flags.iter().zip(&secondary_flags) {
+            interleaved.extend_from_slice(&[*primary, *secondary]);
+        }
+        assert_eq!(
+            editor.encode().unwrap(),
+            expected_uint_literals(&interleaved)
         );
     }
 }
