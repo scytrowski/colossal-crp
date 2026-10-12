@@ -5859,6 +5859,71 @@ mod tests {
         );
         manager.decode_building_timer_geometry_prefix(metadata.save_app_version)?;
 
+        let (problems, problems_end) =
+            manager.decode_building_problems_prefix(metadata.save_app_version)?;
+        let original_problems = problems.encode();
+        let problems_suffix = manager.serialized_object_graph()[problems_end..].to_vec();
+        let mut problem_editor = problems.into_editor();
+        let mut stale_problem_editor = problem_editor.clone();
+        {
+            let problems = problem_editor.problems_mut();
+            problems[0].first = problems[0].first.wrapping_add(1);
+        }
+        let edited_first_problem_word = problem_editor.problems_mut()[0].first;
+        let problem_replacement = problem_editor.encode(metadata.save_app_version)?;
+        manager.replace_building_problems(&problem_editor, metadata.save_app_version)?;
+        let (updated_problems, updated_problems_end) =
+            manager.decode_building_problems_prefix(metadata.save_app_version)?;
+        assert_eq!(
+            updated_problems.problems()[0].first,
+            edited_first_problem_word
+        );
+        assert_eq!(
+            updated_problems_end,
+            problems_end - original_problems.len() + problem_replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_problems_end..],
+            problems_suffix.as_slice()
+        );
+        let graph_after_problem_edit = manager.serialized_object_graph().to_vec();
+        {
+            let problems = stale_problem_editor.problems_mut();
+            problems[0].first = problems[0].first.wrapping_add(2);
+        }
+        assert!(
+            manager
+                .replace_building_problems(&stale_problem_editor, metadata.save_app_version)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), graph_after_problem_edit);
+
+        let truncated_problem_len = manager
+            .root_fields_len()
+            .checked_add(updated_problems_end)
+            .ok_or_else(|| std::io::Error::other("problem test boundary overflow"))?;
+        let mut truncated_problem_stream = manager.encode()?;
+        truncated_problem_stream.truncate(truncated_problem_len);
+        let mut truncated_problem_manager =
+            SimulationManagerData::decode(&truncated_problem_stream)?;
+        let (truncated_problems, _) =
+            truncated_problem_manager.decode_building_problems_prefix(metadata.save_app_version)?;
+        let mut truncated_problem_editor = truncated_problems.into_editor();
+        {
+            let problems = truncated_problem_editor.problems_mut();
+            problems[0].first = problems[0].first.wrapping_add(1);
+        }
+        let truncated_problem_graph = truncated_problem_manager.serialized_object_graph().to_vec();
+        assert!(
+            truncated_problem_manager
+                .replace_building_problems(&truncated_problem_editor, metadata.save_app_version)
+                .is_err()
+        );
+        assert_eq!(
+            truncated_problem_manager.serialized_object_graph(),
+            truncated_problem_graph
+        );
+
         let (population, population_end) =
             manager.decode_building_population_prefix(metadata.save_app_version)?;
         let original_population = population.encode();

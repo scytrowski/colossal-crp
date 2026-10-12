@@ -9917,7 +9917,9 @@ impl SimulationManagerData {
         Ok((data, reader.offset()))
     }
 
-    /// Replaces opaque per-building problem words and preserves the following fields.
+    /// Replaces opaque per-building problem words and preserves following fields.
+    /// The editor must come from the current BuildingManager body. The next
+    /// buffer fields are validated, and failures leave the graph unchanged.
     pub fn replace_building_problems(
         &mut self,
         edited: &BuildingProblemEditor,
@@ -9936,12 +9938,19 @@ impl SimulationManagerData {
                 "edited BuildingManager problem count does not match this stream",
             ));
         }
+        let original_bytes = original.encode();
         let body_start =
             graph_end
-                .checked_sub(original.encode().len())
+                .checked_sub(original_bytes.len())
                 .ok_or(CrpError::ArithmeticOverflow(
                     "BuildingManager problem body start",
                 ))?;
+        if original_bytes.as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager problem bytes do not match the editor's source",
+            ));
+        }
         let replacement = edited.encode(save_app_version)?;
         if graph_end > self.serialized_object_graph.len() {
             return Err(invalid(
@@ -9949,8 +9958,27 @@ impl SimulationManagerData {
                 "BuildingManager problem words extend past manager graph",
             ));
         }
-        self.serialized_object_graph
-            .splice(body_start..graph_end, replacement);
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..graph_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = (|| {
+            let (decoded, _) = self.decode_building_problems_prefix(save_app_version)?;
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten BuildingManager problem words do not match the editor",
+                ));
+            }
+            self.decode_building_buffer_fields_prefix(save_app_version)?;
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten BuildingManager problem words failed validation: {error}"),
+            ));
+        }
         Ok(())
     }
 

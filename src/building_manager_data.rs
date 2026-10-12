@@ -129,7 +129,9 @@ pub struct BuildingProblemPrefix {
 pub struct BuildingProblemEditor {
     format_version: u32,
     active_indices: Vec<u16>,
+    original_problems: Vec<BuildingProblemWords>,
     problems: Vec<BuildingProblemWords>,
+    serialized_prefix: Vec<u8>,
 }
 
 /// One serialized monument or faculty effect factor and position.
@@ -2935,10 +2937,13 @@ impl BuildingProblemPrefix {
     }
     /// Creates an editor for the decoded problem words.
     pub fn into_editor(self) -> BuildingProblemEditor {
+        let original_problems = self.problems.clone();
         BuildingProblemEditor {
             format_version: self.format_version,
             active_indices: self.problems.iter().map(|problem| problem.index).collect(),
+            original_problems,
             problems: self.problems,
+            serialized_prefix: self.serialized_prefix,
         }
     }
 }
@@ -2962,6 +2967,8 @@ impl BuildingProblemEditor {
     }
 
     /// Encodes words using the version and saved-application gates from the game.
+    /// If no values changed, the original encoded bytes are returned exactly.
+    /// An edited shared array is encoded canonically as one scope.
     /// Legacy 32-bit values are accepted only when the widened representation
     /// contains no bits that the old format cannot preserve.
     pub fn encode(&self, save_app_version: Option<u32>) -> Result<Vec<u8>, CrpError> {
@@ -2978,6 +2985,9 @@ impl BuildingProblemEditor {
             return Err(invalid_building_problems(
                 "problem record indices do not match the active-building order",
             ));
+        }
+        if self.problems == self.original_problems {
+            return Ok(self.serialized_prefix.clone());
         }
         let mut output = Vec::new();
         if self.format_version >= TWO_BUILDING_PROBLEMS_VERSION {
@@ -3032,6 +3042,10 @@ impl BuildingProblemEditor {
             write_encoded_uint_array(&mut output, &values);
         }
         Ok(output)
+    }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.serialized_prefix
     }
 }
 
@@ -3654,7 +3668,7 @@ mod tests {
         BuildingBufferFieldsPrefix, BuildingEconomicFieldsPrefix, BuildingFacultyBonusesPrefix,
         BuildingFlag, BuildingFlagsPrefix, BuildingInstanceRecordsPrefix,
         BuildingMonumentEffectsPrefix, BuildingPopulationPrefix, BuildingPrefabPrefix,
-        BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedPrefix,
+        BuildingProblemPrefix, BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedPrefix,
         BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryPrefix,
         fixed_object_header_count, timer_fields_for_version,
     };
@@ -4192,6 +4206,38 @@ mod tests {
         let mut invalid = decoded.into_editor();
         invalid.width.pop();
         assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn building_problem_editor_preserves_unchanged_shared_array_bytes() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 115_000,
+            building_flags: vec![BuildingFlag {
+                index: 1,
+                flags: 1,
+                flags2: 0,
+            }],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
+            serialized_prefix: Vec::new(),
+        };
+        // Two repeat controls encode the pair of zero words in one shared array.
+        let encoded = [0x80, 0x80];
+        let (prefix, consumed) =
+            BuildingProblemPrefix::decode_prefix(115_000, None, &flags, &encoded)
+                .expect("valid noncanonical problem words");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(prefix.encode(), encoded);
+        assert_eq!(prefix.into_editor().encode(None).unwrap(), encoded);
+
+        let (prefix, _) = BuildingProblemPrefix::decode_prefix(115_000, None, &flags, &encoded)
+            .expect("valid noncanonical problem words");
+        let mut editor = prefix.into_editor();
+        editor.problems_mut()[0].first = 1;
+        let mut expected = vec![1];
+        expected.extend_from_slice(&1_u64.to_be_bytes());
+        expected.extend_from_slice(&0_u64.to_be_bytes());
+        assert_eq!(editor.encode(None).unwrap(), expected);
     }
 
     #[test]
