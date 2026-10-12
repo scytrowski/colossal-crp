@@ -10593,6 +10593,7 @@ impl SimulationManagerData {
     }
 
     /// Replaces direct building records while preserving later BuildingManager bytes.
+    /// The editor must come from the current record block.
     pub fn replace_building_instance_records(
         &mut self,
         edited: &BuildingInstanceRecordsEditor,
@@ -10619,6 +10620,12 @@ impl SimulationManagerData {
                 .ok_or(CrpError::ArithmeticOverflow(
                     "BuildingManager instance-record body start",
                 ))?;
+        if original_bytes.as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager instance-record bytes do not match the editor's source",
+            ));
+        }
         let replacement = edited.encode()?;
         if graph_end > self.serialized_object_graph.len() {
             return Err(invalid(
@@ -10632,6 +10639,7 @@ impl SimulationManagerData {
     }
 
     /// Replaces monument-effect tables while preserving later BuildingManager bytes.
+    /// The editor must come from the current table bytes.
     pub fn replace_building_monument_effects(
         &mut self,
         edited: &BuildingMonumentEffectsEditor,
@@ -10653,12 +10661,19 @@ impl SimulationManagerData {
                 "edited monument-effect table lengths do not match this stream",
             ));
         }
+        let original_bytes = original.encode();
         let body_start =
             graph_end
-                .checked_sub(original.encode().len())
+                .checked_sub(original_bytes.len())
                 .ok_or(CrpError::ArithmeticOverflow(
                     "BuildingManager monument-effect start",
                 ))?;
+        if original_bytes.as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager monument-effect bytes do not match the editor's source",
+            ));
+        }
         let replacement = edited.encode()?;
         if graph_end > self.serialized_object_graph.len() {
             return Err(invalid(
@@ -10672,6 +10687,7 @@ impl SimulationManagerData {
     }
 
     /// Replaces faculty-bonus tables while preserving later BuildingManager bytes.
+    /// The editor must come from the current table bytes.
     pub fn replace_building_faculty_bonuses(
         &mut self,
         edited: &BuildingFacultyBonusesEditor,
@@ -10693,12 +10709,19 @@ impl SimulationManagerData {
                 "edited faculty-bonus table lengths do not match this stream",
             ));
         }
+        let original_bytes = original.encode();
         let body_start =
             graph_end
-                .checked_sub(original.encode().len())
+                .checked_sub(original_bytes.len())
                 .ok_or(CrpError::ArithmeticOverflow(
                     "BuildingManager faculty-bonus start",
                 ))?;
+        if original_bytes.as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager faculty-bonus bytes do not match the editor's source",
+            ));
+        }
         let replacement = edited.encode()?;
         if graph_end > self.serialized_object_graph.len() {
             return Err(invalid(
@@ -10727,6 +10750,19 @@ impl SimulationManagerData {
         }
         let (original, graph_end) =
             self.decode_building_race_team_unassigned_prefix(save_app_version)?;
+        let original_bytes = original.encode();
+        let body_start =
+            graph_end
+                .checked_sub(original_bytes.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager race-team-unassigned start",
+                ))?;
+        if original.encode().as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager race-team flags do not match the editor's source",
+            ));
+        }
         if edited.unassigned().len() != original.unassigned().len() {
             return Err(invalid(
                 0,
@@ -10739,12 +10775,6 @@ impl SimulationManagerData {
                 "changing race-team assignment flags requires rewriting the following prefab-reference scope",
             ));
         }
-        let body_start =
-            graph_end
-                .checked_sub(original.encode().len())
-                .ok_or(CrpError::ArithmeticOverflow(
-                    "BuildingManager race-team-unassigned start",
-                ))?;
         let replacement = edited.encode()?;
         if graph_end > self.serialized_object_graph.len() {
             return Err(invalid(
@@ -10759,7 +10789,8 @@ impl SimulationManagerData {
 
     /// Replaces race-team assignment flags, prefab indices, and names together.
     /// The paired edits keep the encoded index count consistent with assigned
-    /// buildings. The remaining manager graph bytes are preserved exactly.
+    /// buildings. Both editors must come from the current source scope; the
+    /// rewritten scope is decoded again and failures leave the graph unchanged.
     pub fn replace_building_race_team(
         &mut self,
         unassigned: &BuildingRaceTeamUnassignedEditor,
@@ -10782,8 +10813,21 @@ impl SimulationManagerData {
         }
         let (original_unassigned, unassigned_end) =
             self.decode_building_race_team_unassigned_prefix(save_app_version)?;
-        let (_, reference_end) =
+        let (original_references, reference_end) =
             self.decode_building_race_team_references_prefix(save_app_version)?;
+        let unassigned_bytes = original_unassigned.encode();
+        let references_bytes = original_references.encode();
+        let start = unassigned_end.checked_sub(unassigned_bytes.len()).ok_or(
+            CrpError::ArithmeticOverflow("BuildingManager race-team assignment start"),
+        )?;
+        if unassigned_bytes.as_slice() != unassigned.original_prefix()
+            || references_bytes.as_slice() != references.original_prefix()
+        {
+            return Err(invalid(
+                start,
+                "BuildingManager race-team bytes do not match the editors' source",
+            ));
+        }
         if unassigned.unassigned().len() != original_unassigned.unassigned().len() {
             return Err(invalid(
                 0,
@@ -10801,21 +10845,52 @@ impl SimulationManagerData {
                 "race-team index count does not match assigned buildings",
             ));
         }
-        let start = unassigned_end
-            .checked_sub(original_unassigned.encode().len())
-            .ok_or(CrpError::ArithmeticOverflow(
-                "BuildingManager race-team assignment start",
-            ))?;
         if reference_end < unassigned_end || reference_end > self.serialized_object_graph.len() {
             return Err(invalid(
                 start,
                 "race-team reference scope extends past manager graph",
             ));
         }
-        let mut replacement = unassigned.encode()?;
-        replacement.extend_from_slice(&references.encode()?);
-        self.serialized_object_graph
-            .splice(start..reference_end, replacement);
+        let replacement_unassigned = unassigned.encode()?;
+        let replacement_references = references.encode()?;
+        let mut replacement = replacement_unassigned.clone();
+        replacement.extend_from_slice(&replacement_references);
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(start..reference_end, replacement);
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = (|| {
+            let (decoded_unassigned, decoded_unassigned_end) =
+                self.decode_building_race_team_unassigned_prefix(save_app_version)?;
+            if decoded_unassigned.encode() != replacement_unassigned {
+                return Err(invalid(
+                    start,
+                    "rewritten BuildingManager race-team flags do not match the editors",
+                ));
+            }
+            let (decoded_references, _) =
+                self.decode_building_race_team_references_prefix(save_app_version)?;
+            if decoded_references.encode() != replacement_references
+                || decoded_references.indices().len()
+                    != decoded_unassigned
+                        .unassigned()
+                        .iter()
+                        .filter(|is_unassigned| !**is_unassigned)
+                        .count()
+            {
+                return Err(invalid(
+                    decoded_unassigned_end,
+                    "rewritten BuildingManager race-team references failed validation",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                start,
+                format!("rewritten BuildingManager race-team scope failed validation: {error}"),
+            ));
+        }
         Ok(())
     }
 

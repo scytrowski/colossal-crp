@@ -1,5 +1,5 @@
 use crate::CrpError;
-use crate::data_serializer::{Reader, write_nullable_unique_string, write_unique_string};
+use crate::data_serializer::{Reader, write_nullable_unique_string};
 use crate::encoded_array::{
     read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
     read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
@@ -158,6 +158,7 @@ pub struct BuildingMonumentEffectsEditor {
     format_version: u32,
     temporary: Vec<BuildingEffectValue>,
     final_values: Vec<BuildingEffectValue>,
+    original_prefix: Vec<u8>,
 }
 
 /// The two fixed BuildingManager faculty-bonus tables.
@@ -175,6 +176,7 @@ pub struct BuildingFacultyBonusesEditor {
     format_version: u32,
     temporary: Vec<BuildingEffectValue>,
     final_values: Vec<BuildingEffectValue>,
+    original_prefix: Vec<u8>,
 }
 
 /// Race-team-unassigned booleans for active buildings from inner version 120002.
@@ -201,13 +203,16 @@ pub struct BuildingRaceTeamReferencesPrefix {
     format_version: u32,
     indices: Vec<u16>,
     prefab_names: Vec<Option<String>>,
+    serialized_indices: Vec<u8>,
+    serialized_name_count: Vec<u8>,
+    serialized_name_entries: Vec<Vec<u8>>,
     serialized_prefix: Vec<u8>,
 }
 
 /// Editable race-team indices and prefab names from the reference scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildingRaceTeamReferencesEditor {
-    format_version: u32,
+    original: BuildingRaceTeamReferencesPrefix,
     indices: Vec<u16>,
     prefab_names: Vec<Option<String>>,
 }
@@ -515,6 +520,7 @@ pub struct BuildingInstanceRecordsPrefix {
 pub struct BuildingInstanceRecordsEditor {
     format_version: u32,
     records: Vec<BuildingInstanceRecord>,
+    original_prefix: Vec<u8>,
 }
 
 fn invalid_building_encoded_fields(offset: usize, reason: impl Into<String>) -> CrpError {
@@ -2691,6 +2697,7 @@ impl BuildingInstanceRecordsPrefix {
         BuildingInstanceRecordsEditor {
             format_version: self.format_version,
             records: self.records,
+            original_prefix: self.serialized_prefix,
         }
     }
 }
@@ -2707,6 +2714,9 @@ impl BuildingInstanceRecordsEditor {
     /// Returns the number of editable active-building records.
     pub fn record_count(&self) -> usize {
         self.records.len()
+    }
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original_prefix
     }
     /// Encodes records in the fixed 24-byte layout used by inner version 164+.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
@@ -3099,6 +3109,7 @@ impl BuildingMonumentEffectsPrefix {
             format_version: self.format_version,
             temporary: self.temporary,
             final_values: self.final_values,
+            original_prefix: self.serialized_prefix,
         }
     }
 }
@@ -3107,6 +3118,9 @@ impl BuildingMonumentEffectsEditor {
     /// Returns the inner DataSerializer version associated with these tables.
     pub fn format_version(&self) -> u32 {
         self.format_version
+    }
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original_prefix
     }
     /// Returns the temporary monument-effect entries.
     pub fn temporary(&self) -> &[BuildingEffectValue] {
@@ -3178,6 +3192,7 @@ impl BuildingFacultyBonusesPrefix {
             format_version: self.format_version,
             temporary: self.temporary,
             final_values: self.final_values,
+            original_prefix: self.serialized_prefix,
         }
     }
 }
@@ -3186,6 +3201,9 @@ impl BuildingFacultyBonusesEditor {
     /// Returns the inner DataSerializer version associated with these tables.
     pub fn format_version(&self) -> u32 {
         self.format_version
+    }
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original_prefix
     }
     /// Returns the temporary faculty-bonus entries.
     pub fn temporary(&self) -> &[BuildingEffectValue] {
@@ -3393,6 +3411,9 @@ impl BuildingRaceTeamUnassignedEditor {
     pub fn unassigned(&self) -> &[bool] {
         &self.unassigned
     }
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original_bytes
+    }
     /// Encodes changed bools as `00` or `01` and retains unchanged raw bytes.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         if self.format_version < RACE_TEAM_UNASSIGNED_VERSION
@@ -3451,14 +3472,23 @@ impl BuildingRaceTeamReferencesPrefix {
             .filter(|is_unassigned| !**is_unassigned)
             .count();
         let mut reader = Reader::new(bytes);
+        let indices_start = reader.offset();
         let indices = read_encoded_ushort_array(&mut reader, reference_count)?;
+        let serialized_indices = reader.consumed_bytes()[indices_start..reader.offset()].to_vec();
+        let name_count_start = reader.offset();
         let name_count = usize::from(reader.read_u16_be()?);
+        let serialized_name_count =
+            reader.consumed_bytes()[name_count_start..reader.offset()].to_vec();
         if name_count > reader.remaining() {
             return Err(reader.invalid("race-team prefab-name table cannot fit in remaining bytes"));
         }
         let mut prefab_names = Vec::with_capacity(name_count);
+        let mut serialized_name_entries = Vec::with_capacity(name_count);
         for _ in 0..name_count {
+            let name_start = reader.offset();
             prefab_names.push(reader.read_unique_string()?);
+            serialized_name_entries
+                .push(reader.consumed_bytes()[name_start..reader.offset()].to_vec());
         }
         let consumed = reader.offset();
         Ok((
@@ -3466,6 +3496,9 @@ impl BuildingRaceTeamReferencesPrefix {
                 format_version,
                 indices,
                 prefab_names,
+                serialized_indices,
+                serialized_name_count,
+                serialized_name_entries,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -3494,10 +3527,12 @@ impl BuildingRaceTeamReferencesPrefix {
 
     /// Creates an editor for the indices and names in this scope.
     pub fn into_editor(self) -> BuildingRaceTeamReferencesEditor {
+        let indices = self.indices.clone();
+        let prefab_names = self.prefab_names.clone();
         BuildingRaceTeamReferencesEditor {
-            format_version: self.format_version,
-            indices: self.indices,
-            prefab_names: self.prefab_names,
+            original: self,
+            indices,
+            prefab_names,
         }
     }
 }
@@ -3505,7 +3540,7 @@ impl BuildingRaceTeamReferencesPrefix {
 impl BuildingRaceTeamReferencesEditor {
     /// Returns the inner DataSerializer version associated with this scope.
     pub fn format_version(&self) -> u32 {
-        self.format_version
+        self.original.format_version
     }
 
     /// Returns mutable indices in assigned active-building order.
@@ -3523,27 +3558,51 @@ impl BuildingRaceTeamReferencesEditor {
         &mut self.prefab_names
     }
 
-    /// Encodes a canonical UShort index array and prefab-name table.
+    /// Preserves unchanged index and name bytes; changed fields use canonical
+    /// array and string encoding.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
-        if self.format_version < RACE_TEAM_UNASSIGNED_VERSION {
+        let original = &self.original;
+        if self.format_version() < RACE_TEAM_UNASSIGNED_VERSION {
             return Err(invalid_building_race_team_references(
                 "race-team reference scope is absent before inner version 120002",
+            ));
+        }
+        if self.indices == original.indices && self.prefab_names == original.prefab_names {
+            return Ok(original.serialized_prefix.clone());
+        }
+        if original.serialized_name_entries.len() != original.prefab_names.len()
+            || original.serialized_name_count.len() != 2
+        {
+            return Err(invalid_building_race_team_references(
+                "source prefab-name bytes do not match the decoded table",
             ));
         }
         let name_count = u16::try_from(self.prefab_names.len()).map_err(|_| {
             invalid_building_race_team_references("prefab-name count exceeds the on-disk u16")
         })?;
-        let mut output = Vec::new();
-        write_encoded_ushort_array(&mut output, &self.indices);
-        output.extend_from_slice(&name_count.to_be_bytes());
-        for name in &self.prefab_names {
-            if let Some(name) = name {
-                write_unique_string(&mut output, name)?;
+        let mut output = Vec::with_capacity(original.serialized_prefix.len());
+        if self.indices == original.indices {
+            output.extend_from_slice(&original.serialized_indices);
+        } else {
+            write_encoded_ushort_array(&mut output, &self.indices);
+        }
+        if self.prefab_names.len() == original.prefab_names.len() {
+            output.extend_from_slice(&original.serialized_name_count);
+        } else {
+            output.extend_from_slice(&name_count.to_be_bytes());
+        }
+        for (index, name) in self.prefab_names.iter().enumerate() {
+            if original.prefab_names.get(index) == Some(name) {
+                output.extend_from_slice(&original.serialized_name_entries[index]);
             } else {
-                output.push(0xff);
+                write_nullable_unique_string(&mut output, name.as_deref())?;
             }
         }
         Ok(output)
+    }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original.serialized_prefix
     }
 }
 
@@ -3866,7 +3925,7 @@ mod tests {
             BuildingRaceTeamUnassignedPrefix::decode_prefix(120_002, &flags, &[1, 0, 2, 1])
                 .expect("unassigned flags decode");
         let bytes = [
-            1, 0, 0, 0, 2, 0, 3, // two EncodedArray.UShort indices, then three names
+            0x81, 0, 3, // two repeated-zero indexes, then three names
             0x80, 0, 4, 0xf4, 0xf1, 0xfc, 0x0c, // "team"
             0x80, 0, 5, 0xef, 0x05, 0xf4, 0xfd, 0x0d, // "other"
             0xff, // null prefab name
@@ -3875,7 +3934,7 @@ mod tests {
         let (references, used) =
             BuildingRaceTeamReferencesPrefix::decode_after_unassigned(120_002, &unassigned, &bytes)
                 .expect("reference scope decodes");
-        assert_eq!(references.indices(), [0, 2]);
+        assert_eq!(references.indices(), [0, 0]);
         assert_eq!(
             references.prefab_names(),
             [Some("team".to_owned()), Some("other".to_owned()), None]
@@ -3884,10 +3943,16 @@ mod tests {
         assert_eq!(references.encode(), bytes);
         let editor = references.clone().into_editor();
         assert_eq!(editor.encode().expect("reference scope encodes"), bytes);
+        let mut name_only = references.clone().into_editor();
+        name_only.prefab_names_mut()[0] = Some("renamed team".to_owned());
+        let name_only_bytes = name_only.encode().expect("name-only edit encodes");
+        assert!(name_only_bytes.starts_with(&bytes[..3]));
+        assert!(name_only_bytes.ends_with(&bytes[10..]));
         let mut edited = editor;
         edited.indices_mut()[0] = 1;
         edited.prefab_names_mut()[0] = Some("new team".to_owned());
         let edited_bytes = edited.encode().expect("edited references encode");
+        assert!(edited_bytes.ends_with(&bytes[10..]));
         let (decoded_edit, edited_used) =
             BuildingRaceTeamReferencesPrefix::decode_after_unassigned(
                 120_002,
@@ -3896,7 +3961,7 @@ mod tests {
             )
             .expect("edited references decode");
         assert_eq!(edited_used, edited_bytes.len());
-        assert_eq!(decoded_edit.indices(), [1, 2]);
+        assert_eq!(decoded_edit.indices(), [1, 0]);
         assert_eq!(decoded_edit.prefab_names()[0].as_deref(), Some("new team"));
         let mut too_many_names = decoded_edit.into_editor();
         *too_many_names.prefab_names_mut() = vec![None; usize::from(u16::MAX) + 1];

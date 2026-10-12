@@ -6065,6 +6065,133 @@ mod tests {
             truncated_economic_graph
         );
 
+        let (instance_records, instance_records_end) =
+            manager.decode_building_instance_records_prefix(metadata.save_app_version)?;
+        let original_instance_records = instance_records.encode();
+        let instance_records_suffix =
+            manager.serialized_object_graph()[instance_records_end..].to_vec();
+        let mut instance_records_editor = instance_records.into_editor();
+        let stale_instance_records_editor = instance_records_editor.clone();
+        {
+            let records = instance_records_editor.records_mut();
+            records[0].base_height = records[0].base_height.wrapping_add(1);
+        }
+        let instance_records_replacement = instance_records_editor.encode()?;
+        manager.replace_building_instance_records(
+            &instance_records_editor,
+            metadata.save_app_version,
+        )?;
+        let (updated_instance_records, updated_instance_records_end) =
+            manager.decode_building_instance_records_prefix(metadata.save_app_version)?;
+        assert_eq!(
+            updated_instance_records.records()[0].base_height,
+            instance_records_editor.records_mut()[0].base_height
+        );
+        assert_eq!(
+            updated_instance_records_end,
+            instance_records_end - original_instance_records.len()
+                + instance_records_replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_instance_records_end..],
+            instance_records_suffix.as_slice()
+        );
+        let graph_after_instance_records_edit = manager.serialized_object_graph().to_vec();
+        assert!(
+            manager
+                .replace_building_instance_records(
+                    &stale_instance_records_editor,
+                    metadata.save_app_version
+                )
+                .is_err()
+        );
+        assert_eq!(
+            manager.serialized_object_graph(),
+            graph_after_instance_records_edit
+        );
+
+        let (monument_effects, monument_effects_end) =
+            manager.decode_building_monument_effects_prefix(metadata.save_app_version)?;
+        let original_monument_effects = monument_effects.encode();
+        let monument_effects_suffix =
+            manager.serialized_object_graph()[monument_effects_end..].to_vec();
+        let mut monument_effects_editor = monument_effects.into_editor();
+        let stale_monument_effects_editor = monument_effects_editor.clone();
+        {
+            let temporary = monument_effects_editor.temporary_mut();
+            temporary[0].factor = temporary[0].factor.wrapping_add(1);
+        }
+        let monument_effects_replacement = monument_effects_editor.encode()?;
+        manager.replace_building_monument_effects(
+            &monument_effects_editor,
+            metadata.save_app_version,
+        )?;
+        let (updated_monument_effects, updated_monument_effects_end) =
+            manager.decode_building_monument_effects_prefix(metadata.save_app_version)?;
+        assert_eq!(
+            updated_monument_effects.temporary()[0].factor,
+            monument_effects_editor.temporary()[0].factor
+        );
+        assert_eq!(
+            updated_monument_effects_end,
+            monument_effects_end - original_monument_effects.len()
+                + monument_effects_replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_monument_effects_end..],
+            monument_effects_suffix.as_slice()
+        );
+        let graph_after_monument_edit = manager.serialized_object_graph().to_vec();
+        assert!(
+            manager
+                .replace_building_monument_effects(
+                    &stale_monument_effects_editor,
+                    metadata.save_app_version
+                )
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), graph_after_monument_edit);
+
+        let (faculty_bonuses, faculty_bonuses_end) =
+            manager.decode_building_faculty_bonuses_prefix(metadata.save_app_version)?;
+        let original_faculty_bonuses = faculty_bonuses.encode();
+        let faculty_bonuses_suffix =
+            manager.serialized_object_graph()[faculty_bonuses_end..].to_vec();
+        let mut faculty_bonuses_editor = faculty_bonuses.into_editor();
+        let stale_faculty_bonuses_editor = faculty_bonuses_editor.clone();
+        {
+            let temporary = faculty_bonuses_editor.temporary_mut();
+            temporary[0].factor = temporary[0].factor.wrapping_add(1);
+        }
+        let faculty_bonuses_replacement = faculty_bonuses_editor.encode()?;
+        manager
+            .replace_building_faculty_bonuses(&faculty_bonuses_editor, metadata.save_app_version)?;
+        let (updated_faculty_bonuses, updated_faculty_bonuses_end) =
+            manager.decode_building_faculty_bonuses_prefix(metadata.save_app_version)?;
+        assert_eq!(
+            updated_faculty_bonuses.temporary()[0].factor,
+            faculty_bonuses_editor.temporary()[0].factor
+        );
+        assert_eq!(
+            updated_faculty_bonuses_end,
+            faculty_bonuses_end - original_faculty_bonuses.len()
+                + faculty_bonuses_replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_faculty_bonuses_end..],
+            faculty_bonuses_suffix.as_slice()
+        );
+        let graph_after_faculty_edit = manager.serialized_object_graph().to_vec();
+        assert!(
+            manager
+                .replace_building_faculty_bonuses(
+                    &stale_faculty_bonuses_editor,
+                    metadata.save_app_version
+                )
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), graph_after_faculty_edit);
+
         let prefab_edited_graph = manager.serialized_object_graph().to_vec();
         let mut stale_prefab_editor = prefab_editor.clone();
         stale_prefab_editor.names_mut()[name_index] = Some("Stale edit".to_owned());
