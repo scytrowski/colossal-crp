@@ -83,8 +83,8 @@ use crate::{
 };
 use crate::{BuildingEconomicFieldsEditor, BuildingPopulationEditor, BuildingTimerGeometryEditor};
 use crate::{
-    DistrictManagerFlagsPrefix, DistrictManagerGridData, DistrictManagerTailData,
-    DistrictParkEditor, DistrictParkRecord,
+    DistrictManagerFlagsEditor, DistrictManagerFlagsPrefix, DistrictManagerGridData,
+    DistrictManagerTailData, DistrictParkEditor, DistrictParkRecord,
 };
 use crate::{
     NetFencePrefabEditor, NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor,
@@ -9141,6 +9141,67 @@ impl SimulationManagerData {
             .checked_add(body_len)
             .ok_or(CrpError::ArithmeticOverflow("DistrictManager prefix end"))?;
         Ok((districts, end))
+    }
+
+    /// Replaces DistrictManager's raw district and park flag arrays.
+    ///
+    /// The editor must come from this graph and preserve both arrays' active
+    /// slots. Changed arrays can resize the prefix. Park records, grids, the
+    /// versioned tail, and following manager tag are revalidated before the
+    /// edit is accepted; failures leave the graph unchanged.
+    pub fn replace_district_manager_flags_prefix(
+        &mut self,
+        edited: &DistrictManagerFlagsEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited DistrictManager flags version does not match this stream",
+            ));
+        }
+        let (original, graph_end) = self.decode_district_manager_flags_prefix()?;
+        let original_bytes = original.encode();
+        let body_start =
+            graph_end
+                .checked_sub(original_bytes.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "DistrictManager flag prefix start",
+                ))?;
+        if original_bytes.as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "DistrictManager flag bytes do not match the editor's source",
+            ));
+        }
+        if graph_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "DistrictManager flag prefix extends past manager graph",
+            ));
+        }
+        let replacement = edited.encode()?;
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(body_start..graph_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        let validation = (|| {
+            let (decoded, _) = self.decode_district_manager_flags_prefix()?;
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten DistrictManager flags do not match the editor",
+                ));
+            }
+            self.decode_district_manager_grids()?;
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten DistrictManager flags failed boundary validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes the district and park grids after the park-record sequence.

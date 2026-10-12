@@ -69,15 +69,16 @@ pub use district_manager_data::{
     DistrictAgeCategory, DistrictAgePopulation, DistrictAirportData, DistrictAirportEditor,
     DistrictCampusData, DistrictCampusSportsData, DistrictCampusSportsEditor,
     DistrictCampusYearReportData, DistrictCampusYearReportEditor, DistrictDemographicBlock,
-    DistrictDemographicKind, DistrictHotelBlock, DistrictManagerFlagsPrefix,
-    DistrictManagerGridData, DistrictManagerGridEditor, DistrictManagerTailData,
-    DistrictParkAttractiveness, DistrictParkCapacities, DistrictParkEditor, DistrictParkGateData,
-    DistrictParkIndustryResource, DistrictParkIndustryResourceKind, DistrictParkIndustryTradeData,
-    DistrictParkProductionData, DistrictParkRecord, DistrictParkVisitorData,
-    DistrictParkWorkStorageDeltas, DistrictPopulationRecord, DistrictPrivateDataBlock,
-    DistrictPrivateDataKind, DistrictSpecializationBlock, DistrictSpecializationKind,
-    DistrictStatisticsBlock, DistrictStatisticsKind, DistrictSubCultureBlock,
-    DistrictSubCultureKind, DistrictTourismBlock, DistrictTourismKind,
+    DistrictDemographicKind, DistrictHotelBlock, DistrictManagerFlagsEditor,
+    DistrictManagerFlagsPrefix, DistrictManagerGridData, DistrictManagerGridEditor,
+    DistrictManagerTailData, DistrictParkAttractiveness, DistrictParkCapacities,
+    DistrictParkEditor, DistrictParkGateData, DistrictParkIndustryResource,
+    DistrictParkIndustryResourceKind, DistrictParkIndustryTradeData, DistrictParkProductionData,
+    DistrictParkRecord, DistrictParkVisitorData, DistrictParkWorkStorageDeltas,
+    DistrictPopulationRecord, DistrictPrivateDataBlock, DistrictPrivateDataKind,
+    DistrictSpecializationBlock, DistrictSpecializationKind, DistrictStatisticsBlock,
+    DistrictStatisticsKind, DistrictSubCultureBlock, DistrictSubCultureKind, DistrictTourismBlock,
+    DistrictTourismKind,
 };
 pub use electricity_manager_data::{
     ElectricityConductiveCellData, ElectricityManagerData, ElectricityPulseGroup,
@@ -5346,6 +5347,69 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads the local CL Wolf Creek game map from data/maps"]
+    fn district_manager_flag_replacement_preserves_park_and_grid_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/maps/CL Wolf Creek.crp");
+        let mut file = File::open(&path)?;
+        let package = Package::read_from(&mut file)?;
+        let asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.asset_type == 52)
+            .ok_or_else(|| std::io::Error::other("Wolf Creek has no type-52 asset"))?;
+        let (_, metadata_len) = SimulationMetaData::decode_from(&asset.data)?;
+        let mut manager = SimulationManagerData::decode(&asset.data[metadata_len..])?;
+        assert_eq!(manager.format_version(), 112_004);
+
+        let (prefix, original_end) = manager.decode_district_manager_flags_prefix()?;
+        let source_prefix = prefix.encode();
+        let suffix = manager.serialized_object_graph()[original_end..].to_vec();
+        let active_park_index = prefix
+            .park_flags()
+            .iter()
+            .position(|flags| *flags != 0)
+            .ok_or_else(|| std::io::Error::other("Wolf Creek has no active park slot"))?;
+        let old_park_flags = prefix.park_flags().to_vec();
+        let mut editor = prefix.into_editor();
+        let old_value = editor.park_flags()[active_park_index];
+        let mut new_value = old_value ^ 1;
+        if new_value == 0 {
+            new_value = old_value | 2;
+        }
+        editor.set_park_flag_bits(active_park_index, new_value)?;
+        let replacement = editor.encode()?;
+        let stale_editor = editor.clone();
+        assert_ne!(replacement.len(), source_prefix.len());
+
+        manager.replace_district_manager_flags_prefix(&editor)?;
+        let (updated, updated_end) = manager.decode_district_manager_flags_prefix()?;
+        assert_eq!(updated.park_flags()[active_park_index], new_value);
+        assert_eq!(
+            updated_end,
+            original_end - source_prefix.len() + replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_end..],
+            suffix.as_slice()
+        );
+        assert_eq!(
+            manager.decode_district_manager_park_records()?.len(),
+            old_park_flags.iter().filter(|flags| **flags != 0).count()
+        );
+        manager.decode_district_manager_grids()?;
+
+        let edited_graph = manager.serialized_object_graph().to_vec();
+        assert!(
+            manager
+                .replace_district_manager_flags_prefix(&stale_editor)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), edited_graph);
         Ok(())
     }
 

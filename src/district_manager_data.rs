@@ -3,9 +3,10 @@ use crate::data_serializer::{Reader, write_nullable_unique_string};
 use crate::encoded_array::{
     read_encoded_bool_array, read_encoded_byte_array, read_encoded_uint_array,
     read_encoded_ulong_array, skip_encoded_ushort_array, write_encoded_bool_array,
-    write_encoded_byte_array, write_encoded_ulong_array,
+    write_encoded_byte_array, write_encoded_uint_array_runs, write_encoded_ulong_array,
 };
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
+use std::ops::Range;
 
 const DISTRICT_COUNT: usize = 128;
 const PARK_FLAGS_VERSION: u32 = 110_001;
@@ -123,12 +124,27 @@ pub struct DistrictManagerFlagsPrefix {
     airline_name: Option<String>,
     airport_panel_opened: Option<bool>,
     district_flags: Vec<u32>,
+    district_flags_range: Range<usize>,
     park_flags_present: bool,
     park_flags: Vec<u32>,
+    park_flags_range: Option<Range<usize>>,
     policy_bools: Option<Vec<bool>>,
     legacy_policy_bools: Option<Vec<bool>>,
     district_population_records: Vec<DistrictPopulationRecord>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for the raw district and park flags in `DistrictManager+Data`.
+///
+/// Changes preserve each slot's zero/nonzero state because those arrays select
+/// the following population and park records. The park array is available from
+/// inner version 110001. Changed arrays are canonically re-encoded and can
+/// resize the prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistrictManagerFlagsEditor {
+    original: DistrictManagerFlagsPrefix,
+    district_flags: Vec<u32>,
+    park_flags: Vec<u32>,
 }
 
 /// A supported park record from inner versions 110025–118011.
@@ -2977,13 +2993,17 @@ impl DistrictManagerFlagsPrefix {
         } else {
             None
         };
+        let district_flags_start = reader.offset();
         let district_flags = read_encoded_uint_array(&mut reader, DISTRICT_COUNT)?;
+        let district_flags_range = district_flags_start..reader.offset();
         let park_flags_present = format_version >= PARK_FLAGS_VERSION;
+        let park_flags_start = reader.offset();
         let park_flags = if park_flags_present {
             read_encoded_uint_array(&mut reader, DISTRICT_COUNT)?
         } else {
             vec![0; DISTRICT_COUNT]
         };
+        let park_flags_range = park_flags_present.then(|| park_flags_start..reader.offset());
         let policy_bool_count = district_policy_bool_count(format_version)?;
         let policy_bools = if policy_bool_count == 0 {
             None
@@ -3305,8 +3325,10 @@ impl DistrictManagerFlagsPrefix {
                 airline_name,
                 airport_panel_opened,
                 district_flags,
+                district_flags_range,
                 park_flags_present,
                 park_flags,
+                park_flags_range,
                 policy_bools,
                 legacy_policy_bools,
                 district_population_records,
@@ -3339,6 +3361,15 @@ impl DistrictManagerFlagsPrefix {
     /// Returns the 128 district flags.
     pub fn district_flags(&self) -> &[u32] {
         &self.district_flags
+    }
+
+    /// Creates an editor for district and version-gated park flag values.
+    pub fn into_editor(self) -> DistrictManagerFlagsEditor {
+        DistrictManagerFlagsEditor {
+            district_flags: self.district_flags.clone(),
+            park_flags: self.park_flags.clone(),
+            original: self,
+        }
     }
 
     /// Returns whether park flags are serialized in this version.
@@ -3572,6 +3603,143 @@ impl DistrictManagerFlagsPrefix {
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
     }
+}
+
+impl DistrictManagerFlagsEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns district flags in serialized slot order.
+    pub fn district_flags(&self) -> &[u32] {
+        &self.district_flags
+    }
+
+    /// Replaces raw flag bits for one district slot without changing activity.
+    pub fn set_district_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        let current = *self.district_flags.get(index).ok_or_else(|| {
+            invalid_district_manager(index, "district flag index is out of range")
+        })?;
+        if (current == 0) != (value == 0) {
+            return Err(invalid_district_manager(
+                index,
+                "district flag edits must preserve the slot's active state",
+            ));
+        }
+        self.district_flags[index] = value;
+        Ok(())
+    }
+
+    /// Returns park flags in serialized slot order.
+    pub fn park_flags(&self) -> &[u32] {
+        &self.park_flags
+    }
+
+    /// Replaces raw flag bits for one park slot without changing activity.
+    ///
+    /// The park flag array is absent before inner version 110001.
+    pub fn set_park_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        if self.original.park_flags_range.is_none() {
+            return Err(invalid_district_manager(
+                index,
+                "park flag array is absent before inner version 110001",
+            ));
+        }
+        let current = *self
+            .park_flags
+            .get(index)
+            .ok_or_else(|| invalid_district_manager(index, "park flag index is out of range"))?;
+        if (current == 0) != (value == 0) {
+            return Err(invalid_district_manager(
+                index,
+                "park flag edits must preserve the slot's active state",
+            ));
+        }
+        self.park_flags[index] = value;
+        Ok(())
+    }
+
+    /// Encodes changed flag arrays while preserving every other prefix byte.
+    ///
+    /// Changed arrays use canonical repeat-delta encoding and can resize the
+    /// prefix. District and park record activity and ordering remain fixed.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.district_flags.len() != DISTRICT_COUNT
+            || self.park_flags.len() != DISTRICT_COUNT
+            || self.original.district_flags.len() != DISTRICT_COUNT
+            || self.original.park_flags.len() != DISTRICT_COUNT
+        {
+            return Err(invalid_district_manager(
+                0,
+                "district or park flag count changed",
+            ));
+        }
+        for (index, (edited, original)) in self
+            .district_flags
+            .iter()
+            .zip(&self.original.district_flags)
+            .enumerate()
+        {
+            if (*edited == 0) != (*original == 0) {
+                return Err(invalid_district_manager(
+                    index,
+                    "district flag edits must preserve the slot's active state",
+                ));
+            }
+        }
+        for (index, (edited, original)) in self
+            .park_flags
+            .iter()
+            .zip(&self.original.park_flags)
+            .enumerate()
+        {
+            if (*edited == 0) != (*original == 0) {
+                return Err(invalid_district_manager(
+                    index,
+                    "park flag edits must preserve the slot's active state",
+                ));
+            }
+            if self.original.park_flags_range.is_none() && *edited != 0 {
+                return Err(invalid_district_manager(
+                    index,
+                    "park flag array is absent before inner version 110001",
+                ));
+            }
+        }
+
+        let mut bytes = self.original.serialized_prefix.clone();
+        if self.park_flags != self.original.park_flags {
+            let range = self.original.park_flags_range.as_ref().ok_or_else(|| {
+                invalid_district_manager(0, "park flag array is absent before inner version 110001")
+            })?;
+            validate_district_flag_range(&bytes, range)?;
+            let mut encoded = Vec::new();
+            write_encoded_uint_array_runs(&mut encoded, &self.park_flags);
+            bytes.splice(range.clone(), encoded);
+        }
+        if self.district_flags != self.original.district_flags {
+            validate_district_flag_range(&bytes, &self.original.district_flags_range)?;
+            let mut encoded = Vec::new();
+            write_encoded_uint_array_runs(&mut encoded, &self.district_flags);
+            bytes.splice(self.original.district_flags_range.clone(), encoded);
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original.serialized_prefix
+    }
+}
+
+fn validate_district_flag_range(bytes: &[u8], range: &Range<usize>) -> Result<(), CrpError> {
+    if range.start > range.end || range.end > bytes.len() {
+        return Err(invalid_district_manager(
+            range.start,
+            "encoded flag range exceeds the original DistrictManager prefix",
+        ));
+    }
+    Ok(())
 }
 
 fn park_happiness_bytes(format_version: u32) -> usize {
@@ -4831,6 +4999,81 @@ mod tests {
         assert_eq!(parks[0].condition(), 0);
         assert_eq!(parks[0].level(), 0);
         assert_eq!(parks[0].encode(), bytes[used..used + park_bytes]);
+    }
+
+    #[test]
+    fn district_manager_flag_editor_reencodes_park_flags_and_preserves_prefix_suffix() {
+        let bytes =
+            include_bytes!("../tests/fixtures/district-manager-prefix-v112004-wolf-creek.bin");
+        let (prefix, used) = DistrictManagerFlagsPrefix::decode_prefix(112_004, bytes).unwrap();
+        let original = prefix.encode();
+        assert_eq!(used, original.len());
+        let park_range = prefix.park_flags_range.clone().unwrap();
+        let suffix_after_park_flags = original[park_range.end..].to_vec();
+        assert_eq!(prefix.park_flags()[0], 1);
+
+        let mut editor = prefix.into_editor();
+        assert!(editor.set_park_flag_bits(0, 0).is_err());
+        assert!(editor.set_park_flag_bits(128, 3).is_err());
+        editor.set_park_flag_bits(0, 3).unwrap();
+        let encoded = editor.encode().unwrap();
+
+        let mut expected = original.clone();
+        expected.splice(
+            park_range,
+            [
+                0, 0, 0, 0, 3, // Literal first value.
+                0, 0, 0, 0, 0, // Literal zero changes the delta.
+                0, 0, 0, 0, 0,    // Literal zero sets the delta to zero.
+                0xfc, // Repeat the remaining 125 zero values.
+            ],
+        );
+        assert_eq!(encoded, expected);
+        assert_ne!(encoded.len(), original.len());
+
+        let (updated, updated_used) =
+            DistrictManagerFlagsPrefix::decode_prefix(112_004, &encoded).unwrap();
+        assert_eq!(updated_used, encoded.len());
+        assert_eq!(updated.park_flags()[0], 3);
+        assert_eq!(
+            &encoded[updated.park_flags_range.as_ref().unwrap().end..],
+            suffix_after_park_flags
+        );
+        assert_eq!(updated.encode(), encoded);
+    }
+
+    #[test]
+    fn district_manager_flag_editor_preserves_district_record_activity() {
+        let bytes =
+            include_bytes!("../tests/fixtures/district-manager-prefix-v112004-wolf-creek.bin");
+        let (prefix, _) = DistrictManagerFlagsPrefix::decode_prefix(112_004, bytes).unwrap();
+        let active_count = prefix
+            .district_flags()
+            .iter()
+            .filter(|flags| **flags != 0)
+            .count();
+        let Some(index) = prefix.district_flags().iter().position(|flags| *flags != 0) else {
+            let mut editor = prefix.into_editor();
+            assert!(editor.set_district_flag_bits(0, 1).is_err());
+            return;
+        };
+        let old_value = prefix.district_flags()[index];
+        let new_value = if old_value == 1 { 3 } else { old_value ^ 1 };
+        let mut editor = prefix.into_editor();
+        editor.set_district_flag_bits(index, new_value).unwrap();
+        let encoded = editor.encode().unwrap();
+        let (updated, consumed) = DistrictManagerFlagsPrefix::decode_prefix(112_004, &encoded)
+            .expect("edited district flags decode");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(updated.district_flags()[index], new_value);
+        assert_eq!(
+            updated
+                .district_flags()
+                .iter()
+                .filter(|flags| **flags != 0)
+                .count(),
+            active_count
+        );
     }
 
     #[test]
