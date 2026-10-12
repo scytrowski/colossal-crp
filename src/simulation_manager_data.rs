@@ -10904,29 +10904,75 @@ impl SimulationManagerData {
             ));
         }
         let (original, _) = self.decode_instance_prefix()?;
+        if original.encode().as_slice() != edited.original_body_bytes() {
+            return Err(invalid(
+                0,
+                "InstanceManager bytes do not match the editor's source body",
+            ));
+        }
         if !edited.retains_groups(&original) {
             return Err(invalid(
                 0,
                 "edited InstanceManager group references differ from this stream",
             ));
         }
-        let (_, water_end) = self.decode_water_prefix()?;
-        let mut reader = Reader::new(&self.serialized_object_graph);
-        reader.read_bytes(water_end)?;
-        let mut strings = vec![
-            "SimulationManager".to_owned(),
-            "GameAreaManager".to_owned(),
-            "TerrainManager".to_owned(),
-            "WaterSimulation".to_owned(),
-        ];
-        expect_profile_tag(&mut reader, &mut strings, "InstanceManager")?;
-        let body_start = reader.offset();
-        let body_end = body_start
-            .checked_add(original.encode().len())
-            .ok_or(CrpError::ArithmeticOverflow("InstanceManager body end"))?;
         let replacement = edited.encode()?;
-        self.serialized_object_graph
-            .splice(body_start..body_end, replacement);
+        let (body_start, next_tag_start) = self.manager_body_boundary(3)?;
+        let source_body_end = body_start
+            .checked_add(edited.original_body_bytes().len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "InstanceManager source body end",
+            ))?;
+        let source_bounded_end = source_body_end
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "InstanceManager closing profiler reference end",
+            ))?;
+        if source_bounded_end != next_tag_start {
+            return Err(invalid(
+                source_body_end,
+                "InstanceManager source body does not end at the PathManager boundary",
+            ));
+        }
+        let expected_end = body_start
+            .checked_add(replacement.len())
+            .and_then(|end| end.checked_add(LOADING_PROFILER_END_TAG_BYTES))
+            .ok_or(CrpError::ArithmeticOverflow(
+                "InstanceManager updated boundary",
+            ))?;
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..source_body_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = (|| {
+            let (decoded, actual_end) = self.decode_instance_prefix()?;
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten InstanceManager body does not match the editor",
+                ));
+            }
+            if actual_end != expected_end {
+                return Err(invalid(
+                    actual_end,
+                    "rewritten InstanceManager does not reach the expected boundary",
+                ));
+            }
+            let (_, actual_next_tag_start) = self.manager_body_boundary(3)?;
+            if actual_next_tag_start != expected_end {
+                return Err(invalid(
+                    actual_next_tag_start,
+                    "rewritten InstanceManager shifted the PathManager boundary unexpectedly",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten InstanceManager body failed validation: {error}"),
+            ));
+        }
         Ok(())
     }
 
@@ -18250,6 +18296,47 @@ mod manager_boundary_tests {
             .collect(),
         );
         (manager, path_body_start)
+    }
+
+    #[test]
+    fn instance_replacement_preserves_noncanonical_names_and_rejects_stale_editors() {
+        let mut source_body = 1_u32.to_be_bytes().to_vec();
+        source_body.extend_from_slice(&7_u32.to_be_bytes());
+        write_unique_string_with_mode(&mut source_body, "Wide source", false).unwrap();
+        source_body.extend_from_slice(&0_u32.to_be_bytes());
+
+        let (mut manager, _) = synthetic_path_manager(&[]);
+        let (body_start, _) = manager.manager_body_boundary(3).unwrap();
+        manager
+            .serialized_object_graph
+            .splice(body_start..body_start + 8, source_body.clone());
+        let (_, original_path_tag_start) = manager.manager_body_boundary(3).unwrap();
+        let graph_with_source = manager.serialized_object_graph().to_vec();
+        let (instance, _) = manager.decode_instance_prefix().unwrap();
+        assert_eq!(instance.encode(), source_body);
+
+        let stale_editor = instance.clone().into_editor();
+        let no_op_editor = instance.clone().into_editor();
+        manager.replace_instance(&no_op_editor).unwrap();
+        assert_eq!(manager.serialized_object_graph(), graph_with_source);
+
+        let mut edited = instance.into_editor();
+        edited.names_mut()[0].name = Some("A longer replacement name".to_owned());
+        manager.replace_instance(&edited).unwrap();
+        let (updated, _) = manager.decode_instance_prefix().unwrap();
+        assert_eq!(
+            updated.names()[0].name.as_deref(),
+            Some("A longer replacement name")
+        );
+        let (_, updated_path_tag_start) = manager.manager_body_boundary(3).unwrap();
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_path_tag_start..],
+            &graph_with_source[original_path_tag_start..]
+        );
+
+        let graph_after_edit = manager.serialized_object_graph().to_vec();
+        assert!(manager.replace_instance(&stale_editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), graph_after_edit);
     }
 
     #[test]
