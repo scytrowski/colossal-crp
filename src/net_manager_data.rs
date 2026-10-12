@@ -751,6 +751,7 @@ pub struct NetNodeInstanceGuideBody {
     activation_count: u8,
     display_count: u8,
     disabled: bool,
+    disabled_raw: u8,
     problems: u64,
     build_index: u32,
     node_id: u16,
@@ -4070,7 +4071,8 @@ impl NetNodeInstanceGuideBody {
         let activation_frame = reader.read_u32_be()?;
         let activation_count = reader.read_u8()?;
         let display_count = reader.read_u8()?;
-        let disabled = reader.read_u8()? == 1;
+        let disabled_raw = reader.read_u8()?;
+        let disabled = disabled_raw == 1;
         let wide_problems = format_version >= 221
             && save_app_version.is_some_and(|version| version >= SAVE_APP_PROBLEMS_VERSION);
         let problems = if wide_problems {
@@ -4090,6 +4092,7 @@ impl NetNodeInstanceGuideBody {
                 activation_count,
                 display_count,
                 disabled,
+                disabled_raw,
                 problems,
                 build_index,
                 node_id,
@@ -4237,7 +4240,11 @@ impl NetNodeInstanceGuideEditor {
         output.extend_from_slice(&self.activation_frame.to_be_bytes());
         output.push(self.activation_count);
         output.push(self.display_count);
-        output.push(u8::from(self.disabled));
+        output.push(if self.disabled == self.original.disabled {
+            self.original.disabled_raw
+        } else {
+            u8::from(self.disabled)
+        });
         if wide_problems {
             output.extend_from_slice(&self.problems.to_be_bytes());
         } else {
@@ -4381,6 +4388,18 @@ mod guide_tests {
         assert!(unchanged.matches_version_gates(220, None));
         assert!(!unchanged.matches_version_gates(221, None));
         assert_eq!(unchanged.encode().expect("no-op guide write"), bytes);
+
+        let mut other_field_edit = guide.clone().into_editor();
+        *other_field_edit.next_repeat_mut() = 0x1122_3344;
+        let mut expected_other_field_edit = bytes;
+        expected_other_field_edit[..4].copy_from_slice(&0x1122_3344_u32.to_be_bytes());
+        assert_eq!(
+            other_field_edit
+                .encode()
+                .expect("guide field edit preserves unchanged raw bool"),
+            expected_other_field_edit
+        );
+
         *unchanged.disabled_mut() = true;
         let mut edited_bytes = bytes;
         edited_bytes[10] = 1;
