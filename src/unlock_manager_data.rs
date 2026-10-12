@@ -81,7 +81,18 @@ pub struct UnlockManagerReferences {
     milestones_not_used: Option<NetObjectHeader>,
     scenario_goals_not_used: Option<NetObjectHeader>,
     profile_end_shared_string_index: u16,
+    profile_end_shared_string_index_offset: usize,
     serialized_body: Vec<u8>,
+}
+
+/// Fixed-width editor for the UnlockManager profiler end index.
+///
+/// Milestone arrays and guide references remain byte-for-byte unchanged so
+/// edits cannot add or remove queued DataSerializer objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlockManagerReferencesEditor {
+    original: UnlockManagerReferences,
+    profile_end_shared_string_index: u16,
 }
 
 impl UnlockManagerReferences {
@@ -123,6 +134,14 @@ impl UnlockManagerReferences {
     /// Returns the decoded fields and profiler index byte for byte.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_body.clone()
+    }
+
+    /// Creates an editor for the fixed-width profiler end index.
+    pub fn into_editor(self) -> UnlockManagerReferencesEditor {
+        UnlockManagerReferencesEditor {
+            profile_end_shared_string_index: self.profile_end_shared_string_index,
+            original: self,
+        }
     }
 
     pub(crate) fn decode(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
@@ -195,6 +214,7 @@ impl UnlockManagerReferences {
         } else {
             None
         };
+        let profile_end_shared_string_index_offset = reader.offset();
         let profile_end_shared_string_index = reader.read_u16_be()?;
         let consumed = reader.offset();
 
@@ -207,10 +227,45 @@ impl UnlockManagerReferences {
                 milestones_not_used,
                 scenario_goals_not_used,
                 profile_end_shared_string_index,
+                profile_end_shared_string_index_offset,
                 serialized_body: bytes[..consumed].to_vec(),
             },
             consumed,
         ))
+    }
+}
+
+impl UnlockManagerReferencesEditor {
+    /// Returns the inner DataSerializer version used for this body.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns mutable access to the stored profiler end shared-string index.
+    ///
+    /// This edits the serialized `u16` only. It does not resolve the index
+    /// against the enclosing DataSerializer shared-string table.
+    pub fn profile_end_shared_string_index_mut(&mut self) -> &mut u16 {
+        &mut self.profile_end_shared_string_index
+    }
+
+    /// Writes the edited index and preserves every other body byte.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = self.original.serialized_body.clone();
+        if let Some(end) = self
+            .original
+            .profile_end_shared_string_index_offset
+            .checked_add(2)
+            && let Some(target) =
+                bytes.get_mut(self.original.profile_end_shared_string_index_offset..end)
+        {
+            target.copy_from_slice(&self.profile_end_shared_string_index.to_be_bytes());
+        }
+        bytes
+    }
+
+    pub(crate) fn original_body_bytes(&self) -> &[u8] {
+        &self.original.serialized_body
     }
 }
 
@@ -345,6 +400,20 @@ mod tests {
         assert_eq!(consumed, bytes.len());
         assert_eq!(record.arrays()[0].references(), &[NetObjectHeader::Null]);
         assert_eq!(record.encode(), bytes);
+    }
+
+    #[test]
+    fn editor_changes_only_the_profile_end_index() {
+        let source = empty_unlock_body(248, 15, false);
+        let (record, consumed) = UnlockManagerReferences::decode(248, &source).unwrap();
+        assert_eq!(consumed, source.len());
+
+        let mut editor = record.into_editor();
+        *editor.profile_end_shared_string_index_mut() = 0x5678;
+        let mut expected = source;
+        let end = expected.len();
+        expected[end - 2..].copy_from_slice(&[0x56, 0x78]);
+        assert_eq!(editor.encode(), expected);
     }
 
     #[test]

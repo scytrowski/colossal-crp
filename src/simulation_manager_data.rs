@@ -69,7 +69,7 @@ use crate::statistics_manager_data::{
     StatisticsManagerEditor,
 };
 use crate::transfer_manager_data::{TransferManagerData, TransferManagerEditor};
-use crate::unlock_manager_data::UnlockManagerReferences;
+use crate::unlock_manager_data::{UnlockManagerReferences, UnlockManagerReferencesEditor};
 use crate::water_manager_data::WaterManagerData;
 use crate::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
@@ -4975,6 +4975,61 @@ impl SimulationManagerData {
         )?;
         self.decode_unlock_manager_references_at()
             .map(|(references, _)| references)
+    }
+
+    /// Replaces the fixed-width profiler end index in `UnlockManager+Data`.
+    ///
+    /// Create `edited` from this manager's decoded UnlockManager body. The
+    /// inner version and original bytes must still match. Milestone arrays and
+    /// guide references remain byte-exact, so the object queue and following
+    /// `MessageManager+Data` boundary do not move. The edited shared-string
+    /// index is written as supplied and is not resolved against the root
+    /// string table.
+    pub fn replace_unlock_manager_references(
+        &mut self,
+        edited: &UnlockManagerReferencesEditor,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited UnlockManager version does not match this stream",
+            ));
+        }
+        self.decode_unlock_manager_references()?;
+        let tag = new_profiler_tag_bytes("UnlockManager")?;
+        let tag_start = find_unique_bytes(
+            &self.serialized_object_graph,
+            &tag,
+            "UnlockManager profiler tag",
+        )?;
+        let body_start = tag_start
+            .checked_add(tag.len())
+            .ok_or(CrpError::ArithmeticOverflow("UnlockManager body start"))?;
+        let original = edited.original_body_bytes();
+        let body_end = body_start
+            .checked_add(original.len())
+            .ok_or(CrpError::ArithmeticOverflow("UnlockManager body end"))?;
+        let Some(current) = self.serialized_object_graph.get(body_start..body_end) else {
+            return Err(invalid(
+                body_start,
+                "UnlockManager body extends past manager graph",
+            ));
+        };
+        if current != original {
+            return Err(invalid(
+                body_start,
+                "UnlockManager bytes do not match the editor's source body",
+            ));
+        }
+        let replacement = edited.encode();
+        if replacement.len() != original.len() {
+            return Err(invalid(
+                body_start,
+                "UnlockManager replacement must preserve the original length",
+            ));
+        }
+        self.serialized_object_graph[body_start..body_end].copy_from_slice(&replacement);
+        Ok(())
     }
 
     fn decode_unlock_manager_references_at(
@@ -19429,9 +19484,33 @@ mod manager_boundary_tests {
                 ..graph.len() - profiler_tag("MessageManager").len()]
         );
 
+        let mut edited = record.into_editor();
+        *edited.profile_end_shared_string_index_mut() = 0x1234;
+        manager.replace_unlock_manager_references(&edited).unwrap();
+        let mut expected = graph.clone();
+        let body_end = expected.len() - profiler_tag("MessageManager").len();
+        expected[body_end - 2..body_end].copy_from_slice(&[0x12, 0x34]);
+        assert_eq!(manager.serialized_object_graph(), expected);
+        assert_eq!(manager.serialized_object_graph().len(), graph.len());
+        assert_eq!(
+            manager
+                .decode_unlock_manager_references()
+                .unwrap()
+                .profile_end_shared_string_index(),
+            0x1234
+        );
+        assert!(manager.replace_unlock_manager_references(&edited).is_err());
+        let mut wrong_version = manager.clone();
+        wrong_version.format_version += 1;
+        assert!(
+            wrong_version
+                .replace_unlock_manager_references(&edited)
+                .is_err()
+        );
+
         manager
             .serialized_object_graph
-            .insert(graph.len() - profiler_tag("MessageManager").len(), 0xaa);
+            .insert(expected.len() - profiler_tag("MessageManager").len(), 0xaa);
         assert!(manager.decode_unlock_manager_references().is_err());
     }
 

@@ -146,6 +146,7 @@ pub use tree_manager_data::{
 };
 pub use unlock_manager_data::{
     UnlockManagerMilestoneArray, UnlockManagerMilestoneKind, UnlockManagerReferences,
+    UnlockManagerReferencesEditor,
 };
 pub use vehicle_manager_data::{
     VehicleInstanceFields, VehicleInstanceFieldsEditor, VehicleInstanceFieldsPrefix,
