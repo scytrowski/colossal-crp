@@ -8432,6 +8432,94 @@ impl SimulationManagerData {
         Ok(())
     }
 
+    /// Replaces the CitizenInstance flag and BuildingInfo prefab-name prefix
+    /// at slot 7, allowing changed names to resize the CitizenManager body.
+    ///
+    /// The edited data must come from this stream, preserve active instance
+    /// slots and all bytes outside that prefix, and use this inner version.
+    /// The shifted active records and TransferManager boundary are decoded
+    /// again before the replacement is accepted.
+    pub fn replace_citizen_manager_instance_prefix(
+        &mut self,
+        edited: &CitizenManagerData,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited CitizenManager instance-prefix version does not match this stream",
+            ));
+        }
+        expect_manager_type(self.manager_objects.as_deref(), 7, "CitizenManager+Data")?;
+        expect_manager_type(self.manager_objects.as_deref(), 8, "TransferManager+Data")?;
+
+        let (current, manager_end) = self.decode_citizen_manager_data()?;
+        if edited.instance_prefix().active_instances()
+            != current.instance_prefix().active_instances()
+        {
+            return Err(invalid(
+                0,
+                "edited CitizenManager active-slot layout does not match this stream",
+            ));
+        }
+        let edited_range = edited.instance_prefix_range()?;
+        let current_range = current.instance_prefix_range()?;
+        let edited_body = edited.original_body_bytes();
+        let current_body = current.original_body_bytes();
+        if edited_range.start != current_range.start
+            || edited_body.get(..edited_range.start) != current_body.get(..current_range.start)
+            || edited_body.get(edited_range.end..) != current_body.get(current_range.end..)
+        {
+            return Err(invalid(
+                edited_range.start,
+                "edited CitizenManager data does not match this stream outside the instance prefix",
+            ));
+        }
+
+        let (body_start, boundary_end) = self.manager_body_boundary(7)?;
+        if boundary_end != manager_end
+            || self.serialized_object_graph.get(body_start..manager_end) != Some(current_body)
+        {
+            return Err(invalid(
+                body_start,
+                "CitizenManager body boundary changed during instance-prefix replacement",
+            ));
+        }
+        let expected_end =
+            body_start
+                .checked_add(edited_body.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "CitizenManager instance-prefix replacement boundary",
+                ))?;
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(body_start..manager_end, edited_body.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        let validation = self
+            .decode_citizen_manager_data()
+            .and_then(|(decoded, actual_end)| {
+                if decoded.encode() != edited_body {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten CitizenManager does not match the edited body",
+                    ));
+                }
+                if actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten CitizenManager boundary does not match its resized body",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("edited CitizenManager prefix failed boundary validation: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Replaces the version 69+ CitizenUnit fields at slot 7 while preserving
     /// the rest of the CitizenManager body byte-for-byte.
     ///
@@ -27445,6 +27533,40 @@ mod manager_boundary_tests {
                 .is_err()
         );
         assert_eq!(wrong_version.serialized_object_graph, stable_graph);
+
+        let old_boundary_suffix = manager.serialized_object_graph[updated_end..].to_vec();
+        let old_body_len = updated.encode().len();
+        let mut name_edited = updated.clone();
+        name_edited
+            .set_instance_prefab_name(0, Some("Changed BuildingInfo".to_owned()))
+            .unwrap();
+        let expected_body = name_edited.encode();
+        assert!(expected_body.len() > old_body_len);
+        manager
+            .replace_citizen_manager_instance_prefix(&name_edited)
+            .unwrap();
+
+        let (renamed, renamed_end) = manager.decode_citizen_manager_data().unwrap();
+        assert_eq!(
+            renamed.instance_prefix().prefab_names(),
+            Some([Some("Changed BuildingInfo".to_owned())].as_slice())
+        );
+        assert_eq!(renamed.active_instances()[0].position(), position);
+        assert_eq!(renamed.active_instances()[0].citizen(), citizen);
+        assert_eq!(
+            renamed.instance_record_bytes(0),
+            updated.instance_record_bytes(0)
+        );
+        assert_eq!(renamed.encode(), expected_body);
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            stable_graph.len() + expected_body.len() - old_body_len
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[renamed_end..],
+            old_boundary_suffix
+        );
+        assert!(manager.serialized_object_graph()[renamed_end..].starts_with(&transfer_tag));
     }
 
     #[test]
