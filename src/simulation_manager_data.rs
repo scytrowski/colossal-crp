@@ -20132,6 +20132,27 @@ mod manager_boundary_tests {
     }
 
     #[test]
+    fn water_manager_no_op_replacement_preserves_noncanonical_boolean_byte() {
+        let mut manager =
+            water_manager_with_next("ZoneManager+Data, Assembly-CSharp", "ZoneManager");
+        let next_tag = profiler_tag("ZoneManager");
+        let next_start = manager
+            .serialized_object_graph
+            .windows(next_tag.len())
+            .position(|window| window == next_tag)
+            .unwrap();
+        let continuation_offset = next_start - 5;
+        manager.serialized_object_graph[continuation_offset] = 2;
+        let original_graph = manager.serialized_object_graph.clone();
+
+        let editor = manager.decode_water_manager_data().unwrap();
+        assert!(editor.can_continue());
+        manager.replace_water_manager_data(&editor).unwrap();
+
+        assert_eq!(manager.serialized_object_graph, original_graph);
+    }
+
+    #[test]
     fn water_manager_scalar_edits_replace_only_the_bounded_body() {
         let mut manager =
             water_manager_with_next("ZoneManager+Data, Assembly-CSharp", "ZoneManager");

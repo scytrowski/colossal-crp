@@ -218,6 +218,7 @@ pub struct WaterManagerData {
     processed_cell_count: i32,
     conductive_cell_count: i32,
     can_continue: bool,
+    original_can_continue: bool,
     scalar_fields_offset: usize,
     guide_references: Vec<NetObjectHeader>,
     original_body: Vec<u8>,
@@ -596,6 +597,7 @@ impl WaterManagerData {
             processed_cell_count,
             conductive_cell_count,
             can_continue,
+            original_can_continue: can_continue,
             scalar_fields_offset,
             guide_references,
             original_body: bytes.to_vec(),
@@ -1963,8 +1965,8 @@ impl WaterManagerData {
         self.conductive_cell_count = value;
     }
 
-    /// Replaces the serialized continuation flag without changing the body
-    /// length.
+    /// Replaces the continuation state without changing the body length.
+    /// The original byte is retained when its decoded boolean value is unchanged.
     pub fn set_can_continue(&mut self, value: bool) {
         self.can_continue = value;
     }
@@ -2073,14 +2075,16 @@ impl WaterManagerData {
                 reason: "conductive-cell counter range is invalid".to_owned(),
             })?
             .copy_from_slice(&self.conductive_cell_count.to_be_bytes());
-        bytes
-            .get_mut(conductive_end..flag_end)
-            .ok_or_else(|| CrpError::InvalidAssetPayload {
-                name: "WaterManager+Data".to_owned(),
-                offset: conductive_end,
-                reason: "continuation flag range is invalid".to_owned(),
-            })?
-            .copy_from_slice(&[u8::from(self.can_continue)]);
+        if self.can_continue != self.original_can_continue {
+            bytes
+                .get_mut(conductive_end..flag_end)
+                .ok_or_else(|| CrpError::InvalidAssetPayload {
+                    name: "WaterManager+Data".to_owned(),
+                    offset: conductive_end,
+                    reason: "continuation flag range is invalid".to_owned(),
+                })?
+                .copy_from_slice(&[u8::from(self.can_continue)]);
+        }
         let stored_node_count = stored_node_count(self.format_version);
         let mut replacements = Vec::new();
         if let Some(encoded) = changed_byte_array(
@@ -4224,6 +4228,29 @@ mod tests {
             assert_eq!(decoded.conductive_cell_count(), 0x1234_5678);
             assert!(!decoded.can_continue());
         }
+    }
+
+    #[test]
+    fn unchanged_noncanonical_continuation_byte_is_preserved() {
+        let mut body = empty_body(265);
+        let continuation_offset = body.len() - 5; // Two null references and the end tag follow.
+        body[continuation_offset] = 2;
+
+        let mut data = WaterManagerData::decode(265, &body).unwrap();
+        assert!(data.can_continue());
+        assert_eq!(data.encode().unwrap(), body);
+
+        data.set_can_continue(false);
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded[continuation_offset], 0);
+        assert_eq!(
+            &encoded[..continuation_offset],
+            &body[..continuation_offset]
+        );
+        assert_eq!(
+            &encoded[continuation_offset + 1..],
+            &body[continuation_offset + 1..]
+        );
     }
 
     #[test]
