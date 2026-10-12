@@ -286,6 +286,34 @@ impl CitizenManagerDataPrefix {
         self.legacy_columns.as_deref()
     }
 
+    /// Replaces a raw value in a legacy sparse column from versions below 30.
+    ///
+    /// Versions below 23 contain one column; versions 23–29 contain four.
+    /// Their meanings are unknown, so this edits only the selected byte. The
+    /// column is re-encoded and may change the prefix length. `sparse_index`
+    /// is zero-based among citizens with nonzero flags, ordered by citizen
+    /// slot. Unknown versions and out-of-range indexes return errors.
+    pub fn set_legacy_column_value(
+        &mut self,
+        column_index: usize,
+        sparse_index: usize,
+        value: u8,
+    ) -> Result<(), CrpError> {
+        let mut columns = self.legacy_columns.clone().ok_or_else(|| {
+            invalid(
+                0,
+                "legacy citizen columns are not serialized from version 30",
+            )
+        })?;
+        let values = columns
+            .get_mut(column_index)
+            .ok_or_else(|| invalid(column_index, "legacy citizen column index is out of range"))?;
+        set_sparse_value(values, sparse_index, value, "legacy citizen column")?;
+        self.replace_byte_column(Some(column_index), values, "legacy citizen column")?;
+        self.legacy_columns = Some(columns);
+        Ok(())
+    }
+
     /// Returns the sparse health values from version 65.
     ///
     /// Values are ordered by the ascending citizen slot among nonzero flags.
@@ -2933,6 +2961,62 @@ mod tests {
         assert_eq!(modern.citizen_flags(), [1, 0, 0]);
         assert_eq!(modern.legacy_columns(), None);
         assert_eq!(modern_consumed, v30.len());
+    }
+
+    #[test]
+    fn edits_legacy_citizen_columns_as_raw_bytes() {
+        let mut v22 = byte_array(&[1, 0, 1]);
+        v22.extend_from_slice(&byte_array(&[0x11, 0x22]));
+        v22.extend_from_slice(&[0xfa, 0xce]);
+        let (mut old, consumed) = CitizenManagerDataPrefix::decode_prefix_with_count(22, 3, &v22)
+            .expect("v22 citizen prefix");
+        old.set_legacy_column_value(0, 1, 0x23)
+            .expect("edit v22 raw column");
+        assert_eq!(old.encode(), [2, 1, 0, 1, 1, 0x11, 0x23]);
+        assert_eq!(&v22[consumed..], [0xfa, 0xce]);
+        assert_eq!(old.legacy_columns(), Some([vec![0x11, 0x23]].as_slice()));
+
+        let mut v23 = byte_array(&[1, 0, 1]);
+        for values in [[0x10, 0x20], [0x30, 0x40], [0x50, 0x60], [0x70, 0x80]] {
+            v23.extend_from_slice(&byte_array(&values));
+        }
+        v23.extend_from_slice(&[0xfa, 0xce]);
+        let (mut middle, consumed) =
+            CitizenManagerDataPrefix::decode_prefix_with_count(23, 3, &v23)
+                .expect("v23 citizen prefix");
+        middle
+            .set_legacy_column_value(2, 1, 0x61)
+            .expect("edit second v23 raw column value");
+        assert_eq!(
+            middle.encode(),
+            [
+                2, 1, 0, 1, 1, 0x10, 0x20, 1, 0x30, 0x40, 1, 0x50, 0x61, 1, 0x70, 0x80,
+            ]
+        );
+        assert_eq!(&v23[consumed..], [0xfa, 0xce]);
+        assert_eq!(
+            middle.legacy_columns(),
+            Some(
+                [
+                    vec![0x10, 0x20],
+                    vec![0x30, 0x40],
+                    vec![0x50, 0x61],
+                    vec![0x70, 0x80],
+                ]
+                .as_slice()
+            )
+        );
+
+        let before_error = middle.encode();
+        assert!(middle.set_legacy_column_value(4, 0, 1).is_err());
+        assert!(middle.set_legacy_column_value(2, 2, 1).is_err());
+        assert_eq!(middle.encode(), before_error);
+
+        let v30 = uint_array(&[1, 0, 1]);
+        let (mut modern, _) = CitizenManagerDataPrefix::decode_prefix_with_count(30, 3, &v30)
+            .expect("v30 citizen prefix");
+        assert!(modern.set_legacy_column_value(0, 0, 1).is_err());
+        assert_eq!(modern.encode(), v30);
     }
 
     #[test]
