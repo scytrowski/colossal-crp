@@ -2178,13 +2178,18 @@ impl DistrictCampusSportsEditor<'_> {
         self.data
     }
 
-    /// Replaces the campus-state bool, writing canonical byte `0` or `1`.
+    /// Replaces the campus-state bool, writing canonical byte `0` or `1` only
+    /// when the decoded value changes.
     pub fn set_is_main_campus(&mut self, value: bool) -> Result<(), CrpError> {
-        self.write_field(
-            self.data.field_offsets.is_main_campus,
-            &[u8::from(value)],
-            "is-main-campus flag",
-        )?;
+        let current_value = self.data.is_main_campus;
+        let offset = self
+            .data
+            .field_offsets
+            .is_main_campus
+            .ok_or_else(|| invalid_district_manager(0, "is-main-campus flag is absent"))?;
+        if current_value != value {
+            self.write_field(Some(offset), &[u8::from(value)], "is-main-campus flag")?;
+        }
         self.data.is_main_campus = value;
         Ok(())
     }
@@ -6162,6 +6167,25 @@ mod tests {
         assert_eq!(sports.sports(), Some(-13));
         assert_eq!(sports.away_matches_done(), Some([false; 5]));
         assert_eq!(sports.campus_building_count(), Some(14));
+
+        let mut noncanonical_campus_record = record.clone();
+        noncanonical_campus_record[super::park_scalar_bytes(version) + sports_offset] = 0x7f;
+        let (noncanonical_parks, _) = prefix
+            .decode_park_records(&noncanonical_campus_record)
+            .unwrap();
+        assert!(
+            !noncanonical_parks[0]
+                .campus_sports_data()
+                .unwrap()
+                .is_main_campus()
+        );
+        let mut unchanged_bool_editor = noncanonical_parks[0].clone().into_editor();
+        unchanged_bool_editor
+            .campus_sports_mut()
+            .unwrap()
+            .set_is_main_campus(false)
+            .unwrap();
+        assert_eq!(unchanged_bool_editor.encode(), noncanonical_campus_record);
 
         let mut fixed_field_editor = parks[0].clone().into_editor();
         fixed_field_editor
