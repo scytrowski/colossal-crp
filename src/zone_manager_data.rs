@@ -1,6 +1,6 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::read_encoded_uint_array;
+use crate::encoded_array::{read_encoded_uint_array, write_encoded_uint_array_runs};
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 use std::ops::Range;
 
@@ -55,6 +55,7 @@ pub struct ZoneManagerDataPrefix {
     format_version: u32,
     serialized_flag_count: usize,
     flags: Vec<u32>,
+    flags_range: Range<usize>,
     blocks: Vec<ZoneBlockRecord>,
     demand: [i8; ZONE_DEMAND_COUNT],
     actual_demand: [i8; ZONE_DEMAND_COUNT],
@@ -67,13 +68,14 @@ pub struct ZoneManagerDataPrefix {
     serialized_prefix: Vec<u8>,
 }
 
-/// Editor for existing ZoneBlock values and versioned demand fields.
+/// Editor for existing ZoneBlock flags, values, and versioned demand fields.
 ///
-/// The selected block slots, flags, and queued object references remain fixed.
-/// All edited fields have fixed-width serialized representations.
+/// Flag edits preserve the active slots and are limited to positions serialized
+/// by the selected version. Queued object references remain fixed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZoneManagerEditor {
     data: ZoneManagerDataPrefix,
+    original_flags: Vec<u32>,
 }
 
 impl ZoneManagerDataPrefix {
@@ -95,7 +97,9 @@ impl ZoneManagerDataPrefix {
             ZONE_FLAGS_OLD_COUNT
         };
         let mut reader = Reader::new(bytes);
+        let flags_start = reader.offset();
         let mut flags = read_encoded_uint_array(&mut reader, serialized_flag_count)?;
+        let flags_range = flags_start..reader.offset();
         flags.resize(ZONE_BLOCK_COUNT - 1, 0);
 
         let blocks_start = reader.offset();
@@ -195,6 +199,7 @@ impl ZoneManagerDataPrefix {
                 format_version,
                 serialized_flag_count,
                 flags,
+                flags_range,
                 blocks,
                 demand,
                 actual_demand,
@@ -251,9 +256,13 @@ impl ZoneManagerDataPrefix {
         &self.object_references
     }
 
-    /// Creates an editor for existing blocks and serialized demand fields.
+    /// Creates an editor for flags, existing blocks, and serialized demand fields.
     pub fn into_editor(self) -> ZoneManagerEditor {
-        ZoneManagerEditor { data: self }
+        let original_flags = self.flags.clone();
+        ZoneManagerEditor {
+            data: self,
+            original_flags,
+        }
     }
 
     /// Writes the original known prefix exactly, including encoded array runs.
@@ -263,6 +272,32 @@ impl ZoneManagerDataPrefix {
 }
 
 impl ZoneManagerEditor {
+    /// Replaces raw flag bits for one serialized ZoneBlock slot.
+    ///
+    /// `index` is zero-based, so zero represents serialized slot one. The
+    /// value must preserve whether the slot is active. Slots omitted by the
+    /// selected version cannot be edited.
+    pub fn set_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        if index >= self.data.serialized_flag_count {
+            return Err(invalid_zone_manager(
+                index,
+                "ZoneBlock flag slot is not serialized by this inner version",
+            ));
+        }
+        let current =
+            *self.data.flags.get(index).ok_or_else(|| {
+                invalid_zone_manager(index, "ZoneBlock flag index is out of range")
+            })?;
+        if (current == 0) != (value == 0) {
+            return Err(invalid_zone_manager(
+                index,
+                "ZoneBlock flag edits must preserve the slot's active state",
+            ));
+        }
+        self.data.flags[index] = value;
+        Ok(())
+    }
+
     /// Returns the inner DataSerializer version.
     pub fn format_version(&self) -> u32 {
         self.data.format_version
@@ -271,7 +306,7 @@ impl ZoneManagerEditor {
     /// Returns mutable records for existing nonzero-flag blocks.
     ///
     /// Block indexes cannot be changed, and this slice cannot add or remove
-    /// records. The serialized flags remain unchanged.
+    /// records. Flag edits are available through [`Self::set_flag_bits`].
     pub fn blocks_mut(&mut self) -> &mut [ZoneBlockRecord] {
         &mut self.data.blocks
     }
@@ -295,10 +330,20 @@ impl ZoneManagerEditor {
         Some(&mut self.data.good_area_found)
     }
 
-    /// Writes edited fixed-width fields and retains every other source byte.
-    /// The serialized flags, block slots, and object references are unchanged.
+    /// Writes edited fields and retains every other source byte.
+    /// Re-encoding changed flags can resize the prefix. Block slots and queued
+    /// object references remain fixed.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.data.serialized_prefix.clone();
+        if self.data.flags.len() != ZONE_BLOCK_COUNT - 1
+            || self.original_flags.len() != ZONE_BLOCK_COUNT - 1
+            || self.data.serialized_flag_count > ZONE_BLOCK_COUNT - 1
+        {
+            return Err(invalid_zone_manager(
+                0,
+                "ZoneBlock flag count does not match the source layout",
+            ));
+        }
         let active_indices = self
             .data
             .flags
@@ -328,6 +373,12 @@ impl ZoneManagerEditor {
             .ok_or(CrpError::ArithmeticOverflow("ZoneBlock record bytes"))?;
         validate_zone_range(
             &bytes,
+            &self.data.flags_range,
+            self.data.flags_range.len(),
+            "ZoneBlock flags",
+        )?;
+        validate_zone_range(
+            &bytes,
             &self.data.blocks_range,
             expected_blocks_len,
             "ZoneBlock records",
@@ -336,26 +387,64 @@ impl ZoneManagerEditor {
         for block in &self.data.blocks {
             append_zone_block(&mut encoded_blocks, block);
         }
-        bytes[self.data.blocks_range.clone()].copy_from_slice(&encoded_blocks);
+        let mut replacements = Vec::new();
+        if self.data.flags != self.original_flags {
+            if self.data.flags[self.data.serialized_flag_count..]
+                != self.original_flags[self.data.serialized_flag_count..]
+            {
+                return Err(invalid_zone_manager(
+                    self.data.serialized_flag_count,
+                    "ZoneBlock flag slots omitted by this version cannot be changed",
+                ));
+            }
+            let mut encoded_flags = Vec::new();
+            write_encoded_uint_array_runs(
+                &mut encoded_flags,
+                &self.data.flags[..self.data.serialized_flag_count],
+            );
+            replacements.push((self.data.flags_range.clone(), encoded_flags));
+        }
+        if bytes.get(self.data.blocks_range.clone()) != Some(encoded_blocks.as_slice()) {
+            replacements.push((self.data.blocks_range.clone(), encoded_blocks));
+        }
 
         if let Some(range) = self.data.demand_range.as_ref() {
             validate_zone_range(&bytes, range, 3, "demand values")?;
-            for (target, value) in bytes[range.clone()].iter_mut().zip(self.data.demand) {
-                *target = value as u8;
+            let encoded = self.data.demand.map(|value| value as u8).to_vec();
+            if bytes.get(range.clone()) != Some(encoded.as_slice()) {
+                replacements.push((range.clone(), encoded));
             }
         }
         if let Some(range) = self.data.actual_demand_range.as_ref() {
             validate_zone_range(&bytes, range, 3, "actual-demand values")?;
-            for (target, value) in bytes[range.clone()].iter_mut().zip(self.data.actual_demand) {
-                *target = value as u8;
+            let encoded = self.data.actual_demand.map(|value| value as u8).to_vec();
+            if bytes.get(range.clone()) != Some(encoded.as_slice()) {
+                replacements.push((range.clone(), encoded));
             }
         }
         if let Some(range) = self.data.good_area_range.as_ref() {
             validate_zone_range(&bytes, range, GOOD_AREA_COUNT * 2, "good-area values")?;
-            for (index, value) in self.data.good_area_found.iter().enumerate() {
-                let start = range.start + index * 2;
-                bytes[start..start + 2].copy_from_slice(&value.to_be_bytes());
+            let mut encoded = Vec::with_capacity(GOOD_AREA_COUNT * 2);
+            for value in &self.data.good_area_found {
+                encoded.extend_from_slice(&value.to_be_bytes());
             }
+            if bytes.get(range.clone()) != Some(encoded.as_slice()) {
+                replacements.push((range.clone(), encoded));
+            }
+        }
+
+        replacements.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        let mut previous_start = bytes.len();
+        for (range, replacement) in replacements {
+            if range.end > previous_start {
+                return Err(invalid_zone_manager(
+                    range.start,
+                    "edited ZoneManager field ranges overlap",
+                ));
+            }
+            validate_zone_range(&bytes, &range, range.len(), "edited field")?;
+            bytes.splice(range.clone(), replacement);
+            previous_start = range.start;
         }
         Ok(bytes)
     }
@@ -410,7 +499,7 @@ fn invalid_zone_manager(offset: usize, reason: impl Into<String>) -> CrpError {
 #[cfg(test)]
 mod tests {
     use super::ZoneManagerDataPrefix;
-    use crate::encoded_array::write_encoded_uint_array;
+    use crate::encoded_array::{write_encoded_uint_array, write_encoded_uint_array_runs};
     use crate::net_manager_data::NetObjectHeader;
 
     fn zero_flags(format_version: u32) -> Vec<u8> {
@@ -485,6 +574,53 @@ mod tests {
                 assert!(editor.actual_demand_mut().is_none());
                 assert!(editor.good_area_found_mut().is_none());
             }
+        }
+    }
+
+    #[test]
+    fn zone_manager_editor_changes_raw_flags_without_changing_active_slots() {
+        for (version, flag_count) in [(164, 16_383), (205, 32_767), (222, 49_151)] {
+            let mut flags = vec![0_u32; flag_count];
+            flags[0] = 1;
+            flags[flag_count - 1] = 2;
+            let mut source = Vec::new();
+            write_encoded_uint_array(&mut source, &flags);
+            let source_flags_len = source.len();
+            source.resize(source.len() + 2 * 70, 0);
+            if version >= 74 {
+                source.extend_from_slice(&[10, 20, 30]);
+            }
+            if version >= 168 {
+                source.extend_from_slice(&[40, 50, 60]);
+            }
+            if version >= 194 {
+                source.extend_from_slice(&[0; 16]);
+            }
+            null_references(&mut source, version);
+
+            let (zone, _) = ZoneManagerDataPrefix::decode_prefix(version, &source).unwrap();
+            let mut editor = zone.into_editor();
+            editor.set_flag_bits(0, 3).unwrap();
+            editor.set_flag_bits(flag_count - 1, 4).unwrap();
+            assert!(editor.set_flag_bits(0, 0).is_err());
+            assert!(editor.set_flag_bits(1, 1).is_err());
+            assert!(editor.set_flag_bits(flag_count, 0).is_err());
+
+            flags[0] = 3;
+            flags[flag_count - 1] = 4;
+            let mut expected = Vec::new();
+            write_encoded_uint_array_runs(&mut expected, &flags);
+            expected.extend_from_slice(&source[source_flags_len..]);
+            let encoded = editor.encode().unwrap();
+            assert_eq!(encoded, expected);
+
+            let (updated, used) = ZoneManagerDataPrefix::decode_prefix(version, &encoded).unwrap();
+            assert_eq!(used, encoded.len());
+            assert_eq!(updated.flags()[0], 3);
+            assert_eq!(updated.flags()[flag_count - 1], 4);
+            assert_eq!(updated.blocks().len(), 2);
+            assert_eq!(updated.blocks()[0].index, 1);
+            assert_eq!(usize::from(updated.blocks()[1].index), flag_count);
         }
     }
 

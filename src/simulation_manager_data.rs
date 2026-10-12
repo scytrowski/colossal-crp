@@ -7393,9 +7393,9 @@ impl SimulationManagerData {
 
     /// Replaces editable ZoneManager block and demand fields in the graph.
     ///
-    /// The editor must come from this graph and inner version. Block slots,
-    /// flags, and queued references remain fixed; replacement preserves the
-    /// body length and validates the adjacent PropManager boundary.
+    /// The editor must come from this graph and inner version. Block slots and
+    /// queued references remain fixed. Re-encoding changed flags can resize
+    /// the body; replacement validates the shifted PropManager boundary.
     pub fn replace_zone_manager_data(
         &mut self,
         edited: &ZoneManagerEditor,
@@ -7414,12 +7414,6 @@ impl SimulationManagerData {
             ));
         }
         let replacement = edited.encode()?;
-        if replacement.len() != edited.original_prefix_bytes().len() {
-            return Err(invalid(
-                13,
-                "ZoneManager edits cannot change the serialized prefix length",
-            ));
-        }
 
         let zone_tag = new_profiler_tag_bytes("ZoneManager")?;
         let body_start = find_unique_bytes(
@@ -7441,12 +7435,18 @@ impl SimulationManagerData {
                 "ZoneManager prefix does not end at the following manager boundary",
             ));
         }
+        let updated_next_tag_start = body_start
+            .checked_add(replacement.len())
+            .and_then(|end| end.checked_add(LOADING_PROFILER_END_TAG_BYTES))
+            .ok_or(CrpError::ArithmeticOverflow("edited ZoneManager boundary"))?;
 
         let mut candidate = self.serialized_object_graph.clone();
         candidate.splice(body_start..body_end, replacement);
         let original = std::mem::replace(&mut self.serialized_object_graph, candidate);
         match self.decode_zone_manager_prefix() {
-            Ok((_, updated_next_tag_start)) if updated_next_tag_start == next_tag_start => Ok(()),
+            Ok((_, actual_next_tag_start)) if actual_next_tag_start == updated_next_tag_start => {
+                Ok(())
+            }
             Ok(_) => {
                 self.serialized_object_graph = original;
                 Err(invalid(
@@ -16077,8 +16077,9 @@ mod manager_boundary_tests {
         DistrictParkIndustryTradeData,
     };
     use crate::encoded_array::{
-        EncodedLongArrayReader, write_encoded_bool_array, write_encoded_byte_array,
-        write_encoded_uint_array, write_encoded_uint_array_runs, write_encoded_ushort_array,
+        EncodedLongArrayReader, read_encoded_uint_array, write_encoded_bool_array,
+        write_encoded_byte_array, write_encoded_uint_array, write_encoded_uint_array_runs,
+        write_encoded_ushort_array,
     };
     use crate::net_manager_data::NetObjectHeader;
     use crate::{
@@ -16332,6 +16333,35 @@ mod manager_boundary_tests {
             manager_array_bytes: Vec::new(),
             serialized_object_graph: graph,
         }
+    }
+
+    fn synthetic_manager_data_with_active_zone_block() -> SimulationManagerData {
+        let mut manager = synthetic_manager_data();
+        let (zone, _) = manager.decode_zone_manager_prefix().unwrap();
+        let source_zone = zone.encode();
+        let mut reader = Reader::new(&source_zone);
+        read_encoded_uint_array(&mut reader, 49_151).unwrap();
+        let source_flags_len = reader.offset();
+
+        let mut flags = vec![0_u32; 49_151];
+        flags[0] = 1;
+        let mut replacement = Vec::new();
+        write_encoded_uint_array(&mut replacement, &flags);
+        replacement.extend_from_slice(&[0; 70]);
+        replacement.extend_from_slice(&source_zone[source_flags_len..]);
+
+        let zone_tag = profiler_tag("ZoneManager");
+        let body_start = manager
+            .serialized_object_graph()
+            .windows(zone_tag.len())
+            .position(|window| window == zone_tag)
+            .unwrap()
+            + zone_tag.len();
+        let body_end = body_start + source_zone.len();
+        manager
+            .serialized_object_graph
+            .splice(body_start..body_end, replacement);
+        manager
     }
 
     fn profiler_tag(name: &str) -> Vec<u8> {
@@ -25388,6 +25418,53 @@ mod manager_boundary_tests {
         let updated_graph = manager.serialized_object_graph().to_vec();
         assert!(manager.replace_zone_manager_data(&editor).is_err());
         assert_eq!(manager.serialized_object_graph(), updated_graph);
+    }
+
+    #[test]
+    fn zone_manager_editor_resizes_flags_and_preserves_prop_boundary() {
+        let mut manager = synthetic_manager_data_with_active_zone_block();
+        let (zone, following_tag_start) = manager.decode_zone_manager_prefix().unwrap();
+        let zone_tag = profiler_tag("ZoneManager");
+        let body_start = manager
+            .serialized_object_graph()
+            .windows(zone_tag.len())
+            .position(|window| window == zone_tag)
+            .unwrap()
+            + zone_tag.len();
+        let source_body = zone.encode();
+        let body_end = body_start + source_body.len();
+        let following_bytes = manager.serialized_object_graph()[body_end..].to_vec();
+        let original_graph_len = manager.serialized_object_graph().len();
+
+        let mut editor = zone.into_editor();
+        editor.set_flag_bits(0, 3).unwrap();
+        let expected_body = editor.encode().unwrap();
+        assert_ne!(expected_body.len(), source_body.len());
+        let expected_next_tag_start = body_start + expected_body.len() + 2;
+        manager.replace_zone_manager_data(&editor).unwrap();
+
+        assert_eq!(
+            manager.serialized_object_graph().len(),
+            original_graph_len - source_body.len() + expected_body.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start + expected_body.len()..],
+            following_bytes
+        );
+        let (updated, updated_next_tag_start) = manager.decode_zone_manager_prefix().unwrap();
+        assert_eq!(updated.flags()[0], 3);
+        assert_eq!(updated.blocks().len(), 1);
+        assert_eq!(updated.blocks()[0].index, 1);
+        assert_eq!(updated_next_tag_start, expected_next_tag_start);
+        assert!(
+            manager.serialized_object_graph()[updated_next_tag_start..]
+                .starts_with(&profiler_tag("PropManager"))
+        );
+
+        let updated_graph = manager.serialized_object_graph().to_vec();
+        assert!(manager.replace_zone_manager_data(&editor).is_err());
+        assert_eq!(manager.serialized_object_graph(), updated_graph);
+        assert_eq!(following_tag_start, body_start + source_body.len() + 2);
     }
 
     #[test]
