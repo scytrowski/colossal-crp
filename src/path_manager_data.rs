@@ -1,6 +1,9 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::{read_encoded_byte_array, read_encoded_ushort_array};
+use crate::encoded_array::{
+    read_encoded_byte_array, read_encoded_ushort_array, write_encoded_byte_array_runs,
+    write_encoded_ushort_array,
+};
 use std::ops::Range;
 
 const PATH_UNIT_COUNT: usize = 262_144;
@@ -46,12 +49,13 @@ pub struct PathUnit {
 
 /// The fifth queued manager body, excluding loading-profiler tags.
 ///
-/// Its original bytes are retained for exact writing. The editor can change
-/// selected fixed-width fields without rewriting the encoded flag array.
+/// Its original bytes are retained for exact unchanged writing. The editor
+/// can re-encode simulation flags and change selected fixed-width fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathManagerData {
     format_version: u32,
     simulation_flags: Vec<u16>,
+    simulation_flags_range: Range<usize>,
     active_units: Vec<PathUnit>,
     path_find_flag_ranges: Vec<Range<usize>>,
     lane_type_ranges: Vec<Range<usize>>,
@@ -60,14 +64,17 @@ pub struct PathManagerData {
     serialized_body: Vec<u8>,
 }
 
-/// In-place editor for selected fields in existing active path units.
+/// Editor for simulation flags and selected fields in existing active units.
 ///
-/// It changes existing path flags, vehicle-type masks, and versioned speed
-/// bytes. Path-unit links, positions, counts, and all other original bytes
-/// remain unchanged.
+/// Simulation-flag edits preserve active slots and use the source version's
+/// byte or UShort layout. Changed flag arrays can resize the body. Path-unit
+/// links, positions, counts, and all other original bytes remain unchanged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathManagerEditor {
     format_version: u32,
+    simulation_flags: Vec<u16>,
+    original_simulation_flags: Vec<u16>,
+    simulation_flags_range: Range<usize>,
     path_find_flags: Vec<u8>,
     lane_types: Vec<u8>,
     vehicle_types: Vec<u32>,
@@ -93,6 +100,7 @@ impl PathManagerData {
             ));
         }
         let mut reader = Reader::new(bytes);
+        let simulation_flags_start = reader.offset();
         let simulation_flags = if format_version >= USHORT_FLAGS_VERSION {
             read_encoded_ushort_array(&mut reader, PATH_UNIT_COUNT - 1)?
         } else {
@@ -101,6 +109,7 @@ impl PathManagerData {
                 .map(u16::from)
                 .collect()
         };
+        let simulation_flags_range = simulation_flags_start..reader.offset();
         let mut active_units = Vec::new();
         let mut path_find_flag_ranges = Vec::new();
         let mut lane_type_ranges = Vec::new();
@@ -177,6 +186,7 @@ impl PathManagerData {
             Self {
                 format_version,
                 simulation_flags,
+                simulation_flags_range,
                 active_units,
                 path_find_flag_ranges,
                 lane_type_ranges,
@@ -208,14 +218,19 @@ impl PathManagerData {
         self.serialized_body.clone()
     }
 
-    /// Consumes the decoded body to expose fixed-width fields for editing.
+    /// Consumes the decoded body to expose flags and unit fields for editing.
     ///
     /// Returns `None` when this inner version omits the speed field. For
-    /// versions with the field, the slice is in active path-unit order and
-    /// can be edited without changing body length or any other path data.
+    /// versions with the field, the slice is in active path-unit order. Editing
+    /// the simulation flag array may resize the body; other fields are fixed
+    /// width.
     pub fn into_editor(self) -> PathManagerEditor {
+        let original_simulation_flags = self.simulation_flags.clone();
         PathManagerEditor {
             format_version: self.format_version,
+            simulation_flags: original_simulation_flags.clone(),
+            original_simulation_flags,
+            simulation_flags_range: self.simulation_flags_range,
             path_find_flags: self
                 .active_units
                 .iter()
@@ -250,6 +265,38 @@ impl PathManagerEditor {
         self.format_version
     }
 
+    /// Returns the current simulation flags in one-based buffer order,
+    /// widened to `u16` for both on-disk layouts.
+    pub fn simulation_flags(&self) -> &[u16] {
+        &self.simulation_flags
+    }
+
+    /// Replaces one serialized path-unit simulation flag.
+    ///
+    /// `index` is zero-based, so zero represents serialized slot one. The
+    /// value must preserve whether the slot is active. Versions before 121011
+    /// store flags as bytes and reject values above 255.
+    pub fn set_simulation_flag(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        let current = *self
+            .simulation_flags
+            .get(index)
+            .ok_or_else(|| invalid(index, "path-unit simulation flag index is out of range"))?;
+        if (current == 0) != (value == 0) {
+            return Err(invalid(
+                index,
+                "path-unit flag edits must preserve the slot's active state",
+            ));
+        }
+        if self.format_version < USHORT_FLAGS_VERSION && value > u8::MAX.into() {
+            return Err(invalid(
+                index,
+                "path-unit simulation flag does not fit the source byte layout",
+            ));
+        }
+        self.simulation_flags[index] = value;
+        Ok(())
+    }
+
     /// Returns mutable path-finding flag bytes in active path-unit order.
     pub fn path_find_flags_mut(&mut self) -> &mut [u8] {
         &mut self.path_find_flags
@@ -278,8 +325,28 @@ impl PathManagerEditor {
         self.speeds.as_deref_mut()
     }
 
-    /// Encodes the original body with edited fixed-width PathUnit fields patched in place.
+    /// Encodes edited simulation flags and fixed-width PathUnit fields.
+    /// Re-encoding changed flags may resize the body.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.simulation_flags.len() != PATH_UNIT_COUNT - 1
+            || self.original_simulation_flags.len() != PATH_UNIT_COUNT - 1
+        {
+            return Err(invalid(
+                0,
+                "path-unit simulation flag count does not match the source buffer",
+            ));
+        }
+        if self
+            .simulation_flags
+            .iter()
+            .zip(&self.original_simulation_flags)
+            .any(|(edited, original)| (*edited == 0) != (*original == 0))
+        {
+            return Err(invalid(
+                0,
+                "path-unit flag edits must preserve active slots",
+            ));
+        }
         let mut output = self.original_body.clone();
         patch_byte_column(
             &mut output,
@@ -328,6 +395,37 @@ impl PathManagerEditor {
                 ));
             }
             None => {}
+        }
+        if self.simulation_flags != self.original_simulation_flags {
+            if self.simulation_flags_range.start > self.simulation_flags_range.end
+                || self.simulation_flags_range.end > output.len()
+            {
+                return Err(invalid(
+                    self.simulation_flags_range.start,
+                    "path-unit simulation flag range exceeds the source body",
+                ));
+            }
+            let mut encoded_flags = Vec::new();
+            if self.format_version >= USHORT_FLAGS_VERSION {
+                write_encoded_ushort_array(&mut encoded_flags, &self.simulation_flags);
+            } else {
+                let byte_flags = self
+                    .simulation_flags
+                    .iter()
+                    .map(|value| {
+                        u8::try_from(*value).map_err(|_| {
+                            invalid(
+                                self.simulation_flags_range.start,
+                                "path-unit simulation flag does not fit the source byte layout",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                write_encoded_byte_array_runs(&mut encoded_flags, &byte_flags);
+            }
+            if output.get(self.simulation_flags_range.clone()) != Some(encoded_flags.as_slice()) {
+                output.splice(self.simulation_flags_range.clone(), encoded_flags);
+            }
         }
         Ok(output)
     }

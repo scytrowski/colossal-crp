@@ -5643,7 +5643,7 @@ impl SimulationManagerData {
         Ok((data, end))
     }
 
-    /// Decodes PathManager into an editor for existing serialized speed bytes.
+    /// Decodes PathManager into an editor for simulation flags and unit fields.
     ///
     /// The editor exposes no speed slice for versions that omit the field.
     pub fn decode_path_manager_editor(&self) -> Result<PathManagerEditor, CrpError> {
@@ -5651,11 +5651,13 @@ impl SimulationManagerData {
         Ok(path.into_editor())
     }
 
-    /// Replaces only existing PathManager speed bytes in the bounded manager body.
+    /// Replaces PathManager simulation flags and existing unit fields in the
+    /// bounded manager body.
     ///
     /// The editor must match this stream's inner version and original PathManager
-    /// body. The body length, flags, path-unit links, and following NetManager
-    /// boundary are checked before and after the fixed-width replacement.
+    /// body. Flag edits preserve path-unit slots; re-encoding can resize the body.
+    /// The path-unit links and shifted NetManager boundary are checked before
+    /// and after replacement.
     pub fn replace_path_manager_data(
         &mut self,
         edited: &PathManagerEditor,
@@ -5674,30 +5676,27 @@ impl SimulationManagerData {
             ));
         }
         let replacement = edited.encode()?;
-        if replacement.len() != edited.original_body_bytes().len() {
-            return Err(invalid(
-                4,
-                "PathManager speed edits must preserve the body length",
-            ));
-        }
         let (body_start, next_tag_start) = self.manager_body_boundary(4)?;
-        let body_end = body_start
-            .checked_add(replacement.len())
-            .ok_or(CrpError::ArithmeticOverflow("PathManager replacement end"))?;
-        let bounded_end = body_end.checked_add(LOADING_PROFILER_END_TAG_BYTES).ok_or(
-            CrpError::ArithmeticOverflow("PathManager closing profiler reference end"),
-        )?;
-        if bounded_end != next_tag_start {
+        let source_body_end = body_start
+            .checked_add(edited.original_body_bytes().len())
+            .ok_or(CrpError::ArithmeticOverflow("PathManager source body end"))?;
+        let source_bounded_end = source_body_end
+            .checked_add(LOADING_PROFILER_END_TAG_BYTES)
+            .ok_or(CrpError::ArithmeticOverflow(
+                "PathManager closing profiler reference end",
+            ))?;
+        if source_bounded_end != next_tag_start {
             return Err(invalid(
-                body_end,
-                "PathManager body does not end at the NetManager boundary",
+                source_body_end,
+                "PathManager source body does not end at the NetManager boundary",
             ));
         }
+        let expected_end = body_start
+            .checked_add(replacement.len())
+            .and_then(|end| end.checked_add(LOADING_PROFILER_END_TAG_BYTES))
+            .ok_or(CrpError::ArithmeticOverflow("PathManager updated boundary"))?;
         let mut candidate_graph = self.serialized_object_graph.clone();
-        candidate_graph
-            .get_mut(body_start..body_end)
-            .ok_or_else(|| invalid(body_start, "PathManager replacement range is invalid"))?
-            .copy_from_slice(&replacement);
+        candidate_graph.splice(body_start..source_body_end, replacement.clone());
         let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
         let validation = self.decode_path_prefix().and_then(|(decoded, actual_end)| {
             if decoded.encode() != replacement {
@@ -5706,9 +5705,6 @@ impl SimulationManagerData {
                     "rewritten PathManager body does not match the editor",
                 ));
             }
-            let expected_end = body_end
-                .checked_add(LOADING_PROFILER_END_TAG_BYTES)
-                .ok_or(CrpError::ArithmeticOverflow("PathManager updated boundary"))?;
             if actual_end != expected_end {
                 return Err(invalid(
                     actual_end,
@@ -17402,7 +17398,7 @@ mod manager_boundary_tests {
     }
 
     #[test]
-    fn path_manager_editor_replaces_only_speed_and_rejects_stale_source()
+    fn path_manager_editor_resizes_flags_and_preserves_speed_and_net_boundary()
     -> Result<(), crate::CrpError> {
         let mut flags = vec![0; 262_143];
         flags[0] = 1;
@@ -17415,26 +17411,36 @@ mod manager_boundary_tests {
             0x3f, 0xc0, 0, 0,  // Length 1.5.
             77, // Serialized speed.
         ]);
-        let path_body_len = path_body.len();
+        let source_body_len = path_body.len();
         let (mut manager, path_body_start) = synthetic_path_manager(&path_body);
         let original_graph = manager.serialized_object_graph.clone();
         let mut editor = manager.decode_path_manager_editor()?;
         assert!(editor.speeds_mut().is_some_and(|speeds| speeds == [77]));
+        assert_eq!(editor.simulation_flags()[0], 1);
+        editor.set_simulation_flag(0, 3)?;
         editor.speeds_mut().expect("version stores speed")[0] = 42;
+        let expected_body = editor.encode()?;
+        assert_ne!(expected_body.len(), source_body_len);
+        let original_following = original_graph[path_body_start + source_body_len..].to_vec();
 
         manager.replace_path_manager_data(&editor)?;
-        assert_eq!(manager.serialized_object_graph.len(), original_graph.len());
-        let changed_offsets = original_graph
-            .iter()
-            .zip(&manager.serialized_object_graph)
-            .enumerate()
-            .filter_map(|(offset, (before, after))| (before != after).then_some(offset))
-            .collect::<Vec<_>>();
-        assert_eq!(changed_offsets, [path_body_start + path_body_len - 1]);
         assert_eq!(
-            manager.serialized_object_graph[path_body_start + path_body_len - 1],
-            42
+            manager.serialized_object_graph.len(),
+            original_graph.len() - source_body_len + expected_body.len()
         );
+        assert_eq!(
+            &manager.serialized_object_graph
+                [path_body_start..path_body_start + expected_body.len()],
+            expected_body
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[path_body_start + expected_body.len()..],
+            original_following
+        );
+        let (updated, updated_end) = manager.decode_path_prefix()?;
+        assert_eq!(updated.simulation_flags()[0], 3);
+        assert_eq!(updated.active_units()[0].speed, 42);
+        assert_eq!(updated_end, path_body_start + expected_body.len() + 2);
 
         let updated_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_path_manager_data(&editor).is_err());

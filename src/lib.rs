@@ -3965,6 +3965,7 @@ mod tests {
         assert_eq!(decoded.encode(), body);
 
         let mut editor = decoded.into_editor();
+        editor.set_simulation_flag(262_142, 0x0200)?;
         editor
             .speeds_mut()
             .ok_or_else(|| CrpError::InvalidAssetPayload {
@@ -3972,7 +3973,10 @@ mod tests {
                 offset: 0,
                 reason: "version 121011 should serialize speed".to_owned(),
             })?[0] = 88;
-        let mut expected = body;
+        let mut expected_flags = vec![0xff; 2_047];
+        expected_flags.extend_from_slice(&[0xfd, 0, 2, 0]);
+        let mut expected = expected_flags;
+        expected.extend_from_slice(&body[flag_bytes.len()..]);
         *expected
             .last_mut()
             .ok_or_else(|| CrpError::InvalidAssetPayload {
@@ -3981,10 +3985,60 @@ mod tests {
                 reason: "synthetic path body should contain a speed byte".to_owned(),
             })? = 88;
         assert_eq!(editor.encode()?, expected);
-        assert_eq!(&expected[..flag_bytes.len()], flag_bytes);
+        let (rewritten, _) = PathManagerData::decode_prefix(121_011, &expected)?;
+        assert_eq!(rewritten.simulation_flags().last(), Some(&0x0200));
+        assert_eq!(rewritten.active_units()[0].index, 262_143);
+        assert_eq!(rewritten.active_units()[0].speed, 88);
         assert!(
             PathManagerData::decode_prefix(121_011, &expected[..flag_bytes.len() - 1]).is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn path_manager_editor_reencodes_byte_simulation_flags() -> Result<(), CrpError> {
+        let mut flags = vec![0_u8; 262_143];
+        flags[0] = 1;
+        let mut body = Vec::new();
+        crate::encoded_array::write_encoded_byte_array(&mut body, &flags);
+        let source_flags_len = body.len();
+        body.extend_from_slice(&[
+            2, 3, // Path-finding and lane-type flags.
+            0, 0, 0, 4, // Four-byte vehicle-type mask from version 113001.
+            0, // Empty position list.
+            0, 0, 5, // Next path-unit index.
+            0, 0, 0, 6, // Build index.
+            0x3f, 0xc0, 0, 0,  // Length = 1.5.
+            77, // Serialized speed.
+        ]);
+
+        let (decoded, used) = PathManagerData::decode_prefix(116_020, &body)?;
+        assert_eq!(used, body.len());
+        assert_eq!(decoded.simulation_flags()[0], 1);
+        let mut editor = decoded.into_editor();
+        editor.set_simulation_flag(0, 3)?;
+        assert!(editor.set_simulation_flag(0, 0).is_err());
+        assert!(editor.set_simulation_flag(1, 1).is_err());
+        assert!(editor.set_simulation_flag(0, 256).is_err());
+        assert!(
+            editor
+                .set_simulation_flag(editor.simulation_flags().len(), 0)
+                .is_err()
+        );
+
+        flags[0] = 3;
+        let mut expected = Vec::new();
+        crate::encoded_array::write_encoded_byte_array_runs(&mut expected, &flags);
+        expected.extend_from_slice(&body[source_flags_len..]);
+        let encoded = editor.encode()?;
+        assert_eq!(encoded, expected);
+        assert_ne!(encoded.len(), body.len());
+        let (rewritten, consumed) = PathManagerData::decode_prefix(116_020, &encoded)?;
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(rewritten.simulation_flags()[0], 3);
+        assert_eq!(rewritten.active_units().len(), 1);
+        assert_eq!(rewritten.active_units()[0].index, 1);
+        assert_eq!(rewritten.active_units()[0].speed, 77);
         Ok(())
     }
 
