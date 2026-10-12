@@ -246,8 +246,9 @@ pub struct EventManagerRouteSchedule {
 /// One active EventManager route in ascending slot order.
 ///
 /// The seven base indexes and version-gated route metadata are exposed as raw
-/// values. Slot index, activity flags, and schedule count are fixed by the
-/// source body and cannot be changed by the route editor.
+/// values. Slot indexes, the activity pattern, and schedule counts are fixed
+/// by the source body; raw route-flag bits can be edited without activating or
+/// deactivating slots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerRouteRecord {
     /// One-based route slot represented by this record.
@@ -296,6 +297,8 @@ pub(crate) struct EventManagerReferenceData {
     format_version: u32,
     event_flags: Vec<u32>,
     event_flags_range: Option<Range<usize>>,
+    route_flags: Vec<u32>,
+    route_flags_range: Option<Range<usize>>,
     pub(crate) active_event_records: Vec<EventManagerEventRecord>,
     active_event_record_ranges: Vec<Range<usize>>,
     active_event_race_data_ranges: Vec<Option<Range<usize>>>,
@@ -354,10 +357,11 @@ pub struct EventManagerEventRecordsEditor {
 /// Editor for existing EventManager routes and their schedules.
 ///
 /// It edits route scalar values and schedule names for inner versions
-/// 121005–121034. Route count, slot indexes, flags, and schedule counts are
-/// fixed. Schedule names keep their source compact or wide encoding when
-/// possible and can resize the manager body. Schedule prefab indexes and other
-/// body bytes are preserved raw.
+/// 121005–121034. Route count, slot indexes, activity pattern, and schedule
+/// counts are fixed. Raw route-flag bits can change while retaining activity.
+/// Schedule names keep their source compact or wide encoding when possible.
+/// Changed arrays and names can resize the manager body. Schedule prefab
+/// indexes and other body bytes are preserved raw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventManagerRouteRecordsEditor {
     original: EventManagerReferenceData,
@@ -644,6 +648,8 @@ impl EventManagerReferenceData {
         ) = read_active_event_records(&mut reader, format_version, &event_flags)?;
 
         let (
+            route_flags,
+            route_flags_range,
             active_event_routes,
             active_event_route_ranges,
             route_schedule_name_ranges,
@@ -651,10 +657,30 @@ impl EventManagerReferenceData {
             route_schedule_count,
         ) = if format_version >= 121_005 {
             let route_capacity = read_capacity(&mut reader, "event route")?;
+            let route_flags_start = reader.offset();
             let route_flags = read_encoded_uint_array(&mut reader, route_capacity - 1)?;
-            read_active_event_routes(&mut reader, format_version, &route_flags)?
+            let route_flags_range = route_flags_start..reader.offset();
+            let (routes, route_ranges, name_ranges, compact_modes, schedule_count) =
+                read_active_event_routes(&mut reader, format_version, &route_flags)?;
+            (
+                route_flags,
+                Some(route_flags_range),
+                routes,
+                route_ranges,
+                name_ranges,
+                compact_modes,
+                schedule_count,
+            )
         } else {
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0)
+            (
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+            )
         };
 
         let milestone_count = usize::from(reader.read_u16_be()?);
@@ -713,6 +739,8 @@ impl EventManagerReferenceData {
             format_version,
             event_flags,
             event_flags_range,
+            route_flags,
+            route_flags_range,
             active_event_records,
             active_event_record_ranges,
             active_event_race_data_ranges,
@@ -750,8 +778,10 @@ impl EventManagerReferenceData {
         let event_flags_range = Some(event_flags_start..reader.offset());
 
         let route_capacity = read_capacity(&mut reader, "event route")?;
+        let route_flags_start = reader.offset();
         let route_flags = read_encoded_uint_array(&mut reader, route_capacity - 1)?;
         reject_active_flags(&reader, &route_flags, "event route")?;
+        let route_flags_range = Some(route_flags_start..reader.offset());
 
         let milestone_count = usize::from(reader.read_u16_be()?);
         let type_data_count = usize::from(reader.read_u16_be()?);
@@ -781,6 +811,8 @@ impl EventManagerReferenceData {
             format_version,
             event_flags,
             event_flags_range,
+            route_flags,
+            route_flags_range,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1446,6 +1478,38 @@ impl EventManagerRouteRecordsEditor {
         &mut self.routes
     }
 
+    /// Replaces raw bits in one active route flag without changing slot
+    /// activity.
+    ///
+    /// The index is zero-based among active routes in ascending slot order.
+    /// The encoded flag array is rewritten canonically and may change width.
+    pub fn set_route_flag_bits(&mut self, route_index: usize, value: u32) -> Result<(), CrpError> {
+        let original = self
+            .original
+            .active_event_routes
+            .get(route_index)
+            .ok_or_else(|| invalid_event_route(route_index, "route index is out of range"))?;
+        let range = self
+            .original
+            .active_event_route_ranges
+            .get(route_index)
+            .ok_or_else(|| {
+                invalid_event_route(route_index, "route range is missing from the source")
+            })?;
+        if (original.flags == 0) != (value == 0) {
+            return Err(invalid_event_route(
+                range.start,
+                "EventManager flag edits must preserve the slot's active state",
+            ));
+        }
+        let route = self
+            .routes
+            .get_mut(route_index)
+            .ok_or_else(|| invalid_event_route(route_index, "edited route is missing"))?;
+        route.flags = value;
+        Ok(())
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>, CrpError> {
         if self.routes.len() != self.original.active_event_routes.len()
             || self.routes.len() != self.original.active_event_route_ranges.len()
@@ -1458,6 +1522,7 @@ impl EventManagerRouteRecordsEditor {
             ));
         }
         let mut output = self.original.serialized_body.clone();
+        let mut route_flags = self.original.route_flags.clone();
         let mut edits = Vec::with_capacity(self.routes.len());
         for (((route, original_route), range), (name_ranges, compact_modes)) in self
             .routes
@@ -1471,13 +1536,24 @@ impl EventManagerRouteRecordsEditor {
                     .zip(&self.original.route_schedule_name_compact_modes),
             )
         {
-            if route.slot_index != original_route.slot_index || route.flags != original_route.flags
+            if route.slot_index != original_route.slot_index
+                || (route.flags == 0) != (original_route.flags == 0)
             {
                 return Err(invalid_event_route(
                     range.start,
-                    "EventManager route slot and activity flags cannot change in this editor",
+                    "EventManager route slot and activity pattern cannot change in this editor",
                 ));
             }
+            let flag_index = usize::from(route.slot_index).checked_sub(1).ok_or(
+                CrpError::ArithmeticOverflow("EventManager route slot index"),
+            )?;
+            let source_flag = route_flags.get_mut(flag_index).ok_or_else(|| {
+                invalid_event_route(
+                    range.start,
+                    "EventManager route flag is absent from the source array",
+                )
+            })?;
+            *source_flag = route.flags;
             if route.schedules.len() != original_route.schedules.len()
                 || route.schedules.len() != name_ranges.len()
                 || route.schedules.len() != compact_modes.len()
@@ -1497,6 +1573,14 @@ impl EventManagerRouteRecordsEditor {
                 range.start,
             )?;
             edits.push((range.clone(), encoded));
+        }
+        if route_flags != self.original.route_flags {
+            let range = self.original.route_flags_range.as_ref().ok_or_else(|| {
+                invalid_event_route(0, "EventManager route flag array is absent from the source")
+            })?;
+            let mut encoded_flags = Vec::new();
+            write_encoded_uint_array(&mut encoded_flags, &route_flags);
+            edits.insert(0, (range.clone(), encoded_flags));
         }
         for (range, encoded) in edits.into_iter().rev() {
             output.splice(range, encoded).for_each(drop);
@@ -3012,6 +3096,8 @@ fn finish(
     format_version: u32,
     event_flags: Vec<u32>,
     event_flags_range: Option<Range<usize>>,
+    route_flags: Vec<u32>,
+    route_flags_range: Option<Range<usize>>,
     active_event_records: Vec<EventManagerEventRecord>,
     active_event_record_ranges: Vec<Range<usize>>,
     active_event_race_data_ranges: Vec<Option<Range<usize>>>,
@@ -3042,6 +3128,8 @@ fn finish(
             format_version,
             event_flags,
             event_flags_range,
+            route_flags,
+            route_flags_range,
             active_event_records,
             active_event_record_ranges,
             active_event_race_data_ranges,
@@ -4129,6 +4217,66 @@ mod tests {
                 "truncated active route body at {end}"
             );
         }
+    }
+
+    #[test]
+    fn route_flag_edits_reencode_and_resize_the_flag_array() {
+        let mut bytes = vec![0x00, 0x00, 0x00, 0x04]; // One event and five route slots.
+        // Values 1, 2, 3, 4: two literal deltas, then two repeats.
+        bytes.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x81,
+        ]);
+        for route in 0..4_u16 {
+            for index in 0..7_u16 {
+                bytes.extend_from_slice(&(route * 10 + index).to_be_bytes());
+            }
+        }
+        bytes.extend_from_slice(&[0x00, 0x00]); // No unlock milestones.
+        bytes.extend_from_slice(&[0x00, 0x00]); // Empty event-prefab names.
+        bytes.push(0xff); // Match-preparing reference.
+        bytes.extend_from_slice(&[0xff, 0xff]); // Null band references.
+        bytes.extend_from_slice(&[0x34, 0x56]); // Band-popularity bonus.
+        bytes.extend_from_slice(&[0x12, 0x34]); // Profiler end index.
+
+        let (decoded, consumed) =
+            EventManagerReferenceData::decode_reader(121_005, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            decoded
+                .active_event_routes
+                .iter()
+                .map(|route| route.flags)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        let mut editor = decoded.into_route_records_editor();
+        assert!(editor.set_route_flag_bits(0, 0).is_err());
+        assert!(editor.set_route_flag_bits(4, 5).is_err());
+        editor.set_route_flag_bits(0, 5).unwrap();
+
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded.len(), bytes.len() + 6);
+        assert_eq!(
+            &encoded[..21],
+            [
+                0x00, 0x00, 0x00, 0x04, 0x03, // Capacity and canonical literal control.
+                0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
+                0x00, 0x04,
+            ]
+        );
+        assert_eq!(&encoded[21..], &bytes[15..]);
+
+        let (rewritten, rewritten_len) =
+            EventManagerReferenceData::decode_reader(121_005, &encoded).unwrap();
+        assert_eq!(rewritten_len, encoded.len());
+        assert_eq!(
+            rewritten
+                .active_event_routes
+                .iter()
+                .map(|route| route.flags)
+                .collect::<Vec<_>>(),
+            [5, 2, 3, 4]
+        );
     }
 
     #[test]

@@ -3917,11 +3917,13 @@ impl SimulationManagerData {
     /// Replaces existing EventManager route and schedule values in place.
     ///
     /// The editor must match this stream's version and exact source body.
-    /// Route count, slot indexes, activity flags, and schedule counts remain
-    /// fixed. Schedule names preserve their source encoding when possible and
-    /// may resize the route records and manager body. A compact name switches
-    /// to wide encoding when its new value cannot fit compact form. The
-    /// separate schedule-prefab scope and other bytes are preserved.
+    /// Route count, slot indexes, activity pattern, and schedule counts remain
+    /// fixed. Raw route-flag bits can change; the flag array is canonically
+    /// encoded and may resize the manager body. Schedule names preserve their
+    /// source encoding when possible and may resize the route records. A
+    /// compact name switches to wide encoding when its new value cannot fit
+    /// compact form. The separate schedule-prefab scope and other bytes are
+    /// preserved.
     pub fn replace_event_manager_route_records(
         &mut self,
         edited: &EventManagerRouteRecordsEditor,
@@ -17299,6 +17301,10 @@ mod manager_boundary_tests {
         editor.routes_mut()[0].schedules[0].frequency = Some(0x55);
         editor.routes_mut()[0].schedules[0].start_day = Some(0x66);
         editor.routes_mut()[0].schedules[0].start_month = Some(0x77);
+        assert!(editor.set_route_flag_bits(0, 0).is_err());
+        assert!(editor.set_route_flag_bits(1, 3).is_err());
+        editor.set_route_flag_bits(0, 3).unwrap();
+        body[route_start - 4..route_start].copy_from_slice(&3_u32.to_be_bytes());
 
         let mut invalid_editor = editor.clone();
         invalid_editor.routes_mut()[0]
@@ -17311,7 +17317,7 @@ mod manager_boundary_tests {
         );
         assert_eq!(manager.serialized_object_graph(), original_graph);
         let mut invalid_editor = editor.clone();
-        invalid_editor.routes_mut()[0].flags ^= 1;
+        invalid_editor.routes_mut()[0].flags = 0;
         assert!(
             manager
                 .replace_event_manager_route_records(&invalid_editor)
