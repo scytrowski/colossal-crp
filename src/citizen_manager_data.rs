@@ -787,6 +787,12 @@ fn shift_active_instance_offsets(
             "CitizenManager instance performance indices",
         )?;
         shift_optional_manager_offset(
+            &mut record.compatibility_value_offset,
+            old_boundary,
+            new_boundary,
+            "CitizenManager instance compatibility value",
+        )?;
+        shift_optional_manager_offset(
             &mut record.source_building_offset,
             old_boundary,
             new_boundary,
@@ -1276,6 +1282,7 @@ pub struct CitizenInstanceRecord {
     performer_index: Option<u8>,
     racer_index: Option<u8>,
     compatibility_value: Option<u16>,
+    compatibility_value_offset: Option<usize>,
     source_building: Option<u16>,
     target_building: u16,
     color_rgb_offset: Option<usize>,
@@ -1726,6 +1733,16 @@ impl CitizenManagerData {
                         .checked_add(offset)
                         .ok_or(CrpError::ArithmeticOverflow(
                             "CitizenManager instance performer/racer offset",
+                        ))
+                })
+                .transpose()?;
+            record.compatibility_value_offset = record
+                .compatibility_value_offset
+                .map(|offset| {
+                    instance_fields_start
+                        .checked_add(offset)
+                        .ok_or(CrpError::ArithmeticOverflow(
+                            "CitizenManager instance compatibility-value offset",
                         ))
                 })
                 .transpose()?;
@@ -2418,6 +2435,28 @@ impl CitizenManagerData {
         Ok(())
     }
 
+    /// Replaces the raw compatibility value serialized only at inner version
+    /// 121028. Its meaning is unknown; other versions return an error.
+    pub fn set_instance_compatibility_value(
+        &mut self,
+        record_index: usize,
+        value: u16,
+    ) -> Result<(), CrpError> {
+        let record = self
+            .active_instances
+            .get(record_index)
+            .ok_or_else(|| invalid(0, "CitizenInstance record index is out of range"))?;
+        let offset = record.compatibility_value_offset.ok_or_else(|| {
+            invalid(
+                record.original_record_start,
+                "CitizenInstance compatibility value is not serialized at this version",
+            )
+        })?;
+        write_fixed_bytes(&mut self.original_body, offset, &value.to_be_bytes())?;
+        self.active_instances[record_index].compatibility_value = Some(value);
+        Ok(())
+    }
+
     /// Replaces the source-building index from inner version 180.
     pub fn set_instance_source_building(
         &mut self,
@@ -2596,24 +2635,27 @@ fn decode_citizen_instance_record(
     } else {
         None
     };
-    let (performer_index, racer_index, compatibility_value) = if format_version
-        >= CITIZEN_INSTANCE_PERFORMER_VERSION
-    {
-        let performer_index = reader.read_u8()?;
-        let racer_index = reader.read_u8()?;
-        let compatibility_value = if format_version < CITIZEN_INSTANCE_COMPATIBILITY_END_VERSION {
-            Some(reader.read_u16_be()?)
+    let (performer_index, racer_index, compatibility_value, compatibility_value_offset) =
+        if format_version >= CITIZEN_INSTANCE_PERFORMER_VERSION {
+            let performer_index = reader.read_u8()?;
+            let racer_index = reader.read_u8()?;
+            let compatibility_value_offset = (format_version
+                < CITIZEN_INSTANCE_COMPATIBILITY_END_VERSION)
+                .then_some(reader.offset());
+            let compatibility_value = if compatibility_value_offset.is_some() {
+                Some(reader.read_u16_be()?)
+            } else {
+                None
+            };
+            (
+                Some(performer_index),
+                Some(racer_index),
+                compatibility_value,
+                compatibility_value_offset,
+            )
         } else {
-            None
+            (None, None, None, None)
         };
-        (
-            Some(performer_index),
-            Some(racer_index),
-            compatibility_value,
-        )
-    } else {
-        (None, None, None)
-    };
     let source_building_offset = if format_version >= CITIZEN_INSTANCE_SOURCE_BUILDING_VERSION {
         Some(reader.offset())
     } else {
@@ -2645,6 +2687,7 @@ fn decode_citizen_instance_record(
         performer_index,
         racer_index,
         compatibility_value,
+        compatibility_value_offset,
         source_building,
         target_building,
         color_rgb_offset,
@@ -3727,6 +3770,44 @@ mod tests {
         assert_eq!(uncolored.active_instances()[0].color_rgb(), None);
         assert!(uncolored.set_instance_color_rgb(0, [1, 2, 3]).is_err());
         assert_eq!(uncolored.encode(), uncolored_bytes);
+    }
+
+    #[test]
+    fn edits_version_121028_compatibility_value_as_raw_u16() {
+        let source = single_active_instance_body(121_028, 1);
+        let mut data =
+            CitizenManagerData::decode(121_028, &source).expect("version-121028 manager");
+        let offset = data.active_instances()[0]
+            .compatibility_value_offset
+            .expect("version-121028 compatibility field");
+        assert_eq!(&source[offset..offset + 2], &[0xab, 0xcd]);
+        assert_eq!(
+            data.active_instances()[0].compatibility_value(),
+            Some(0xabcd)
+        );
+
+        let mut expected = source.clone();
+        expected[offset..offset + 2].copy_from_slice(&0x1357_u16.to_be_bytes());
+        data.set_instance_compatibility_value(0, 0x1357)
+            .expect("edit raw compatibility value");
+        assert_eq!(
+            data.active_instances()[0].compatibility_value(),
+            Some(0x1357)
+        );
+        assert_eq!(data.encode(), expected);
+        let reread = CitizenManagerData::decode(121_028, &expected).expect("edited manager");
+        assert_eq!(
+            reread.active_instances()[0].compatibility_value(),
+            Some(0x1357)
+        );
+
+        let v121029 = single_active_instance_body(121_029, 1);
+        let mut newer =
+            CitizenManagerData::decode(121_029, &v121029).expect("version-121029 manager");
+        assert_eq!(newer.active_instances()[0].compatibility_value(), None);
+        assert!(newer.set_instance_compatibility_value(0, 0x1357).is_err());
+        assert!(newer.set_instance_compatibility_value(1, 0x1357).is_err());
+        assert_eq!(newer.encode(), v121029);
     }
 
     #[test]
