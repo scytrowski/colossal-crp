@@ -90,7 +90,7 @@ use crate::{
     NetFencePrefabEditor, NetFencePrefabPrefix, NetGuideCountsPrefix, NetInfoPrefabEditor,
     NetInfoPrefabPrefix, NetLanePrefix, NetManagerTailEditor, NetManagerTailPrefix,
     NetNodeCountersEditor, NetNodeCountersPrefix, NetNodeFlagsEditor, NetNodeFlagsPrefix,
-    NetNodeProblemsPrefix, NetNodeRecordsPrefix, NetSegmentCoverageEditor,
+    NetNodeProblemsEditor, NetNodeProblemsPrefix, NetNodeRecordsPrefix, NetSegmentCoverageEditor,
     NetSegmentCoveragePrefix, NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix,
     NetSegmentFlagsPrefix, NetSegmentProblemsPrefix, NetSegmentRecordsEditor,
     NetSegmentRecordsPrefix, NetSegmentTrafficLightsPrefix, NetTreePrefabEditor,
@@ -5922,17 +5922,120 @@ impl SimulationManagerData {
         &self,
         save_app_version: Option<u32>,
     ) -> Result<(NetNodeProblemsPrefix, usize), CrpError> {
+        let (_, data, _, end) = self.decode_net_node_problems_with_range(save_app_version)?;
+        Ok((data, end))
+    }
+
+    fn decode_net_node_problems_with_range(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<(NetNodeFlagsPrefix, NetNodeProblemsPrefix, usize, usize), CrpError> {
         let (node_flags, node_end) = self.decode_net_node_flags_prefix()?;
-        let mut reader = Reader::new(&self.serialized_object_graph);
-        reader.read_bytes(node_end)?;
+        let body = self
+            .serialized_object_graph
+            .get(node_end..)
+            .ok_or_else(|| invalid(node_end, "NetManager node-problem start is out of range"))?;
         let (data, body_length) = NetNodeProblemsPrefix::decode_prefix(
             self.format_version,
             save_app_version,
             &node_flags,
-            reader.remaining_bytes(),
+            body,
         )?;
-        reader.read_bytes(body_length)?;
-        Ok((data, reader.offset()))
+        let body_end = node_end
+            .checked_add(body_length)
+            .ok_or(CrpError::ArithmeticOverflow("NetManager node-problem end"))?;
+        Ok((node_flags, data, node_end, body_end))
+    }
+
+    /// Decodes NetManager node problem bits into an editor.
+    ///
+    /// `save_app_version` selects the UInt versus ULong layout for inner
+    /// versions 221–114999 and is retained by the editor.
+    pub fn decode_net_node_problems_editor(
+        &self,
+        save_app_version: Option<u32>,
+    ) -> Result<NetNodeProblemsEditor, CrpError> {
+        let (_, problems, _, _) = self.decode_net_node_problems_with_range(save_app_version)?;
+        Ok(problems.into_editor())
+    }
+
+    /// Replaces NetManager's problem-bit arrays for active nodes.
+    ///
+    /// The editor must match the stream's node flags, version, save-app gate,
+    /// and original bytes. Changed values can resize this section; the
+    /// following node-counter arrays are decoded before the edit is accepted.
+    pub fn replace_net_node_problems(
+        &mut self,
+        edited: &NetNodeProblemsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version
+            || edited.save_app_version() != save_app_version
+        {
+            return Err(invalid(
+                5,
+                "edited NetManager node-problem version does not match this stream",
+            ));
+        }
+        let (current_flags, current, body_start, body_end) =
+            self.decode_net_node_problems_with_range(save_app_version)?;
+        if current_flags.encode().as_slice() != edited.original_node_flags() {
+            return Err(invalid(
+                body_start,
+                "NetManager node flags do not match the problem editor's source",
+            ));
+        }
+        if current.encode().as_slice() != edited.original_prefix_bytes() {
+            return Err(invalid(
+                body_start,
+                "NetManager node-problem bytes do not match the editor's source prefix",
+            ));
+        }
+        let replacement = edited.encode()?;
+        if body_start.checked_add(current.encode().len()) != Some(body_end) {
+            return Err(invalid(
+                body_start,
+                "NetManager node-problem prefix range is inconsistent",
+            ));
+        }
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..body_end, replacement.iter().copied());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = self
+            .decode_net_node_problems_with_range(save_app_version)
+            .and_then(|(decoded_flags, decoded, actual_start, actual_end)| {
+                if decoded_flags.encode() != current_flags.encode() {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager node problems changed their source flags",
+                    ));
+                }
+                if decoded.encode() != replacement {
+                    return Err(invalid(
+                        body_start,
+                        "rewritten NetManager node problems do not match the editor",
+                    ));
+                }
+                let expected_end = body_start
+                    .checked_add(replacement.len())
+                    .ok_or(CrpError::ArithmeticOverflow("NetManager node-problem end"))?;
+                if actual_start != body_start || actual_end != expected_end {
+                    return Err(invalid(
+                        actual_end,
+                        "rewritten NetManager node problems have an unexpected boundary",
+                    ));
+                }
+                self.decode_net_node_counters_with_range(save_app_version)?;
+                Ok(())
+            });
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten NetManager node problems failed validation: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes sparse node wait times and counters after the problem array.
@@ -17748,6 +17851,72 @@ mod manager_boundary_tests {
 
         let edited_graph = manager.serialized_object_graph.clone();
         assert!(manager.replace_net_node_flags(&editor, Some(0)).is_err());
+        assert_eq!(manager.serialized_object_graph, edited_graph);
+        Ok(())
+    }
+
+    #[test]
+    fn net_node_problem_editor_resizes_and_preserves_following_counters()
+    -> Result<(), crate::CrpError> {
+        let path_fixture = include_bytes!("../tests/fixtures/path-manager-body-v116020-desert.bin");
+        let (mut manager, _) = synthetic_path_manager(path_fixture);
+        let lane_flags = vec![0_u16; 262_143];
+        let mut lane_prefix = Vec::new();
+        write_encoded_ushort_array(&mut lane_prefix, &lane_flags);
+        manager
+            .serialized_object_graph
+            .extend_from_slice(&lane_prefix);
+
+        let mut node_flags = vec![0_u32; 32_767];
+        node_flags[0] = 1;
+        write_encoded_uint_array_runs(&mut manager.serialized_object_graph, &node_flags);
+        let original_problem_start = manager.serialized_object_graph.len();
+        manager.serialized_object_graph.push(0x80); // One repeated zero ULong.
+        let original_problem_end = manager.serialized_object_graph.len();
+        write_encoded_byte_array(&mut manager.serialized_object_graph, &[5]);
+        write_encoded_ushort_array(&mut manager.serialized_object_graph, &[7, 9]);
+        manager
+            .serialized_object_graph
+            .extend_from_slice(&[0xaa, 0xbb]);
+
+        let (original, decoded_problem_end) =
+            manager.decode_net_node_problems_prefix(Some(201_499_120))?;
+        assert_eq!(decoded_problem_end, original_problem_end);
+        assert_eq!(original.problems()[0].problems1, 0);
+        let original_node_flags = manager.decode_net_node_flags_prefix()?.0.encode();
+        let following_counters = manager.serialized_object_graph[decoded_problem_end..].to_vec();
+        let mut editor = manager.decode_net_node_problems_editor(Some(201_499_120))?;
+        editor.problems1_mut()[0] = 0x1122_3344_5566_7788;
+        let replacement = editor.encode()?;
+        assert!(replacement.len() > original.encode().len());
+
+        manager.replace_net_node_problems(&editor, Some(201_499_120))?;
+        let (updated, updated_problem_end) =
+            manager.decode_net_node_problems_prefix(Some(201_499_120))?;
+        assert_eq!(updated.problems()[0].problems1, 0x1122_3344_5566_7788);
+        assert_eq!(
+            updated_problem_end,
+            original_problem_start + replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph[updated_problem_end..],
+            following_counters
+        );
+        assert_eq!(
+            manager.decode_net_node_flags_prefix()?.0.encode(),
+            original_node_flags
+        );
+        let (counters, _) = manager.decode_net_node_counters_prefix(Some(201_499_120))?;
+        assert_eq!(counters.counters()[0].max_wait_time, 5);
+        assert_eq!(counters.counters()[0].temp_counter, 7);
+        assert_eq!(counters.counters()[0].final_counter, 9);
+
+        let edited_graph = manager.serialized_object_graph.clone();
+        assert!(
+            manager
+                .replace_net_node_problems(&editor, Some(201_499_120))
+                .is_err()
+        );
         assert_eq!(manager.serialized_object_graph, edited_graph);
         Ok(())
     }

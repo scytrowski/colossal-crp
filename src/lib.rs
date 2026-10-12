@@ -109,8 +109,8 @@ pub use net_manager_data::{
     NetInfoPrefabPrefix, NetLane, NetLaneEditor, NetLanePrefix, NetManagerTailEditor,
     NetManagerTailPrefix, NetNodeCounter, NetNodeCountersEditor, NetNodeCountersPrefix,
     NetNodeFlag, NetNodeFlagsEditor, NetNodeFlagsPrefix, NetNodeInstanceGuideBody,
-    NetNodeInstanceGuideEditor, NetNodeProblem, NetNodeProblemsPrefix, NetNodeRecord,
-    NetNodeRecordsEditor, NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage,
+    NetNodeInstanceGuideEditor, NetNodeProblem, NetNodeProblemsEditor, NetNodeProblemsPrefix,
+    NetNodeRecord, NetNodeRecordsEditor, NetNodeRecordsPrefix, NetObjectHeader, NetSegmentCoverage,
     NetSegmentCoverageEditor, NetSegmentCoveragePrefix, NetSegmentEnvironment,
     NetSegmentEnvironmentEditor, NetSegmentEnvironmentPrefix, NetSegmentFlag,
     NetSegmentFlagsEditor, NetSegmentFlagsPrefix, NetSegmentProblem, NetSegmentProblemsEditor,
@@ -5778,6 +5778,30 @@ mod tests {
         manager.decode_net_node_counters_prefix(metadata.save_app_version)?;
         manager.decode_net_node_records_prefix(metadata.save_app_version)?;
         manager.decode_net_segment_flags_prefix(metadata.save_app_version)?;
+
+        let (problems, original_problem_end) =
+            manager.decode_net_node_problems_prefix(metadata.save_app_version)?;
+        let original_problem_bytes = problems.encode();
+        let problem_suffix = manager.serialized_object_graph()[original_problem_end..].to_vec();
+        let mut problem_editor =
+            manager.decode_net_node_problems_editor(metadata.save_app_version)?;
+        problem_editor.problems1_mut()[0] = 1;
+        let problem_replacement = problem_editor.encode()?;
+        assert_ne!(problem_replacement, original_problem_bytes);
+        manager.replace_net_node_problems(&problem_editor, metadata.save_app_version)?;
+        let (updated_problems, updated_problem_end) =
+            manager.decode_net_node_problems_prefix(metadata.save_app_version)?;
+        assert_eq!(updated_problems.problems()[0].problems1, 1);
+        assert_eq!(
+            updated_problem_end,
+            original_problem_end - original_problem_bytes.len() + problem_replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_problem_end..],
+            problem_suffix.as_slice()
+        );
+        manager.decode_net_node_counters_prefix(metadata.save_app_version)?;
+        manager.decode_net_node_records_prefix(metadata.save_app_version)?;
 
         let edited_graph = manager.serialized_object_graph().to_vec();
         assert!(

@@ -143,7 +143,25 @@ pub struct NetNodeProblemsPrefix {
     format_version: u32,
     save_app_version: Option<u32>,
     problems: Vec<NetNodeProblem>,
+    source_node_flags: Vec<u8>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for problem-bit arrays belonging to active NetManager nodes.
+///
+/// The version and save-app gates select whether edited values use a legacy
+/// UInt, one ULong, or interleaved ULong pairs. The source node-flag bytes and
+/// active-node order remain fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNodeProblemsEditor {
+    format_version: u32,
+    save_app_version: Option<u32>,
+    problems1: Vec<u64>,
+    problems2: Option<Vec<u64>>,
+    original_problems1: Vec<u64>,
+    original_problems2: Option<Vec<u64>>,
+    original_node_flags: Vec<u8>,
+    original_prefix: Vec<u8>,
 }
 
 /// Wait time and two counters for one active network node.
@@ -1252,6 +1270,7 @@ impl NetNodeProblemsPrefix {
                 format_version,
                 save_app_version,
                 problems,
+                source_node_flags: node_flags.encode(),
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -1276,6 +1295,136 @@ impl NetNodeProblemsPrefix {
     /// Writes the original encoded problem array exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Consumes the prefix to edit the serialized problem-bit arrays.
+    pub fn into_editor(self) -> NetNodeProblemsEditor {
+        let problems1 = self
+            .problems
+            .iter()
+            .map(|problem| problem.problems1)
+            .collect::<Vec<_>>();
+        let problems2 = (self.format_version >= TWO_PROBLEMS_VERSION).then(|| {
+            self.problems
+                .iter()
+                .map(|problem| problem.problems2)
+                .collect::<Vec<_>>()
+        });
+        NetNodeProblemsEditor {
+            format_version: self.format_version,
+            save_app_version: self.save_app_version,
+            original_problems1: problems1.clone(),
+            original_problems2: problems2.clone(),
+            problems1,
+            problems2,
+            original_node_flags: self.source_node_flags,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl NetNodeProblemsEditor {
+    /// Returns the inner DataSerializer version associated with this prefix.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns the saved application version used for the legacy problem gate.
+    pub fn save_app_version(&self) -> Option<u32> {
+        self.save_app_version
+    }
+
+    /// Returns mutable first problem-bit values for active nodes in buffer order.
+    pub fn problems1_mut(&mut self) -> &mut [u64] {
+        &mut self.problems1
+    }
+
+    /// Returns mutable second problem-bit values from inner version 115000 onward.
+    pub fn problems2_mut(&mut self) -> Option<&mut [u64]> {
+        self.problems2.as_deref_mut()
+    }
+
+    /// Encodes edited values using the source version's node-problem layout.
+    ///
+    /// Unchanged values preserve their original bytes. Legacy UInt values can
+    /// represent only the relocated low 30 bits and high two bits of the
+    /// exposed 64-bit value; values outside that mask are rejected.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.problems1.len() != self.original_problems1.len()
+            || self.problems2.as_ref().map(Vec::len)
+                != self.original_problems2.as_ref().map(Vec::len)
+        {
+            return Err(invalid(
+                0,
+                "edited node problem counts do not match the source",
+            ));
+        }
+        if self.problems1 == self.original_problems1 && self.problems2 == self.original_problems2 {
+            return Ok(self.original_prefix.clone());
+        }
+        if self.format_version < 164 {
+            return Err(invalid(
+                0,
+                "node problem values require inner version 164 or newer",
+            ));
+        }
+        if (self.format_version >= TWO_PROBLEMS_VERSION) != self.problems2.is_some() {
+            return Err(invalid(
+                0,
+                "second node problem values do not match this NetManager version",
+            ));
+        }
+
+        let mut output = Vec::new();
+        if self.format_version >= TWO_PROBLEMS_VERSION {
+            let problems2 = self.problems2.as_ref().ok_or_else(|| {
+                invalid(0, "second node problem values are absent from this version")
+            })?;
+            let value_count =
+                self.problems1
+                    .len()
+                    .checked_mul(2)
+                    .ok_or(CrpError::ArithmeticOverflow(
+                        "NetManager node problem count",
+                    ))?;
+            let mut interleaved = Vec::with_capacity(value_count);
+            for (&first, &second) in self.problems1.iter().zip(problems2) {
+                interleaved.push(first);
+                interleaved.push(second);
+            }
+            write_encoded_ulong_array(&mut output, &interleaved);
+        } else if self.format_version >= 221
+            && self
+                .save_app_version
+                .is_some_and(|version| version >= SAVE_APP_PROBLEMS_VERSION)
+        {
+            write_encoded_ulong_array(&mut output, &self.problems1);
+        } else {
+            const LEGACY_PROBLEM_MASK: u64 = 0xc000_0000_3fff_ffff;
+            let mut values = Vec::with_capacity(self.problems1.len());
+            for (index, &problem) in self.problems1.iter().enumerate() {
+                if problem & !LEGACY_PROBLEM_MASK != 0 {
+                    return Err(invalid(
+                        index,
+                        "edited node problem cannot be represented by the legacy UInt layout",
+                    ));
+                }
+                let value = ((problem & 0xc000_0000_0000_0000) >> 32) | (problem & 0x3fff_ffff);
+                values.push(u32::try_from(value).map_err(|_| {
+                    CrpError::ArithmeticOverflow("NetManager legacy node problem value")
+                })?);
+            }
+            write_encoded_uint_array(&mut output, &values);
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_node_flags(&self) -> &[u8] {
+        &self.original_node_flags
+    }
+
+    pub(crate) fn original_prefix_bytes(&self) -> &[u8] {
+        &self.original_prefix
     }
 }
 
@@ -4447,5 +4596,135 @@ mod net_node_flag_editor_tests {
             editor.encode().unwrap(),
             expected_uint_literals(&interleaved)
         );
+    }
+}
+
+#[cfg(test)]
+mod net_node_problem_editor_tests {
+    use super::{
+        LEGACY_NODE_FLAG_COUNT, NODE_COUNT, NetNodeFlagsPrefix, NetNodeProblemsPrefix,
+        SAVE_APP_PROBLEMS_VERSION, TWO_NODE_FLAGS_VERSION, TWO_PROBLEMS_VERSION,
+    };
+
+    fn expected_uint_literals(values: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for chunk in values.chunks(64) {
+            bytes.push((chunk.len() - 1) as u8);
+            for value in chunk {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        bytes
+    }
+
+    fn expected_ulong_literals(values: &[u64]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for chunk in values.chunks(64) {
+            bytes.push((chunk.len() - 1) as u8);
+            for value in chunk {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        bytes
+    }
+
+    fn node_flags(format_version: u32, active_indexes: &[usize]) -> NetNodeFlagsPrefix {
+        let primary_count = if format_version < 202 {
+            LEGACY_NODE_FLAG_COUNT
+        } else {
+            NODE_COUNT - 1
+        };
+        let mut primary = vec![0; primary_count];
+        for index in active_indexes {
+            primary[*index] = 1;
+        }
+        let encoded = if format_version >= TWO_NODE_FLAGS_VERSION {
+            let mut paired = Vec::with_capacity(primary.len() * 2);
+            for value in primary {
+                paired.extend_from_slice(&[value, 0]);
+            }
+            expected_uint_literals(&paired)
+        } else {
+            expected_uint_literals(&primary)
+        };
+        NetNodeFlagsPrefix::decode_prefix(format_version, &encoded)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn legacy_node_problem_editor_reverses_bit_relocation_and_rejects_unrepresentable_bits() {
+        let flags = node_flags(164, &[0, 2]);
+        let original_values = [0xc000_0005, 0x8000_0007];
+        let source = expected_uint_literals(&original_values);
+        let (prefix, consumed) =
+            NetNodeProblemsPrefix::decode_prefix(164, None, &flags, &source).unwrap();
+        assert_eq!(consumed, source.len());
+        assert_eq!(prefix.problems()[0].problems1, 0xc000_0000_0000_0005);
+        assert_eq!(prefix.problems()[1].problems1, 0x8000_0000_0000_0007);
+        assert_eq!(prefix.encode(), source);
+
+        let mut editor = prefix.into_editor();
+        editor.problems1_mut()[0] = 0x4000_0000_0000_0009;
+        editor.problems1_mut()[1] = 10;
+        assert_eq!(
+            editor.encode().unwrap(),
+            expected_uint_literals(&[0x4000_0009, 10])
+        );
+        editor.problems1_mut()[0] = 1 << 40;
+        assert!(editor.encode().is_err());
+    }
+
+    #[test]
+    fn node_problem_editor_obeys_application_and_format_gates() {
+        let flags = node_flags(221, &[0]);
+        let old_source = expected_uint_literals(&[0xc000_0001]);
+        let (old_prefix, _) = NetNodeProblemsPrefix::decode_prefix(
+            221,
+            Some(SAVE_APP_PROBLEMS_VERSION - 1),
+            &flags,
+            &old_source,
+        )
+        .unwrap();
+        let mut old_editor = old_prefix.into_editor();
+        old_editor.problems1_mut()[0] = 0x4000_0000_0000_0002;
+        assert_eq!(
+            old_editor.encode().unwrap(),
+            expected_uint_literals(&[0x4000_0002])
+        );
+
+        let wide_source = expected_ulong_literals(&[7]);
+        let (wide_prefix, _) = NetNodeProblemsPrefix::decode_prefix(
+            221,
+            Some(SAVE_APP_PROBLEMS_VERSION),
+            &flags,
+            &wide_source,
+        )
+        .unwrap();
+        let mut wide_editor = wide_prefix.into_editor();
+        wide_editor.problems1_mut()[0] = 0x1122_3344_5566_7788;
+        assert_eq!(
+            wide_editor.encode().unwrap(),
+            expected_ulong_literals(&[0x1122_3344_5566_7788])
+        );
+        assert!(NetNodeProblemsPrefix::decode_prefix(221, None, &flags, &old_source).is_err());
+
+        let modern_flags = node_flags(TWO_PROBLEMS_VERSION, &[0, 2]);
+        let modern_source = expected_ulong_literals(&[1, 2, 3, 4]);
+        let (modern_prefix, _) = NetNodeProblemsPrefix::decode_prefix(
+            TWO_PROBLEMS_VERSION,
+            None,
+            &modern_flags,
+            &modern_source,
+        )
+        .unwrap();
+        let mut modern_editor = modern_prefix.into_editor();
+        modern_editor.problems1_mut()[0] = 5;
+        modern_editor.problems2_mut().unwrap()[0] = 6;
+        assert_eq!(
+            modern_editor.encode().unwrap(),
+            expected_ulong_literals(&[5, 6, 3, 4])
+        );
+        assert!(modern_editor.problems2_mut().is_some());
     }
 }
