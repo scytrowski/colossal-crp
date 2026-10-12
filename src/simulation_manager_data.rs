@@ -10431,7 +10431,10 @@ impl SimulationManagerData {
         Ok(())
     }
 
-    /// Replaces only the population-related arrays, preserving all other graph bytes.
+    /// Replaces only the population-related arrays, preserving other fields.
+    /// The editor must come from the current BuildingManager body. The next
+    /// economic and service-selection fields are validated, and failures leave
+    /// the graph unchanged.
     pub fn replace_building_population(
         &mut self,
         edited: &BuildingPopulationEditor,
@@ -10450,12 +10453,19 @@ impl SimulationManagerData {
                 "edited BuildingManager active-building count does not match this stream",
             ));
         }
+        let original_bytes = original.encode();
         let body_start =
             graph_end
-                .checked_sub(original.encode().len())
+                .checked_sub(original_bytes.len())
                 .ok_or(CrpError::ArithmeticOverflow(
                     "BuildingManager population body start",
                 ))?;
+        if original_bytes.as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager population bytes do not match the editor's source",
+            ));
+        }
         let replacement = edited.encode()?;
         if graph_end > self.serialized_object_graph.len() {
             return Err(invalid(
@@ -10463,12 +10473,34 @@ impl SimulationManagerData {
                 "BuildingManager population body extends past manager graph",
             ));
         }
-        self.serialized_object_graph
-            .splice(body_start..graph_end, replacement);
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..graph_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = (|| {
+            let (decoded, _) = self.decode_building_population_prefix(save_app_version)?;
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten BuildingManager population fields do not match the editor",
+                ));
+            }
+            self.decode_building_service_selection_prefix(save_app_version)?;
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten BuildingManager population fields failed validation: {error}"),
+            ));
+        }
         Ok(())
     }
 
     /// Replaces only the traffic, routing, cash, room, and employment arrays.
+    /// The editor must come from the current BuildingManager body. The next
+    /// service-selection table is validated, and failures leave the graph
+    /// unchanged.
     pub fn replace_building_economic_fields(
         &mut self,
         edited: &BuildingEconomicFieldsEditor,
@@ -10488,12 +10520,19 @@ impl SimulationManagerData {
                 "edited BuildingManager active-building count does not match this stream",
             ));
         }
+        let original_bytes = original.encode();
         let body_start =
             graph_end
-                .checked_sub(original.encode().len())
+                .checked_sub(original_bytes.len())
                 .ok_or(CrpError::ArithmeticOverflow(
                     "BuildingManager economic fields body start",
                 ))?;
+        if original_bytes.as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager economic-field bytes do not match the editor's source",
+            ));
+        }
         let replacement = edited.encode()?;
         if graph_end > self.serialized_object_graph.len() {
             return Err(invalid(
@@ -10501,8 +10540,27 @@ impl SimulationManagerData {
                 "BuildingManager economic fields extend past manager graph",
             ));
         }
-        self.serialized_object_graph
-            .splice(body_start..graph_end, replacement);
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..graph_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = (|| {
+            let (decoded, _) = self.decode_building_economic_fields_prefix(save_app_version)?;
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten BuildingManager economic fields do not match the editor",
+                ));
+            }
+            self.decode_building_service_selection_prefix(save_app_version)?;
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten BuildingManager economic fields failed validation: {error}"),
+            ));
+        }
         Ok(())
     }
 

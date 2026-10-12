@@ -384,14 +384,14 @@ pub struct BuildingPopulationPrefix {
     seniors: Vec<u8>,
     fire_hazard: Vec<u8>,
     level: Vec<u8>,
+    serialized_fields: Vec<Vec<u8>>,
     serialized_prefix: Vec<u8>,
 }
 
 /// Editable per-building education, population, hazard, and level arrays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildingPopulationEditor {
-    format_version: u32,
-    active_building_count: usize,
+    original: BuildingPopulationPrefix,
     education1: Vec<u8>,
     education2: Vec<u8>,
     education3: Vec<u8>,
@@ -424,14 +424,14 @@ pub struct BuildingEconomicFieldsPrefix {
     educated3_unemployed: Vec<u8>,
     all_unemployed: Vec<u8>,
     event_route_index: Vec<u16>,
+    serialized_fields: Vec<Vec<u8>>,
     serialized_prefix: Vec<u8>,
 }
 
 /// Editable traffic, routing, cash, room, and employment columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildingEconomicFieldsEditor {
-    format_version: u32,
-    active_building_count: usize,
+    original: BuildingEconomicFieldsPrefix,
     cargo_traffic_rate: Vec<u32>,
     garbage_traffic_rate: Vec<u32>,
     access_segment: Vec<u16>,
@@ -534,6 +534,28 @@ fn read_ushort_field(
     Ok(values)
 }
 
+fn read_uint_field(
+    reader: &mut Reader<'_>,
+    count: usize,
+    serialized_fields: &mut Vec<Vec<u8>>,
+) -> Result<Vec<u32>, CrpError> {
+    let start = reader.offset();
+    let values = read_encoded_uint_array(reader, count)?;
+    serialized_fields.push(reader.consumed_bytes()[start..reader.offset()].to_vec());
+    Ok(values)
+}
+
+fn read_int_field(
+    reader: &mut Reader<'_>,
+    count: usize,
+    serialized_fields: &mut Vec<Vec<u8>>,
+) -> Result<Vec<i32>, CrpError> {
+    let start = reader.offset();
+    let values = read_encoded_int_array(reader, count)?;
+    serialized_fields.push(reader.consumed_bytes()[start..reader.offset()].to_vec());
+    Ok(values)
+}
+
 fn read_byte_field(
     reader: &mut Reader<'_>,
     count: usize,
@@ -545,11 +567,12 @@ fn read_byte_field(
     Ok(values)
 }
 
-fn write_ushort_field<'a>(
+fn write_preserving_field<'a, T: PartialEq>(
     output: &mut Vec<u8>,
     original_fields: &mut impl Iterator<Item = &'a Vec<u8>>,
-    values: &[u16],
-    original_values: &[u16],
+    values: &[T],
+    original_values: &[T],
+    write_changed: impl FnOnce(&mut Vec<u8>, &[T]) -> Result<(), CrpError>,
 ) -> Result<(), CrpError> {
     let original_bytes = original_fields.next().ok_or_else(|| {
         invalid_building_encoded_fields(output.len(), "source field bytes are missing")
@@ -557,9 +580,63 @@ fn write_ushort_field<'a>(
     if values == original_values {
         output.extend_from_slice(original_bytes);
     } else {
-        write_encoded_ushort_array(output, values);
+        write_changed(output, values)?;
     }
     Ok(())
+}
+
+fn write_ushort_field<'a>(
+    output: &mut Vec<u8>,
+    original_fields: &mut impl Iterator<Item = &'a Vec<u8>>,
+    values: &[u16],
+    original_values: &[u16],
+) -> Result<(), CrpError> {
+    write_preserving_field(
+        output,
+        original_fields,
+        values,
+        original_values,
+        |output, values| {
+            write_encoded_ushort_array(output, values);
+            Ok(())
+        },
+    )
+}
+
+fn write_uint_field<'a>(
+    output: &mut Vec<u8>,
+    original_fields: &mut impl Iterator<Item = &'a Vec<u8>>,
+    values: &[u32],
+    original_values: &[u32],
+) -> Result<(), CrpError> {
+    write_preserving_field(
+        output,
+        original_fields,
+        values,
+        original_values,
+        |output, values| {
+            write_encoded_uint_array(output, values);
+            Ok(())
+        },
+    )
+}
+
+fn write_int_field<'a>(
+    output: &mut Vec<u8>,
+    original_fields: &mut impl Iterator<Item = &'a Vec<u8>>,
+    values: &[i32],
+    original_values: &[i32],
+) -> Result<(), CrpError> {
+    write_preserving_field(
+        output,
+        original_fields,
+        values,
+        original_values,
+        |output, values| {
+            write_encoded_int_array(output, values);
+            Ok(())
+        },
+    )
 }
 
 fn write_byte_field<'a>(
@@ -568,15 +645,16 @@ fn write_byte_field<'a>(
     values: &[u8],
     original_values: &[u8],
 ) -> Result<(), CrpError> {
-    let original_bytes = original_fields.next().ok_or_else(|| {
-        invalid_building_encoded_fields(output.len(), "source field bytes are missing")
-    })?;
-    if values == original_values {
-        output.extend_from_slice(original_bytes);
-    } else {
-        write_encoded_byte_array(output, values);
-    }
-    Ok(())
+    write_preserving_field(
+        output,
+        original_fields,
+        values,
+        original_values,
+        |output, values| {
+            write_encoded_byte_array(output, values);
+            Ok(())
+        },
+    )
 }
 
 impl BuildingBufferFieldsPrefix {
@@ -1695,26 +1773,30 @@ impl BuildingPopulationPrefix {
             .filter(|building| building.flags != 0)
             .count();
         let mut reader = Reader::new(bytes);
-        let education1 = read_encoded_byte_array(&mut reader, active_building_count)?;
-        let education2 = read_encoded_byte_array(&mut reader, active_building_count)?;
-        let education3 = read_encoded_byte_array(&mut reader, active_building_count)?;
+        let mut serialized_fields = Vec::new();
+        let education1 =
+            read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?;
+        let education2 =
+            read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?;
+        let education3 =
+            read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?;
         let children = if format_version >= 113_005 {
-            read_encoded_byte_array(&mut reader, active_building_count)?
+            read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
-        let teens = read_encoded_byte_array(&mut reader, active_building_count)?;
-        let youngs = read_encoded_byte_array(&mut reader, active_building_count)?;
-        let adults = read_encoded_byte_array(&mut reader, active_building_count)?;
-        let seniors = read_encoded_byte_array(&mut reader, active_building_count)?;
+        let teens = read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?;
+        let youngs = read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?;
+        let adults = read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?;
+        let seniors = read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?;
         let fire_hazard = if format_version >= 175 {
-            read_encoded_byte_array(&mut reader, active_building_count)?
+            read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         // Before 111005 the game consumes and discards this column from 207 onward.
         let level = if format_version >= 207 {
-            read_encoded_byte_array(&mut reader, active_building_count)?
+            read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
@@ -1733,6 +1815,7 @@ impl BuildingPopulationPrefix {
                 seniors,
                 fire_hazard,
                 level,
+                serialized_fields,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -1795,21 +1878,31 @@ impl BuildingPopulationPrefix {
         self.serialized_prefix.clone()
     }
 
-    /// Creates an editor; changed arrays will use canonical literal encoding.
+    /// Creates an editor that retains unchanged array bytes and writes changed
+    /// arrays with canonical literal encoding.
     pub fn into_editor(self) -> BuildingPopulationEditor {
+        let education1 = self.education1.clone();
+        let education2 = self.education2.clone();
+        let education3 = self.education3.clone();
+        let children = self.children.clone();
+        let teens = self.teens.clone();
+        let youngs = self.youngs.clone();
+        let adults = self.adults.clone();
+        let seniors = self.seniors.clone();
+        let fire_hazard = self.fire_hazard.clone();
+        let level = self.level.clone();
         BuildingPopulationEditor {
-            format_version: self.format_version,
-            active_building_count: self.active_building_count,
-            education1: self.education1,
-            education2: self.education2,
-            education3: self.education3,
-            children: self.children,
-            teens: self.teens,
-            youngs: self.youngs,
-            adults: self.adults,
-            seniors: self.seniors,
-            fire_hazard: self.fire_hazard,
-            level: self.level,
+            original: self,
+            education1,
+            education2,
+            education3,
+            children,
+            teens,
+            youngs,
+            adults,
+            seniors,
+            fire_hazard,
+            level,
         }
     }
 }
@@ -1817,11 +1910,11 @@ impl BuildingPopulationPrefix {
 impl BuildingPopulationEditor {
     /// Returns the inner DataSerializer version associated with these arrays.
     pub fn format_version(&self) -> u32 {
-        self.format_version
+        self.original.format_version
     }
     /// Returns the number of active buildings represented by these arrays.
     pub fn active_building_count(&self) -> usize {
-        self.active_building_count
+        self.original.active_building_count
     }
     /// Returns editable education-level-1 values.
     pub fn education1_mut(&mut self) -> &mut [u8] {
@@ -1864,15 +1957,17 @@ impl BuildingPopulationEditor {
         &mut self.level
     }
 
-    /// Encodes the version-gated arrays with canonical literal controls.
+    /// Encodes the version-gated arrays, preserving unchanged field bytes.
+    /// Changed arrays use canonical literal controls.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
-        if self.format_version < 164 {
+        let original = &self.original;
+        if original.format_version < 164 {
             return Err(invalid_population("unsupported inner version"));
         }
-        let count = self.active_building_count;
-        let has_children = self.format_version >= 113_005;
-        let has_fire_hazard = self.format_version >= 175;
-        let has_level = self.format_version >= 207;
+        let count = original.active_building_count;
+        let has_children = original.format_version >= 113_005;
+        let has_fire_hazard = original.format_version >= 175;
+        let has_level = original.format_version >= 207;
         if [
             self.education1.len(),
             self.education2.len(),
@@ -1892,23 +1987,57 @@ impl BuildingPopulationEditor {
                 "one or more array counts do not match version and active buildings",
             ));
         }
-        let mut output = Vec::new();
-        for array in [&self.education1, &self.education2, &self.education3] {
-            write_encoded_byte_array(&mut output, array);
+        let mut output = Vec::with_capacity(original.serialized_prefix.len());
+        let mut original_fields = original.serialized_fields.iter();
+        for (values, original_values) in [
+            (&self.education1, &original.education1),
+            (&self.education2, &original.education2),
+            (&self.education3, &original.education3),
+        ] {
+            write_byte_field(&mut output, &mut original_fields, values, original_values)?;
         }
         if has_children {
-            write_encoded_byte_array(&mut output, &self.children);
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.children,
+                &original.children,
+            )?;
         }
-        for array in [&self.teens, &self.youngs, &self.adults, &self.seniors] {
-            write_encoded_byte_array(&mut output, array);
+        for (values, original_values) in [
+            (&self.teens, &original.teens),
+            (&self.youngs, &original.youngs),
+            (&self.adults, &original.adults),
+            (&self.seniors, &original.seniors),
+        ] {
+            write_byte_field(&mut output, &mut original_fields, values, original_values)?;
         }
         if has_fire_hazard {
-            write_encoded_byte_array(&mut output, &self.fire_hazard);
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.fire_hazard,
+                &original.fire_hazard,
+            )?;
         }
         if has_level {
-            write_encoded_byte_array(&mut output, &self.level);
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.level,
+                &original.level,
+            )?;
+        }
+        if original_fields.next().is_some() {
+            return Err(invalid_population(
+                "source contains more fields than the version allows",
+            ));
         }
         Ok(output)
+    }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original.serialized_prefix
     }
 }
 
@@ -1928,30 +2057,31 @@ impl BuildingEconomicFieldsPrefix {
             .filter(|building| building.flags != 0)
             .count();
         let mut reader = Reader::new(bytes);
+        let mut serialized_fields = Vec::new();
         let cargo_traffic_rate = if format_version >= 115_004 {
-            read_encoded_uint_array(&mut reader, active_building_count)?
+            read_uint_field(&mut reader, active_building_count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let garbage_traffic_rate = if format_version >= 115_022 {
-            read_encoded_uint_array(&mut reader, active_building_count)?
+            read_uint_field(&mut reader, active_building_count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let access_segment = if format_version >= 115_013 {
-            read_encoded_ushort_array(&mut reader, active_building_count)?
+            read_ushort_field(&mut reader, active_building_count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let event_access_segment = if format_version >= 121_017 {
-            read_encoded_ushort_array(&mut reader, active_building_count)?
+            read_ushort_field(&mut reader, active_building_count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let cash_buffer = if format_version >= 116_006 {
-            read_encoded_int_array(&mut reader, active_building_count)?
+            read_int_field(&mut reader, active_building_count, &mut serialized_fields)?
         } else if format_version >= 116_001 {
-            read_encoded_ushort_array(&mut reader, active_building_count)?
+            read_ushort_field(&mut reader, active_building_count, &mut serialized_fields)?
                 .into_iter()
                 .map(i32::from)
                 .collect()
@@ -1960,10 +2090,10 @@ impl BuildingEconomicFieldsPrefix {
         };
         let (room_cost, room_cost_target, room_max, room_used) = if format_version >= 117_005 {
             (
-                read_encoded_ushort_array(&mut reader, active_building_count)?,
-                read_encoded_ushort_array(&mut reader, active_building_count)?,
-                read_encoded_ushort_array(&mut reader, active_building_count)?,
-                read_encoded_ushort_array(&mut reader, active_building_count)?,
+                read_ushort_field(&mut reader, active_building_count, &mut serialized_fields)?,
+                read_ushort_field(&mut reader, active_building_count, &mut serialized_fields)?,
+                read_ushort_field(&mut reader, active_building_count, &mut serialized_fields)?,
+                read_ushort_field(&mut reader, active_building_count, &mut serialized_fields)?,
             )
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
@@ -1976,17 +2106,17 @@ impl BuildingEconomicFieldsPrefix {
             all_unemployed,
         ) = if format_version >= 120_001 {
             (
-                read_encoded_byte_array(&mut reader, active_building_count)?,
-                read_encoded_byte_array(&mut reader, active_building_count)?,
-                read_encoded_byte_array(&mut reader, active_building_count)?,
-                read_encoded_byte_array(&mut reader, active_building_count)?,
-                read_encoded_byte_array(&mut reader, active_building_count)?,
+                read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?,
+                read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?,
+                read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?,
+                read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?,
+                read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?,
             )
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
         let event_route_index = if format_version >= 121_005 {
-            read_encoded_ushort_array(&mut reader, active_building_count)?
+            read_ushort_field(&mut reader, active_building_count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
@@ -2010,6 +2140,7 @@ impl BuildingEconomicFieldsPrefix {
                 educated3_unemployed,
                 all_unemployed,
                 event_route_index,
+                serialized_fields,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -2089,26 +2220,41 @@ impl BuildingEconomicFieldsPrefix {
         self.serialized_prefix.clone()
     }
 
-    /// Creates an editor; changed fields use valid canonical array encoding.
+    /// Creates an editor that retains unchanged field bytes and writes changed
+    /// arrays with canonical encoding.
     pub fn into_editor(self) -> BuildingEconomicFieldsEditor {
+        let cargo_traffic_rate = self.cargo_traffic_rate.clone();
+        let garbage_traffic_rate = self.garbage_traffic_rate.clone();
+        let access_segment = self.access_segment.clone();
+        let event_access_segment = self.event_access_segment.clone();
+        let cash_buffer = self.cash_buffer.clone();
+        let room_cost = self.room_cost.clone();
+        let room_cost_target = self.room_cost_target.clone();
+        let room_max = self.room_max.clone();
+        let room_used = self.room_used.clone();
+        let educated0_unemployed = self.educated0_unemployed.clone();
+        let educated1_unemployed = self.educated1_unemployed.clone();
+        let educated2_unemployed = self.educated2_unemployed.clone();
+        let educated3_unemployed = self.educated3_unemployed.clone();
+        let all_unemployed = self.all_unemployed.clone();
+        let event_route_index = self.event_route_index.clone();
         BuildingEconomicFieldsEditor {
-            format_version: self.format_version,
-            active_building_count: self.active_building_count,
-            cargo_traffic_rate: self.cargo_traffic_rate,
-            garbage_traffic_rate: self.garbage_traffic_rate,
-            access_segment: self.access_segment,
-            event_access_segment: self.event_access_segment,
-            cash_buffer: self.cash_buffer,
-            room_cost: self.room_cost,
-            room_cost_target: self.room_cost_target,
-            room_max: self.room_max,
-            room_used: self.room_used,
-            educated0_unemployed: self.educated0_unemployed,
-            educated1_unemployed: self.educated1_unemployed,
-            educated2_unemployed: self.educated2_unemployed,
-            educated3_unemployed: self.educated3_unemployed,
-            all_unemployed: self.all_unemployed,
-            event_route_index: self.event_route_index,
+            original: self,
+            cargo_traffic_rate,
+            garbage_traffic_rate,
+            access_segment,
+            event_access_segment,
+            cash_buffer,
+            room_cost,
+            room_cost_target,
+            room_max,
+            room_used,
+            educated0_unemployed,
+            educated1_unemployed,
+            educated2_unemployed,
+            educated3_unemployed,
+            all_unemployed,
+            event_route_index,
         }
     }
 }
@@ -2116,11 +2262,11 @@ impl BuildingEconomicFieldsPrefix {
 impl BuildingEconomicFieldsEditor {
     /// Returns the inner DataSerializer version associated with these fields.
     pub fn format_version(&self) -> u32 {
-        self.format_version
+        self.original.format_version
     }
     /// Returns the active-building count represented by these fields.
     pub fn active_building_count(&self) -> usize {
-        self.active_building_count
+        self.original.active_building_count
     }
     /// Returns editable cargo traffic values.
     pub fn cargo_traffic_rate_mut(&mut self) -> &mut [u32] {
@@ -2183,49 +2329,31 @@ impl BuildingEconomicFieldsEditor {
         &mut self.event_route_index
     }
 
-    /// Encodes the version-gated arrays and checks each active-building count.
+    /// Encodes the version-gated arrays, preserving unchanged field bytes.
+    /// Changed arrays use canonical encoding.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
-        if self.format_version < 164 {
+        let original = &self.original;
+        let version = original.format_version;
+        if version < 164 {
             return Err(invalid_economic("unsupported inner version"));
         }
-        let count = self.active_building_count;
+        let count = original.active_building_count;
         let gate_counts = [
-            (
-                self.format_version >= 115_004,
-                self.cargo_traffic_rate.len(),
-            ),
-            (
-                self.format_version >= 115_022,
-                self.garbage_traffic_rate.len(),
-            ),
-            (self.format_version >= 115_013, self.access_segment.len()),
-            (
-                self.format_version >= 121_017,
-                self.event_access_segment.len(),
-            ),
-            (self.format_version >= 116_001, self.cash_buffer.len()),
-            (self.format_version >= 117_005, self.room_cost.len()),
-            (self.format_version >= 117_005, self.room_cost_target.len()),
-            (self.format_version >= 117_005, self.room_max.len()),
-            (self.format_version >= 117_005, self.room_used.len()),
-            (
-                self.format_version >= 120_001,
-                self.educated0_unemployed.len(),
-            ),
-            (
-                self.format_version >= 120_001,
-                self.educated1_unemployed.len(),
-            ),
-            (
-                self.format_version >= 120_001,
-                self.educated2_unemployed.len(),
-            ),
-            (
-                self.format_version >= 120_001,
-                self.educated3_unemployed.len(),
-            ),
-            (self.format_version >= 120_001, self.all_unemployed.len()),
-            (self.format_version >= 121_005, self.event_route_index.len()),
+            (version >= 115_004, self.cargo_traffic_rate.len()),
+            (version >= 115_022, self.garbage_traffic_rate.len()),
+            (version >= 115_013, self.access_segment.len()),
+            (version >= 121_017, self.event_access_segment.len()),
+            (version >= 116_001, self.cash_buffer.len()),
+            (version >= 117_005, self.room_cost.len()),
+            (version >= 117_005, self.room_cost_target.len()),
+            (version >= 117_005, self.room_max.len()),
+            (version >= 117_005, self.room_used.len()),
+            (version >= 120_001, self.educated0_unemployed.len()),
+            (version >= 120_001, self.educated1_unemployed.len()),
+            (version >= 120_001, self.educated2_unemployed.len()),
+            (version >= 120_001, self.educated3_unemployed.len()),
+            (version >= 120_001, self.all_unemployed.len()),
+            (version >= 121_005, self.event_route_index.len()),
         ];
         if gate_counts
             .iter()
@@ -2235,8 +2363,8 @@ impl BuildingEconomicFieldsEditor {
                 "one or more array counts do not match version and active buildings",
             ));
         }
-        if self.format_version < 116_006
-            && self.format_version >= 116_001
+        if version < 116_006
+            && version >= 116_001
             && self
                 .cash_buffer
                 .iter()
@@ -2246,54 +2374,106 @@ impl BuildingEconomicFieldsEditor {
                 "legacy cash buffer value does not fit in u16",
             ));
         }
-        let mut output = Vec::new();
-        if self.format_version >= 115_004 {
-            write_encoded_uint_array(&mut output, &self.cargo_traffic_rate);
+        let mut output = Vec::with_capacity(original.serialized_prefix.len());
+        let mut original_fields = original.serialized_fields.iter();
+        if version >= 115_004 {
+            write_uint_field(
+                &mut output,
+                &mut original_fields,
+                &self.cargo_traffic_rate,
+                &original.cargo_traffic_rate,
+            )?;
         }
-        if self.format_version >= 115_022 {
-            write_encoded_uint_array(&mut output, &self.garbage_traffic_rate);
+        if version >= 115_022 {
+            write_uint_field(
+                &mut output,
+                &mut original_fields,
+                &self.garbage_traffic_rate,
+                &original.garbage_traffic_rate,
+            )?;
         }
-        if self.format_version >= 115_013 {
-            write_encoded_ushort_array(&mut output, &self.access_segment);
+        if version >= 115_013 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.access_segment,
+                &original.access_segment,
+            )?;
         }
-        if self.format_version >= 121_017 {
-            write_encoded_ushort_array(&mut output, &self.event_access_segment);
+        if version >= 121_017 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.event_access_segment,
+                &original.event_access_segment,
+            )?;
         }
-        if self.format_version >= 116_006 {
-            write_encoded_int_array(&mut output, &self.cash_buffer);
-        } else if self.format_version >= 116_001 {
-            let values = self
-                .cash_buffer
-                .iter()
-                .map(|value| *value as u16)
-                .collect::<Vec<_>>();
-            write_encoded_ushort_array(&mut output, &values);
+        if version >= 116_006 {
+            write_int_field(
+                &mut output,
+                &mut original_fields,
+                &self.cash_buffer,
+                &original.cash_buffer,
+            )?;
+        } else if version >= 116_001 {
+            write_preserving_field(
+                &mut output,
+                &mut original_fields,
+                &self.cash_buffer,
+                &original.cash_buffer,
+                |output, values| {
+                    let values = values
+                        .iter()
+                        .map(|value| {
+                            u16::try_from(*value).map_err(|_| {
+                                invalid_economic("legacy cash buffer value does not fit in u16")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    write_encoded_ushort_array(output, &values);
+                    Ok(())
+                },
+            )?;
         }
-        if self.format_version >= 117_005 {
-            for values in [
-                &self.room_cost,
-                &self.room_cost_target,
-                &self.room_max,
-                &self.room_used,
+        if version >= 117_005 {
+            for (values, original_values) in [
+                (&self.room_cost, &original.room_cost),
+                (&self.room_cost_target, &original.room_cost_target),
+                (&self.room_max, &original.room_max),
+                (&self.room_used, &original.room_used),
             ] {
-                write_encoded_ushort_array(&mut output, values);
+                write_ushort_field(&mut output, &mut original_fields, values, original_values)?;
             }
         }
-        if self.format_version >= 120_001 {
-            for values in [
-                &self.educated0_unemployed,
-                &self.educated1_unemployed,
-                &self.educated2_unemployed,
-                &self.educated3_unemployed,
-                &self.all_unemployed,
+        if version >= 120_001 {
+            for (values, original_values) in [
+                (&self.educated0_unemployed, &original.educated0_unemployed),
+                (&self.educated1_unemployed, &original.educated1_unemployed),
+                (&self.educated2_unemployed, &original.educated2_unemployed),
+                (&self.educated3_unemployed, &original.educated3_unemployed),
+                (&self.all_unemployed, &original.all_unemployed),
             ] {
-                write_encoded_byte_array(&mut output, values);
+                write_byte_field(&mut output, &mut original_fields, values, original_values)?;
             }
         }
-        if self.format_version >= 121_005 {
-            write_encoded_ushort_array(&mut output, &self.event_route_index);
+        if version >= 121_005 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.event_route_index,
+                &original.event_route_index,
+            )?;
+        }
+        if original_fields.next().is_some() {
+            return Err(invalid_economic(
+                "source contains more fields than the version allows",
+            ));
         }
         Ok(output)
+    }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original.serialized_prefix
     }
 }
 
@@ -3473,8 +3653,8 @@ mod tests {
     use super::{
         BuildingBufferFieldsPrefix, BuildingEconomicFieldsPrefix, BuildingFacultyBonusesPrefix,
         BuildingFlag, BuildingFlagsPrefix, BuildingInstanceRecordsPrefix,
-        BuildingMonumentEffectsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
-        BuildingPrefabPrefix, BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedPrefix,
+        BuildingMonumentEffectsPrefix, BuildingPopulationPrefix, BuildingPrefabPrefix,
+        BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedPrefix,
         BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryPrefix,
         fixed_object_header_count, timer_fields_for_version,
     };
@@ -4089,21 +4269,45 @@ mod tests {
         assert_eq!(prefix.level(), [10]);
         assert_eq!(prefix.encode(), encoded);
 
-        let invalid = BuildingPopulationEditor {
-            format_version: 113_005,
-            active_building_count: 1,
-            education1: vec![1],
-            education2: vec![2],
-            education3: vec![3],
-            children: Vec::new(),
-            teens: vec![5],
-            youngs: vec![6],
-            adults: vec![7],
-            seniors: vec![8],
-            fire_hazard: vec![9],
-            level: vec![10],
-        };
+        let mut invalid = prefix.into_editor();
+        invalid.children.clear();
         assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn building_population_editor_preserves_unchanged_encoded_columns() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 207,
+            building_flags: vec![
+                BuildingFlag {
+                    index: 1,
+                    flags: 1,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 2,
+                    flags: 1,
+                    flags2: 0,
+                },
+            ],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
+            serialized_prefix: Vec::new(),
+        };
+        // Each column uses a repeat control for two zero values.
+        let encoded = [0x81; 9];
+        let (prefix, consumed) = BuildingPopulationPrefix::decode_prefix(207, &flags, &encoded)
+            .expect("valid noncanonical population columns");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(prefix.into_editor().encode().unwrap(), encoded);
+
+        let (prefix, _) = BuildingPopulationPrefix::decode_prefix(207, &flags, &encoded)
+            .expect("valid noncanonical population columns");
+        let mut editor = prefix.into_editor();
+        editor.education1_mut()[0] = 1;
+        let mut expected = vec![1, 1, 0];
+        expected.extend([0x81; 8]);
+        assert_eq!(editor.encode().unwrap(), expected);
     }
 
     #[test]
@@ -4150,6 +4354,66 @@ mod tests {
             .expect("rewritten economic fields");
         assert_eq!(updated.cash_buffer(), [-11]);
         assert_eq!(updated.event_route_index(), [21]);
+    }
+
+    #[test]
+    fn building_economic_editor_preserves_unchanged_encoded_columns() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 121_017,
+            building_flags: vec![
+                BuildingFlag {
+                    index: 1,
+                    flags: 1,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 2,
+                    flags: 1,
+                    flags2: 0,
+                },
+            ],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
+            serialized_prefix: Vec::new(),
+        };
+        // Each encoded numeric or byte column repeats its initial zero delta.
+        let encoded = [0x81; 15];
+        let (prefix, consumed) =
+            BuildingEconomicFieldsPrefix::decode_prefix(121_017, &flags, &encoded)
+                .expect("valid noncanonical economic columns");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(prefix.into_editor().encode().unwrap(), encoded);
+
+        let (prefix, _) = BuildingEconomicFieldsPrefix::decode_prefix(121_017, &flags, &encoded)
+            .expect("valid noncanonical economic columns");
+        let mut editor = prefix.into_editor();
+        editor.cargo_traffic_rate_mut()[0] = 1;
+        let mut expected = vec![1, 0, 0, 0, 1, 0, 0, 0, 0];
+        expected.extend([0x81; 14]);
+        assert_eq!(editor.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn building_legacy_cash_editor_preserves_unchanged_encoded_fields() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 116_001,
+            building_flags: vec![BuildingFlag {
+                index: 1,
+                flags: 1,
+                flags2: 0,
+            }],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
+            serialized_prefix: Vec::new(),
+        };
+        let encoded = [0x80; 4];
+        let (prefix, consumed) =
+            BuildingEconomicFieldsPrefix::decode_prefix(116_001, &flags, &encoded)
+                .expect("valid legacy noncanonical fields");
+        assert_eq!(consumed, encoded.len());
+        let mut editor = prefix.into_editor();
+        editor.cargo_traffic_rate_mut()[0] = 1;
+        assert_eq!(editor.encode().unwrap(), [0, 0, 0, 0, 1, 0x80, 0x80, 0x80]);
     }
 
     #[test]

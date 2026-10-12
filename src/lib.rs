@@ -5859,6 +5859,147 @@ mod tests {
         );
         manager.decode_building_timer_geometry_prefix(metadata.save_app_version)?;
 
+        let (population, population_end) =
+            manager.decode_building_population_prefix(metadata.save_app_version)?;
+        let original_population = population.encode();
+        let population_suffix = manager.serialized_object_graph()[population_end..].to_vec();
+        let mut population_editor = population.into_editor();
+        let mut stale_population_editor = population_editor.clone();
+        {
+            let education1 = population_editor.education1_mut();
+            education1[0] = education1[0].wrapping_add(1);
+        }
+        let population_replacement = population_editor.encode()?;
+        manager.replace_building_population(&population_editor, metadata.save_app_version)?;
+        let (updated_population, updated_population_end) =
+            manager.decode_building_population_prefix(metadata.save_app_version)?;
+        assert_eq!(
+            updated_population.education1()[0],
+            population_editor.education1_mut()[0]
+        );
+        assert_eq!(
+            updated_population_end,
+            population_end - original_population.len() + population_replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_population_end..],
+            population_suffix.as_slice()
+        );
+        let graph_after_population_edit = manager.serialized_object_graph().to_vec();
+        {
+            let education1 = stale_population_editor.education1_mut();
+            education1[0] = education1[0].wrapping_add(2);
+        }
+        assert!(
+            manager
+                .replace_building_population(&stale_population_editor, metadata.save_app_version)
+                .is_err()
+        );
+        assert_eq!(
+            manager.serialized_object_graph(),
+            graph_after_population_edit
+        );
+
+        let truncated_population_len = manager
+            .root_fields_len()
+            .checked_add(updated_population_end)
+            .ok_or_else(|| std::io::Error::other("population test boundary overflow"))?;
+        let mut truncated_population_stream = manager.encode()?;
+        truncated_population_stream.truncate(truncated_population_len);
+        let mut truncated_population_manager =
+            SimulationManagerData::decode(&truncated_population_stream)?;
+        let (truncated_population, _) = truncated_population_manager
+            .decode_building_population_prefix(metadata.save_app_version)?;
+        let mut truncated_population_editor = truncated_population.into_editor();
+        {
+            let education2 = truncated_population_editor.education2_mut();
+            education2[0] = education2[0].wrapping_add(1);
+        }
+        let truncated_population_graph = truncated_population_manager
+            .serialized_object_graph()
+            .to_vec();
+        assert!(
+            truncated_population_manager
+                .replace_building_population(
+                    &truncated_population_editor,
+                    metadata.save_app_version
+                )
+                .is_err()
+        );
+        assert_eq!(
+            truncated_population_manager.serialized_object_graph(),
+            truncated_population_graph
+        );
+
+        let (economic_fields, economic_end) =
+            manager.decode_building_economic_fields_prefix(metadata.save_app_version)?;
+        let original_economic_fields = economic_fields.encode();
+        let economic_suffix = manager.serialized_object_graph()[economic_end..].to_vec();
+        let mut economic_editor = economic_fields.into_editor();
+        let mut stale_economic_editor = economic_editor.clone();
+        {
+            let cargo_traffic_rate = economic_editor.cargo_traffic_rate_mut();
+            cargo_traffic_rate[0] = cargo_traffic_rate[0].wrapping_add(1);
+        }
+        let economic_replacement = economic_editor.encode()?;
+        manager.replace_building_economic_fields(&economic_editor, metadata.save_app_version)?;
+        let (updated_economic_fields, updated_economic_end) =
+            manager.decode_building_economic_fields_prefix(metadata.save_app_version)?;
+        assert_eq!(
+            updated_economic_fields.cargo_traffic_rate()[0],
+            economic_editor.cargo_traffic_rate_mut()[0]
+        );
+        assert_eq!(
+            updated_economic_end,
+            economic_end - original_economic_fields.len() + economic_replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_economic_end..],
+            economic_suffix.as_slice()
+        );
+        let graph_after_economic_edit = manager.serialized_object_graph().to_vec();
+        {
+            let cargo_traffic_rate = stale_economic_editor.cargo_traffic_rate_mut();
+            cargo_traffic_rate[0] = cargo_traffic_rate[0].wrapping_add(2);
+        }
+        assert!(
+            manager
+                .replace_building_economic_fields(&stale_economic_editor, metadata.save_app_version)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), graph_after_economic_edit);
+
+        let truncated_economic_len = manager
+            .root_fields_len()
+            .checked_add(updated_economic_end)
+            .ok_or_else(|| std::io::Error::other("economic test boundary overflow"))?;
+        let mut truncated_economic_stream = manager.encode()?;
+        truncated_economic_stream.truncate(truncated_economic_len);
+        let mut truncated_economic_manager =
+            SimulationManagerData::decode(&truncated_economic_stream)?;
+        let (truncated_economic_fields, _) = truncated_economic_manager
+            .decode_building_economic_fields_prefix(metadata.save_app_version)?;
+        let mut truncated_economic_editor = truncated_economic_fields.into_editor();
+        {
+            let cargo_traffic_rate = truncated_economic_editor.cargo_traffic_rate_mut();
+            cargo_traffic_rate[0] = cargo_traffic_rate[0].wrapping_add(1);
+        }
+        let truncated_economic_graph = truncated_economic_manager
+            .serialized_object_graph()
+            .to_vec();
+        assert!(
+            truncated_economic_manager
+                .replace_building_economic_fields(
+                    &truncated_economic_editor,
+                    metadata.save_app_version
+                )
+                .is_err()
+        );
+        assert_eq!(
+            truncated_economic_manager.serialized_object_graph(),
+            truncated_economic_graph
+        );
+
         let prefab_edited_graph = manager.serialized_object_graph().to_vec();
         let mut stale_prefab_editor = prefab_editor.clone();
         stale_prefab_editor.names_mut()[name_index] = Some("Stale edit".to_owned());
