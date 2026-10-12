@@ -234,7 +234,33 @@ pub struct BuildingBufferFieldsPrefix {
     build_water_height: Vec<u16>,
     production_rate: Vec<u8>,
     water_pollution: Vec<u8>,
+    serialized_fields: Vec<Vec<u8>>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editable versioned network, utility, and byte fields for active buildings.
+///
+/// Each array keeps its original bytes until that field changes. Changed
+/// arrays use canonical encoded-array blocks and may resize the prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingBufferFieldsEditor {
+    original: BuildingBufferFieldsPrefix,
+    net_node: Vec<u16>,
+    sub_building: Vec<u16>,
+    water_source: Vec<u16>,
+    legacy_water_source_release: Vec<u16>,
+    electricity_buffer: Vec<u16>,
+    water_buffer: Vec<u16>,
+    sewage_buffer: Vec<u16>,
+    heating_buffer: Vec<u16>,
+    garbage_buffer: Vec<u16>,
+    crime_buffer: Vec<u16>,
+    mail_buffer: Vec<u16>,
+    custom_buffer1: Vec<u16>,
+    custom_buffer2: Vec<u16>,
+    build_water_height: Vec<u16>,
+    production_rate: Vec<u8>,
+    water_pollution: Vec<u8>,
 }
 
 /// Per-building byte state following utility buffers and pollution values.
@@ -454,6 +480,70 @@ pub struct BuildingInstanceRecordsEditor {
     records: Vec<BuildingInstanceRecord>,
 }
 
+fn invalid_building_buffer_fields(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "BuildingManager buffer fields".to_owned(),
+        offset,
+        reason: reason.into(),
+    }
+}
+
+fn read_ushort_field(
+    reader: &mut Reader<'_>,
+    count: usize,
+    serialized_fields: &mut Vec<Vec<u8>>,
+) -> Result<Vec<u16>, CrpError> {
+    let start = reader.offset();
+    let values = read_encoded_ushort_array(reader, count)?;
+    serialized_fields.push(reader.consumed_bytes()[start..reader.offset()].to_vec());
+    Ok(values)
+}
+
+fn read_byte_field(
+    reader: &mut Reader<'_>,
+    count: usize,
+    serialized_fields: &mut Vec<Vec<u8>>,
+) -> Result<Vec<u8>, CrpError> {
+    let start = reader.offset();
+    let values = read_encoded_byte_array(reader, count)?;
+    serialized_fields.push(reader.consumed_bytes()[start..reader.offset()].to_vec());
+    Ok(values)
+}
+
+fn write_ushort_field<'a>(
+    output: &mut Vec<u8>,
+    original_fields: &mut impl Iterator<Item = &'a Vec<u8>>,
+    values: &[u16],
+    original_values: &[u16],
+) -> Result<(), CrpError> {
+    let original_bytes = original_fields.next().ok_or_else(|| {
+        invalid_building_buffer_fields(output.len(), "source field bytes are missing")
+    })?;
+    if values == original_values {
+        output.extend_from_slice(original_bytes);
+    } else {
+        write_encoded_ushort_array(output, values);
+    }
+    Ok(())
+}
+
+fn write_byte_field<'a>(
+    output: &mut Vec<u8>,
+    original_fields: &mut impl Iterator<Item = &'a Vec<u8>>,
+    values: &[u8],
+    original_values: &[u8],
+) -> Result<(), CrpError> {
+    let original_bytes = original_fields.next().ok_or_else(|| {
+        invalid_building_buffer_fields(output.len(), "source field bytes are missing")
+    })?;
+    if values == original_values {
+        output.extend_from_slice(original_bytes);
+    } else {
+        write_encoded_byte_array(output, values);
+    }
+    Ok(())
+}
+
 impl BuildingBufferFieldsPrefix {
     /// Decodes versioned network, utility, and byte fields for active buildings.
     ///
@@ -478,83 +568,84 @@ impl BuildingBufferFieldsPrefix {
             .filter(|building| building.flags != 0)
             .count();
         let mut reader = Reader::new(bytes);
+        let mut serialized_fields = Vec::new();
         let net_node = if format_version >= 33 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let sub_building = if format_version >= 208 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let water_source = if format_version >= 33 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let legacy_water_source_release = if (95..184).contains(&format_version) {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let electricity_buffer = if format_version >= 33 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let water_buffer = if format_version >= 33 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let sewage_buffer = if format_version >= 33 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let heating_buffer = if format_version >= 227 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let garbage_buffer = if format_version >= 33 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let crime_buffer = if format_version >= 33 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let mail_buffer = if format_version >= 111_003 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let custom_buffer1 = if format_version >= 33 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let custom_buffer2 = if format_version >= 66 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let build_water_height = if format_version >= 308 {
-            read_encoded_ushort_array(&mut reader, count)?
+            read_ushort_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let production_rate = if format_version >= 33 {
-            read_encoded_byte_array(&mut reader, count)?
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
         let water_pollution = if format_version >= 33 {
-            read_encoded_byte_array(&mut reader, count)?
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
@@ -578,6 +669,7 @@ impl BuildingBufferFieldsPrefix {
                 build_water_height,
                 production_rate,
                 water_pollution,
+                serialized_fields,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -656,6 +748,266 @@ impl BuildingBufferFieldsPrefix {
     /// Writes the original encoded fields exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Creates an editor for values paired with the existing active-building order.
+    pub fn into_editor(self) -> BuildingBufferFieldsEditor {
+        BuildingBufferFieldsEditor {
+            net_node: self.net_node.clone(),
+            sub_building: self.sub_building.clone(),
+            water_source: self.water_source.clone(),
+            legacy_water_source_release: self.legacy_water_source_release.clone(),
+            electricity_buffer: self.electricity_buffer.clone(),
+            water_buffer: self.water_buffer.clone(),
+            sewage_buffer: self.sewage_buffer.clone(),
+            heating_buffer: self.heating_buffer.clone(),
+            garbage_buffer: self.garbage_buffer.clone(),
+            crime_buffer: self.crime_buffer.clone(),
+            mail_buffer: self.mail_buffer.clone(),
+            custom_buffer1: self.custom_buffer1.clone(),
+            custom_buffer2: self.custom_buffer2.clone(),
+            build_water_height: self.build_water_height.clone(),
+            production_rate: self.production_rate.clone(),
+            water_pollution: self.water_pollution.clone(),
+            original: self,
+        }
+    }
+}
+
+impl BuildingBufferFieldsEditor {
+    /// Returns the inner DataSerializer version associated with these fields.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns editable network-node indices in active-building order.
+    pub fn net_node_mut(&mut self) -> &mut [u16] {
+        &mut self.net_node
+    }
+    /// Returns editable sub-building indices from version 208 onward.
+    pub fn sub_building_mut(&mut self) -> &mut [u16] {
+        &mut self.sub_building
+    }
+    /// Returns editable water-source indices in active-building order.
+    pub fn water_source_mut(&mut self) -> &mut [u16] {
+        &mut self.water_source
+    }
+    /// Returns editable legacy water-source release values from versions 95–183.
+    pub fn legacy_water_source_release_mut(&mut self) -> &mut [u16] {
+        &mut self.legacy_water_source_release
+    }
+    /// Returns editable electricity-buffer indices in active-building order.
+    pub fn electricity_buffer_mut(&mut self) -> &mut [u16] {
+        &mut self.electricity_buffer
+    }
+    /// Returns editable water-buffer indices in active-building order.
+    pub fn water_buffer_mut(&mut self) -> &mut [u16] {
+        &mut self.water_buffer
+    }
+    /// Returns editable sewage-buffer indices in active-building order.
+    pub fn sewage_buffer_mut(&mut self) -> &mut [u16] {
+        &mut self.sewage_buffer
+    }
+    /// Returns editable heating-buffer indices from version 227 onward.
+    pub fn heating_buffer_mut(&mut self) -> &mut [u16] {
+        &mut self.heating_buffer
+    }
+    /// Returns editable garbage-buffer indices in active-building order.
+    pub fn garbage_buffer_mut(&mut self) -> &mut [u16] {
+        &mut self.garbage_buffer
+    }
+    /// Returns editable crime-buffer indices in active-building order.
+    pub fn crime_buffer_mut(&mut self) -> &mut [u16] {
+        &mut self.crime_buffer
+    }
+    /// Returns editable mail-buffer indices from version 111003 onward.
+    pub fn mail_buffer_mut(&mut self) -> &mut [u16] {
+        &mut self.mail_buffer
+    }
+    /// Returns editable custom-buffer-1 indices in active-building order.
+    pub fn custom_buffer1_mut(&mut self) -> &mut [u16] {
+        &mut self.custom_buffer1
+    }
+    /// Returns editable custom-buffer-2 indices from version 66 onward.
+    pub fn custom_buffer2_mut(&mut self) -> &mut [u16] {
+        &mut self.custom_buffer2
+    }
+    /// Returns editable build-water-height values from version 308 onward.
+    pub fn build_water_height_mut(&mut self) -> &mut [u16] {
+        &mut self.build_water_height
+    }
+    /// Returns editable production-rate bytes.
+    pub fn production_rate_mut(&mut self) -> &mut [u8] {
+        &mut self.production_rate
+    }
+    /// Returns editable water-pollution bytes.
+    pub fn water_pollution_mut(&mut self) -> &mut [u8] {
+        &mut self.water_pollution
+    }
+
+    /// Writes changed arrays canonically and preserves all other source bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let version = self.format_version();
+        if version < 164 {
+            return Err(invalid_building_buffer_fields(
+                0,
+                "unsupported inner version",
+            ));
+        }
+        let original = &self.original;
+        if self.net_node == original.net_node
+            && self.sub_building == original.sub_building
+            && self.water_source == original.water_source
+            && self.legacy_water_source_release == original.legacy_water_source_release
+            && self.electricity_buffer == original.electricity_buffer
+            && self.water_buffer == original.water_buffer
+            && self.sewage_buffer == original.sewage_buffer
+            && self.heating_buffer == original.heating_buffer
+            && self.garbage_buffer == original.garbage_buffer
+            && self.crime_buffer == original.crime_buffer
+            && self.mail_buffer == original.mail_buffer
+            && self.custom_buffer1 == original.custom_buffer1
+            && self.custom_buffer2 == original.custom_buffer2
+            && self.build_water_height == original.build_water_height
+            && self.production_rate == original.production_rate
+            && self.water_pollution == original.water_pollution
+        {
+            return Ok(original.serialized_prefix.clone());
+        }
+
+        let mut output = Vec::with_capacity(original.serialized_prefix.len());
+        let mut original_fields = original.serialized_fields.iter();
+        if version >= 33 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.net_node,
+                &original.net_node,
+            )?;
+        }
+        if version >= 208 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.sub_building,
+                &original.sub_building,
+            )?;
+        }
+        if version >= 33 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.water_source,
+                &original.water_source,
+            )?;
+        }
+        if (95..184).contains(&version) {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.legacy_water_source_release,
+                &original.legacy_water_source_release,
+            )?;
+        }
+        if version >= 33 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.electricity_buffer,
+                &original.electricity_buffer,
+            )?;
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.water_buffer,
+                &original.water_buffer,
+            )?;
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.sewage_buffer,
+                &original.sewage_buffer,
+            )?;
+        }
+        if version >= 227 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.heating_buffer,
+                &original.heating_buffer,
+            )?;
+        }
+        if version >= 33 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.garbage_buffer,
+                &original.garbage_buffer,
+            )?;
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.crime_buffer,
+                &original.crime_buffer,
+            )?;
+        }
+        if version >= 111_003 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.mail_buffer,
+                &original.mail_buffer,
+            )?;
+        }
+        if version >= 33 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.custom_buffer1,
+                &original.custom_buffer1,
+            )?;
+        }
+        if version >= 66 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.custom_buffer2,
+                &original.custom_buffer2,
+            )?;
+        }
+        if version >= 308 {
+            write_ushort_field(
+                &mut output,
+                &mut original_fields,
+                &self.build_water_height,
+                &original.build_water_height,
+            )?;
+        }
+        if version >= 33 {
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.production_rate,
+                &original.production_rate,
+            )?;
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.water_pollution,
+                &original.water_pollution,
+            )?;
+        }
+        if original_fields.next().is_some() {
+            return Err(invalid_building_buffer_fields(
+                output.len(),
+                "source contains more serialized fields than the version allows",
+            ));
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original.serialized_prefix
     }
 }
 
@@ -2694,10 +3046,10 @@ impl BuildingManagerObjectHeadersPrefix {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildingEconomicFieldsPrefix, BuildingFacultyBonusesPrefix, BuildingFlag,
-        BuildingFlagsPrefix, BuildingInstanceRecordsPrefix, BuildingMonumentEffectsPrefix,
-        BuildingPopulationEditor, BuildingPopulationPrefix, BuildingPrefabPrefix,
-        BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedPrefix,
+        BuildingBufferFieldsPrefix, BuildingEconomicFieldsPrefix, BuildingFacultyBonusesPrefix,
+        BuildingFlag, BuildingFlagsPrefix, BuildingInstanceRecordsPrefix,
+        BuildingMonumentEffectsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
+        BuildingPrefabPrefix, BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedPrefix,
         BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
         fixed_object_header_count, timer_fields_for_version,
     };
@@ -3000,6 +3352,54 @@ mod tests {
             decoded.names(),
             [None, Some("BB".to_owned()), Some("Ω".to_owned())]
         );
+    }
+
+    #[test]
+    fn building_buffer_fields_editor_resizes_only_the_changed_array() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 116_020,
+            building_flags: (1..=3)
+                .map(|index| BuildingFlag {
+                    index,
+                    flags: 1,
+                    flags2: 0,
+                })
+                .collect(),
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
+            serialized_prefix: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        for start in 10..23 {
+            crate::encoded_array::write_encoded_ushort_array(
+                &mut bytes,
+                &[start, start + 1, start + 2],
+            );
+        }
+        crate::encoded_array::write_encoded_byte_array(&mut bytes, &[24, 25, 26]);
+        crate::encoded_array::write_encoded_byte_array(&mut bytes, &[27, 28, 29]);
+
+        let (prefix, consumed) = BuildingBufferFieldsPrefix::decode_prefix(116_020, &flags, &bytes)
+            .expect("versioned buffer fields decode");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(prefix.net_node(), [10, 11, 12]);
+        assert_eq!(prefix.sub_building(), [11, 12, 13]);
+        assert_eq!(prefix.mail_buffer(), [19, 20, 21]);
+        assert_eq!(prefix.production_rate(), [24, 25, 26]);
+        assert_eq!(prefix.water_pollution(), [27, 28, 29]);
+
+        let mut editor = prefix.into_editor();
+        editor.net_node_mut().fill(0);
+        let edited = editor.encode().expect("buffer-field edit encodes");
+        let expected = [&[0x82][..], &bytes[7..]].concat();
+        assert_eq!(edited, expected);
+        let (decoded, decoded_len) =
+            BuildingBufferFieldsPrefix::decode_prefix(116_020, &flags, &edited)
+                .expect("edited buffer fields decode");
+        assert_eq!(decoded_len, edited.len());
+        assert_eq!(decoded.net_node(), [0, 0, 0]);
+        assert_eq!(decoded.sub_building(), [11, 12, 13]);
+        assert_eq!(decoded.water_pollution(), [27, 28, 29]);
     }
 
     #[test]

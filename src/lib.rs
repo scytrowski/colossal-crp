@@ -46,17 +46,17 @@ pub use audio_manager_data::{
     AudioManagerData, AudioManagerEditor, AudioRadioChannel, AudioRadioContent,
 };
 pub use building_manager_data::{
-    BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsEditor,
-    BuildingEconomicFieldsPrefix, BuildingEffectValue, BuildingFacultyBonusesEditor,
-    BuildingFacultyBonusesPrefix, BuildingFlag, BuildingFlagsEditor, BuildingFlagsPrefix,
-    BuildingInstanceRecord, BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
-    BuildingManagerObjectHeadersPrefix, BuildingMonumentEffectsEditor,
-    BuildingMonumentEffectsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
-    BuildingPrefabEditor, BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix,
-    BuildingProblemWords, BuildingRaceTeamReferencesEditor, BuildingRaceTeamReferencesPrefix,
-    BuildingRaceTeamUnassignedEditor, BuildingRaceTeamUnassignedPrefix, BuildingServiceSelection,
-    BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
-    BuildingTimerGeometryPrefix,
+    BuildingBufferFieldsEditor, BuildingBufferFieldsPrefix, BuildingByteStatePrefix,
+    BuildingEconomicFieldsEditor, BuildingEconomicFieldsPrefix, BuildingEffectValue,
+    BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlag, BuildingFlagsEditor,
+    BuildingFlagsPrefix, BuildingInstanceRecord, BuildingInstanceRecordsEditor,
+    BuildingInstanceRecordsPrefix, BuildingManagerObjectHeadersPrefix,
+    BuildingMonumentEffectsEditor, BuildingMonumentEffectsPrefix, BuildingPopulationEditor,
+    BuildingPopulationPrefix, BuildingPrefabEditor, BuildingPrefabPrefix, BuildingProblemEditor,
+    BuildingProblemPrefix, BuildingProblemWords, BuildingRaceTeamReferencesEditor,
+    BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedEditor,
+    BuildingRaceTeamUnassignedPrefix, BuildingServiceSelection, BuildingServiceSelectionPrefix,
+    BuildingTimerField, BuildingTimerGeometryEditor, BuildingTimerGeometryPrefix,
 };
 pub use citizen_manager_data::{
     CitizenInstanceDataPrefix, CitizenInstanceRecord, CitizenInstanceSlot,
@@ -3366,6 +3366,17 @@ mod tests {
         assert!(decoded.sub_building().is_empty());
         assert!(decoded.mail_buffer().is_empty());
         assert_eq!(decoded.encode(), bytes);
+
+        let mut editor = decoded.into_editor();
+        editor.legacy_water_source_release_mut()[0] = 42;
+        let edited = editor.encode()?;
+        assert_eq!(&edited[..6], &bytes[..6]);
+        assert_eq!(&edited[6..9], &[0, 0, 42]);
+        assert_eq!(&edited[9..], &bytes[9..]);
+        let (updated, updated_len) =
+            BuildingBufferFieldsPrefix::decode_prefix(180, &flags, &edited)?;
+        assert_eq!(updated_len, edited.len());
+        assert_eq!(updated.legacy_water_source_release(), &[42]);
         Ok(())
     }
 
@@ -5738,6 +5749,28 @@ mod tests {
             prefab_suffix.as_slice()
         );
         manager.decode_building_object_headers_prefix(metadata.save_app_version)?;
+
+        let (buffer_fields, buffer_end) =
+            manager.decode_building_buffer_fields_prefix(metadata.save_app_version)?;
+        let original_buffer_fields = buffer_fields.encode();
+        let buffer_suffix = manager.serialized_object_graph()[buffer_end..].to_vec();
+        let next_net_node = buffer_fields.net_node()[0].wrapping_add(1);
+        let mut buffer_editor = buffer_fields.into_editor();
+        buffer_editor.net_node_mut()[0] = next_net_node;
+        let buffer_replacement = buffer_editor.encode()?;
+        manager.replace_building_buffer_fields(&buffer_editor, metadata.save_app_version)?;
+        let (updated_buffer_fields, updated_buffer_end) =
+            manager.decode_building_buffer_fields_prefix(metadata.save_app_version)?;
+        assert_eq!(updated_buffer_fields.net_node()[0], next_net_node);
+        assert_eq!(
+            updated_buffer_end,
+            buffer_end - original_buffer_fields.len() + buffer_replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_buffer_end..],
+            buffer_suffix.as_slice()
+        );
+        manager.decode_building_byte_state_prefix(metadata.save_app_version)?;
 
         let prefab_edited_graph = manager.serialized_object_graph().to_vec();
         let mut stale_prefab_editor = prefab_editor.clone();

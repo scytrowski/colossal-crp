@@ -72,12 +72,12 @@ use crate::transfer_manager_data::{TransferManagerData, TransferManagerEditor};
 use crate::unlock_manager_data::{UnlockManagerReferences, UnlockManagerReferencesEditor};
 use crate::water_manager_data::WaterManagerData;
 use crate::{
-    BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsPrefix,
-    BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlagsEditor,
-    BuildingFlagsPrefix, BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
-    BuildingManagerObjectHeadersPrefix, BuildingMonumentEffectsEditor,
-    BuildingMonumentEffectsPrefix, BuildingPopulationPrefix, BuildingPrefabEditor,
-    BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix,
+    BuildingBufferFieldsEditor, BuildingBufferFieldsPrefix, BuildingByteStatePrefix,
+    BuildingEconomicFieldsPrefix, BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix,
+    BuildingFlagsEditor, BuildingFlagsPrefix, BuildingInstanceRecordsEditor,
+    BuildingInstanceRecordsPrefix, BuildingManagerObjectHeadersPrefix,
+    BuildingMonumentEffectsEditor, BuildingMonumentEffectsPrefix, BuildingPopulationPrefix,
+    BuildingPrefabEditor, BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix,
     BuildingRaceTeamReferencesEditor, BuildingRaceTeamReferencesPrefix,
     BuildingRaceTeamUnassignedEditor, BuildingRaceTeamUnassignedPrefix,
     BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
@@ -9970,6 +9970,70 @@ impl SimulationManagerData {
         )?;
         reader.read_bytes(used)?;
         Ok((data, reader.offset()))
+    }
+
+    /// Replaces versioned BuildingManager network, utility, and byte fields.
+    ///
+    /// The editor must come from this graph and retain every active-building
+    /// field count. Changed arrays can resize the body; the following byte
+    /// state is decoded again before accepting the edit. Failures leave the
+    /// graph unchanged.
+    pub fn replace_building_buffer_fields(
+        &mut self,
+        edited: &BuildingBufferFieldsEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited BuildingManager buffer-field version does not match this stream",
+            ));
+        }
+        let (original, graph_end) = self.decode_building_buffer_fields_prefix(save_app_version)?;
+        let original_bytes = original.encode();
+        let body_start =
+            graph_end
+                .checked_sub(original_bytes.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager buffer-field prefix start",
+                ))?;
+        if original_bytes.as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager buffer-field bytes do not match the editor's source",
+            ));
+        }
+        if graph_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager buffer-field prefix extends past manager graph",
+            ));
+        }
+        let replacement = edited.encode()?;
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(body_start..graph_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        let validation = (|| {
+            let (decoded, _) = self.decode_building_buffer_fields_prefix(save_app_version)?;
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten BuildingManager buffer fields do not match the editor",
+                ));
+            }
+            self.decode_building_byte_state_prefix(save_app_version)?;
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!(
+                    "rewritten BuildingManager buffer fields failed boundary validation: {error}"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes versioned per-building byte state after network and utility buffers.
