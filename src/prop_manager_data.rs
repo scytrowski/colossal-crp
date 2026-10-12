@@ -10,12 +10,13 @@ const LOGO_TABLE_VERSION: u32 = 121_026;
 ///
 /// The decoder supports the legacy layout below inner version 121026 and the
 /// logo-table layout from version 121026. It retains the exact known bytes for
-/// lossless rewriting. The editor can change existing active-prop columns
-/// without changing flags, prefab-name scopes, or logo tables.
+/// lossless rewriting. The editor can change raw flag bits while preserving
+/// active slots and logo-scope selection, along with active-prop columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropManagerDataPrefix {
     format_version: u32,
     flags: Vec<u16>,
+    flags_range: Range<usize>,
     prefab_indices: Vec<u16>,
     prefab_indices_range: Range<usize>,
     prefab_names: Vec<Option<String>>,
@@ -35,13 +36,15 @@ pub struct PropManagerDataPrefix {
 
 /// Editor for existing active PropManager prefab assignments and transform columns.
 ///
-/// Prop flags, prefab-name scopes, logo tables, and record counts are retained.
-/// Changed encoded columns use canonical `EncodedArray.UShort` encoding;
-/// unchanged columns and all other bytes retain their original representation.
+/// Raw Prop flags can change while preserving slot activity and logo-scope
+/// selection. Changed encoded arrays use canonical `EncodedArray.UShort`
+/// encoding; unchanged columns and all other bytes retain their original
+/// representation.
 /// The source layout may be legacy or include the version-121026 logo tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropManagerEditor {
     data: PropManagerDataPrefix,
+    original_flags: Vec<u16>,
     original_prefab_indices: Vec<u16>,
     original_position_x: Vec<i16>,
     original_position_z: Vec<i16>,
@@ -57,7 +60,9 @@ impl PropManagerDataPrefix {
     /// malformed fields return an error.
     pub fn decode_prefix(format_version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
         let mut reader = Reader::new(bytes);
+        let flags_start = reader.offset();
         let flags = read_encoded_ushort_array(&mut reader, PROP_INSTANCE_COUNT)?;
+        let flags_range = flags_start..reader.offset();
         let active_count = flags.iter().filter(|flags| **flags != 0).count();
         let prefab_indices_start = reader.offset();
         let prefab_indices = read_encoded_ushort_array(&mut reader, active_count)?;
@@ -108,6 +113,7 @@ impl PropManagerDataPrefix {
             Self {
                 format_version,
                 flags,
+                flags_range,
                 prefab_indices,
                 prefab_indices_range,
                 prefab_names,
@@ -136,6 +142,7 @@ impl PropManagerDataPrefix {
     /// Creates an editor for existing active-prop assignments and transforms.
     pub fn into_editor(self) -> PropManagerEditor {
         PropManagerEditor {
+            original_flags: self.flags.clone(),
             original_prefab_indices: self.prefab_indices.clone(),
             original_position_x: self.position_x.clone(),
             original_position_z: self.position_z.clone(),
@@ -211,6 +218,33 @@ impl PropManagerEditor {
         self.data.format_version
     }
 
+    /// Replaces raw flag bits for an existing PropInstance slot.
+    ///
+    /// `index` is zero-based, so zero represents serialized slot one. The
+    /// value must preserve the slot's zero/nonzero activity state. From
+    /// version 121026 onward, it must also preserve the `0x0300` logo-kind
+    /// bits so the race-team and event-logo tables keep their existing
+    /// lengths. Other flag meanings are not modeled.
+    pub fn set_flag_bits(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        let current = *self.data.flags.get(index).ok_or_else(|| {
+            invalid_prop_manager(index, "PropInstance flag index is out of range")
+        })?;
+        if (current == 0) != (value == 0) {
+            return Err(invalid_prop_manager(
+                index,
+                "PropInstance flag edits must preserve the slot's active state",
+            ));
+        }
+        if self.data.logo_tables_present && current & 0x0300 != value & 0x0300 {
+            return Err(invalid_prop_manager(
+                index,
+                "PropInstance flag edits must preserve the logo-kind bits",
+            ));
+        }
+        self.data.flags[index] = value;
+        Ok(())
+    }
+
     /// Returns mutable PropInfo assignments in active-prop order.
     pub fn prefab_indices_mut(&mut self) -> &mut [u16] {
         &mut self.data.prefab_indices
@@ -235,7 +269,10 @@ impl PropManagerEditor {
     /// Returns an error if the source column ranges or record counts are inconsistent.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let count = self.original_prefab_indices.len();
-        if self.data.prefab_indices.len() != count
+        if self.data.flags.len() != PROP_INSTANCE_COUNT
+            || self.original_flags.len() != PROP_INSTANCE_COUNT
+            || self.data.flags.len() != self.original_flags.len()
+            || self.data.prefab_indices.len() != count
             || self.data.position_x.len() != count
             || self.data.position_z.len() != count
             || self.data.angles.len() != count
@@ -251,6 +288,14 @@ impl PropManagerEditor {
 
         let mut bytes = self.data.serialized_prefix.clone();
         let mut replacements = Vec::new();
+        if self.data.flags != self.original_flags {
+            replacements.push(encode_ushort_column(
+                &bytes,
+                &self.data.flags_range,
+                &self.data.flags,
+                "flags",
+            )?);
+        }
         if self.data.prefab_indices != self.original_prefab_indices {
             replacements.push(encode_ushort_column(
                 &bytes,
@@ -495,6 +540,47 @@ mod tests {
         assert_eq!(updated.position_x(), &[0, 0, 0]);
         assert_eq!(updated.position_z(), &[5, 6, 7]);
         assert_eq!(updated.angles(), &[0, 0, 0]);
+    }
+
+    #[test]
+    fn prop_manager_editor_edits_flags_without_changing_sparse_layout() {
+        let bytes = two_logo_prefix();
+        let (props, _) = PropManagerDataPrefix::decode_prefix(121_026, &bytes).unwrap();
+        let mut editor = props.into_editor();
+        editor.set_flag_bits(0, 0x0101).unwrap();
+        editor.set_flag_bits(1, 0x0202).unwrap();
+        assert!(editor.set_flag_bits(0, 0x0200).is_err());
+        assert!(editor.set_flag_bits(2, 1).is_err());
+        assert!(editor.set_flag_bits(65_535, 1).is_err());
+
+        let encoded = editor.encode().unwrap();
+        assert_eq!(&encoded[..9], &[3, 0x01, 0x01, 0x02, 0x02, 0, 0, 0, 0]);
+        assert_eq!(&encoded[9..], &bytes[9..]);
+        let (updated, consumed) = PropManagerDataPrefix::decode_prefix(121_026, &encoded).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(updated.flags()[..4], [0x0101, 0x0202, 0, 0]);
+        assert_eq!(updated.prefab_indices(), &[0x11, 0x22]);
+        assert_eq!(updated.race_logo_indices(), &[0x44]);
+        assert_eq!(updated.event_logo_indices(), &[0x55]);
+
+        let (legacy, _) = PropManagerDataPrefix::decode_prefix(116_020, LEGACY_FIXTURE).unwrap();
+        let active_index = legacy.flags().iter().position(|flags| *flags != 0).unwrap();
+        let current_value = legacy.flags()[active_index];
+        let original_prefab_indices = legacy.prefab_indices().to_vec();
+        let changed_value = if current_value == 1 {
+            2
+        } else {
+            current_value ^ 1
+        };
+        let mut legacy_editor = legacy.into_editor();
+        legacy_editor
+            .set_flag_bits(active_index, changed_value)
+            .unwrap();
+        let legacy_encoded = legacy_editor.encode().unwrap();
+        let (legacy_updated, _) =
+            PropManagerDataPrefix::decode_prefix(116_020, &legacy_encoded).unwrap();
+        assert_eq!(legacy_updated.flags()[active_index], changed_value);
+        assert_eq!(legacy_updated.prefab_indices(), original_prefab_indices);
     }
 
     #[test]

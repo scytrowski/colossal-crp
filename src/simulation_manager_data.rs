@@ -7521,8 +7521,9 @@ impl SimulationManagerData {
     /// Replaces existing PropManager prefab assignments and transform columns.
     ///
     /// The editor must come from the current manager body and inner version.
-    /// Flags, prefab-name scopes, logo tables, and record counts stay unchanged.
-    /// Changed encoded columns can resize the graph; the TreeManager boundary
+    /// Flag edits preserve slot activity and, from version 121026, logo-kind
+    /// selection. Prefab-name scopes, logo tables, and record counts stay fixed.
+    /// Changed encoded arrays can resize the graph; the TreeManager boundary
     /// is checked again after replacement.
     pub fn replace_prop_manager_data(
         &mut self,
@@ -25402,6 +25403,7 @@ mod manager_boundary_tests {
         flags[..3].fill(1);
         let mut encoded_flags = Vec::new();
         write_encoded_ushort_array(&mut encoded_flags, &flags);
+        let encoded_flags_len = encoded_flags.len();
         let mut prop_body = encoded_flags;
         write_encoded_ushort_array(&mut prop_body, &[1, 2, 3]);
         prop_body.extend_from_slice(&[0, 0]); // Empty PropInfo name scope.
@@ -25418,16 +25420,26 @@ mod manager_boundary_tests {
         let original_graph = manager.serialized_object_graph().to_vec();
         let original_graph_len = original_graph.len();
         let mut editor = manager.decode_prop_manager_editor().unwrap();
+        editor.set_flag_bits(0, 3).unwrap();
         editor.position_x_mut().fill(0);
 
         let mut expected_graph = original_graph;
         let x_start = body_start + x_offset;
         expected_graph.splice(x_start..x_start + encoded_x.len(), [0x82]);
+        let mut expected_flags = flags;
+        expected_flags[0] = 3;
+        let mut expected_encoded_flags = Vec::new();
+        write_encoded_ushort_array(&mut expected_encoded_flags, &expected_flags);
+        expected_graph.splice(
+            body_start..body_start + encoded_flags_len,
+            expected_encoded_flags,
+        );
         assert_eq!(expected_graph.len(), original_graph_len - 6);
         manager.replace_prop_manager_data(&editor).unwrap();
 
         assert_eq!(manager.serialized_object_graph(), expected_graph);
         let (updated, tree_start) = manager.decode_prop_manager_prefix().unwrap();
+        assert_eq!(updated.flags()[0], 3);
         assert_eq!(updated.position_x(), &[0, 0, 0]);
         assert_eq!(updated.prefab_indices(), &[1, 2, 3]);
         assert!(
