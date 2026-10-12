@@ -10365,9 +10365,10 @@ impl SimulationManagerData {
 
     /// Replaces timer and building-dimension arrays, preserving the rest of the graph.
     ///
-    /// The editor must come from this stream's BuildingManager body. Edited
-    /// arrays use canonical literal controls; validation failures leave the
-    /// serialized object graph unchanged.
+    /// The editor must come from this stream's current BuildingManager body.
+    /// Unchanged arrays retain their original bytes; changed arrays use
+    /// canonical literal controls. The following population arrays are
+    /// validated after replacement, and failures leave the graph unchanged.
     pub fn replace_building_timer_geometry(
         &mut self,
         edited: &BuildingTimerGeometryEditor,
@@ -10386,12 +10387,19 @@ impl SimulationManagerData {
                 "edited BuildingManager active-building count does not match this stream",
             ));
         }
+        let original_bytes = original.encode();
         let body_start =
             graph_end
-                .checked_sub(original.encoded_len())
+                .checked_sub(original_bytes.len())
                 .ok_or(CrpError::ArithmeticOverflow(
                     "BuildingManager timer body start",
                 ))?;
+        if original_bytes.as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager timer bytes do not match the editor's source",
+            ));
+        }
         let replacement = edited.encode()?;
         if graph_end > self.serialized_object_graph.len() {
             return Err(invalid(
@@ -10399,8 +10407,27 @@ impl SimulationManagerData {
                 "BuildingManager timer body extends past manager graph",
             ));
         }
-        self.serialized_object_graph
-            .splice(body_start..graph_end, replacement);
+        let mut candidate_graph = self.serialized_object_graph.clone();
+        candidate_graph.splice(body_start..graph_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate_graph);
+        let validation = (|| {
+            let (decoded, _) = self.decode_building_timer_geometry_prefix(save_app_version)?;
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten BuildingManager timer fields do not match the editor",
+                ));
+            }
+            self.decode_building_population_prefix(save_app_version)?;
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!("rewritten BuildingManager timer fields failed validation: {error}"),
+            ));
+        }
         Ok(())
     }
 

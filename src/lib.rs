@@ -7308,6 +7308,34 @@ mod tests {
                                 &edited_manager.serialized_object_graph()[rewritten_end..],
                                 original_suffix
                             );
+
+                            let graph_limit = manager_data
+                                .root_fields_len()
+                                .checked_add(graph_end)
+                                .ok_or_else(|| {
+                                    std::io::Error::other(
+                                        "BuildingManager timer fixture boundary overflow",
+                                    )
+                                })?;
+                            let mut truncated_stream = manager_data.encode()?;
+                            truncated_stream.truncate(graph_limit);
+                            let mut truncated_manager =
+                                SimulationManagerData::decode(&truncated_stream)?;
+                            let (truncated_timers, _) = truncated_manager
+                                .decode_building_timer_geometry_prefix(metadata.save_app_version)?;
+                            let mut rollback_editor = truncated_timers.into_editor();
+                            let width = rollback_editor.width_mut();
+                            width[0] = width[0].wrapping_add(1);
+                            let original_truncated_stream = truncated_manager.encode()?;
+                            assert!(
+                                truncated_manager
+                                    .replace_building_timer_geometry(
+                                        &rollback_editor,
+                                        metadata.save_app_version,
+                                    )
+                                    .is_err()
+                            );
+                            assert_eq!(truncated_manager.encode()?, original_truncated_stream);
                             checked_building_timer_convenience = true;
                         }
                         let population_start = net_reader.offset();

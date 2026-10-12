@@ -340,8 +340,8 @@ pub enum BuildingTimerField {
 ///
 /// Timer values are stored field-major: the full active-building column for one
 /// timer precedes the next timer column. Unchanged data writes its original
-/// encoded bytes exactly; [`into_editor`](Self::into_editor) enables canonical
-/// writing after edits.
+/// encoded bytes exactly. In the editor, unchanged arrays retain those bytes
+/// while changed arrays use canonical literal encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildingTimerGeometryPrefix {
     format_version: u32,
@@ -351,15 +351,14 @@ pub struct BuildingTimerGeometryPrefix {
     level_up_progress: Vec<u8>,
     width: Vec<u8>,
     length: Vec<u8>,
+    serialized_fields: Vec<Vec<u8>>,
     serialized_prefix: Vec<u8>,
 }
 
 /// Editable timer and building-dimension arrays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildingTimerGeometryEditor {
-    format_version: u32,
-    active_building_count: usize,
-    timer_fields: Vec<BuildingTimerField>,
+    original: BuildingTimerGeometryPrefix,
     timer_values: Vec<u8>,
     level_up_progress: Vec<u8>,
     width: Vec<u8>,
@@ -1466,14 +1465,15 @@ impl BuildingTimerGeometryPrefix {
                 "BuildingManager timer value count",
             ))?;
         let mut reader = Reader::new(bytes);
-        let timer_values = read_encoded_byte_array(&mut reader, timer_count)?;
+        let mut serialized_fields = Vec::new();
+        let timer_values = read_byte_field(&mut reader, timer_count, &mut serialized_fields)?;
         let level_up_progress = if format_version >= 170 {
-            read_encoded_byte_array(&mut reader, active_building_count)?
+            read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?
         } else {
             Vec::new()
         };
-        let width = read_encoded_byte_array(&mut reader, active_building_count)?;
-        let length = read_encoded_byte_array(&mut reader, active_building_count)?;
+        let width = read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?;
+        let length = read_byte_field(&mut reader, active_building_count, &mut serialized_fields)?;
         let consumed = reader.offset();
         Ok((
             Self {
@@ -1484,6 +1484,7 @@ impl BuildingTimerGeometryPrefix {
                 level_up_progress,
                 width,
                 length,
+                serialized_fields,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -1536,20 +1537,19 @@ impl BuildingTimerGeometryPrefix {
         self.serialized_prefix.clone()
     }
 
-    pub(crate) fn encoded_len(&self) -> usize {
-        self.serialized_prefix.len()
-    }
-
-    /// Creates an editor; changed arrays will use canonical literal encoding.
+    /// Creates an editor that retains unchanged field bytes and writes changed
+    /// arrays with canonical literal encoding.
     pub fn into_editor(self) -> BuildingTimerGeometryEditor {
+        let timer_values = self.timer_values.clone();
+        let level_up_progress = self.level_up_progress.clone();
+        let width = self.width.clone();
+        let length = self.length.clone();
         BuildingTimerGeometryEditor {
-            format_version: self.format_version,
-            active_building_count: self.active_building_count,
-            timer_fields: self.timer_fields,
-            timer_values: self.timer_values,
-            level_up_progress: self.level_up_progress,
-            width: self.width,
-            length: self.length,
+            original: self,
+            timer_values,
+            level_up_progress,
+            width,
+            length,
         }
     }
 }
@@ -1557,22 +1557,23 @@ impl BuildingTimerGeometryPrefix {
 impl BuildingTimerGeometryEditor {
     /// Returns the inner DataSerializer version associated with these arrays.
     pub fn format_version(&self) -> u32 {
-        self.format_version
+        self.original.format_version
     }
 
     /// Returns the number of active buildings represented by these arrays.
     pub fn active_building_count(&self) -> usize {
-        self.active_building_count
+        self.original.active_building_count
     }
 
     /// Returns one editable timer column, or `None` when absent in this version.
     pub fn timer_mut(&mut self, field: BuildingTimerField) -> Option<&mut [u8]> {
         let index = self
+            .original
             .timer_fields
             .iter()
             .position(|candidate| *candidate == field)?;
-        let start = index.checked_mul(self.active_building_count)?;
-        let end = start.checked_add(self.active_building_count)?;
+        let start = index.checked_mul(self.active_building_count())?;
+        let end = start.checked_add(self.active_building_count())?;
         self.timer_values.get_mut(start..end)
     }
 
@@ -1594,40 +1595,81 @@ impl BuildingTimerGeometryEditor {
     /// Encodes timer columns and dimensions with valid canonical byte-array controls.
     ///
     /// The game writes timer columns through one shared array in field-major
-    /// order. Edited output uses literal runs of at most 128 bytes and may not
-    /// match the original game's control-block grouping.
+    /// order. Unchanged arrays retain their original encoded bytes; changed
+    /// arrays use literal runs of at most 128 bytes.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
-        if self.format_version < 164
-            || self.timer_fields != timer_fields_for_version(self.format_version)
+        let original = &self.original;
+        if original.format_version < 164
+            || original.timer_fields != timer_fields_for_version(original.format_version)
         {
             return Err(invalid_timer("invalid timer version or fields"));
         }
         let expected_timer_count = self
-            .active_building_count
-            .checked_mul(self.timer_fields.len())
+            .active_building_count()
+            .checked_mul(original.timer_fields.len())
             .ok_or(CrpError::ArithmeticOverflow(
                 "BuildingManager timer value count",
             ))?;
         if self.timer_values.len() != expected_timer_count
             || self.level_up_progress.len()
-                != if self.format_version >= 170 {
-                    self.active_building_count
+                != if original.format_version >= 170 {
+                    self.active_building_count()
                 } else {
                     0
                 }
-            || self.width.len() != self.active_building_count
-            || self.length.len() != self.active_building_count
+            || self.width.len() != self.active_building_count()
+            || self.length.len() != self.active_building_count()
         {
             return Err(invalid_timer(
                 "timer, level, width, or length count is invalid",
             ));
         }
-        let mut output = Vec::new();
-        write_encoded_byte_array(&mut output, &self.timer_values);
-        write_encoded_byte_array(&mut output, &self.level_up_progress);
-        write_encoded_byte_array(&mut output, &self.width);
-        write_encoded_byte_array(&mut output, &self.length);
+        if self.timer_values == original.timer_values
+            && self.level_up_progress == original.level_up_progress
+            && self.width == original.width
+            && self.length == original.length
+        {
+            return Ok(original.serialized_prefix.clone());
+        }
+
+        let mut output = Vec::with_capacity(original.serialized_prefix.len());
+        let mut original_fields = original.serialized_fields.iter();
+        write_byte_field(
+            &mut output,
+            &mut original_fields,
+            &self.timer_values,
+            &original.timer_values,
+        )?;
+        if original.format_version >= 170 {
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.level_up_progress,
+                &original.level_up_progress,
+            )?;
+        }
+        write_byte_field(
+            &mut output,
+            &mut original_fields,
+            &self.width,
+            &original.width,
+        )?;
+        write_byte_field(
+            &mut output,
+            &mut original_fields,
+            &self.length,
+            &original.length,
+        )?;
+        if original_fields.next().is_some() {
+            return Err(invalid_timer(
+                "source contains more timer fields than the version allows",
+            ));
+        }
         Ok(output)
+    }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original.serialized_prefix
     }
 }
 
@@ -3433,7 +3475,7 @@ mod tests {
         BuildingFlag, BuildingFlagsPrefix, BuildingInstanceRecordsPrefix,
         BuildingMonumentEffectsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
         BuildingPrefabPrefix, BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedPrefix,
-        BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
+        BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryPrefix,
         fixed_object_header_count, timer_fields_for_version,
     };
 
@@ -3914,25 +3956,61 @@ mod tests {
     }
 
     #[test]
-    fn building_timer_editor_writes_field_major_literal_bytes() {
-        let editor = BuildingTimerGeometryEditor {
+    fn building_timer_editor_preserves_unchanged_arrays_and_writes_changed_literals() {
+        let flags = BuildingFlagsPrefix {
             format_version: 231,
-            active_building_count: 2,
-            timer_fields: timer_fields_for_version(231),
-            timer_values: (0..22).collect(),
-            level_up_progress: vec![30, 31],
-            width: vec![2, 3],
-            length: vec![4, 5],
+            building_flags: vec![
+                BuildingFlag {
+                    index: 1,
+                    flags: 1,
+                    flags2: 0,
+                },
+                BuildingFlag {
+                    index: 2,
+                    flags: 2,
+                    flags2: 0,
+                },
+            ],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
+            serialized_prefix: Vec::new(),
         };
-        let mut expected = vec![21];
-        expected.extend(0..22);
-        expected.extend([1, 30, 31, 1, 2, 3, 1, 4, 5]);
-        assert_eq!(editor.encode().expect("valid timer editor"), expected);
+        // Each 0x80+ control is a valid repeat encoding for the zero values
+        // in that field. The timer block advertises 128 values; the reader
+        // consumes only its 22-value preallocated buffer.
+        let source = [0xff, 0x81, 0x81, 0x81];
+        let (prefix, consumed) = BuildingTimerGeometryPrefix::decode_prefix(231, &flags, &source)
+            .expect("valid noncanonical timer arrays");
+        assert_eq!(consumed, source.len());
+        assert_eq!(prefix.into_editor().encode().unwrap(), source);
 
-        let invalid = BuildingTimerGeometryEditor {
-            width: vec![2],
-            ..editor
-        };
+        let (prefix, _) = BuildingTimerGeometryPrefix::decode_prefix(231, &flags, &source)
+            .expect("valid noncanonical timer arrays");
+        let mut editor = prefix.into_editor();
+        editor.timer_mut(BuildingTimerField::Electricity).unwrap()[0] = 1;
+        editor.width_mut()[0] = 2;
+
+        let mut expected = vec![21];
+        let mut timer_values = vec![0; 22];
+        timer_values[0] = 1;
+        expected.extend(timer_values);
+        expected.extend([0x81, 1, 2, 0, 0x81]);
+        let rewritten = editor.encode().expect("valid timer editor");
+        assert_eq!(rewritten, expected);
+
+        let (decoded, decoded_len) =
+            BuildingTimerGeometryPrefix::decode_prefix(231, &flags, &rewritten)
+                .expect("rewritten timer fields decode");
+        assert_eq!(decoded_len, rewritten.len());
+        assert_eq!(
+            decoded.timer(BuildingTimerField::Electricity).unwrap(),
+            [1, 0]
+        );
+        assert_eq!(decoded.width(), [2, 0]);
+        assert_eq!(decoded.length(), [0, 0]);
+
+        let mut invalid = decoded.into_editor();
+        invalid.width.pop();
         assert!(invalid.encode().is_err());
     }
 
