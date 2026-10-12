@@ -1794,6 +1794,7 @@ impl DistrictAirportEditor<'_> {
     pub fn set_aircraft_stand(&mut self, value: bool) -> Result<(), CrpError> {
         self.set_bool_field(
             self.data.field_offsets.aircraft_stand,
+            self.data.aircraft_stand,
             value,
             "airport aircraft-stand flag",
         )?;
@@ -1803,7 +1804,12 @@ impl DistrictAirportEditor<'_> {
 
     /// Replaces the runway presence flag from inner version 114008.
     pub fn set_runway(&mut self, value: bool) -> Result<(), CrpError> {
-        self.set_bool_field(self.data.field_offsets.runway, value, "airport runway flag")?;
+        self.set_bool_field(
+            self.data.field_offsets.runway,
+            self.data.runway,
+            value,
+            "airport runway flag",
+        )?;
         self.data.runway = Some(value);
         Ok(())
     }
@@ -1812,6 +1818,7 @@ impl DistrictAirportEditor<'_> {
     pub fn set_terminal(&mut self, value: bool) -> Result<(), CrpError> {
         self.set_bool_field(
             self.data.field_offsets.terminal,
+            self.data.terminal,
             value,
             "airport terminal flag",
         )?;
@@ -1858,12 +1865,16 @@ impl DistrictAirportEditor<'_> {
     fn set_bool_field(
         &mut self,
         offset: Option<usize>,
+        current_value: Option<bool>,
         value: bool,
         field: &str,
     ) -> Result<(), CrpError> {
         let offset =
             offset.ok_or_else(|| invalid_district_manager(0, format!("{field} is absent")))?;
-        write_park_record_field(self.serialized, offset, &[u8::from(value)], field)
+        if current_value != Some(value) {
+            write_park_record_field(self.serialized, offset, &[u8::from(value)], field)?;
+        }
+        Ok(())
     }
 }
 
@@ -5489,6 +5500,14 @@ mod tests {
                     .is_err()
             );
             if version >= super::AIRPORT_FLAGS_VERSION {
+                let mut unchanged_flag_editor = parks[0].clone().into_editor();
+                unchanged_flag_editor
+                    .airport_data_mut()
+                    .unwrap()
+                    .set_runway(false)
+                    .unwrap();
+                assert_eq!(unchanged_flag_editor.encode(), record);
+
                 let mut one_flag_editor = parks[0].clone().into_editor();
                 one_flag_editor
                     .airport_data_mut()
