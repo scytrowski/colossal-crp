@@ -27,8 +27,10 @@ pub struct PropManagerDataPrefix {
     angles: Vec<u16>,
     angles_range: Range<usize>,
     race_logo_indices: Vec<u16>,
+    race_logo_indices_range: Option<Range<usize>>,
     race_logo_names: Vec<Option<String>>,
     event_logo_indices: Vec<u16>,
+    event_logo_indices_range: Option<Range<usize>>,
     event_logo_names: Vec<Option<String>>,
     logo_tables_present: bool,
     serialized_prefix: Vec<u8>,
@@ -39,7 +41,8 @@ pub struct PropManagerDataPrefix {
 /// Raw Prop flags can change while preserving slot activity and logo-scope
 /// selection. Changed encoded arrays use canonical `EncodedArray.UShort`
 /// encoding; unchanged columns and all other bytes retain their original
-/// representation.
+/// representation. From version 121026, existing race-team and event logo
+/// assignments can also be edited without changing either name table.
 /// The source layout may be legacy or include the version-121026 logo tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropManagerEditor {
@@ -49,6 +52,8 @@ pub struct PropManagerEditor {
     original_position_x: Vec<i16>,
     original_position_z: Vec<i16>,
     original_angles: Vec<u16>,
+    original_race_logo_indices: Vec<u16>,
+    original_event_logo_indices: Vec<u16>,
 }
 
 impl PropManagerDataPrefix {
@@ -85,28 +90,40 @@ impl PropManagerDataPrefix {
         let angles_range = angles_start..reader.offset();
 
         let logo_tables_present = format_version >= LOGO_TABLE_VERSION;
-        let (race_logo_indices, race_logo_names, event_logo_indices, event_logo_names) =
-            if logo_tables_present {
-                let race_count = flags
-                    .iter()
-                    .filter(|flags| **flags & 0x0300 == 0x0100)
-                    .count();
-                let event_count = flags
-                    .iter()
-                    .filter(|flags| **flags & 0x0300 == 0x0200)
-                    .count();
-                let race_indices = read_encoded_ushort_array(&mut reader, race_count)?;
-                let race_names = read_prefab_names(&mut reader)?;
-                let event_indices = read_encoded_ushort_array(&mut reader, event_count)?;
-                (
-                    race_indices,
-                    race_names,
-                    event_indices,
-                    read_prefab_names(&mut reader)?,
-                )
-            } else {
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-            };
+        let (
+            race_logo_indices,
+            race_logo_indices_range,
+            race_logo_names,
+            event_logo_indices,
+            event_logo_indices_range,
+            event_logo_names,
+        ) = if logo_tables_present {
+            let race_count = flags
+                .iter()
+                .filter(|flags| **flags & 0x0300 == 0x0100)
+                .count();
+            let event_count = flags
+                .iter()
+                .filter(|flags| **flags & 0x0300 == 0x0200)
+                .count();
+            let race_start = reader.offset();
+            let race_indices = read_encoded_ushort_array(&mut reader, race_count)?;
+            let race_range = race_start..reader.offset();
+            let race_names = read_prefab_names(&mut reader)?;
+            let event_start = reader.offset();
+            let event_indices = read_encoded_ushort_array(&mut reader, event_count)?;
+            let event_range = event_start..reader.offset();
+            (
+                race_indices,
+                Some(race_range),
+                race_names,
+                event_indices,
+                Some(event_range),
+                read_prefab_names(&mut reader)?,
+            )
+        } else {
+            (Vec::new(), None, Vec::new(), Vec::new(), None, Vec::new())
+        };
         let consumed = reader.offset();
 
         Ok((
@@ -124,8 +141,10 @@ impl PropManagerDataPrefix {
                 angles,
                 angles_range,
                 race_logo_indices,
+                race_logo_indices_range,
                 race_logo_names,
                 event_logo_indices,
+                event_logo_indices_range,
                 event_logo_names,
                 logo_tables_present,
                 serialized_prefix: bytes[..consumed].to_vec(),
@@ -147,6 +166,8 @@ impl PropManagerDataPrefix {
             original_position_x: self.position_x.clone(),
             original_position_z: self.position_z.clone(),
             original_angles: self.angles.clone(),
+            original_race_logo_indices: self.race_logo_indices.clone(),
+            original_event_logo_indices: self.event_logo_indices.clone(),
             data: self,
         }
     }
@@ -265,6 +286,18 @@ impl PropManagerEditor {
         &mut self.data.angles
     }
 
+    /// Returns mutable race-team logo assignments in PropInstance flag order.
+    /// The slice is empty when the version-121026 logo tables are absent.
+    pub fn race_logo_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.data.race_logo_indices
+    }
+
+    /// Returns mutable event logo assignments in PropInstance flag order.
+    /// The slice is empty when the version-121026 logo tables are absent.
+    pub fn event_logo_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.data.event_logo_indices
+    }
+
     /// Writes edited columns while retaining all unedited source bytes.
     /// Returns an error if the source column ranges or record counts are inconsistent.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
@@ -279,6 +312,8 @@ impl PropManagerEditor {
             || self.original_position_x.len() != count
             || self.original_position_z.len() != count
             || self.original_angles.len() != count
+            || self.data.race_logo_indices.len() != self.original_race_logo_indices.len()
+            || self.data.event_logo_indices.len() != self.original_event_logo_indices.len()
         {
             return Err(invalid_prop_manager(
                 0,
@@ -338,6 +373,31 @@ impl PropManagerEditor {
                 &self.data.angles_range,
                 &self.data.angles,
                 "angles",
+            )?);
+        }
+        if self.data.race_logo_indices != self.original_race_logo_indices {
+            let range = self.data.race_logo_indices_range.as_ref().ok_or_else(|| {
+                invalid_prop_manager(
+                    0,
+                    "race-team logo assignments are unavailable in this version",
+                )
+            })?;
+            replacements.push(encode_ushort_column(
+                &bytes,
+                range,
+                &self.data.race_logo_indices,
+                "race-team logo indexes",
+            )?);
+        }
+        if self.data.event_logo_indices != self.original_event_logo_indices {
+            let range = self.data.event_logo_indices_range.as_ref().ok_or_else(|| {
+                invalid_prop_manager(0, "event logo assignments are unavailable in this version")
+            })?;
+            replacements.push(encode_ushort_column(
+                &bytes,
+                range,
+                &self.data.event_logo_indices,
+                "event logo indexes",
             )?);
         }
 
@@ -413,7 +473,7 @@ fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, Crp
 
 #[cfg(test)]
 mod tests {
-    use super::PropManagerDataPrefix;
+    use super::{PROP_INSTANCE_COUNT, PropManagerDataPrefix};
     use crate::encoded_array::write_encoded_ushort_array;
 
     const LEGACY_FIXTURE: &[u8] =
@@ -502,6 +562,65 @@ mod tests {
         assert_eq!(props.race_logo_indices(), &[0x44]);
         assert_eq!(props.event_logo_indices(), &[0x55]);
         assert_eq!(props.encode(), bytes);
+    }
+
+    #[test]
+    fn prop_manager_editor_reencodes_changed_logo_assignments_exactly() {
+        let bytes = two_logo_prefix();
+        let (props, _) = PropManagerDataPrefix::decode_prefix(121_026, &bytes).unwrap();
+        let mut editor = props.into_editor();
+        editor.race_logo_indices_mut()[0] = 0x1234;
+        editor.event_logo_indices_mut()[0] = 0xabcd;
+
+        let mut expected = bytes.clone();
+        expected[544..546].copy_from_slice(&[0x12, 0x34]);
+        expected[549..551].copy_from_slice(&[0xab, 0xcd]);
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+
+        let (updated, consumed) = PropManagerDataPrefix::decode_prefix(121_026, &encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(updated.race_logo_indices(), &[0x1234]);
+        assert_eq!(updated.event_logo_indices(), &[0xabcd]);
+        assert_eq!(updated.race_logo_names(), &[]);
+        assert_eq!(updated.event_logo_names(), &[]);
+    }
+
+    #[test]
+    fn prop_manager_logo_assignment_resize_preserves_later_scopes() {
+        let mut flags = vec![0_u16; PROP_INSTANCE_COUNT];
+        flags[..4].fill(0x0100);
+        flags[4] = 0x0200;
+        let mut bytes = Vec::new();
+        write_encoded_ushort_array(&mut bytes, &flags);
+        write_encoded_ushort_array(&mut bytes, &[1, 2, 3, 4, 5]);
+        bytes.extend_from_slice(&[0, 0]); // Empty PropInfo names.
+        write_encoded_ushort_array(&mut bytes, &[0; 5]); // X positions.
+        write_encoded_ushort_array(&mut bytes, &[0; 5]); // Z positions.
+        write_encoded_ushort_array(&mut bytes, &[0; 5]); // Angles.
+        write_encoded_ushort_array(&mut bytes, &[5, 10, 15, 20]);
+        bytes.extend_from_slice(&[0, 0]); // Empty race-team names.
+        write_encoded_ushort_array(&mut bytes, &[30]);
+        bytes.extend_from_slice(&[0, 0]); // Empty event names.
+
+        let (props, consumed) = PropManagerDataPrefix::decode_prefix(121_026, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(props.race_logo_indices(), &[5, 10, 15, 20]);
+        assert_eq!(props.event_logo_indices(), &[30]);
+        let race_range = props.race_logo_indices_range.clone().unwrap();
+        let mut editor = props.into_editor();
+        editor.race_logo_indices_mut().fill(0);
+
+        let mut expected = bytes.clone();
+        expected.splice(race_range, [0x83]); // Four repeated zero indexes.
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+        assert_eq!(encoded.len(), bytes.len() - 3);
+
+        let (updated, consumed) = PropManagerDataPrefix::decode_prefix(121_026, &encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(updated.race_logo_indices(), &[0; 4]);
+        assert_eq!(updated.event_logo_indices(), &[30]);
     }
 
     #[test]

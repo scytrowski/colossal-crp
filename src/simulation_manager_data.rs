@@ -7708,7 +7708,8 @@ impl SimulationManagerData {
     ///
     /// The editor must come from the current manager body and inner version.
     /// Flag edits preserve slot activity and, from version 121026, logo-kind
-    /// selection. Prefab-name scopes, logo tables, and record counts stay fixed.
+    /// selection. Existing race-team and event logo assignments can change;
+    /// prefab-name scopes and record counts stay fixed.
     /// Changed encoded arrays can resize the graph; the TreeManager boundary
     /// is checked again after replacement.
     pub fn replace_prop_manager_data(
