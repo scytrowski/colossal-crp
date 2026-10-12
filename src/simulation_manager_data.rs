@@ -26137,7 +26137,8 @@ mod manager_boundary_tests {
 
         let mut tree_body = encoded_flags;
         tree_body.extend_from_slice(&encoded_prefabs);
-        tree_body.extend_from_slice(&[0, 0]); // Empty prefab-name scope.
+        tree_body.extend_from_slice(&[0, 1, 0xff]); // One null tree prefab name.
+        let name_offset = encoded_flags_len + encoded_prefabs.len() + 2;
         let x_offset = tree_body.len();
         tree_body.extend_from_slice(&encoded_x);
         write_encoded_ushort_array(&mut tree_body, &[40, 50, 60]);
@@ -26164,12 +26165,15 @@ mod manager_boundary_tests {
         let original_graph_len = original_graph.len();
         let mut editor = manager.decode_tree_manager_editor().unwrap();
         editor.set_flag_bits(0, 3).unwrap();
+        editor.prefab_names_mut()[0] = Some("A".to_owned());
         for tree in editor.trees_mut() {
             tree.position_x = 0;
         }
         let mut expected_graph = original_graph;
         let x_start = body_start + x_offset;
         expected_graph.splice(x_start..x_start + encoded_x.len(), [0x82]);
+        let name_start = body_start + name_offset;
+        expected_graph.splice(name_start..name_start + 1, [0x80, 0, 1, 0xc1]);
         let mut expected_flags = flags.clone();
         expected_flags[0] = 3;
         let mut encoded_expected_flags = Vec::new();
@@ -26184,6 +26188,7 @@ mod manager_boundary_tests {
             expected_graph.len(),
             original_graph_len - (encoded_x.len() - 1) - encoded_flags_len
                 + encoded_expected_flags_len
+                + 3
         );
         manager.replace_tree_manager_data(&editor).unwrap();
 
@@ -26194,6 +26199,7 @@ mod manager_boundary_tests {
         );
         let (updated, weather_start) = manager.decode_tree_manager_prefix().unwrap();
         assert_eq!(updated.flags()[0], 3);
+        assert_eq!(updated.prefab_names(), &[Some("A".to_owned())]);
         assert!(updated.trees().iter().all(|tree| tree.position_x == 0));
         assert!(
             manager.serialized_object_graph()[weather_start..]
@@ -26208,7 +26214,7 @@ mod manager_boundary_tests {
         }
         let expanded_column = [2, 0, 10, 0, 20, 0, 30];
         let mut expanded_graph = manager.serialized_object_graph().to_vec();
-        let edited_x_start = x_start - encoded_flags_len + encoded_expected_flags_len;
+        let edited_x_start = x_start - encoded_flags_len + encoded_expected_flags_len + 3;
         expanded_graph.splice(edited_x_start..edited_x_start + 1, expanded_column);
         manager
             .replace_tree_manager_data(&expansion_editor)
@@ -26216,7 +26222,7 @@ mod manager_boundary_tests {
         assert_eq!(manager.serialized_object_graph(), expanded_graph);
         assert_eq!(
             expanded_graph.len(),
-            original_graph_len - encoded_flags_len + encoded_expected_flags_len
+            original_graph_len - encoded_flags_len + encoded_expected_flags_len + 3
         );
         let (expanded, weather_start) = manager.decode_tree_manager_prefix().unwrap();
         assert_eq!(
@@ -26227,6 +26233,7 @@ mod manager_boundary_tests {
                 .collect::<Vec<_>>(),
             [10, 20, 30]
         );
+        assert_eq!(expanded.prefab_names(), &[Some("A".to_owned())]);
         assert!(
             manager.serialized_object_graph()[weather_start..]
                 .starts_with(&profiler_tag("WeatherManager"))

@@ -1,5 +1,5 @@
 use crate::CrpError;
-use crate::data_serializer::Reader;
+use crate::data_serializer::{Reader, write_nullable_unique_string};
 use crate::encoded_array::{read_encoded_ushort_array, write_encoded_ushort_array};
 use std::ops::Range;
 
@@ -38,6 +38,7 @@ pub struct TreeManagerDataPrefix {
     flags: Vec<u16>,
     serialized_fire_flags: Vec<u16>,
     prefab_names: Vec<Option<String>>,
+    prefab_name_ranges: Vec<Range<usize>>,
     trees: Vec<TreeInstanceRecord>,
     flags_range: Range<usize>,
     prefab_indices_range: Range<usize>,
@@ -59,6 +60,7 @@ pub struct TreeManagerDataPrefix {
 pub struct TreeManagerEditor {
     data: TreeManagerDataPrefix,
     original_flags: Vec<u16>,
+    original_prefab_names: Vec<Option<String>>,
     original_trees: Vec<TreeInstanceRecord>,
 }
 
@@ -98,7 +100,7 @@ impl TreeManagerDataPrefix {
         let prefab_indices_start = reader.offset();
         let prefab_indices = read_encoded_ushort_array(&mut reader, active_indices.len())?;
         let prefab_indices_range = prefab_indices_start..reader.offset();
-        let prefab_names = read_prefab_names(&mut reader)?;
+        let (prefab_names, prefab_name_ranges) = read_prefab_names(&mut reader)?;
         let position_x_start = reader.offset();
         let position_x = read_encoded_ushort_array(&mut reader, active_indices.len())?;
         let position_x_range = position_x_start..reader.offset();
@@ -147,6 +149,7 @@ impl TreeManagerDataPrefix {
                 flags,
                 serialized_fire_flags,
                 prefab_names,
+                prefab_name_ranges,
                 trees,
                 flags_range,
                 prefab_indices_range,
@@ -189,10 +192,12 @@ impl TreeManagerDataPrefix {
     /// versioned burning-tree records.
     pub fn into_editor(self) -> TreeManagerEditor {
         let original_flags = self.flags.clone();
+        let original_prefab_names = self.prefab_names.clone();
         let original_trees = self.trees.clone();
         TreeManagerEditor {
             data: self,
             original_flags,
+            original_prefab_names,
             original_trees,
         }
     }
@@ -242,6 +247,13 @@ impl TreeManagerEditor {
         &mut self.data.trees
     }
 
+    /// Returns mutable tree prefab names in their original table order.
+    /// The number and order of entries are fixed; changed strings use
+    /// canonical DataSerializer encoding and can resize the manager body.
+    pub fn prefab_names_mut(&mut self) -> &mut [Option<String>] {
+        &mut self.data.prefab_names
+    }
+
     /// Returns mutable burning-tree records without changing their count.
     /// Returns `None` for versions before 266.
     pub fn burning_trees_mut(&mut self) -> Option<&mut [BurningTreeRecord]> {
@@ -273,8 +285,9 @@ impl TreeManagerEditor {
     /// Writes edited fields while retaining unchanged source bytes.
     ///
     /// Changing raw flags, prefab indexes, or positions re-encodes only the
-    /// affected `EncodedArray.UShort` column. That column may change length;
-    /// preserved source fire bits are restored when flags are rewritten.
+    /// affected `EncodedArray.UShort` column. Changed prefab names use
+    /// canonical DataSerializer encoding; both may change the body length.
+    /// Preserved source fire bits are restored when flags are rewritten.
     /// Burning-tree records use fixed-width fields, and their list can be
     /// replaced from version 266. Tree slots and their count cannot change.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
@@ -282,6 +295,8 @@ impl TreeManagerEditor {
         if self.data.flags.len() != TREE_CAPACITY - 1
             || self.original_flags.len() != TREE_CAPACITY - 1
             || self.data.serialized_fire_flags.len() != TREE_CAPACITY - 1
+            || self.data.prefab_names.len() != self.original_prefab_names.len()
+            || self.data.prefab_names.len() != self.data.prefab_name_ranges.len()
             || self.data.trees.len() != self.original_trees.len()
         {
             return Err(invalid_tree_manager(
@@ -319,6 +334,14 @@ impl TreeManagerEditor {
                 "tree flags",
             )?);
         }
+
+        replacements.extend(encode_name_replacements(
+            &bytes,
+            &self.original_prefab_names,
+            &self.data.prefab_names,
+            &self.data.prefab_name_ranges,
+            "tree prefab names",
+        )?);
 
         let current_prefab_indices = self
             .data
@@ -494,13 +517,50 @@ fn validate_range(
     Ok(())
 }
 
-fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, CrpError> {
+fn read_prefab_names(
+    reader: &mut Reader<'_>,
+) -> Result<(Vec<Option<String>>, Vec<Range<usize>>), CrpError> {
     let count = usize::from(reader.read_u16_be()?);
     let mut names = Vec::with_capacity(count);
+    let mut ranges = Vec::with_capacity(count);
     for _ in 0..count {
+        let start = reader.offset();
         names.push(reader.read_unique_string()?);
+        ranges.push(start..reader.offset());
     }
-    Ok(names)
+    Ok((names, ranges))
+}
+
+fn encode_name_replacements(
+    source: &[u8],
+    original: &[Option<String>],
+    edited: &[Option<String>],
+    ranges: &[Range<usize>],
+    field: &str,
+) -> Result<Vec<(Range<usize>, Vec<u8>)>, CrpError> {
+    if original.len() != edited.len() || original.len() != ranges.len() {
+        return Err(invalid_tree_manager(
+            0,
+            format!("{field} entry counts do not match the source"),
+        ));
+    }
+
+    let mut replacements = Vec::new();
+    for (index, ((before, after), range)) in original.iter().zip(edited).zip(ranges).enumerate() {
+        if before == after {
+            continue;
+        }
+        if range.start > range.end || range.end > source.len() {
+            return Err(invalid_tree_manager(
+                range.start,
+                format!("{field} entry {index} byte range is invalid"),
+            ));
+        }
+        let mut encoded = Vec::new();
+        write_nullable_unique_string(&mut encoded, after.as_deref())?;
+        replacements.push((range.clone(), encoded));
+    }
+    Ok(replacements)
 }
 
 fn invalid_tree_manager(offset: usize, reason: impl Into<String>) -> CrpError {
@@ -807,6 +867,40 @@ mod tests {
         );
         assert_eq!(updated.trees()[0].position_z, -2);
         assert_eq!(updated.trees()[2].position_z, 12);
+    }
+
+    #[test]
+    fn tree_manager_editor_changes_existing_prefab_names_exactly() {
+        let mut flags = vec![0_u16; TREE_CAPACITY - 1];
+        flags[..2].fill(1);
+        let mut source = Vec::new();
+        write_encoded_ushort_array(&mut source, &flags);
+        write_encoded_ushort_array(&mut source, &[12, 14]);
+        source.extend_from_slice(&[0, 2]); // Two tree prefab names.
+        source.extend_from_slice(&[0, 0, 1, 0xff, 0xd0]); // Wide "P".
+        source.push(0xff); // Null name.
+        write_encoded_ushort_array(&mut source, &[1, 2]);
+        write_encoded_ushort_array(&mut source, &[3, 4]);
+
+        let (tree_manager, consumed) = TreeManagerDataPrefix::decode_prefix(194, &source).unwrap();
+        assert_eq!(consumed, source.len());
+        assert_eq!(tree_manager.prefab_names(), &[Some("P".to_owned()), None]);
+        let name_ranges = tree_manager.prefab_name_ranges.clone();
+        let mut editor = tree_manager.into_editor();
+        editor.prefab_names_mut()[0] = None;
+        editor.prefab_names_mut()[1] = Some("A".to_owned());
+
+        let mut expected = source.clone();
+        expected.splice(name_ranges[1].clone(), [0x80, 0, 1, 0xc1]);
+        expected.splice(name_ranges[0].clone(), [0xff]);
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+
+        let (updated, consumed) = TreeManagerDataPrefix::decode_prefix(194, &encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(updated.prefab_names(), &[None, Some("A".to_owned())]);
+        assert_eq!(updated.trees()[0].prefab_index, 12);
+        assert_eq!(updated.trees()[1].prefab_index, 14);
     }
 
     #[test]
