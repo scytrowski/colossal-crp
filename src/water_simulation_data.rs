@@ -5,10 +5,17 @@ use crate::encoded_array::{read_encoded_ushort_array, write_encoded_ushort_array
 const GRID_SIDE: usize = 1081;
 const CELL_COUNT: usize = GRID_SIDE * GRID_SIDE;
 const WATER_SOURCE_RECORD_LENGTH: usize = 43;
+const LEGACY_WATER_SOURCE_RECORD_LENGTH: usize = 34;
+const OLDEST_WATER_SOURCE_RECORD_LENGTH: usize = 28;
 const WATER_WAVE_LEGACY_RECORD_LENGTH: usize = 23;
 const WATER_WAVE_RECORD_LENGTH: usize = 24;
 
-/// A water source in the version-184-and-newer layout.
+/// A water source decoded from a versioned `WaterSimulation+Data` record.
+///
+/// Before inner version 184, output position is copied from input position,
+/// the effective input rate is stored separately, and five legacy values that
+/// the game reader discards are exposed in `legacy_parameters`. The editor
+/// preserves these old source records verbatim and rejects edits to them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaterSource {
     /// Input position in world coordinates.
@@ -19,8 +26,12 @@ pub struct WaterSource {
     pub source_type: u16,
     /// Target stored by the game.
     pub target: u16,
-    /// Five 24-bit source parameters in serialized order.
+    /// Five 24-bit source parameters in the version-184-and-newer layout.
     pub parameters: [u32; 5],
+    /// Effective input rate in the pre-184 source layout.
+    pub legacy_input_rate: Option<u32>,
+    /// Five pre-184 source values discarded by the game reader, in wire order.
+    pub legacy_parameters: Option<[u32; 5]>,
 }
 
 /// One `WaterWave` record in a version-259-or-newer WaterSimulation body.
@@ -55,10 +66,10 @@ pub struct WaterWave {
     pub current_time: u16,
 }
 
-/// Decoded `WaterSimulation+Data` fields for inner serializer versions 184+.
+/// Decoded `WaterSimulation+Data` fields supported by the versioned reader.
 ///
 /// The original body is retained for byte-exact writing. Unknown record values
-/// and encoded-array run choices are never normalized on re-encoding.
+/// and encoded-array run choices are never normalized on unchanged encoding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaterSimulationData {
     format_version: u32,
@@ -67,6 +78,7 @@ pub struct WaterSimulationData {
     velocity_x: Vec<i16>,
     velocity_z: Vec<i16>,
     sources: Vec<WaterSource>,
+    source_records: Vec<u8>,
     wave_count: u16,
     waves: Vec<WaterWave>,
     wave_records: Vec<u8>,
@@ -80,12 +92,73 @@ pub struct WaterSimulationData {
 ///
 /// Create this by consuming a decoded [`WaterSimulationData`] with
 /// [`into_editor`](WaterSimulationData::into_editor). Encoding writes fresh
-/// arrays, sources, and tail fields. Unchanged wave records retain their
-/// original bytes; edited waves are written from typed fields.
+/// arrays and versioned tail fields. Unchanged pre-184 source records and wave
+/// records retain their original bytes; edited waves are written from typed
+/// fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaterSimulationEditor {
     data: WaterSimulationData,
+    original_sources: Vec<WaterSource>,
     original_waves: Vec<WaterWave>,
+}
+
+fn read_water_source(version: u32, reader: &mut Reader<'_>) -> Result<WaterSource, CrpError> {
+    let input_position = [
+        reader.read_f32_be()?,
+        reader.read_f32_be()?,
+        reader.read_f32_be()?,
+    ];
+    let output_position = if version >= 184 {
+        [
+            reader.read_f32_be()?,
+            reader.read_f32_be()?,
+            reader.read_f32_be()?,
+        ]
+    } else {
+        input_position
+    };
+    let source_type = reader.read_u16_be()?;
+    if version >= 184 {
+        let target = reader.read_u16_be()?;
+        let mut parameters = [0_u32; 5];
+        for parameter in &mut parameters {
+            *parameter = reader.read_u24_be()?;
+        }
+        return Ok(WaterSource {
+            input_position,
+            output_position,
+            source_type,
+            target,
+            parameters,
+            legacy_input_rate: None,
+            legacy_parameters: None,
+        });
+    }
+
+    let raw_input_rate = if version >= 95 {
+        reader.read_u24_be()?
+    } else {
+        u32::from(reader.read_u16_be()?)
+    };
+    let legacy_input_rate = Some(if source_type == 1 { raw_input_rate } else { 0 });
+    let target = reader.read_u16_be()?;
+    let mut legacy_parameters = [0_u32; 5];
+    for parameter in &mut legacy_parameters {
+        *parameter = if version >= 95 {
+            reader.read_u24_be()?
+        } else {
+            u32::from(reader.read_u16_be()?)
+        };
+    }
+    Ok(WaterSource {
+        input_position,
+        output_position,
+        source_type,
+        target,
+        parameters: [0; 5],
+        legacy_input_rate,
+        legacy_parameters: Some(legacy_parameters),
+    })
 }
 
 impl WaterWave {
@@ -145,15 +218,10 @@ impl WaterSimulationData {
     /// Decodes a WaterSimulation body and returns its byte length.
     ///
     /// The stream must start after the `WaterSimulation` profiler begin tag.
-    /// Versions before 184 are rejected because their source record layout has
-    /// not been implemented. Malformed arrays and truncated records return an error.
+    /// Versions before 42 store velocities only for wet cells. Before version
+    /// 184, source records use a legacy layout and are preserved as raw bytes
+    /// for writing. Malformed arrays and truncated records return an error.
     pub fn decode_prefix(version: u32, bytes: &[u8]) -> Result<(Self, usize), CrpError> {
-        if version < 184 {
-            return Err(invalid(
-                0,
-                "WaterSource layout before version 184 is unsupported",
-            ));
-        }
         let mut reader = Reader::new(bytes);
         let heights = read_encoded_ushort_array(&mut reader, CELL_COUNT)?;
         let wet_count = heights.iter().filter(|height| **height != 0).count();
@@ -172,14 +240,18 @@ impl WaterSimulationData {
             .iter()
             .enumerate()
             .filter(|(index, height)| {
-                **height != 0 || (*index % GRID_SIDE < GRID_SIDE - 1 && heights[*index + 1] != 0)
+                **height != 0
+                    || (version >= 42
+                        && *index % GRID_SIDE < GRID_SIDE - 1
+                        && heights[*index + 1] != 0)
             })
             .count();
         let packed_x = read_encoded_ushort_array(&mut reader, x_count)?;
         let mut velocity_x = vec![0_i16; CELL_COUNT];
         let mut x_iter = packed_x.into_iter();
         for (index, value) in velocity_x.iter_mut().enumerate() {
-            if heights[index] != 0 || (index % GRID_SIDE < GRID_SIDE - 1 && heights[index + 1] != 0)
+            if heights[index] != 0
+                || (version >= 42 && index % GRID_SIDE < GRID_SIDE - 1 && heights[index + 1] != 0)
             {
                 *value = x_iter
                     .next()
@@ -193,7 +265,9 @@ impl WaterSimulationData {
             .enumerate()
             .filter(|(index, height)| {
                 **height != 0
-                    || (*index / GRID_SIDE < GRID_SIDE - 1 && heights[*index + GRID_SIDE] != 0)
+                    || (version >= 42
+                        && *index / GRID_SIDE < GRID_SIDE - 1
+                        && heights[*index + GRID_SIDE] != 0)
             })
             .count();
         let packed_z = read_encoded_ushort_array(&mut reader, z_count)?;
@@ -201,7 +275,9 @@ impl WaterSimulationData {
         let mut z_iter = packed_z.into_iter();
         for (index, value) in velocity_z.iter_mut().enumerate() {
             if heights[index] != 0
-                || (index / GRID_SIDE < GRID_SIDE - 1 && heights[index + GRID_SIDE] != 0)
+                || (version >= 42
+                    && index / GRID_SIDE < GRID_SIDE - 1
+                    && heights[index + GRID_SIDE] != 0)
             {
                 *value = z_iter
                     .next()
@@ -211,37 +287,23 @@ impl WaterSimulationData {
         }
 
         let source_count = usize::from(reader.read_u16_be()?);
-        if source_count > reader.remaining() / WATER_SOURCE_RECORD_LENGTH {
+        let source_record_length = if version >= 184 {
+            WATER_SOURCE_RECORD_LENGTH
+        } else if version >= 95 {
+            LEGACY_WATER_SOURCE_RECORD_LENGTH
+        } else {
+            OLDEST_WATER_SOURCE_RECORD_LENGTH
+        };
+        if source_count > reader.remaining() / source_record_length {
             return Err(reader.invalid("water source records exceed remaining bytes"));
         }
+        let source_records_start = reader.offset();
         let mut sources = Vec::with_capacity(source_count);
         for _ in 0..source_count {
-            let input_position = [
-                reader.read_f32_be()?,
-                reader.read_f32_be()?,
-                reader.read_f32_be()?,
-            ];
-            let output_position = [
-                reader.read_f32_be()?,
-                reader.read_f32_be()?,
-                reader.read_f32_be()?,
-            ];
-            let source_type = reader.read_u16_be()?;
-            let target = reader.read_u16_be()?;
-            let mut parameters = [0_u32; 5];
-            for parameter in &mut parameters {
-                let bytes = reader.read_bytes(3)?;
-                *parameter =
-                    (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
-            }
-            sources.push(WaterSource {
-                input_position,
-                output_position,
-                source_type,
-                target,
-                parameters,
-            });
+            sources.push(read_water_source(version, &mut reader)?);
         }
+        let source_records =
+            reader.consumed_bytes()[source_records_start..reader.offset()].to_vec();
         let (wave_count, waves, wave_records) = if version >= 259 {
             let count = reader.read_u16_be()?;
             let record_length = if version >= 261 {
@@ -289,6 +351,7 @@ impl WaterSimulationData {
                 velocity_x,
                 velocity_z,
                 sources,
+                source_records,
                 wave_count,
                 waves,
                 wave_records,
@@ -368,7 +431,9 @@ impl WaterSimulationData {
     /// Edited writes always use canonical array controls.
     pub fn into_editor(mut self) -> WaterSimulationEditor {
         self.serialized_body = Vec::new();
+        let original_sources = self.sources.clone();
         WaterSimulationEditor {
+            original_sources,
             original_waves: self.waves.clone(),
             data: self,
         }
@@ -399,19 +464,23 @@ impl WaterSimulationEditor {
 
     /// Returns editable signed horizontal velocities.
     ///
-    /// Values at cells outside the height/neighbor mask must remain zero.
+    /// Values outside the reader's versioned height mask must remain zero;
+    /// neighboring dry cells join the mask from version 42.
     pub fn velocity_x_mut(&mut self) -> &mut [i16] {
         &mut self.data.velocity_x
     }
 
     /// Returns editable signed vertical velocities.
     ///
-    /// Values at cells outside the height/neighbor mask must remain zero.
+    /// Values outside the reader's versioned height mask must remain zero;
+    /// neighboring dry cells join the mask from version 42.
     pub fn velocity_z_mut(&mut self) -> &mut [i16] {
         &mut self.data.velocity_z
     }
 
     /// Returns the editable source list; at most 65,535 sources can be written.
+    /// Before version 184, source records are preserved verbatim and any edit
+    /// to the list or its values makes encoding fail.
     pub fn sources_mut(&mut self) -> &mut Vec<WaterSource> {
         &mut self.data.sources
     }
@@ -439,21 +508,17 @@ impl WaterSimulationEditor {
         self.data.frame_index = frame_index;
     }
 
-    /// Encodes changed fields for inner versions 184 and newer.
+    /// Encodes changed fields for the decoded reader layout.
     ///
     /// Array blocks are regenerated using literal and repeated-delta controls,
     /// so bytes can differ from the game's original run grouping. Original
-    /// wave bytes are preserved when unchanged and re-encoded when edited.
-    /// Returns an error if counts or 24-bit parameters overflow, an old-version
-    /// wave type is unrepresentable, or a value would be dropped by a sparse mask.
+    /// wave bytes and pre-184 source records are preserved when unchanged.
+    /// Editing pre-184 source records is rejected because the supplied DLL
+    /// writer does not implement the reader's legacy layout. Returns an error
+    /// if counts or 24-bit parameters overflow, an old-version wave type is
+    /// unrepresentable, or a value would be dropped by a sparse mask.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let data = &self.data;
-        if data.format_version < 184 {
-            return Err(invalid(
-                0,
-                "WaterSource layout before version 184 is unsupported",
-            ));
-        }
         if data.heights.len() != CELL_COUNT
             || data.pollution.len() != CELL_COUNT
             || data.velocity_x.len() != CELL_COUNT
@@ -462,6 +527,24 @@ impl WaterSimulationEditor {
             return Err(invalid(
                 0,
                 "WaterSimulation grids must have 1,168,561 cells",
+            ));
+        }
+        if data.format_version < 131 && data.sea_level.to_bits() != 0 {
+            return Err(invalid(
+                0,
+                "sea level is unavailable before inner version 131",
+            ));
+        }
+        if data.format_version < 147 && data.pollution_rates != [0, 0] {
+            return Err(invalid(
+                0,
+                "pollution disposal rates are unavailable before inner version 147",
+            ));
+        }
+        if data.format_version < 173 && data.frame_index != 0 {
+            return Err(invalid(
+                0,
+                "water frame index is unavailable before inner version 173",
             ));
         }
         let source_count = u16::try_from(data.sources.len())
@@ -482,7 +565,10 @@ impl WaterSimulationEditor {
                     "nonzero pollution in dry WaterSimulation cell",
                 ));
             }
-            let has_x = wet || (index % GRID_SIDE < GRID_SIDE - 1 && data.heights[index + 1] != 0);
+            let has_x = wet
+                || (data.format_version >= 42
+                    && index % GRID_SIDE < GRID_SIDE - 1
+                    && data.heights[index + 1] != 0);
             if has_x {
                 packed_x.push(data.velocity_x[index] as u16);
             } else if data.velocity_x[index] != 0 {
@@ -491,8 +577,10 @@ impl WaterSimulationEditor {
                     "horizontal velocity is outside the sparse mask",
                 ));
             }
-            let has_z =
-                wet || (index / GRID_SIDE < GRID_SIDE - 1 && data.heights[index + GRID_SIDE] != 0);
+            let has_z = wet
+                || (data.format_version >= 42
+                    && index / GRID_SIDE < GRID_SIDE - 1
+                    && data.heights[index + GRID_SIDE] != 0);
             if has_z {
                 packed_z.push(data.velocity_z[index] as u16);
             } else if data.velocity_z[index] != 0 {
@@ -507,21 +595,51 @@ impl WaterSimulationEditor {
         write_encoded_ushort_array(&mut output, &packed_z);
 
         output.extend_from_slice(&source_count.to_be_bytes());
-        for (index, source) in data.sources.iter().enumerate() {
-            for coordinate in source
-                .input_position
-                .into_iter()
-                .chain(source.output_position)
-            {
-                output.extend_from_slice(&coordinate.to_bits().to_be_bytes());
+        if data.format_version < 184 {
+            if !water_sources_wire_equal(&data.sources, &self.original_sources) {
+                return Err(invalid(
+                    output.len(),
+                    "pre-184 water source records are preserved but cannot be edited",
+                ));
             }
-            output.extend_from_slice(&source.source_type.to_be_bytes());
-            output.extend_from_slice(&source.target.to_be_bytes());
-            for parameter in source.parameters {
-                if parameter > 0x00ff_ffff {
-                    return Err(invalid(index, "water source parameter exceeds 24 bits"));
+            let record_length = if data.format_version >= 95 {
+                LEGACY_WATER_SOURCE_RECORD_LENGTH
+            } else {
+                OLDEST_WATER_SOURCE_RECORD_LENGTH
+            };
+            let expected_length = data.sources.len().checked_mul(record_length).ok_or(
+                CrpError::ArithmeticOverflow("legacy water source table length"),
+            )?;
+            if self.data.source_records.len() != expected_length {
+                return Err(invalid(
+                    output.len(),
+                    "legacy water source records do not match their saved count",
+                ));
+            }
+            output.extend_from_slice(&data.source_records);
+        } else {
+            for (index, source) in data.sources.iter().enumerate() {
+                if source.legacy_input_rate.is_some() || source.legacy_parameters.is_some() {
+                    return Err(invalid(
+                        index,
+                        "legacy water source values are unavailable from version 184",
+                    ));
                 }
-                output.extend_from_slice(&parameter.to_be_bytes()[1..]);
+                for coordinate in source
+                    .input_position
+                    .into_iter()
+                    .chain(source.output_position)
+                {
+                    output.extend_from_slice(&coordinate.to_bits().to_be_bytes());
+                }
+                output.extend_from_slice(&source.source_type.to_be_bytes());
+                output.extend_from_slice(&source.target.to_be_bytes());
+                for parameter in source.parameters {
+                    if parameter > 0x00ff_ffff {
+                        return Err(invalid(index, "water source parameter exceeds 24 bits"));
+                    }
+                    output.extend_from_slice(&parameter.to_be_bytes()[1..]);
+                }
             }
         }
 
@@ -556,11 +674,30 @@ impl WaterSimulationEditor {
                 "water waves are unavailable before version 259",
             ));
         }
-        output.extend_from_slice(&data.sea_level.to_bits().to_be_bytes());
-        output.extend(data.pollution_rates.map(|rate| rate as u8));
-        output.extend_from_slice(&data.frame_index.to_be_bytes());
+        if data.format_version >= 131 {
+            output.extend_from_slice(&data.sea_level.to_bits().to_be_bytes());
+        }
+        if data.format_version >= 147 {
+            output.extend(data.pollution_rates.map(|rate| rate as u8));
+        }
+        if data.format_version >= 173 {
+            output.extend_from_slice(&data.frame_index.to_be_bytes());
+        }
         Ok(output)
     }
+}
+
+fn water_sources_wire_equal(left: &[WaterSource], right: &[WaterSource]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.input_position.map(f32::to_bits) == right.input_position.map(f32::to_bits)
+                && left.output_position.map(f32::to_bits) == right.output_position.map(f32::to_bits)
+                && left.source_type == right.source_type
+                && left.target == right.target
+                && left.parameters == right.parameters
+                && left.legacy_input_rate == right.legacy_input_rate
+                && left.legacy_parameters == right.legacy_parameters
+        })
 }
 
 fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
@@ -573,9 +710,9 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CELL_COUNT, WaterSimulationData, WaterWave};
+    use super::{CELL_COUNT, GRID_SIDE, WaterSimulationData, WaterWave};
     use crate::data_serializer::Reader;
-    use crate::encoded_array::write_encoded_ushort_array;
+    use crate::encoded_array::{read_encoded_ushort_array, write_encoded_ushort_array};
 
     fn zero_run(output: &mut Vec<u8>, mut remaining: usize) {
         while remaining > 0 {
@@ -606,9 +743,44 @@ mod tests {
         bytes
     }
 
+    fn legacy_sample_body(version: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        zero_run(&mut bytes, CELL_COUNT);
+        bytes.extend_from_slice(&1_u16.to_be_bytes()); // One legacy water source.
+        for value in [1.0_f32, 2.0, 3.0] {
+            bytes.extend_from_slice(&value.to_bits().to_be_bytes());
+        }
+        bytes.extend_from_slice(&1_u16.to_be_bytes()); // Pump source.
+        if version >= 95 {
+            bytes.extend_from_slice(&[0x01, 0x02, 0x03]); // Input rate.
+        } else {
+            bytes.extend_from_slice(&[0x12, 0x34]); // Input rate.
+        }
+        bytes.extend_from_slice(&8_u16.to_be_bytes()); // Target.
+        for value in [11_u32, 12, 13, 14, 15] {
+            if version >= 95 {
+                bytes.extend_from_slice(&value.to_be_bytes()[1..]);
+            } else {
+                bytes.extend_from_slice(&(value as u16).to_be_bytes());
+            }
+        }
+        if version >= 131 {
+            bytes.extend_from_slice(&38.0_f32.to_bits().to_be_bytes());
+        }
+        if version >= 147 {
+            bytes.extend_from_slice(&[1, 2]);
+        }
+        if version >= 173 {
+            bytes.extend_from_slice(&123_u32.to_be_bytes());
+        }
+        bytes
+    }
+
     #[test]
     fn water_body_decodes_independent_fields_and_preserves_bytes() {
-        for (version, wave_record_length) in [(194, None), (259, Some(23)), (261, Some(24))] {
+        for (version, wave_record_length) in
+            [(184, None), (194, None), (259, Some(23)), (261, Some(24))]
+        {
             let bytes = sample_body(wave_record_length);
             let (water, consumed) = WaterSimulationData::decode_prefix(version, &bytes).unwrap();
             assert_eq!(consumed, bytes.len());
@@ -635,10 +807,9 @@ mod tests {
     }
 
     #[test]
-    fn water_body_rejects_truncation_and_unsupported_source_layout() {
+    fn water_body_rejects_truncation() {
         let bytes = sample_body(Some(24));
         assert!(WaterSimulationData::decode_prefix(261, &bytes[..bytes.len() - 1]).is_err());
-        assert!(WaterSimulationData::decode_prefix(183, &bytes).is_err());
         for (version, record_length) in [(259, 23), (261, 24)] {
             let bytes = sample_body(Some(record_length));
             let wave_start = bytes.len() - 10 - record_length;
@@ -650,6 +821,92 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn water_reader_decodes_and_preserves_legacy_source_layouts() {
+        for (version, expected_rate) in
+            [(41, 0x1234), (94, 0x1234), (95, 0x010203), (183, 0x010203)]
+        {
+            let bytes = legacy_sample_body(version);
+            let (water, consumed) = WaterSimulationData::decode_prefix(version, &bytes).unwrap();
+            assert_eq!(consumed, bytes.len(), "version {version}");
+            assert_eq!(water.sources().len(), 1, "version {version}");
+            let source = &water.sources()[0];
+            assert_eq!(source.input_position, [1.0, 2.0, 3.0]);
+            assert_eq!(source.output_position, source.input_position);
+            assert_eq!(source.source_type, 1);
+            assert_eq!(source.target, 8);
+            assert_eq!(source.parameters, [0; 5]);
+            assert_eq!(source.legacy_input_rate, Some(expected_rate));
+            assert_eq!(source.legacy_parameters, Some([11, 12, 13, 14, 15]));
+            assert_eq!(water.encode(), bytes);
+            assert!(
+                WaterSimulationData::decode_prefix(version, &bytes[..bytes.len() - 1]).is_err()
+            );
+            assert_eq!(
+                water.into_editor().encode().unwrap(),
+                bytes,
+                "legacy source bytes are preserved at version {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn water_legacy_velocity_arrays_store_only_wet_cells_before_version_42() {
+        let bytes = legacy_sample_body(41);
+        let (water, _) = WaterSimulationData::decode_prefix(41, &bytes).unwrap();
+        let source_records = water.source_records.clone();
+        let mut editor = water.into_editor();
+        editor.heights_mut()[GRID_SIDE] = 1;
+        editor.pollution_mut()[GRID_SIDE] = 9;
+        editor.velocity_x_mut()[GRID_SIDE] = -2;
+        editor.velocity_z_mut()[GRID_SIDE] = 3;
+        let encoded = editor.encode().unwrap();
+
+        // Before version 42, each velocity array has one entry for this
+        // single wet cell, with no neighboring dry entries.
+        let mut arrays = Reader::new(&encoded);
+        read_encoded_ushort_array(&mut arrays, CELL_COUNT).unwrap();
+        let pollution_start = arrays.offset();
+        assert_eq!(read_encoded_ushort_array(&mut arrays, 1).unwrap(), [9]);
+        assert_eq!(&encoded[pollution_start..arrays.offset()], &[0, 0, 9]);
+        let x_start = arrays.offset();
+        assert_eq!(read_encoded_ushort_array(&mut arrays, 1).unwrap(), [0xfffe]);
+        assert_eq!(&encoded[x_start..arrays.offset()], &[0, 0xff, 0xfe]);
+        let z_start = arrays.offset();
+        assert_eq!(read_encoded_ushort_array(&mut arrays, 1).unwrap(), [3]);
+        assert_eq!(&encoded[z_start..arrays.offset()], &[0, 0, 3]);
+
+        let (decoded, consumed) = WaterSimulationData::decode_prefix(41, &encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.heights()[GRID_SIDE], 1);
+        assert_eq!(decoded.pollution()[GRID_SIDE], 9);
+        assert_eq!(decoded.velocity_x()[GRID_SIDE], -2);
+        assert_eq!(decoded.velocity_z()[GRID_SIDE], 3);
+        assert_eq!(decoded.source_records, source_records);
+
+        let mut edited_source = decoded.into_editor();
+        edited_source.sources_mut()[0].target = 9;
+        assert!(edited_source.encode().is_err());
+    }
+
+    #[test]
+    fn water_editor_rejects_tail_values_before_their_version_gates() {
+        let (water, _) = WaterSimulationData::decode_prefix(130, &legacy_sample_body(130)).unwrap();
+        let mut editor = water.into_editor();
+        editor.set_sea_level(1.0);
+        assert!(editor.encode().is_err());
+
+        let (water, _) = WaterSimulationData::decode_prefix(146, &legacy_sample_body(146)).unwrap();
+        let mut editor = water.into_editor();
+        editor.set_pollution_rates([1, 0]);
+        assert!(editor.encode().is_err());
+
+        let (water, _) = WaterSimulationData::decode_prefix(172, &legacy_sample_body(172)).unwrap();
+        let mut editor = water.into_editor();
+        editor.set_frame_index(1);
+        assert!(editor.encode().is_err());
     }
 
     #[test]
@@ -698,6 +955,15 @@ mod tests {
         assert_eq!(water.velocity_x()[1081], 3);
         assert_eq!(water.velocity_z()[0], 4);
         assert_eq!(water.velocity_z()[1081], 5);
+
+        let grid_and_source_bytes = &bytes[..bytes.len() - 10];
+        let (transition, consumed) = WaterSimulationData::decode_prefix(42, grid_and_source_bytes)
+            .expect("version 42 uses the neighboring-cell velocity masks");
+        assert_eq!(consumed, grid_and_source_bytes.len());
+        assert_eq!(transition.velocity_x()[1080], 0);
+        assert_eq!(transition.velocity_x()[1081], 3);
+        assert_eq!(transition.velocity_z()[0], 4);
+        assert_eq!(transition.velocity_z()[1081], 5);
     }
 
     #[test]
