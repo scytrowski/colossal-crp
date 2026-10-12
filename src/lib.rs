@@ -46,17 +46,18 @@ pub use audio_manager_data::{
     AudioManagerData, AudioManagerEditor, AudioRadioChannel, AudioRadioContent,
 };
 pub use building_manager_data::{
-    BuildingBufferFieldsEditor, BuildingBufferFieldsPrefix, BuildingByteStatePrefix,
-    BuildingEconomicFieldsEditor, BuildingEconomicFieldsPrefix, BuildingEffectValue,
-    BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlag, BuildingFlagsEditor,
-    BuildingFlagsPrefix, BuildingInstanceRecord, BuildingInstanceRecordsEditor,
-    BuildingInstanceRecordsPrefix, BuildingManagerObjectHeadersPrefix,
-    BuildingMonumentEffectsEditor, BuildingMonumentEffectsPrefix, BuildingPopulationEditor,
-    BuildingPopulationPrefix, BuildingPrefabEditor, BuildingPrefabPrefix, BuildingProblemEditor,
-    BuildingProblemPrefix, BuildingProblemWords, BuildingRaceTeamReferencesEditor,
-    BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedEditor,
-    BuildingRaceTeamUnassignedPrefix, BuildingServiceSelection, BuildingServiceSelectionPrefix,
-    BuildingTimerField, BuildingTimerGeometryEditor, BuildingTimerGeometryPrefix,
+    BuildingBufferFieldsEditor, BuildingBufferFieldsPrefix, BuildingByteStateEditor,
+    BuildingByteStatePrefix, BuildingEconomicFieldsEditor, BuildingEconomicFieldsPrefix,
+    BuildingEffectValue, BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlag,
+    BuildingFlagsEditor, BuildingFlagsPrefix, BuildingInstanceRecord,
+    BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
+    BuildingManagerObjectHeadersPrefix, BuildingMonumentEffectsEditor,
+    BuildingMonumentEffectsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
+    BuildingPrefabEditor, BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix,
+    BuildingProblemWords, BuildingRaceTeamReferencesEditor, BuildingRaceTeamReferencesPrefix,
+    BuildingRaceTeamUnassignedEditor, BuildingRaceTeamUnassignedPrefix, BuildingServiceSelection,
+    BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
+    BuildingTimerGeometryPrefix,
 };
 pub use citizen_manager_data::{
     CitizenInstanceDataPrefix, CitizenInstanceRecord, CitizenInstanceSlot,
@@ -3441,6 +3442,25 @@ mod tests {
         assert_eq!(decoded.final_import()[0], 12);
         assert_eq!(decoded.final_export()[0], 13);
         assert_eq!(decoded.encode(), bytes);
+
+        let original_construct_len = encoded_literals(decoded.construct_state()).len();
+        let mut editor = decoded.into_editor();
+        editor.construct_state_mut()[0] = 2;
+        let mut changed_construct = vec![0; count];
+        changed_construct[0] = 2;
+        let mut expected = bytes.clone();
+        expected.splice(
+            0..original_construct_len,
+            encoded_literals(&changed_construct),
+        );
+        let edited = editor.encode()?;
+        assert_eq!(edited, expected);
+        let (updated, updated_len) =
+            BuildingByteStatePrefix::decode_prefix(116_020, &flags, &edited)?;
+        assert_eq!(updated_len, edited.len());
+        assert_eq!(updated.construct_state()[0], 2);
+        assert_eq!(updated.fire_damage()[0], 3);
+        assert_eq!(updated.final_export()[0], 13);
         assert!(
             BuildingByteStatePrefix::decode_prefix(116_020, &flags, &bytes[..bytes.len() - 1])
                 .is_err()
@@ -5770,7 +5790,31 @@ mod tests {
             &manager.serialized_object_graph()[updated_buffer_end..],
             buffer_suffix.as_slice()
         );
-        manager.decode_building_byte_state_prefix(metadata.save_app_version)?;
+        let (byte_state, byte_state_end) =
+            manager.decode_building_byte_state_prefix(metadata.save_app_version)?;
+        let original_byte_state = byte_state.encode();
+        let timer_suffix = manager.serialized_object_graph()[byte_state_end..].to_vec();
+        let next_construct_state = byte_state.construct_state()[0].wrapping_add(1);
+        let mut byte_state_editor = byte_state.into_editor();
+        byte_state_editor.construct_state_mut()[0] = next_construct_state;
+        let byte_state_replacement = byte_state_editor.encode()?;
+        manager
+            .replace_building_byte_state_prefix(&byte_state_editor, metadata.save_app_version)?;
+        let (updated_byte_state, updated_byte_state_end) =
+            manager.decode_building_byte_state_prefix(metadata.save_app_version)?;
+        assert_eq!(
+            updated_byte_state.construct_state()[0],
+            next_construct_state
+        );
+        assert_eq!(
+            updated_byte_state_end,
+            byte_state_end - original_byte_state.len() + byte_state_replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_byte_state_end..],
+            timer_suffix.as_slice()
+        );
+        manager.decode_building_timer_geometry_prefix(metadata.save_app_version)?;
 
         let prefab_edited_graph = manager.serialized_object_graph().to_vec();
         let mut stale_prefab_editor = prefab_editor.clone();

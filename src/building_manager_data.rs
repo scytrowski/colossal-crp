@@ -283,7 +283,30 @@ pub struct BuildingByteStatePrefix {
     temp_export: Vec<u8>,
     final_import: Vec<u8>,
     final_export: Vec<u8>,
+    serialized_fields: Vec<Vec<u8>>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editable raw per-building byte state from the `BuildingManager` arrays.
+///
+/// Active-building counts and version gates remain fixed. Unchanged arrays
+/// preserve their original bytes; changed arrays use canonical byte encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingByteStateEditor {
+    original: BuildingByteStatePrefix,
+    construct_state: Vec<u8>,
+    fire_intensity: Vec<u8>,
+    fire_damage: Vec<u8>,
+    production_state: Vec<u8>,
+    health: Vec<u8>,
+    child_health: Vec<u8>,
+    senior_health: Vec<u8>,
+    happiness: Vec<u8>,
+    citizen_count: Vec<u8>,
+    temp_import: Vec<u8>,
+    temp_export: Vec<u8>,
+    final_import: Vec<u8>,
+    final_export: Vec<u8>,
 }
 
 /// A field in the shared, field-major BuildingManager timer array.
@@ -480,9 +503,9 @@ pub struct BuildingInstanceRecordsEditor {
     records: Vec<BuildingInstanceRecord>,
 }
 
-fn invalid_building_buffer_fields(offset: usize, reason: impl Into<String>) -> CrpError {
+fn invalid_building_encoded_fields(offset: usize, reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
-        name: "BuildingManager buffer fields".to_owned(),
+        name: "BuildingManager encoded fields".to_owned(),
         offset,
         reason: reason.into(),
     }
@@ -517,7 +540,7 @@ fn write_ushort_field<'a>(
     original_values: &[u16],
 ) -> Result<(), CrpError> {
     let original_bytes = original_fields.next().ok_or_else(|| {
-        invalid_building_buffer_fields(output.len(), "source field bytes are missing")
+        invalid_building_encoded_fields(output.len(), "source field bytes are missing")
     })?;
     if values == original_values {
         output.extend_from_slice(original_bytes);
@@ -534,7 +557,7 @@ fn write_byte_field<'a>(
     original_values: &[u8],
 ) -> Result<(), CrpError> {
     let original_bytes = original_fields.next().ok_or_else(|| {
-        invalid_building_buffer_fields(output.len(), "source field bytes are missing")
+        invalid_building_encoded_fields(output.len(), "source field bytes are missing")
     })?;
     if values == original_values {
         output.extend_from_slice(original_bytes);
@@ -849,7 +872,7 @@ impl BuildingBufferFieldsEditor {
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let version = self.format_version();
         if version < 164 {
-            return Err(invalid_building_buffer_fields(
+            return Err(invalid_building_encoded_fields(
                 0,
                 "unsupported inner version",
             ));
@@ -998,7 +1021,7 @@ impl BuildingBufferFieldsEditor {
             )?;
         }
         if original_fields.next().is_some() {
-            return Err(invalid_building_buffer_fields(
+            return Err(invalid_building_encoded_fields(
                 output.len(),
                 "source contains more serialized fields than the version allows",
             ));
@@ -1035,26 +1058,72 @@ impl BuildingByteStatePrefix {
             .filter(|building| building.flags != 0)
             .count();
         let mut reader = Reader::new(bytes);
-        let mut read = |since| {
-            if format_version >= since {
-                read_encoded_byte_array(&mut reader, count)
-            } else {
-                Ok(Vec::new())
-            }
+        let mut serialized_fields = Vec::new();
+        let construct_state = if format_version >= 33 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
         };
-        let construct_state = read(33)?;
-        let fire_intensity = read(35)?;
-        let fire_damage = read(35)?;
-        let production_state = read(81)?;
-        let health = read(55)?;
-        let child_health = read(113_004)?;
-        let senior_health = read(113_004)?;
-        let happiness = read(55)?;
-        let citizen_count = read(55)?;
-        let temp_import = read(72)?;
-        let temp_export = read(72)?;
-        let final_import = read(72)?;
-        let final_export = read(72)?;
+        let fire_intensity = if format_version >= 35 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
+        let fire_damage = if format_version >= 35 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
+        let production_state = if format_version >= 81 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
+        let health = if format_version >= 55 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
+        let child_health = if format_version >= 113_004 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
+        let senior_health = if format_version >= 113_004 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
+        let happiness = if format_version >= 55 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
+        let citizen_count = if format_version >= 55 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
+        let temp_import = if format_version >= 72 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
+        let temp_export = if format_version >= 72 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
+        let final_import = if format_version >= 72 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
+        let final_export = if format_version >= 72 {
+            read_byte_field(&mut reader, count, &mut serialized_fields)?
+        } else {
+            Vec::new()
+        };
         let consumed = reader.offset();
         Ok((
             Self {
@@ -1072,6 +1141,7 @@ impl BuildingByteStatePrefix {
                 temp_export,
                 final_import,
                 final_export,
+                serialized_fields,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -1137,6 +1207,220 @@ impl BuildingByteStatePrefix {
     /// Writes the original encoded fields exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Creates an editor for the existing active-building byte arrays.
+    pub fn into_editor(self) -> BuildingByteStateEditor {
+        BuildingByteStateEditor {
+            construct_state: self.construct_state.clone(),
+            fire_intensity: self.fire_intensity.clone(),
+            fire_damage: self.fire_damage.clone(),
+            production_state: self.production_state.clone(),
+            health: self.health.clone(),
+            child_health: self.child_health.clone(),
+            senior_health: self.senior_health.clone(),
+            happiness: self.happiness.clone(),
+            citizen_count: self.citizen_count.clone(),
+            temp_import: self.temp_import.clone(),
+            temp_export: self.temp_export.clone(),
+            final_import: self.final_import.clone(),
+            final_export: self.final_export.clone(),
+            original: self,
+        }
+    }
+}
+
+impl BuildingByteStateEditor {
+    /// Returns the inner DataSerializer version associated with these arrays.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns editable raw construction-state bytes.
+    pub fn construct_state_mut(&mut self) -> &mut [u8] {
+        &mut self.construct_state
+    }
+    /// Returns editable raw fire-intensity bytes from version 35 onward.
+    pub fn fire_intensity_mut(&mut self) -> &mut [u8] {
+        &mut self.fire_intensity
+    }
+    /// Returns editable raw fire-damage bytes from version 35 onward.
+    pub fn fire_damage_mut(&mut self) -> &mut [u8] {
+        &mut self.fire_damage
+    }
+    /// Returns editable raw production-state bytes from version 81 onward.
+    pub fn production_state_mut(&mut self) -> &mut [u8] {
+        &mut self.production_state
+    }
+    /// Returns editable raw health bytes from version 55 onward.
+    pub fn health_mut(&mut self) -> &mut [u8] {
+        &mut self.health
+    }
+    /// Returns editable raw child-health bytes from version 113004 onward.
+    pub fn child_health_mut(&mut self) -> &mut [u8] {
+        &mut self.child_health
+    }
+    /// Returns editable raw senior-health bytes from version 113004 onward.
+    pub fn senior_health_mut(&mut self) -> &mut [u8] {
+        &mut self.senior_health
+    }
+    /// Returns editable raw happiness bytes from version 55 onward.
+    pub fn happiness_mut(&mut self) -> &mut [u8] {
+        &mut self.happiness
+    }
+    /// Returns editable raw citizen-count bytes from version 55 onward.
+    pub fn citizen_count_mut(&mut self) -> &mut [u8] {
+        &mut self.citizen_count
+    }
+    /// Returns editable raw temporary-import bytes from version 72 onward.
+    pub fn temp_import_mut(&mut self) -> &mut [u8] {
+        &mut self.temp_import
+    }
+    /// Returns editable raw temporary-export bytes from version 72 onward.
+    pub fn temp_export_mut(&mut self) -> &mut [u8] {
+        &mut self.temp_export
+    }
+    /// Returns editable raw final-import bytes from version 72 onward.
+    pub fn final_import_mut(&mut self) -> &mut [u8] {
+        &mut self.final_import
+    }
+    /// Returns editable raw final-export bytes from version 72 onward.
+    pub fn final_export_mut(&mut self) -> &mut [u8] {
+        &mut self.final_export
+    }
+
+    /// Writes changed byte arrays canonically and preserves unedited source bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let version = self.format_version();
+        if version < 164 {
+            return Err(invalid_building_encoded_fields(
+                0,
+                "unsupported inner version",
+            ));
+        }
+        let original = &self.original;
+        if self.construct_state == original.construct_state
+            && self.fire_intensity == original.fire_intensity
+            && self.fire_damage == original.fire_damage
+            && self.production_state == original.production_state
+            && self.health == original.health
+            && self.child_health == original.child_health
+            && self.senior_health == original.senior_health
+            && self.happiness == original.happiness
+            && self.citizen_count == original.citizen_count
+            && self.temp_import == original.temp_import
+            && self.temp_export == original.temp_export
+            && self.final_import == original.final_import
+            && self.final_export == original.final_export
+        {
+            return Ok(original.serialized_prefix.clone());
+        }
+
+        let mut output = Vec::with_capacity(original.serialized_prefix.len());
+        let mut original_fields = original.serialized_fields.iter();
+        if version >= 33 {
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.construct_state,
+                &original.construct_state,
+            )?;
+        }
+        if version >= 35 {
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.fire_intensity,
+                &original.fire_intensity,
+            )?;
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.fire_damage,
+                &original.fire_damage,
+            )?;
+        }
+        if version >= 81 {
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.production_state,
+                &original.production_state,
+            )?;
+        }
+        if version >= 55 {
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.health,
+                &original.health,
+            )?;
+        }
+        if version >= 113_004 {
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.child_health,
+                &original.child_health,
+            )?;
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.senior_health,
+                &original.senior_health,
+            )?;
+        }
+        if version >= 55 {
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.happiness,
+                &original.happiness,
+            )?;
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.citizen_count,
+                &original.citizen_count,
+            )?;
+        }
+        if version >= 72 {
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.temp_import,
+                &original.temp_import,
+            )?;
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.temp_export,
+                &original.temp_export,
+            )?;
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.final_import,
+                &original.final_import,
+            )?;
+            write_byte_field(
+                &mut output,
+                &mut original_fields,
+                &self.final_export,
+                &original.final_export,
+            )?;
+        }
+        if original_fields.next().is_some() {
+            return Err(invalid_building_encoded_fields(
+                output.len(),
+                "source contains more byte-state fields than the version allows",
+            ));
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original.serialized_prefix
     }
 }
 
