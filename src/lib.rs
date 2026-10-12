@@ -56,8 +56,8 @@ pub use building_manager_data::{
     BuildingPrefabEditor, BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix,
     BuildingProblemWords, BuildingRaceTeamReferencesEditor, BuildingRaceTeamReferencesPrefix,
     BuildingRaceTeamUnassignedEditor, BuildingRaceTeamUnassignedPrefix, BuildingServiceSelection,
-    BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
-    BuildingTimerGeometryPrefix,
+    BuildingServiceSelectionEditor, BuildingServiceSelectionPrefix, BuildingTimerField,
+    BuildingTimerGeometryEditor, BuildingTimerGeometryPrefix,
 };
 pub use citizen_manager_data::{
     CitizenInstanceDataPrefix, CitizenInstanceRecord, CitizenInstanceSlot,
@@ -5769,6 +5769,49 @@ mod tests {
             prefab_suffix.as_slice()
         );
         manager.decode_building_object_headers_prefix(metadata.save_app_version)?;
+
+        let (service_selection, service_selection_end) =
+            manager.decode_building_service_selection_prefix(metadata.save_app_version)?;
+        let service_selection_suffix =
+            manager.serialized_object_graph()[service_selection_end..].to_vec();
+        let mut service_selection_editor = service_selection.into_editor();
+        let vehicle_key = service_selection_editor
+            .vehicle_service_indices_mut()
+            .first_mut()
+            .map(|key| {
+                *key = key.wrapping_add(1);
+                *key
+            });
+        let additional_vehicle_key = service_selection_editor
+            .additional_vehicle_service_indices_mut()
+            .first_mut()
+            .map(|key| {
+                *key = key.wrapping_add(1);
+                *key
+            });
+        manager.replace_building_service_selection_prefix(
+            &service_selection_editor,
+            metadata.save_app_version,
+        )?;
+        let (updated_service_selection, updated_selection_end) =
+            manager.decode_building_service_selection_prefix(metadata.save_app_version)?;
+        assert_eq!(updated_selection_end, service_selection_end);
+        if let Some(key) = vehicle_key {
+            assert_eq!(
+                updated_service_selection.vehicle_selection()[0].service_index,
+                key
+            );
+        }
+        if let Some(key) = additional_vehicle_key {
+            assert_eq!(
+                updated_service_selection.additional_vehicle_selection()[0].service_index,
+                key
+            );
+        }
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_selection_end..],
+            service_selection_suffix.as_slice()
+        );
 
         let (buffer_fields, buffer_end) =
             manager.decode_building_buffer_fields_prefix(metadata.save_app_version)?;

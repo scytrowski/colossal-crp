@@ -469,8 +469,21 @@ pub struct BuildingServiceSelectionPrefix {
     format_version: u32,
     vehicle_selection: Vec<BuildingServiceSelection>,
     additional_vehicle_selection: Vec<BuildingServiceSelection>,
+    vehicle_selection_index_ranges: Vec<Range<usize>>,
+    additional_vehicle_selection_index_ranges: Vec<Range<usize>>,
     shared_strings: Vec<Option<String>>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editable `u16` keys in BuildingManager's existing service-selection tables.
+///
+/// Entry counts, shared-string references, and their global table order remain
+/// fixed; only the keys are writable through this editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingServiceSelectionEditor {
+    original: BuildingServiceSelectionPrefix,
+    vehicle_service_indices: Vec<u16>,
+    additional_vehicle_service_indices: Vec<u16>,
 }
 
 /// Directly serialized fields for one active BuildingManager entry.
@@ -2257,22 +2270,25 @@ impl BuildingServiceSelectionPrefix {
             return Err(invalid_service_selection("unsupported inner version"));
         }
         let mut reader = Reader::new(bytes);
-        let vehicle_selection = if format_version >= 114_001 {
+        let (vehicle_selection, vehicle_selection_index_ranges) = if format_version >= 114_001 {
             read_service_selection_table(&mut reader, &mut shared_strings)?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        let additional_vehicle_selection = if format_version >= 116_020 {
-            read_service_selection_table(&mut reader, &mut shared_strings)?
-        } else {
-            Vec::new()
-        };
+        let (additional_vehicle_selection, additional_vehicle_selection_index_ranges) =
+            if format_version >= 116_020 {
+                read_service_selection_table(&mut reader, &mut shared_strings)?
+            } else {
+                (Vec::new(), Vec::new())
+            };
         let consumed = reader.offset();
         Ok((
             Self {
                 format_version,
                 vehicle_selection,
                 additional_vehicle_selection,
+                vehicle_selection_index_ranges,
+                additional_vehicle_selection_index_ranges,
                 shared_strings,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
@@ -2299,6 +2315,86 @@ impl BuildingServiceSelectionPrefix {
     /// Writes the original encoded table bytes exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+
+    /// Creates an editor for existing vehicle-selection table keys.
+    pub fn into_editor(self) -> BuildingServiceSelectionEditor {
+        let vehicle_service_indices = self
+            .vehicle_selection
+            .iter()
+            .map(|entry| entry.service_index)
+            .collect();
+        let additional_vehicle_service_indices = self
+            .additional_vehicle_selection
+            .iter()
+            .map(|entry| entry.service_index)
+            .collect();
+        BuildingServiceSelectionEditor {
+            original: self,
+            vehicle_service_indices,
+            additional_vehicle_service_indices,
+        }
+    }
+}
+
+impl BuildingServiceSelectionEditor {
+    /// Returns the inner DataSerializer version associated with these tables.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns editable keys from the primary vehicle-selection table.
+    pub fn vehicle_service_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.vehicle_service_indices
+    }
+
+    /// Returns editable keys from the additional table from version 116020.
+    pub fn additional_vehicle_service_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.additional_vehicle_service_indices
+    }
+
+    /// Rewrites existing keys and preserves counts, string references, and all other bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        let original = &self.original;
+        if self.format_version() < 164
+            || self.vehicle_service_indices.len() != original.vehicle_selection.len()
+            || self.additional_vehicle_service_indices.len()
+                != original.additional_vehicle_selection.len()
+            || original.vehicle_selection_index_ranges.len() != original.vehicle_selection.len()
+            || original.additional_vehicle_selection_index_ranges.len()
+                != original.additional_vehicle_selection.len()
+        {
+            return Err(invalid_service_selection(
+                "edited service-selection keys do not match the source tables",
+            ));
+        }
+
+        let mut output = original.serialized_prefix.clone();
+        for (range, service_index) in original
+            .vehicle_selection_index_ranges
+            .iter()
+            .chain(&original.additional_vehicle_selection_index_ranges)
+            .zip(
+                self.vehicle_service_indices
+                    .iter()
+                    .chain(&self.additional_vehicle_service_indices),
+            )
+        {
+            if range.end.checked_sub(range.start) != Some(2) {
+                return Err(invalid_service_selection(
+                    "service-selection key range is invalid",
+                ));
+            }
+            let target = output.get_mut(range.clone()).ok_or_else(|| {
+                invalid_service_selection("service-selection key range exceeds the source prefix")
+            })?;
+            target.copy_from_slice(&service_index.to_be_bytes());
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original.serialized_prefix
     }
 }
 
@@ -2436,7 +2532,7 @@ fn invalid_building_records(reason: impl Into<String>) -> CrpError {
 fn read_service_selection_table(
     reader: &mut Reader<'_>,
     shared_strings: &mut Vec<Option<String>>,
-) -> Result<Vec<BuildingServiceSelection>, CrpError> {
+) -> Result<(Vec<BuildingServiceSelection>, Vec<Range<usize>>), CrpError> {
     let count = reader.read_i16_be()?;
     if count < 0 {
         return Err(reader.invalid(format!("negative service-selection count {count}")));
@@ -2447,15 +2543,18 @@ fn read_service_selection_table(
         return Err(reader.invalid("service-selection count cannot fit in remaining bytes"));
     }
     let mut entries = Vec::with_capacity(count);
+    let mut service_index_ranges = Vec::with_capacity(count);
     for _ in 0..count {
+        let index_start = reader.offset();
         let service_index = reader.read_u16_be()?;
+        service_index_ranges.push(index_start..reader.offset());
         let value = reader.read_shared_string(shared_strings)?;
         entries.push(BuildingServiceSelection {
             service_index,
             value,
         });
     }
-    Ok(entries)
+    Ok((entries, service_index_ranges))
 }
 
 fn invalid_service_selection(reason: impl Into<String>) -> CrpError {
@@ -4039,6 +4138,43 @@ mod tests {
         );
         assert_eq!(prefix.shared_strings().len(), 9);
         assert_eq!(prefix.encode(), encoded);
+
+        let mut editor = prefix.into_editor();
+        assert_eq!(editor.encode().expect("unchanged selection table"), encoded);
+        editor.vehicle_service_indices_mut()[0] = 0x1234;
+        editor.additional_vehicle_service_indices_mut()[0] = 0x4567;
+        let mut expected = encoded.to_vec();
+        expected[2..4].copy_from_slice(&0x1234_u16.to_be_bytes());
+        expected[15..17].copy_from_slice(&0x4567_u16.to_be_bytes());
+        let edited = editor.encode().expect("edited selection keys encode");
+        assert_eq!(edited, expected);
+        let shared = [
+            "SimulationManager",
+            "GameAreaManager",
+            "TerrainManager",
+            "WaterSimulation",
+            "InstanceManager",
+            "PathManager",
+            "NetManager",
+            "BuildingManager",
+        ]
+        .into_iter()
+        .map(|value| Some(value.to_owned()))
+        .collect();
+        let (decoded, decoded_len) =
+            BuildingServiceSelectionPrefix::decode_prefix(116_020, &edited, shared)
+                .expect("edited selection tables decode");
+        assert_eq!(decoded_len, edited.len());
+        assert_eq!(decoded.vehicle_selection()[0].service_index, 0x1234);
+        assert_eq!(decoded.vehicle_selection()[0].value.as_deref(), Some("P"));
+        assert_eq!(
+            decoded.additional_vehicle_selection()[0].service_index,
+            0x4567
+        );
+        assert_eq!(
+            decoded.additional_vehicle_selection()[0].value.as_deref(),
+            Some("P")
+        );
     }
 
     #[test]
