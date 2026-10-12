@@ -76,10 +76,11 @@ use crate::{
     BuildingFacultyBonusesEditor, BuildingFacultyBonusesPrefix, BuildingFlagsEditor,
     BuildingFlagsPrefix, BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingMonumentEffectsEditor,
-    BuildingMonumentEffectsPrefix, BuildingPopulationPrefix, BuildingPrefabPrefix,
-    BuildingProblemEditor, BuildingProblemPrefix, BuildingRaceTeamReferencesEditor,
-    BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedEditor,
-    BuildingRaceTeamUnassignedPrefix, BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
+    BuildingMonumentEffectsPrefix, BuildingPopulationPrefix, BuildingPrefabEditor,
+    BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix,
+    BuildingRaceTeamReferencesEditor, BuildingRaceTeamReferencesPrefix,
+    BuildingRaceTeamUnassignedEditor, BuildingRaceTeamUnassignedPrefix,
+    BuildingServiceSelectionPrefix, BuildingTimerGeometryPrefix,
 };
 use crate::{BuildingEconomicFieldsEditor, BuildingPopulationEditor, BuildingTimerGeometryEditor};
 use crate::{
@@ -9811,6 +9812,70 @@ impl SimulationManagerData {
         )?;
         reader.read_bytes(used)?;
         Ok((data, reader.offset()))
+    }
+
+    /// Replaces BuildingManager prefab assignments and names.
+    ///
+    /// The editor must come from this graph and retain all assignment and name
+    /// counts. Changed names can resize the manager graph; the object-header
+    /// boundary is decoded again before the edit is accepted. Failures leave
+    /// the graph unchanged.
+    pub fn replace_building_prefabs_prefix(
+        &mut self,
+        edited: &BuildingPrefabEditor,
+        save_app_version: Option<u32>,
+    ) -> Result<(), CrpError> {
+        if edited.format_version() != self.format_version {
+            return Err(invalid(
+                0,
+                "edited BuildingManager prefab version does not match this stream",
+            ));
+        }
+        let (original, graph_end) = self.decode_building_prefabs_prefix(save_app_version)?;
+        let original_bytes = original.encode();
+        let body_start =
+            graph_end
+                .checked_sub(original_bytes.len())
+                .ok_or(CrpError::ArithmeticOverflow(
+                    "BuildingManager prefab prefix start",
+                ))?;
+        if original_bytes.as_slice() != edited.original_prefix() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager prefab bytes do not match the editor's source",
+            ));
+        }
+        if graph_end > self.serialized_object_graph.len() {
+            return Err(invalid(
+                body_start,
+                "BuildingManager prefab prefix extends past manager graph",
+            ));
+        }
+        let replacement = edited.encode()?;
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(body_start..graph_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
+        let validation = (|| {
+            let (decoded, _) = self.decode_building_prefabs_prefix(save_app_version)?;
+            if decoded.encode() != replacement {
+                return Err(invalid(
+                    body_start,
+                    "rewritten BuildingManager prefab table does not match the editor",
+                ));
+            }
+            self.decode_building_object_headers_prefix(save_app_version)?;
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.serialized_object_graph = original_graph;
+            return Err(invalid(
+                body_start,
+                format!(
+                    "rewritten BuildingManager prefab table failed boundary validation: {error}"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes BuildingManager prefab data and versioned object headers.

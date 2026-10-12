@@ -52,8 +52,8 @@ pub use building_manager_data::{
     BuildingInstanceRecord, BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingMonumentEffectsEditor,
     BuildingMonumentEffectsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
-    BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix, BuildingProblemWords,
-    BuildingRaceTeamReferencesEditor, BuildingRaceTeamReferencesPrefix,
+    BuildingPrefabEditor, BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix,
+    BuildingProblemWords, BuildingRaceTeamReferencesEditor, BuildingRaceTeamReferencesPrefix,
     BuildingRaceTeamUnassignedEditor, BuildingRaceTeamUnassignedPrefix, BuildingServiceSelection,
     BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
     BuildingTimerGeometryPrefix,
@@ -5705,8 +5705,49 @@ mod tests {
             &manager.serialized_object_graph()[updated_end..],
             suffix.as_slice()
         );
-        let (prefabs, _) = manager.decode_building_prefabs_prefix(metadata.save_app_version)?;
+        let (prefabs, prefab_end) =
+            manager.decode_building_prefabs_prefix(metadata.save_app_version)?;
         assert_eq!(prefabs.building_indices().len(), 189);
+        let original_prefabs = prefabs.encode();
+        let prefab_suffix = manager.serialized_object_graph()[prefab_end..].to_vec();
+        let name_index = prefabs
+            .names()
+            .iter()
+            .position(|name| name.as_deref() == Some("Wildlife Spawn Point"))
+            .ok_or_else(|| std::io::Error::other("fixture prefab name was not found"))?;
+        let mut prefab_editor = prefabs.into_editor();
+        prefab_editor.building_indices_mut()[0] = 499;
+        prefab_editor.names_mut()[name_index] = Some("Updated Wildlife Spawn Point".to_owned());
+        let prefab_replacement = prefab_editor.encode()?;
+        assert_ne!(prefab_replacement.len(), original_prefabs.len());
+        manager.replace_building_prefabs_prefix(&prefab_editor, metadata.save_app_version)?;
+
+        let (updated_prefabs, updated_prefab_end) =
+            manager.decode_building_prefabs_prefix(metadata.save_app_version)?;
+        assert_eq!(updated_prefabs.building_indices()[0], 499);
+        assert_eq!(
+            updated_prefabs.names()[name_index].as_deref(),
+            Some("Updated Wildlife Spawn Point")
+        );
+        assert_eq!(
+            updated_prefab_end,
+            prefab_end - original_prefabs.len() + prefab_replacement.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[updated_prefab_end..],
+            prefab_suffix.as_slice()
+        );
+        manager.decode_building_object_headers_prefix(metadata.save_app_version)?;
+
+        let prefab_edited_graph = manager.serialized_object_graph().to_vec();
+        let mut stale_prefab_editor = prefab_editor.clone();
+        stale_prefab_editor.names_mut()[name_index] = Some("Stale edit".to_owned());
+        assert!(
+            manager
+                .replace_building_prefabs_prefix(&stale_prefab_editor, metadata.save_app_version)
+                .is_err()
+        );
+        assert_eq!(manager.serialized_object_graph(), prefab_edited_graph);
 
         let edited_graph = manager.serialized_object_graph().to_vec();
         stale_editor.set_secondary_flag_bits(0, 9)?;

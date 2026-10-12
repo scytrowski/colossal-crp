@@ -1,5 +1,5 @@
 use crate::CrpError;
-use crate::data_serializer::{Reader, write_unique_string};
+use crate::data_serializer::{Reader, write_nullable_unique_string, write_unique_string};
 use crate::encoded_array::{
     read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
     read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
@@ -64,7 +64,36 @@ pub struct BuildingPrefabPrefix {
     guide_indices: Vec<u16>,
     milestone_indices: Vec<u16>,
     names: Vec<Option<String>>,
+    serialized_building_indices: Vec<u8>,
+    serialized_guide_indices: Vec<u8>,
+    serialized_milestone_indices: Vec<u8>,
+    serialized_name_count: Vec<u8>,
+    serialized_name_entries: Vec<Vec<u8>>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editable existing BuildingManager prefab assignments and names.
+///
+/// The three assignment counts and the prefab-name count stay fixed. Changed
+/// index arrays use canonical `EncodedArray.UShort` encoding; unchanged name
+/// entries retain their original bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingPrefabEditor {
+    format_version: u32,
+    building_indices: Vec<u16>,
+    guide_indices: Vec<u16>,
+    milestone_indices: Vec<u16>,
+    names: Vec<Option<String>>,
+    original_building_indices: Vec<u16>,
+    original_guide_indices: Vec<u16>,
+    original_milestone_indices: Vec<u16>,
+    original_names: Vec<Option<String>>,
+    serialized_building_indices: Vec<u8>,
+    serialized_guide_indices: Vec<u8>,
+    serialized_milestone_indices: Vec<u8>,
+    serialized_name_count: Vec<u8>,
+    serialized_name_entries: Vec<Vec<u8>>,
+    original_prefix: Vec<u8>,
 }
 
 /// Versioned object headers following the BuildingManager prefab table.
@@ -2667,9 +2696,10 @@ mod tests {
     use super::{
         BuildingEconomicFieldsPrefix, BuildingFacultyBonusesPrefix, BuildingFlag,
         BuildingFlagsPrefix, BuildingInstanceRecordsPrefix, BuildingMonumentEffectsPrefix,
-        BuildingPopulationEditor, BuildingPopulationPrefix, BuildingRaceTeamReferencesPrefix,
-        BuildingRaceTeamUnassignedPrefix, BuildingServiceSelectionPrefix, BuildingTimerField,
-        BuildingTimerGeometryEditor, fixed_object_header_count, timer_fields_for_version,
+        BuildingPopulationEditor, BuildingPopulationPrefix, BuildingPrefabPrefix,
+        BuildingRaceTeamReferencesPrefix, BuildingRaceTeamUnassignedPrefix,
+        BuildingServiceSelectionPrefix, BuildingTimerField, BuildingTimerGeometryEditor,
+        fixed_object_header_count, timer_fields_for_version,
     };
 
     #[test]
@@ -2907,6 +2937,68 @@ mod tests {
                 &bytes[..bytes.len() - 1],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn building_prefab_editor_reencodes_changed_fields_and_retains_other_bytes() {
+        let flags = BuildingFlagsPrefix {
+            format_version: 116_020,
+            building_flags: (1..=3)
+                .map(|index| BuildingFlag {
+                    index,
+                    flags: 1,
+                    flags2: 0,
+                })
+                .collect(),
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
+            serialized_prefix: Vec::new(),
+        };
+        let bytes = [
+            2, 0, 10, 0, 20, 0, 30, // Three building-prefab indexes.
+            0, 0, 7, // One guide-prefab index.
+            0, 0, 9, // One milestone-prefab index.
+            0, 3,    // Three names.
+            0xff, // Null.
+            0x80, 0, 1, 0xc1, // Compact "A".
+            0, 0, 1, 3, 0x29, // Wide "Ω".
+        ];
+        let (prefix, consumed) = BuildingPrefabPrefix::decode_prefix(116_020, &flags, 1, 1, &bytes)
+            .expect("building prefab table decodes");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(prefix.building_indices(), [10, 20, 30]);
+        assert_eq!(prefix.guide_indices(), [7]);
+        assert_eq!(prefix.milestone_indices(), [9]);
+        assert_eq!(
+            prefix.names(),
+            [None, Some("A".to_owned()), Some("Ω".to_owned())]
+        );
+
+        let mut editor = prefix.into_editor();
+        editor.building_indices_mut().fill(0);
+        editor.names_mut()[1] = Some("BB".to_owned());
+        let edited = editor.encode().expect("building prefab edits encode");
+        let expected = [
+            0x82, // Three repeated zero deltas.
+            0, 0, 7, // Unchanged guide index.
+            0, 0, 9, // Unchanged milestone index.
+            0, 3,    // Unchanged name count.
+            0xff, // Unchanged null entry.
+            0x80, 0, 2, 0xc2, 0, // Compact "BB".
+            0, 0, 1, 3, 0x29, // Unchanged wide "Ω" entry.
+        ];
+        assert_eq!(edited, expected);
+        let (decoded, decoded_len) =
+            BuildingPrefabPrefix::decode_prefix(116_020, &flags, 1, 1, &edited)
+                .expect("edited building prefab table decodes");
+        assert_eq!(decoded_len, edited.len());
+        assert_eq!(decoded.building_indices(), [0, 0, 0]);
+        assert_eq!(decoded.guide_indices(), [7]);
+        assert_eq!(decoded.milestone_indices(), [9]);
+        assert_eq!(
+            decoded.names(),
+            [None, Some("BB".to_owned()), Some("Ω".to_owned())]
         );
     }
 
@@ -3304,14 +3396,30 @@ impl BuildingPrefabPrefix {
             .iter()
             .filter(|building| building.flags != 0)
             .count();
+        let building_indices_start = reader.offset();
         let building_indices = read_encoded_ushort_array(&mut reader, building_count)?;
+        let serialized_building_indices =
+            reader.consumed_bytes()[building_indices_start..reader.offset()].to_vec();
+        let guide_indices_start = reader.offset();
         let guide_indices = read_encoded_ushort_array(&mut reader, usize::from(guide_count))?;
+        let serialized_guide_indices =
+            reader.consumed_bytes()[guide_indices_start..reader.offset()].to_vec();
+        let milestone_indices_start = reader.offset();
         let milestone_indices =
             read_encoded_ushort_array(&mut reader, usize::from(milestone_count))?;
+        let serialized_milestone_indices =
+            reader.consumed_bytes()[milestone_indices_start..reader.offset()].to_vec();
+        let name_count_start = reader.offset();
         let name_count = usize::from(reader.read_u16_be()?);
+        let serialized_name_count =
+            reader.consumed_bytes()[name_count_start..reader.offset()].to_vec();
         let mut names = Vec::with_capacity(name_count);
+        let mut serialized_name_entries = Vec::with_capacity(name_count);
         for _ in 0..name_count {
+            let name_start = reader.offset();
             names.push(reader.read_unique_string()?);
+            serialized_name_entries
+                .push(reader.consumed_bytes()[name_start..reader.offset()].to_vec());
         }
         let consumed = reader.offset();
         Ok((
@@ -3321,6 +3429,11 @@ impl BuildingPrefabPrefix {
                 guide_indices,
                 milestone_indices,
                 names,
+                serialized_building_indices,
+                serialized_guide_indices,
+                serialized_milestone_indices,
+                serialized_name_count,
+                serialized_name_entries,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -3355,6 +3468,122 @@ impl BuildingPrefabPrefix {
     /// Writes the original encoded tables and names exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+}
+
+impl BuildingPrefabPrefix {
+    /// Creates an editor for existing assignment entries and prefab names.
+    pub fn into_editor(self) -> BuildingPrefabEditor {
+        BuildingPrefabEditor {
+            format_version: self.format_version,
+            original_building_indices: self.building_indices.clone(),
+            original_guide_indices: self.guide_indices.clone(),
+            original_milestone_indices: self.milestone_indices.clone(),
+            original_names: self.names.clone(),
+            building_indices: self.building_indices,
+            guide_indices: self.guide_indices,
+            milestone_indices: self.milestone_indices,
+            names: self.names,
+            serialized_building_indices: self.serialized_building_indices,
+            serialized_guide_indices: self.serialized_guide_indices,
+            serialized_milestone_indices: self.serialized_milestone_indices,
+            serialized_name_count: self.serialized_name_count,
+            serialized_name_entries: self.serialized_name_entries,
+            original_prefix: self.serialized_prefix,
+        }
+    }
+}
+
+impl BuildingPrefabEditor {
+    /// Returns the inner DataSerializer version associated with these tables.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    /// Returns editable prefab indexes for active buildings.
+    pub fn building_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.building_indices
+    }
+
+    /// Returns editable prefab indexes for guide entries.
+    pub fn guide_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.guide_indices
+    }
+
+    /// Returns editable prefab indexes for milestone entries.
+    pub fn milestone_indices_mut(&mut self) -> &mut [u16] {
+        &mut self.milestone_indices
+    }
+
+    /// Returns editable prefab names in serialized table order.
+    pub fn names_mut(&mut self) -> &mut [Option<String>] {
+        &mut self.names
+    }
+
+    /// Encodes changed index arrays and names while retaining unchanged bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.format_version < 164
+            || self.building_indices.len() != self.original_building_indices.len()
+            || self.guide_indices.len() != self.original_guide_indices.len()
+            || self.milestone_indices.len() != self.original_milestone_indices.len()
+            || self.names.len() != self.original_names.len()
+            || self.names.len() != self.serialized_name_entries.len()
+            || self.serialized_name_count.len() != 2
+        {
+            return Err(invalid_building_prefabs(
+                "edited assignment or prefab-name counts do not match the source",
+            ));
+        }
+        if self.building_indices == self.original_building_indices
+            && self.guide_indices == self.original_guide_indices
+            && self.milestone_indices == self.original_milestone_indices
+            && self.names == self.original_names
+        {
+            return Ok(self.original_prefix.clone());
+        }
+
+        let mut output = Vec::with_capacity(self.original_prefix.len());
+        if self.building_indices == self.original_building_indices {
+            output.extend_from_slice(&self.serialized_building_indices);
+        } else {
+            write_encoded_ushort_array(&mut output, &self.building_indices);
+        }
+        if self.guide_indices == self.original_guide_indices {
+            output.extend_from_slice(&self.serialized_guide_indices);
+        } else {
+            write_encoded_ushort_array(&mut output, &self.guide_indices);
+        }
+        if self.milestone_indices == self.original_milestone_indices {
+            output.extend_from_slice(&self.serialized_milestone_indices);
+        } else {
+            write_encoded_ushort_array(&mut output, &self.milestone_indices);
+        }
+        output.extend_from_slice(&self.serialized_name_count);
+        for ((name, original_name), raw_entry) in self
+            .names
+            .iter()
+            .zip(&self.original_names)
+            .zip(&self.serialized_name_entries)
+        {
+            if name == original_name {
+                output.extend_from_slice(raw_entry);
+            } else {
+                write_nullable_unique_string(&mut output, name.as_deref())?;
+            }
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn original_prefix(&self) -> &[u8] {
+        &self.original_prefix
+    }
+}
+
+fn invalid_building_prefabs(reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "BuildingManager prefab table".to_owned(),
+        offset: 0,
+        reason: reason.into(),
     }
 }
 
