@@ -21,6 +21,10 @@ impl<'a> PayloadReader<'a> {
         self.data.len() - self.offset
     }
 
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
     pub(crate) fn invalid(&self, reason: impl Into<String>) -> CrpError {
         CrpError::InvalidAssetPayload {
             name: self.asset_name.to_owned(),
