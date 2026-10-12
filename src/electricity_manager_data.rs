@@ -118,6 +118,7 @@ pub struct ElectricityManagerData {
     processed_cell_count: i32,
     conductive_cell_count: i32,
     can_continue: bool,
+    original_can_continue: bool,
     scalar_fields_offset: usize,
     original_body: Vec<u8>,
 }
@@ -269,6 +270,7 @@ impl ElectricityManagerData {
             processed_cell_count,
             conductive_cell_count,
             can_continue,
+            original_can_continue: can_continue,
             scalar_fields_offset,
             original_body: bytes.to_vec(),
         })
@@ -813,7 +815,8 @@ impl ElectricityManagerData {
         self.conductive_cell_count = value;
     }
 
-    /// Replaces the serialized continuation flag without changing the body length.
+    /// Replaces the continuation state without changing the body length.
+    /// The original byte is retained when its decoded boolean value is unchanged.
     pub fn set_can_continue(&mut self, value: bool) {
         self.can_continue = value;
     }
@@ -879,14 +882,16 @@ impl ElectricityManagerData {
                 reason: "conductive-cell counter range is invalid".to_owned(),
             })?
             .copy_from_slice(&self.conductive_cell_count.to_be_bytes());
-        bytes
-            .get_mut(conductive_end..flag_end)
-            .ok_or_else(|| CrpError::InvalidAssetPayload {
-                name: "ElectricityManager+Data".to_owned(),
-                offset: conductive_end,
-                reason: "continuation flag range is invalid".to_owned(),
-            })?
-            .copy_from_slice(&[u8::from(self.can_continue)]);
+        if self.can_continue != self.original_can_continue {
+            bytes
+                .get_mut(conductive_end..flag_end)
+                .ok_or_else(|| CrpError::InvalidAssetPayload {
+                    name: "ElectricityManager+Data".to_owned(),
+                    offset: conductive_end,
+                    reason: "continuation flag range is invalid".to_owned(),
+                })?
+                .copy_from_slice(&[u8::from(self.can_continue)]);
+        }
         self.validate_sparse_lengths(self.scalar_fields_offset)?;
         write_pulse_groups(
             &mut bytes,
@@ -2027,6 +2032,29 @@ mod tests {
         assert_eq!(decoded.processed_cell_count(), -17);
         assert_eq!(decoded.conductive_cell_count(), 0x0102_0304);
         assert!(!decoded.can_continue());
+    }
+
+    #[test]
+    fn unchanged_noncanonical_continuation_byte_is_preserved() {
+        let mut body = empty_body(117_000);
+        let continuation_offset = body.len() - END_PROFILER_REFERENCE_LEN - 1;
+        body[continuation_offset] = 2;
+
+        let mut data = ElectricityManagerData::decode(117_000, &body).unwrap();
+        assert!(data.can_continue());
+        assert_eq!(data.encode().unwrap(), body);
+
+        data.set_can_continue(false);
+        let encoded = data.encode().unwrap();
+        assert_eq!(encoded[continuation_offset], 0);
+        assert_eq!(
+            &encoded[..continuation_offset],
+            &body[..continuation_offset]
+        );
+        assert_eq!(
+            &encoded[continuation_offset + 1..],
+            &body[continuation_offset + 1..]
+        );
     }
 
     #[test]
