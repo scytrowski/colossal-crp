@@ -4272,8 +4272,9 @@ impl SimulationManagerData {
         Ok(self.decode_disaster_manager_data()?.into_editor())
     }
 
-    /// Replaces existing DisasterManager record values while preserving the
-    /// manager's byte length, references, and following manager boundary.
+    /// Replaces DisasterManager flags, record values, and counters while
+    /// preserving references and validating the following manager boundary.
+    /// Re-encoding changed flags can resize the manager body.
     pub fn replace_disaster_manager_data(
         &mut self,
         edited: &DisasterManagerEditor,
@@ -4292,37 +4293,36 @@ impl SimulationManagerData {
             ));
         }
         let replacement = edited.encode()?;
-        if replacement.len() != edited.original_body_bytes().len() {
-            return Err(invalid(
-                0,
-                "DisasterManager edits must preserve the manager body length",
-            ));
-        }
         let managers = self
             .manager_objects
             .as_deref()
             .ok_or_else(|| invalid(0, "manager object array is null"))?;
         let slot = unique_manager_slot(Some(managers), "DisasterManager+Data")?;
         let (body_start, next_tag_start) = self.manager_body_boundary(slot)?;
-        let body_end =
+        let source_body_end = body_start
+            .checked_add(edited.original_body_bytes().len())
+            .ok_or(CrpError::ArithmeticOverflow(
+                "DisasterManager source body end",
+            ))?;
+        if source_body_end != next_tag_start {
+            return Err(invalid(
+                body_start,
+                "DisasterManager source body does not reach the expected manager boundary",
+            ));
+        }
+        let updated_next_tag_start =
             body_start
                 .checked_add(replacement.len())
                 .ok_or(CrpError::ArithmeticOverflow(
                     "DisasterManager replacement end",
                 ))?;
-        if body_end != next_tag_start {
-            return Err(invalid(
-                body_start,
-                "DisasterManager replacement does not reach the expected manager boundary",
-            ));
-        }
 
-        let original = self
-            .serialized_object_graph
-            .get(body_start..body_end)
-            .ok_or_else(|| invalid(body_start, "DisasterManager source body exceeds graph"))?
-            .to_vec();
-        self.serialized_object_graph[body_start..body_end].copy_from_slice(&replacement);
+        self.serialized_object_graph
+            .get(body_start..source_body_end)
+            .ok_or_else(|| invalid(body_start, "DisasterManager source body exceeds graph"))?;
+        let mut candidate = self.serialized_object_graph.clone();
+        candidate.splice(body_start..source_body_end, replacement.clone());
+        let original_graph = std::mem::replace(&mut self.serialized_object_graph, candidate);
         let validation = self.decode_disaster_manager_data().and_then(|decoded| {
             if decoded.encode_unchanged() != replacement {
                 return Err(invalid(
@@ -4330,10 +4330,17 @@ impl SimulationManagerData {
                     "rewritten DisasterManager bytes failed exact body validation",
                 ));
             }
+            let (actual_body_start, actual_next_tag_start) = self.manager_body_boundary(slot)?;
+            if actual_body_start != body_start || actual_next_tag_start != updated_next_tag_start {
+                return Err(invalid(
+                    body_start,
+                    "rewritten DisasterManager did not preserve the shifted manager boundary",
+                ));
+            }
             Ok(())
         });
         if let Err(error) = validation {
-            self.serialized_object_graph[body_start..body_end].copy_from_slice(&original);
+            self.serialized_object_graph = original_graph;
             return Err(invalid(
                 body_start,
                 format!("rewritten DisasterManager body failed validation: {error}"),
@@ -18028,9 +18035,11 @@ mod manager_boundary_tests {
 
     fn disaster_manager_with_active_record() -> SimulationManagerData {
         let mut graph = profiler_tag("DisasterManager");
+        graph.extend_from_slice(&[0x00, 0x80]); // 129 slots, including reserved slot zero.
+        let mut flags = vec![0_u32; 128];
+        flags[0] = 0x8001;
+        write_encoded_uint_array(&mut graph, &flags);
         graph.extend_from_slice(&[
-            0x00, 0x01, // Two slots including reserved slot zero.
-            0x00, 0x00, 0x00, 0x00, 0x01, // One active disaster flag.
             0x00, 0x00, // No unlock milestones.
             0x00, 0x00, // No last-spawn frames.
             0x00, 0x00, // No warning guides.
@@ -18383,21 +18392,35 @@ mod manager_boundary_tests {
     fn disaster_manager_editor_replaces_active_fields_and_rejects_stale_source() {
         let mut manager = disaster_manager_with_active_record();
         let original_graph = manager.serialized_object_graph().to_vec();
-        let tail_start = original_graph.len() - profiler_tag("InfoManager").len();
-        let original_tail = original_graph[tail_start - 4..].to_vec();
+        let source_body = manager
+            .decode_disaster_manager_data()
+            .unwrap()
+            .encode_unchanged();
+        let body_start = profiler_tag("DisasterManager").len();
+        let body_end = body_start + source_body.len();
+        let original_following = original_graph[body_end..].to_vec();
         let mut stale_editor = manager.decode_disaster_manager_editor().unwrap();
         let mut edited = manager.decode_disaster_manager_editor().unwrap();
         assert_eq!(edited.records()[0].slot_index, 1);
+        assert_eq!(edited.flags()[0], 1);
+        edited.set_flag_bits(0, 3).unwrap();
         edited.records_mut()[0].intensity = Some(99);
         edited.records_mut()[0].casualty_count = Some(17);
+        let expected_body = edited.encode().unwrap();
+        assert_ne!(expected_body.len(), source_body.len());
 
         manager.replace_disaster_manager_data(&edited).unwrap();
         let decoded = manager.decode_disaster_manager_data().unwrap();
+        assert_eq!(decoded.flags()[0], 3);
         assert_eq!(decoded.records()[0].intensity, Some(99));
         assert_eq!(decoded.records()[0].casualty_count, Some(17));
         assert_eq!(
-            &manager.serialized_object_graph()[tail_start - 4..],
-            original_tail
+            manager.serialized_object_graph().len(),
+            original_graph.len() - source_body.len() + expected_body.len()
+        );
+        assert_eq!(
+            &manager.serialized_object_graph()[body_start + expected_body.len()..],
+            original_following
         );
 
         let rewritten_graph = manager.serialized_object_graph().to_vec();

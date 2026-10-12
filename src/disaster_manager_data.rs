@@ -1,10 +1,13 @@
 use crate::CrpError;
 use crate::data_serializer::Reader;
-use crate::encoded_array::{read_encoded_uint_array, skip_encoded_ushort_array};
+use crate::encoded_array::{
+    read_encoded_uint_array, skip_encoded_ushort_array, write_encoded_uint_array_runs,
+};
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
 use std::ops::Range;
 
-const SLOT_INDEX_MASK: u32 = !0x8000;
+const DISASTER_TRANSIENT_FLAG: u32 = 0x8000;
+const SLOT_INDEX_MASK: u32 = !DISASTER_TRANSIENT_FLAG;
 const LAST_SPAWN_FRAMES_VERSION: u32 = 291;
 const WARNING_GUIDES_VERSION: u32 = 293;
 
@@ -61,6 +64,9 @@ pub struct DisasterRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisasterManagerData {
     format_version: u32,
+    flags: Vec<u32>,
+    serialized_transient_flags: Vec<u32>,
+    flags_range: Range<usize>,
     records: Vec<DisasterRecord>,
     record_ranges: Vec<Range<usize>>,
     object_headers: Vec<NetObjectHeader>,
@@ -72,15 +78,15 @@ pub struct DisasterManagerData {
     serialized_body: Vec<u8>,
 }
 
-/// Editor for active disaster records and fixed-width manager counters.
+/// Editor for disaster flags, active records, and fixed-width manager counters.
 ///
-/// The set of records, last-spawn frame count, and version-selected field
-/// presence must remain unchanged. Editing these fixed-width values preserves
-/// all other manager bytes, including prefab tables, references, and the
-/// profiler boundary.
+/// Flag edits preserve active slots and the source `0x8000` bits. The set of
+/// records, last-spawn frame count, and version-selected field presence remain
+/// unchanged. Re-encoding changed flags may resize the manager body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisasterManagerEditor {
     original: DisasterManagerData,
+    flags: Vec<u32>,
     records: Vec<DisasterRecord>,
     last_spawn_frames: Vec<u32>,
     random_disaster_cooldown: Option<u16>,
@@ -98,11 +104,21 @@ impl DisasterManagerData {
         let slot_count = usize::from(reader.read_u16_be()?)
             .checked_add(1)
             .ok_or(CrpError::ArithmeticOverflow("DisasterManager slot count"))?;
-        let flags = read_encoded_uint_array(&mut reader, slot_count - 1)?;
+        let flags_start = reader.offset();
+        let serialized_flags = read_encoded_uint_array(&mut reader, slot_count - 1)?;
+        let flags_range = flags_start..reader.offset();
+        let serialized_transient_flags = serialized_flags
+            .iter()
+            .map(|flag| *flag & DISASTER_TRANSIENT_FLAG)
+            .collect();
+        let flags = serialized_flags
+            .into_iter()
+            .map(|flag| flag & SLOT_INDEX_MASK)
+            .collect::<Vec<_>>();
         let active_slots = flags
             .iter()
             .enumerate()
-            .filter_map(|(index, flag)| (flag & SLOT_INDEX_MASK != 0).then_some(index + 1))
+            .filter_map(|(index, flag)| (*flag != 0).then_some(index + 1))
             .collect::<Vec<_>>();
 
         let milestone_count = usize::from(reader.read_u16_be()?);
@@ -156,6 +172,9 @@ impl DisasterManagerData {
         Ok((
             Self {
                 format_version,
+                flags,
+                serialized_transient_flags,
+                flags_range,
                 records,
                 record_ranges,
                 object_headers,
@@ -173,6 +192,12 @@ impl DisasterManagerData {
     /// Returns the inner DataSerializer version used for this manager.
     pub fn format_version(&self) -> u32 {
         self.format_version
+    }
+
+    /// Returns serialized slot flags after clearing the reader-cleared
+    /// `0x8000` bit. Slot zero is reserved and therefore not included.
+    pub fn flags(&self) -> &[u32] {
+        &self.flags
     }
 
     /// Returns active records in ascending buffer-slot order.
@@ -212,10 +237,12 @@ impl DisasterManagerData {
 
     /// Converts the decoded records to an editor.
     pub fn into_editor(self) -> DisasterManagerEditor {
+        let flags = self.flags.clone();
         DisasterManagerEditor {
             records: self.records.clone(),
             last_spawn_frames: self.last_spawn_frames.clone(),
             random_disaster_cooldown: self.random_disaster_cooldown,
+            flags,
             original: self,
         }
     }
@@ -225,6 +252,36 @@ impl DisasterManagerEditor {
     /// Returns the inner DataSerializer version used for this manager.
     pub fn format_version(&self) -> u32 {
         self.original.format_version
+    }
+
+    /// Returns the current raw flag values with source `0x8000` bits cleared.
+    pub fn flags(&self) -> &[u32] {
+        &self.flags
+    }
+
+    /// Replaces raw flag bits for one serialized disaster slot.
+    ///
+    /// `index` is zero-based, so zero represents serialized slot one. The
+    /// value must preserve whether the slot has a record. The reader-cleared
+    /// `0x8000` bit is preserved from the source and cannot be set here.
+    pub fn set_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        let current = *self.flags.get(index).ok_or_else(|| {
+            invalid_disaster_manager(index, "disaster flag index is out of range")
+        })?;
+        if (current == 0) != (value == 0) {
+            return Err(invalid_disaster_manager(
+                index,
+                "disaster flag edits must preserve the slot's active state",
+            ));
+        }
+        if value & DISASTER_TRANSIENT_FLAG != 0 {
+            return Err(invalid_disaster_manager(
+                index,
+                "reader-cleared disaster flag 0x8000 is preserved from the source",
+            ));
+        }
+        self.flags[index] = value;
+        Ok(())
     }
 
     /// Returns the active records that can be edited.
@@ -262,19 +319,65 @@ impl DisasterManagerEditor {
         Ok(())
     }
 
-    /// Encodes edited records and counters into a copy of the source body.
+    /// Encodes edited flags, records, and counters into a copy of the source
+    /// body. Changed flags may resize the body; all other edited fields retain
+    /// their original serialized widths.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
-        if self.records.len() != self.original.records.len()
+        if self.flags.len() != self.original.flags.len()
+            || self.flags.len() != self.original.serialized_transient_flags.len()
+            || self.records.len() != self.original.records.len()
             || self.records.len() != self.original.record_ranges.len()
             || self.last_spawn_frames.len() != self.original.last_spawn_frames.len()
         {
             return Err(invalid_disaster_manager(
                 0,
-                "active disaster record count cannot change in this editor",
+                "disaster flags, active records, or counter counts do not match the source",
             ));
         }
 
         let mut output = self.original.serialized_body.clone();
+        let mut replacements = Vec::new();
+        if self
+            .flags
+            .iter()
+            .zip(&self.original.flags)
+            .any(|(edited, original)| (*edited == 0) != (*original == 0))
+        {
+            return Err(invalid_disaster_manager(
+                0,
+                "disaster flag edits must preserve the active slots",
+            ));
+        }
+        if self
+            .flags
+            .iter()
+            .any(|flags| *flags & DISASTER_TRANSIENT_FLAG != 0)
+        {
+            return Err(invalid_disaster_manager(
+                0,
+                "reader-cleared disaster flag 0x8000 cannot be changed",
+            ));
+        }
+        if self.flags != self.original.flags {
+            let serialized_flags = self
+                .flags
+                .iter()
+                .zip(&self.original.serialized_transient_flags)
+                .map(|(flags, transient)| *flags | *transient)
+                .collect::<Vec<_>>();
+            let mut encoded_flags = Vec::new();
+            write_encoded_uint_array_runs(&mut encoded_flags, &serialized_flags);
+            validate_disaster_range(
+                &output,
+                &self.original.flags_range,
+                self.original.flags_range.len(),
+                "disaster flags",
+            )?;
+            if output.get(self.original.flags_range.clone()) != Some(encoded_flags.as_slice()) {
+                replacements.push((self.original.flags_range.clone(), encoded_flags));
+            }
+        }
+
         for ((edited, original), range) in self
             .records
             .iter()
@@ -294,10 +397,10 @@ impl DisasterManagerEditor {
                     "edited disaster record changed its serialized width",
                 ));
             }
-            let target = output.get_mut(range.clone()).ok_or_else(|| {
-                invalid_disaster_manager(range.start, "disaster record range exceeds source body")
-            })?;
-            target.copy_from_slice(&encoded);
+            validate_disaster_range(&output, range, encoded.len(), "disaster record")?;
+            if output.get(range.clone()) != Some(encoded.as_slice()) {
+                replacements.push((range.clone(), encoded));
+            }
         }
 
         let frame_range = self.original.last_spawn_frames_range.clone();
@@ -312,15 +415,15 @@ impl DisasterManagerEditor {
                 "last-spawn frame edit changed its serialized width",
             ));
         }
-        output
-            .get_mut(frame_range.clone())
-            .ok_or_else(|| {
-                invalid_disaster_manager(
-                    frame_range.start,
-                    "last-spawn frame range exceeds source body",
-                )
-            })?
-            .copy_from_slice(&frame_bytes);
+        validate_disaster_range(
+            &output,
+            &frame_range,
+            frame_bytes.len(),
+            "last-spawn frames",
+        )?;
+        if output.get(frame_range.clone()) != Some(frame_bytes.as_slice()) {
+            replacements.push((frame_range, frame_bytes));
+        }
 
         match (
             self.random_disaster_cooldown,
@@ -328,15 +431,11 @@ impl DisasterManagerEditor {
             self.original.random_disaster_cooldown_range.as_ref(),
         ) {
             (Some(value), Some(_), Some(range)) if range.len() == 2 => {
-                output
-                    .get_mut(range.clone())
-                    .ok_or_else(|| {
-                        invalid_disaster_manager(
-                            range.start,
-                            "random-disaster cooldown range exceeds source body",
-                        )
-                    })?
-                    .copy_from_slice(&value.to_be_bytes());
+                validate_disaster_range(&output, range, 2, "random-disaster cooldown")?;
+                let encoded = value.to_be_bytes().to_vec();
+                if output.get(range.clone()) != Some(encoded.as_slice()) {
+                    replacements.push((range.clone(), encoded));
+                }
             }
             (None, None, None) => {}
             _ => {
@@ -345,6 +444,20 @@ impl DisasterManagerEditor {
                     "random-disaster cooldown layout changed in this editor",
                 ));
             }
+        }
+
+        replacements.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        let mut previous_start = output.len();
+        for (range, replacement) in replacements {
+            if range.end > previous_start {
+                return Err(invalid_disaster_manager(
+                    range.start,
+                    "edited DisasterManager field ranges overlap",
+                ));
+            }
+            validate_disaster_range(&output, &range, range.len(), "edited field")?;
+            output.splice(range.clone(), replacement);
+            previous_start = range.start;
         }
         Ok(output)
     }
@@ -674,9 +787,25 @@ fn invalid_disaster_manager(offset: usize, reason: impl Into<String>) -> CrpErro
     }
 }
 
+fn validate_disaster_range(
+    source: &[u8],
+    range: &Range<usize>,
+    expected_len: usize,
+    field: &str,
+) -> Result<(), CrpError> {
+    if range.start > range.end || range.end > source.len() || range.len() != expected_len {
+        return Err(invalid_disaster_manager(
+            range.start,
+            format!("{field} range does not match its decoded values"),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::DisasterManagerData;
+    use crate::encoded_array::write_encoded_uint_array_runs;
 
     fn active_record_body(version: u32, record: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0x00, 0x01]; // Two slots; slot zero is reserved.
@@ -764,6 +893,32 @@ mod tests {
             Some([4.0, 5.0, 6.0])
         );
         assert_eq!(&encoded[encoded.len() - 4..], &[0x12, 0x34, 0xab, 0xcd]);
+    }
+
+    #[test]
+    fn disaster_flag_editor_preserves_reader_cleared_bits() {
+        let mut body = active_record_body(301, &[0; 63]);
+        body[5] = 0x80; // Serialized value is 0x00008001; the reader clears 0x8000.
+        let (decoded, _) = DisasterManagerData::decode(301, &body).unwrap();
+        assert_eq!(decoded.flags(), [1]);
+
+        let mut editor = decoded.into_editor();
+        editor.set_flag_bits(0, 3).unwrap();
+        assert!(editor.set_flag_bits(0, 0).is_err());
+        assert!(editor.set_flag_bits(0, 0x8003).is_err());
+        assert!(editor.set_flag_bits(1, 1).is_err());
+
+        let mut expected_flags = Vec::new();
+        write_encoded_uint_array_runs(&mut expected_flags, &[0x0000_8003]);
+        assert_eq!(expected_flags, [0, 0, 0, 0x80, 3]);
+        let mut expected = body;
+        expected.splice(2..7, expected_flags);
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+        let (updated, consumed) = DisasterManagerData::decode(301, &encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(updated.flags(), [3]);
+        assert_eq!(updated.records().len(), 1);
     }
 
     #[test]
