@@ -1,5 +1,5 @@
 use crate::CrpError;
-use crate::data_serializer::Reader;
+use crate::data_serializer::{Reader, write_nullable_unique_string};
 use crate::encoded_array::{
     read_encoded_uint_array, read_encoded_ushort_array, write_encoded_uint_array_runs,
 };
@@ -53,6 +53,7 @@ pub struct AudioManagerData {
     channel_flags_range: Range<usize>,
     channel_prefab_indices: Vec<u16>,
     channel_prefab_names: Vec<Option<String>>,
+    channel_prefab_name_ranges: Vec<Range<usize>>,
     radio_channels: Vec<AudioRadioChannel>,
     channel_record_offsets: Vec<usize>,
     radio_content_capacity: u32,
@@ -60,6 +61,7 @@ pub struct AudioManagerData {
     content_flags_range: Range<usize>,
     content_prefab_indices: Vec<u16>,
     content_prefab_names: Vec<Option<String>>,
+    content_prefab_name_ranges: Vec<Range<usize>>,
     unlock_milestone_prefab_indices: Vec<u16>,
     unlock_milestone_references: Vec<NetObjectHeader>,
     radio_contents: Vec<AudioRadioContent>,
@@ -88,7 +90,7 @@ impl AudioManagerData {
         let channel_flags_range = channel_flags_start..reader.offset();
         let channel_count = channel_flags.iter().filter(|flags| **flags != 0).count();
         let channel_prefab_indices = read_encoded_ushort_array(&mut reader, channel_count)?;
-        let channel_prefab_names = read_prefab_names(&mut reader)?;
+        let (channel_prefab_names, channel_prefab_name_ranges) = read_prefab_names(&mut reader)?;
 
         let mut radio_channels = Vec::with_capacity(channel_count);
         let mut channel_record_offsets = Vec::with_capacity(channel_count);
@@ -131,7 +133,7 @@ impl AudioManagerData {
             read_encoded_ushort_array(&mut reader, content_prefab_index_count)?;
         let content_prefab_indices = all_content_prefab_indices[..content_count].to_vec();
         let unlock_milestone_prefab_indices = all_content_prefab_indices[content_count..].to_vec();
-        let content_prefab_names = read_prefab_names(&mut reader)?;
+        let (content_prefab_names, content_prefab_name_ranges) = read_prefab_names(&mut reader)?;
 
         let mut unlock_milestone_references = Vec::with_capacity(unlock_milestone_count);
         for _ in 0..unlock_milestone_count {
@@ -166,6 +168,7 @@ impl AudioManagerData {
                 channel_flags_range,
                 channel_prefab_indices,
                 channel_prefab_names,
+                channel_prefab_name_ranges,
                 radio_channels,
                 channel_record_offsets,
                 radio_content_capacity,
@@ -173,6 +176,7 @@ impl AudioManagerData {
                 content_flags_range,
                 content_prefab_indices,
                 content_prefab_names,
+                content_prefab_name_ranges,
                 unlock_milestone_prefab_indices,
                 unlock_milestone_references,
                 radio_contents,
@@ -260,8 +264,10 @@ impl AudioManagerData {
 
     /// Creates an editor for existing channel and content flags and records.
     ///
-    /// Flag edits preserve each slot's active state. They can change encoded
-    /// array lengths; record counts and prefab assignments stay fixed.
+    /// Flag edits preserve each slot's active state. Existing channel and
+    /// content prefab names can change without changing their table counts.
+    /// Changed arrays or strings can resize the body; record counts and prefab
+    /// assignments stay fixed.
     pub fn into_editor(self) -> AudioManagerEditor {
         AudioManagerEditor::from(self)
     }
@@ -269,15 +275,18 @@ impl AudioManagerData {
 
 /// Fixed-width edits for existing AudioManager radio records.
 ///
-/// The editor can change channel playback state and content cooldowns. Slot
-/// indices, prefab assignments, active flags, and all opaque scope bytes are
-/// retained from the source. Encoding preserves the original body length.
+/// The editor can change channel playback state, content cooldowns, and
+/// existing channel/content prefab names. Slot indices, prefab assignments,
+/// active flags, and object references remain fixed. Changed names or flag
+/// arrays can resize the body; other source bytes retain their representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioManagerEditor {
     original: AudioManagerData,
     channel_flags: Vec<u32>,
+    channel_prefab_names: Vec<Option<String>>,
     radio_channels: Vec<AudioRadioChannel>,
     content_flags: Vec<u32>,
+    content_prefab_names: Vec<Option<String>>,
     radio_contents: Vec<AudioRadioContent>,
 }
 
@@ -285,8 +294,10 @@ impl From<AudioManagerData> for AudioManagerEditor {
     fn from(original: AudioManagerData) -> Self {
         Self {
             channel_flags: original.channel_flags.clone(),
+            channel_prefab_names: original.channel_prefab_names.clone(),
             radio_channels: original.radio_channels.clone(),
             content_flags: original.content_flags.clone(),
+            content_prefab_names: original.content_prefab_names.clone(),
             radio_contents: original.radio_contents.clone(),
             original,
         }
@@ -303,6 +314,18 @@ impl AudioManagerEditor {
     /// meanings are not modeled.
     pub fn channel_flags(&self) -> &[u32] {
         &self.channel_flags
+    }
+
+    /// Returns channel prefab names in their original table order.
+    pub fn channel_prefab_names(&self) -> &[Option<String>] {
+        &self.channel_prefab_names
+    }
+
+    /// Returns mutable channel prefab names in their original table order.
+    /// The number and order of entries are fixed; changed strings use
+    /// canonical DataSerializer encoding and can resize the body.
+    pub fn channel_prefab_names_mut(&mut self) -> &mut [Option<String>] {
+        &mut self.channel_prefab_names
     }
 
     /// Replaces raw flag bits for one serialized radio-channel slot.
@@ -347,6 +370,18 @@ impl AudioManagerEditor {
         &self.content_flags
     }
 
+    /// Returns content prefab names in their original table order.
+    pub fn content_prefab_names(&self) -> &[Option<String>] {
+        &self.content_prefab_names
+    }
+
+    /// Returns mutable content prefab names in their original table order.
+    /// The number and order of entries are fixed; changed strings use
+    /// canonical DataSerializer encoding and can resize the body.
+    pub fn content_prefab_names_mut(&mut self) -> &mut [Option<String>] {
+        &mut self.content_prefab_names
+    }
+
     /// Replaces raw flag bits for one serialized radio-content slot.
     ///
     /// `index` is zero-based, so zero represents serialized slot one. The
@@ -381,6 +416,10 @@ impl AudioManagerEditor {
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         if self.channel_flags.len() != self.original.channel_flags.len()
             || self.content_flags.len() != self.original.content_flags.len()
+            || self.channel_prefab_names.len() != self.original.channel_prefab_names.len()
+            || self.channel_prefab_names.len() != self.original.channel_prefab_name_ranges.len()
+            || self.content_prefab_names.len() != self.original.content_prefab_names.len()
+            || self.content_prefab_names.len() != self.original.content_prefab_name_ranges.len()
             || self.radio_channels.len() != self.original.radio_channels.len()
             || self.radio_channels.len() != self.original.channel_record_offsets.len()
             || self.radio_contents.len() != self.original.radio_contents.len()
@@ -475,19 +514,47 @@ impl AudioManagerEditor {
             write_u16_at(&mut bytes, *offset, edited.cooldown)?;
         }
 
+        let mut replacements = Vec::new();
+        replacements.extend(encode_name_replacements(
+            &bytes,
+            &self.original.channel_prefab_names,
+            &self.channel_prefab_names,
+            &self.original.channel_prefab_name_ranges,
+            "channel prefab names",
+        )?);
+        replacements.extend(encode_name_replacements(
+            &bytes,
+            &self.original.content_prefab_names,
+            &self.content_prefab_names,
+            &self.original.content_prefab_name_ranges,
+            "content prefab names",
+        )?);
         if self.content_flags != self.original.content_flags {
             let range = self.original.content_flags_range.clone();
             validate_flag_range(&bytes, &range)?;
             let mut encoded = Vec::new();
             write_encoded_uint_array_runs(&mut encoded, &self.content_flags);
-            bytes.splice(range, encoded);
+            replacements.push((range, encoded));
         }
         if self.channel_flags != self.original.channel_flags {
             let range = self.original.channel_flags_range.clone();
             validate_flag_range(&bytes, &range)?;
             let mut encoded = Vec::new();
             write_encoded_uint_array_runs(&mut encoded, &self.channel_flags);
-            bytes.splice(range, encoded);
+            replacements.push((range, encoded));
+        }
+        replacements.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        let mut previous_start = bytes.len();
+        for (range, replacement) in replacements {
+            if range.end > previous_start {
+                return Err(invalid(
+                    range.start,
+                    "edited AudioManager field ranges overlap",
+                ));
+            }
+            validate_flag_range(&bytes, &range)?;
+            bytes.splice(range.clone(), replacement);
+            previous_start = range.start;
         }
         Ok(bytes)
     }
@@ -534,13 +601,50 @@ fn invalid(offset: usize, reason: impl Into<String>) -> CrpError {
     }
 }
 
-fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, CrpError> {
+fn read_prefab_names(
+    reader: &mut Reader<'_>,
+) -> Result<(Vec<Option<String>>, Vec<Range<usize>>), CrpError> {
     let count = usize::from(reader.read_u16_be()?);
     let mut names = Vec::with_capacity(count);
+    let mut ranges = Vec::with_capacity(count);
     for _ in 0..count {
+        let start = reader.offset();
         names.push(reader.read_unique_string()?);
+        ranges.push(start..reader.offset());
     }
-    Ok(names)
+    Ok((names, ranges))
+}
+
+fn encode_name_replacements(
+    source: &[u8],
+    original: &[Option<String>],
+    edited: &[Option<String>],
+    ranges: &[Range<usize>],
+    field: &str,
+) -> Result<Vec<(Range<usize>, Vec<u8>)>, CrpError> {
+    if original.len() != edited.len() || original.len() != ranges.len() {
+        return Err(invalid(
+            0,
+            format!("{field} entry counts do not match the source"),
+        ));
+    }
+
+    let mut replacements = Vec::new();
+    for (index, ((before, after), range)) in original.iter().zip(edited).zip(ranges).enumerate() {
+        if before == after {
+            continue;
+        }
+        if range.start > range.end || range.end > source.len() {
+            return Err(invalid(
+                range.start,
+                format!("{field} entry {index} byte range is invalid"),
+            ));
+        }
+        let mut encoded = Vec::new();
+        write_nullable_unique_string(&mut encoded, after.as_deref())?;
+        replacements.push((range.clone(), encoded));
+    }
+    Ok(replacements)
 }
 
 #[cfg(test)]
@@ -623,6 +727,34 @@ mod tests {
                 cooldown: 9,
             }]
         );
+    }
+
+    #[test]
+    fn editor_changes_channel_and_content_prefab_names_exactly() {
+        let bytes = one_channel_one_content_body(281);
+        let (decoded, consumed) = AudioManagerData::decode_prefix(281, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        let channel_name_range = decoded.channel_prefab_name_ranges[0].clone();
+        let content_name_range = decoded.content_prefab_name_ranges[1].clone();
+        let mut editor = decoded.into_editor();
+        editor.channel_prefab_names_mut()[0] = Some("AB".to_owned());
+        editor.content_prefab_names_mut()[1] = None;
+
+        let mut expected = bytes.clone();
+        expected.splice(content_name_range, [0xff]);
+        expected.splice(channel_name_range, [0x80, 0, 2, 0xc1, 1]);
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+
+        let (updated, consumed) = AudioManagerData::decode_prefix(281, &encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(updated.channel_prefab_names(), &[Some("AB".to_owned())]);
+        assert_eq!(
+            updated.content_prefab_names(),
+            &[Some("Content".to_owned()), None]
+        );
+        assert_eq!(updated.radio_channels()[0].play_position, Some(7));
+        assert_eq!(updated.radio_contents()[0].cooldown, 9);
     }
 
     #[test]

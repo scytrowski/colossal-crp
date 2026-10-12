@@ -4377,11 +4377,11 @@ impl SimulationManagerData {
         Ok(data)
     }
 
-    /// Replaces existing channel/content flags and fixed-width record fields.
+    /// Replaces existing channel/content flags, fields, and prefab names.
     ///
     /// The editor must come from this manager graph and preserve its active
-    /// slots and prefab assignments. Changed flag arrays can resize the body;
-    /// the following manager boundary is checked after replacement.
+    /// slots and prefab assignments. Changed flag arrays and prefab names can
+    /// resize the body; the following manager boundary is checked afterward.
     pub fn replace_audio_manager_data(
         &mut self,
         edited: &AudioManagerEditor,
@@ -18542,7 +18542,7 @@ mod manager_boundary_tests {
             0x00, 0x00, // One content slot, including reserved index zero.
             0x00, 0x00, 0x00, 0x00, 0x01, // One active channel flag.
             0x00, 0x00, 0x00, // One channel prefab index, zero.
-            0x00, 0x00, // Empty channel prefab-name table.
+            0x00, 0x01, 0xff, // One null channel prefab name.
             0x00, 0x01, 0x00, 0x02, 0x03, 0x04, 0x00, 0x05, // Channel state.
             0x00, 0x00, // No unlock milestones.
             0x00, 0x00, // Empty content prefab-name table.
@@ -18959,17 +18959,19 @@ mod manager_boundary_tests {
         let mut manager = audio_manager_with_active_channel();
         let audio_tag_len = profiler_tag("AudioManager").len();
         let body_start = audio_tag_len;
-        let body_len = 26;
+        let body_len = 27;
         let following_bytes = manager.serialized_object_graph[body_start + body_len..].to_vec();
         let graph_len = manager.serialized_object_graph.len();
 
         let mut edited = manager.decode_audio_manager_data().unwrap().into_editor();
+        edited.channel_prefab_names_mut()[0] = Some("A".to_owned());
         let channel = &mut edited.radio_channels_mut()[0];
         channel.current_content_index = 100;
         channel.next_content_index = 200;
         channel.state_chain_index = 6;
         channel.state_repeat_count = 7;
         channel.play_position = Some(0x3456);
+        assert_eq!(edited.encode().unwrap().len(), body_len + 3);
         manager.replace_audio_manager_data(&edited).unwrap();
 
         let decoded = manager.decode_audio_manager_data().unwrap();
@@ -18979,9 +18981,10 @@ mod manager_boundary_tests {
         assert_eq!(channel.state_chain_index, 6);
         assert_eq!(channel.state_repeat_count, 7);
         assert_eq!(channel.play_position, Some(0x3456));
-        assert_eq!(manager.serialized_object_graph.len(), graph_len);
+        assert_eq!(decoded.channel_prefab_names(), &[Some("A".to_owned())]);
+        assert_eq!(manager.serialized_object_graph.len(), graph_len + 3);
         assert_eq!(
-            &manager.serialized_object_graph[body_start + body_len..],
+            &manager.serialized_object_graph[body_start + body_len + 3..],
             following_bytes
         );
 
