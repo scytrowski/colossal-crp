@@ -36,8 +36,10 @@ pub struct BurningTreeRecord {
 pub struct TreeManagerDataPrefix {
     format_version: u32,
     flags: Vec<u16>,
+    serialized_fire_flags: Vec<u16>,
     prefab_names: Vec<Option<String>>,
     trees: Vec<TreeInstanceRecord>,
+    flags_range: Range<usize>,
     prefab_indices_range: Range<usize>,
     position_x_range: Range<usize>,
     position_z_range: Range<usize>,
@@ -46,15 +48,17 @@ pub struct TreeManagerDataPrefix {
     serialized_prefix: Vec<u8>,
 }
 
-/// Editor for existing active trees and burning-tree records.
+/// Editor for existing tree flags, active trees, and burning-tree records.
 ///
-/// Tree slots and their count remain unchanged. Burning-tree records from
-/// version 266 can be replaced as a list. Changed `EncodedArray.UShort` columns
-/// use the canonical encoding; unchanged columns and all other bytes retain
-/// their source representation.
+/// Raw non-fire flag bits can be edited while preserving active slots and the
+/// source fire bits. Tree slots and their count remain unchanged. Burning-tree
+/// records from version 266 can be replaced as a list. Changed
+/// `EncodedArray.UShort` columns use the canonical encoding; unchanged columns
+/// and all other bytes retain their source representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeManagerEditor {
     data: TreeManagerDataPrefix,
+    original_flags: Vec<u16>,
     original_trees: Vec<TreeInstanceRecord>,
 }
 
@@ -71,7 +75,13 @@ impl TreeManagerDataPrefix {
         }
 
         let mut reader = Reader::new(bytes);
+        let flags_start = reader.offset();
         let serialized_flags = read_encoded_ushort_array(&mut reader, TREE_CAPACITY - 1)?;
+        let flags_range = flags_start..reader.offset();
+        let serialized_fire_flags = serialized_flags
+            .iter()
+            .map(|flags| flags & TREE_FIRE_FLAGS)
+            .collect();
         let mut flags = serialized_flags;
         flags.resize(TREE_CAPACITY - 1, 0);
         // Deserialize clears these runtime-only flags before loading the
@@ -135,8 +145,10 @@ impl TreeManagerDataPrefix {
             Self {
                 format_version,
                 flags,
+                serialized_fire_flags,
                 prefab_names,
                 trees,
+                flags_range,
                 prefab_indices_range,
                 position_x_range,
                 position_z_range,
@@ -173,11 +185,14 @@ impl TreeManagerDataPrefix {
         self.burning_trees.as_deref()
     }
 
-    /// Creates an editor for existing active trees and burning-tree records.
+    /// Creates an editor for raw flags, existing active trees, and any
+    /// versioned burning-tree records.
     pub fn into_editor(self) -> TreeManagerEditor {
+        let original_flags = self.flags.clone();
         let original_trees = self.trees.clone();
         TreeManagerEditor {
             data: self,
+            original_flags,
             original_trees,
         }
     }
@@ -192,6 +207,34 @@ impl TreeManagerEditor {
     /// Returns the inner DataSerializer version.
     pub fn format_version(&self) -> u32 {
         self.data.format_version
+    }
+
+    /// Replaces raw non-fire flag bits for one serialized tree slot.
+    ///
+    /// `index` is zero-based, so zero represents serialized slot one. The
+    /// value must preserve the slot's zero/nonzero active state and cannot set
+    /// runtime fire bits `0x00C0`; those bits are preserved from the source
+    /// array. A separate burning-tree table is present from version 266.
+    pub fn set_flag_bits(&mut self, index: usize, value: u16) -> Result<(), CrpError> {
+        let current = *self
+            .data
+            .flags
+            .get(index)
+            .ok_or_else(|| invalid_tree_manager(index, "tree flag index is out of range"))?;
+        if (current == 0) != (value == 0) {
+            return Err(invalid_tree_manager(
+                index,
+                "tree flag edits must preserve the slot's active state",
+            ));
+        }
+        if value & TREE_FIRE_FLAGS != 0 {
+            return Err(invalid_tree_manager(
+                index,
+                "runtime tree fire bits are preserved from the source and cannot be changed here",
+            ));
+        }
+        self.data.flags[index] = value;
+        Ok(())
     }
 
     /// Returns mutable active tree records without changing their count or slots.
@@ -229,16 +272,21 @@ impl TreeManagerEditor {
 
     /// Writes edited fields while retaining unchanged source bytes.
     ///
-    /// Changing prefab indexes or positions re-encodes only the affected
-    /// `EncodedArray.UShort` column. That column may change length. Burning-tree
-    /// records use fixed-width fields, and their list can be replaced from
-    /// version 266. Tree slots and their count cannot change.
+    /// Changing raw flags, prefab indexes, or positions re-encodes only the
+    /// affected `EncodedArray.UShort` column. That column may change length;
+    /// preserved source fire bits are restored when flags are rewritten.
+    /// Burning-tree records use fixed-width fields, and their list can be
+    /// replaced from version 266. Tree slots and their count cannot change.
     pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
         let mut bytes = self.data.serialized_prefix.clone();
-        if self.data.trees.len() != self.original_trees.len() {
+        if self.data.flags.len() != TREE_CAPACITY - 1
+            || self.original_flags.len() != TREE_CAPACITY - 1
+            || self.data.serialized_fire_flags.len() != TREE_CAPACITY - 1
+            || self.data.trees.len() != self.original_trees.len()
+        {
             return Err(invalid_tree_manager(
                 0,
-                "active tree record count does not match the source",
+                "tree flags or active record counts do not match the source",
             ));
         }
 
@@ -256,6 +304,22 @@ impl TreeManagerEditor {
         }
 
         let mut replacements = Vec::new();
+        if self.data.flags != self.original_flags {
+            let serialized_flags = self
+                .data
+                .flags
+                .iter()
+                .zip(&self.data.serialized_fire_flags)
+                .map(|(flags, fire_flags)| flags | fire_flags)
+                .collect::<Vec<_>>();
+            replacements.push(encode_ushort_column(
+                &bytes,
+                &self.data.flags_range,
+                &serialized_flags,
+                "tree flags",
+            )?);
+        }
+
         let current_prefab_indices = self
             .data
             .trees
@@ -449,7 +513,7 @@ fn invalid_tree_manager(offset: usize, reason: impl Into<String>) -> CrpError {
 
 #[cfg(test)]
 mod tests {
-    use super::{BurningTreeRecord, TREE_CAPACITY, TreeManagerDataPrefix};
+    use super::{BURNING_TREES_VERSION, BurningTreeRecord, TREE_CAPACITY, TreeManagerDataPrefix};
     use crate::data_serializer::write_u24_be;
     use crate::encoded_array::write_encoded_ushort_array;
 
@@ -502,6 +566,72 @@ mod tests {
         assert_eq!(tree_manager.prefab_names(), &[Some("T".to_owned())]);
         assert_eq!(tree_manager.flags()[8], 0);
         assert_eq!(tree_manager.encode(), bytes);
+    }
+
+    #[test]
+    fn tree_manager_editor_preserves_fire_bits_when_editing_raw_flags() {
+        for format_version in [194, 266] {
+            let mut serialized_flags = vec![0_u16; TREE_CAPACITY - 1];
+            serialized_flags[0] = 1;
+            serialized_flags[8] = 0x40;
+            serialized_flags[9] = 3;
+            let mut bytes = Vec::new();
+            write_encoded_ushort_array(&mut bytes, &serialized_flags);
+            let flags_len = bytes.len();
+            write_encoded_ushort_array(&mut bytes, &[12, 14]);
+            bytes.extend_from_slice(&[0, 0]); // Empty prefab-name scope.
+            write_encoded_ushort_array(&mut bytes, &[10, 20]);
+            write_encoded_ushort_array(&mut bytes, &[30, 40]);
+            if format_version >= BURNING_TREES_VERSION {
+                bytes.extend_from_slice(&[0, 0, 1, 0, 0, 10, 4, 5]);
+            }
+
+            let (trees, _) = TreeManagerDataPrefix::decode_prefix(format_version, &bytes).unwrap();
+            assert_eq!(trees.flags()[8], 0);
+            let mut editor = trees.into_editor();
+            editor.set_flag_bits(0, 5).unwrap();
+            editor.set_flag_bits(9, 2).unwrap();
+            assert!(editor.set_flag_bits(0, 0).is_err());
+            assert!(editor.set_flag_bits(8, 1).is_err());
+            assert!(editor.set_flag_bits(0, 0x41).is_err());
+            assert!(editor.set_flag_bits(TREE_CAPACITY - 1, 1).is_err());
+
+            let mut expected_wire_flags = serialized_flags;
+            expected_wire_flags[0] = 5;
+            expected_wire_flags[9] = 2;
+            let mut expected = Vec::new();
+            write_encoded_ushort_array(&mut expected, &expected_wire_flags);
+            expected.extend_from_slice(&bytes[flags_len..]);
+            let encoded = editor.encode().unwrap();
+            assert_eq!(encoded, expected);
+
+            let (updated, consumed) =
+                TreeManagerDataPrefix::decode_prefix(format_version, &encoded).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(updated.flags()[0], 5);
+            assert_eq!(updated.flags()[8], 0);
+            assert_eq!(updated.flags()[9], 2);
+            assert_eq!(
+                updated
+                    .trees()
+                    .iter()
+                    .map(|tree| tree.index)
+                    .collect::<Vec<_>>(),
+                [1, 10]
+            );
+            if format_version >= BURNING_TREES_VERSION {
+                assert_eq!(
+                    updated.burning_trees().unwrap(),
+                    &[BurningTreeRecord {
+                        tree_index: 10,
+                        fire_intensity: 4,
+                        fire_damage: 5,
+                    }]
+                );
+            } else {
+                assert_eq!(updated.burning_trees(), None);
+            }
+        }
     }
 
     #[test]
