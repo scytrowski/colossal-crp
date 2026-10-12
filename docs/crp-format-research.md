@@ -1,6 +1,20 @@
 # Preliminary research on the `.crp` format
 
-Status as of 2026-10-11. These notes are based on the game DLLs and samples in `data/maps/`. They record current observations, not a complete implementation specification.
+Status as of 2026-10-12. These notes are based on the game DLLs and samples in `data/maps/`. They record current observations, not a complete implementation specification.
+
+## Package and serializer version coverage
+
+The local corpus contains 105 map packages and 469 indexed assets. All 469 payload checksums match their index entries. All outer package versions 4–10 are represented, with 110 type-52 assets across the 105 maps. The table records the inner version at the start of each type-52 `SimulationMetaData` stream. This is sample coverage only: it does not establish a payload version gate or show that an outer package version causes a particular inner version.
+
+| Outer package version | Maps | Type-52 assets | Observed inner `SimulationMetaData` versions |
+| --- | ---: | ---: | --- |
+| 4 | 21 | 21 | 244, 293, 312, 316, 320 |
+| 5 | 2 | 2 | 109006 |
+| 6 | 20 | 20 | 109011, 110025, 111013, 111015, 112004, 112031, 113007 |
+| 7 | 4 | 4 | 113010 |
+| 8 | 16 | 16 | 114007, 114008, 114009, 114011, 115014, 115023 |
+| 9 | 16 | 16 | 116010, 116011, 116019, 116020 |
+| 10 | 26 | 31 | 194, 206, 237, 241, 117004, 117005, 117013, 118011 |
 
 `TransferManagerData` now decodes the reader's versioned amount arrays, raw 16-per-reason counts, and offer columns from inner version 37; `SimulationManagerData` bounds it between the TransferManager and NaturalResourceManager profiler tags. `TransferManagerEditor` edits fixed-size arrays and can replace the offer list with up to one million records, while preserving unchanged encoded columns byte-for-byte. The serialized reason-count total must match the offer count; each versioned field must be present only at its reader gate. Manager replacement resizes the body and retains the following graph bytes. The editor does not resolve the closing profiler reference or name individual count categories. Decoding and editing are capped at one million offers to bound allocations from untrusted counts.
 
@@ -895,13 +909,13 @@ The previously reported 42 `FF` bytes and `00 19`/`00 1C` references occur after
 - StatisticsManager boundaries align in all 110 assets; its inline fields, reference table, and two levels of queued statistic bodies are validated in `CL Wolf Creek` at inner version 112004. The first-level body queue resolves shared-type indexes 38–40 to `StatisticArray`, `StatisticInt64`, and `StatisticInt32` in that sample, and the integer readers have game-produced fixtures. Remaining graph bytes, the other 109 arrays, and pre-189 end-frame behavior remain unvalidated against game-produced bodies.
 - UnlockManager boundaries align in all 110 assets, but the corpus has no active milestone references or scenario triggers; its live milestone object bodies and scenario-specific branches remain unvalidated against game-produced samples. GuideManager's version-derived reference counts were walked in all 110 assets, and its 48 queued guide bodies were located and validated in `CL Wolf Creek`; other versions and saved guide states remain unvalidated. The BuildingManager guide queue is located in that sample, but its bodies are all zero and their positions are derived from reference order and DLL schemas; other versions and nonzero guide state remain unvalidated. The supplied GuideManager writer and reader also have documented old-version field-count asymmetries.
 - Whether type-53 nested packages occur in other `.crp` families and what real nested-package depths and inner layouts those families use. The DLL recognizes and recursively opens type-53 assets, but no such entry appears in the local map corpus; its stream path does not enforce the containing asset's declared size.
-- Payload-level differences across outer package versions 4–10 and package families beyond the map types in the corpus. The index field layout itself is unchanged in these versions.
+- Payload-level differences caused by outer package versions 4–10 remain unisolated: all seven versions occur in the map corpus, but this inventory does not compare equivalent payloads saved under different outer versions. Package families beyond the map types are also absent. The index field layout itself is unchanged in these versions.
 
 ## Next research steps
 
 1. Establish the historical gate and writer behavior for EconomyManager's split-array candidate. The available DLL directory contains only the current `Assembly-CSharp.dll`, whose reader and writer disagree; samples at 116011/116019 select the earlier layout, while selected samples at 117005–118011 select the segmented candidate and omit the reader-only version-287 cash value. Keep this selection sample-specific until an older writer DLL or a discriminating save is available. The EventManager counted block likewise needs an older DLL or a sample that identifies its type and gate. Active lines and nonempty milestones in TransportManager remain without game-produced sample coverage. Raw active-line flags are editable while preserving each slot's active state; their bit meanings remain unknown. Active-line prefab indexes and names, scalar fields, raw flags, and legacy per-line vehicle selections are editable in Rust. Milestone prefab indexes can be changed, and milestone references can be cleared to null and restored; existing-object or null milestones can be appended, and null or existing-object milestones can be removed while new-object declarations remain protected from removal. Milestone and fixed tail references can be redirected to earlier objects of the same runtime type or cleared to null; the null marker is one byte, so clearing a reference can resize the bounded manager body. Changing milestone counts or indexes may also resize their encoded sections. Tail fields follow reader gates 316–318, while the supplied writer does not confirm their historical gates. TransportManager selection entries can be inserted or removed when they reference existing shared strings; adding or removing shared-string declarations remains unsupported because later managers may refer to their global indexes. Milestone and tail edits have synthetic expected-byte coverage only.
 2. Inspect representative non-map packages for type-53 nested packages and additional asset types.
-3. Compare payload-level behavior across outer package versions 4–10 and observed inner serializer versions where game-produced samples are available.
+3. Find equivalent payloads saved under different outer package versions, or other controlled samples, to separate outer-container effects from the observed inner serializer-version changes.
 
 ## Limitations of this pass
 
