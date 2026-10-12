@@ -7698,20 +7698,20 @@ impl SimulationManagerData {
         Ok((props, tree_tag_start))
     }
 
-    /// Decodes PropManager into an editor for existing active-prop columns.
+    /// Decodes PropManager into an editor for existing prop fields and names.
     pub fn decode_prop_manager_editor(&self) -> Result<PropManagerEditor, CrpError> {
         let (props, _) = self.decode_prop_manager_prefix()?;
         Ok(props.into_editor())
     }
 
-    /// Replaces existing PropManager prefab assignments and transform columns.
+    /// Replaces existing PropManager fields and prefab-name values.
     ///
     /// The editor must come from the current manager body and inner version.
     /// Flag edits preserve slot activity and, from version 121026, logo-kind
-    /// selection. Existing race-team and event logo assignments can change;
-    /// prefab-name scopes and record counts stay fixed.
-    /// Changed encoded arrays can resize the graph; the TreeManager boundary
-    /// is checked again after replacement.
+    /// selection. Existing race-team and event logo assignments and names can
+    /// change. Name counts and record counts stay fixed; changed strings and
+    /// encoded arrays can resize the graph. The TreeManager boundary is
+    /// checked again after replacement.
     pub fn replace_prop_manager_data(
         &mut self,
         edited: &PropManagerEditor,
@@ -26011,8 +26011,12 @@ mod manager_boundary_tests {
         write_encoded_ushort_array(&mut encoded_flags, &flags);
         let encoded_flags_len = encoded_flags.len();
         let mut prop_body = encoded_flags;
-        write_encoded_ushort_array(&mut prop_body, &[1, 2, 3]);
-        prop_body.extend_from_slice(&[0, 0]); // Empty PropInfo name scope.
+        let mut encoded_prefab_indices = Vec::new();
+        write_encoded_ushort_array(&mut encoded_prefab_indices, &[1, 2, 3]);
+        let encoded_prefab_indices_len = encoded_prefab_indices.len();
+        prop_body.extend_from_slice(&encoded_prefab_indices);
+        prop_body.extend_from_slice(&[0, 1, 0xff]); // One null PropInfo name.
+        let name_offset = encoded_flags_len + encoded_prefab_indices_len + 2;
         let x_offset = prop_body.len();
         let mut encoded_x = Vec::new();
         write_encoded_ushort_array(&mut encoded_x, &[10, 20, 30]);
@@ -26027,11 +26031,14 @@ mod manager_boundary_tests {
         let original_graph_len = original_graph.len();
         let mut editor = manager.decode_prop_manager_editor().unwrap();
         editor.set_flag_bits(0, 3).unwrap();
+        editor.prefab_names_mut()[0] = Some("A".to_owned());
         editor.position_x_mut().fill(0);
 
         let mut expected_graph = original_graph;
         let x_start = body_start + x_offset;
         expected_graph.splice(x_start..x_start + encoded_x.len(), [0x82]);
+        let name_start = body_start + name_offset;
+        expected_graph.splice(name_start..name_start + 1, [0x80, 0, 1, 0xc1]);
         let mut expected_flags = flags;
         expected_flags[0] = 3;
         let mut expected_encoded_flags = Vec::new();
@@ -26040,7 +26047,7 @@ mod manager_boundary_tests {
             body_start..body_start + encoded_flags_len,
             expected_encoded_flags,
         );
-        assert_eq!(expected_graph.len(), original_graph_len - 6);
+        assert_eq!(expected_graph.len(), original_graph_len - 3);
         manager.replace_prop_manager_data(&editor).unwrap();
 
         assert_eq!(manager.serialized_object_graph(), expected_graph);
@@ -26048,6 +26055,7 @@ mod manager_boundary_tests {
         assert_eq!(updated.flags()[0], 3);
         assert_eq!(updated.position_x(), &[0, 0, 0]);
         assert_eq!(updated.prefab_indices(), &[1, 2, 3]);
+        assert_eq!(updated.prefab_names(), &[Some("A".to_owned())]);
         assert!(
             manager.serialized_object_graph()[tree_start..]
                 .starts_with(&profiler_tag("TreeManager"))

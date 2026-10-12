@@ -1,5 +1,5 @@
 use crate::CrpError;
-use crate::data_serializer::Reader;
+use crate::data_serializer::{Reader, write_nullable_unique_string};
 use crate::encoded_array::{read_encoded_ushort_array, write_encoded_ushort_array};
 use std::ops::Range;
 
@@ -11,7 +11,8 @@ const LOGO_TABLE_VERSION: u32 = 121_026;
 /// The decoder supports the legacy layout below inner version 121026 and the
 /// logo-table layout from version 121026. It retains the exact known bytes for
 /// lossless rewriting. The editor can change raw flag bits while preserving
-/// active slots and logo-scope selection, along with active-prop columns.
+/// active slots and logo-scope selection, along with active-prop columns and
+/// existing prefab-name values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropManagerDataPrefix {
     format_version: u32,
@@ -20,6 +21,7 @@ pub struct PropManagerDataPrefix {
     prefab_indices: Vec<u16>,
     prefab_indices_range: Range<usize>,
     prefab_names: Vec<Option<String>>,
+    prefab_name_ranges: Vec<Range<usize>>,
     position_x: Vec<i16>,
     position_x_range: Range<usize>,
     position_z: Vec<i16>,
@@ -29,9 +31,11 @@ pub struct PropManagerDataPrefix {
     race_logo_indices: Vec<u16>,
     race_logo_indices_range: Option<Range<usize>>,
     race_logo_names: Vec<Option<String>>,
+    race_logo_name_ranges: Vec<Range<usize>>,
     event_logo_indices: Vec<u16>,
     event_logo_indices_range: Option<Range<usize>>,
     event_logo_names: Vec<Option<String>>,
+    event_logo_name_ranges: Vec<Range<usize>>,
     logo_tables_present: bool,
     serialized_prefix: Vec<u8>,
 }
@@ -42,7 +46,9 @@ pub struct PropManagerDataPrefix {
 /// selection. Changed encoded arrays use canonical `EncodedArray.UShort`
 /// encoding; unchanged columns and all other bytes retain their original
 /// representation. From version 121026, existing race-team and event logo
-/// assignments can also be edited without changing either name table.
+/// assignments and names can also be edited without changing entry counts.
+/// Changed names use canonical DataSerializer string encoding; unchanged name
+/// bytes retain their source representation.
 /// The source layout may be legacy or include the version-121026 logo tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropManagerEditor {
@@ -52,8 +58,11 @@ pub struct PropManagerEditor {
     original_position_x: Vec<i16>,
     original_position_z: Vec<i16>,
     original_angles: Vec<u16>,
+    original_prefab_names: Vec<Option<String>>,
     original_race_logo_indices: Vec<u16>,
+    original_race_logo_names: Vec<Option<String>>,
     original_event_logo_indices: Vec<u16>,
+    original_event_logo_names: Vec<Option<String>>,
 }
 
 impl PropManagerDataPrefix {
@@ -72,7 +81,7 @@ impl PropManagerDataPrefix {
         let prefab_indices_start = reader.offset();
         let prefab_indices = read_encoded_ushort_array(&mut reader, active_count)?;
         let prefab_indices_range = prefab_indices_start..reader.offset();
-        let prefab_names = read_prefab_names(&mut reader)?;
+        let (prefab_names, prefab_name_ranges) = read_prefab_names(&mut reader)?;
         let position_x_start = reader.offset();
         let position_x = read_encoded_ushort_array(&mut reader, active_count)?
             .into_iter()
@@ -94,9 +103,11 @@ impl PropManagerDataPrefix {
             race_logo_indices,
             race_logo_indices_range,
             race_logo_names,
+            race_logo_name_ranges,
             event_logo_indices,
             event_logo_indices_range,
             event_logo_names,
+            event_logo_name_ranges,
         ) = if logo_tables_present {
             let race_count = flags
                 .iter()
@@ -109,20 +120,32 @@ impl PropManagerDataPrefix {
             let race_start = reader.offset();
             let race_indices = read_encoded_ushort_array(&mut reader, race_count)?;
             let race_range = race_start..reader.offset();
-            let race_names = read_prefab_names(&mut reader)?;
+            let (race_names, race_name_ranges) = read_prefab_names(&mut reader)?;
             let event_start = reader.offset();
             let event_indices = read_encoded_ushort_array(&mut reader, event_count)?;
             let event_range = event_start..reader.offset();
+            let (event_names, event_name_ranges) = read_prefab_names(&mut reader)?;
             (
                 race_indices,
                 Some(race_range),
                 race_names,
+                race_name_ranges,
                 event_indices,
                 Some(event_range),
-                read_prefab_names(&mut reader)?,
+                event_names,
+                event_name_ranges,
             )
         } else {
-            (Vec::new(), None, Vec::new(), Vec::new(), None, Vec::new())
+            (
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
         };
         let consumed = reader.offset();
 
@@ -134,6 +157,7 @@ impl PropManagerDataPrefix {
                 prefab_indices,
                 prefab_indices_range,
                 prefab_names,
+                prefab_name_ranges,
                 position_x,
                 position_x_range,
                 position_z,
@@ -143,9 +167,11 @@ impl PropManagerDataPrefix {
                 race_logo_indices,
                 race_logo_indices_range,
                 race_logo_names,
+                race_logo_name_ranges,
                 event_logo_indices,
                 event_logo_indices_range,
                 event_logo_names,
+                event_logo_name_ranges,
                 logo_tables_present,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
@@ -163,11 +189,14 @@ impl PropManagerDataPrefix {
         PropManagerEditor {
             original_flags: self.flags.clone(),
             original_prefab_indices: self.prefab_indices.clone(),
+            original_prefab_names: self.prefab_names.clone(),
             original_position_x: self.position_x.clone(),
             original_position_z: self.position_z.clone(),
             original_angles: self.angles.clone(),
             original_race_logo_indices: self.race_logo_indices.clone(),
+            original_race_logo_names: self.race_logo_names.clone(),
             original_event_logo_indices: self.event_logo_indices.clone(),
+            original_event_logo_names: self.event_logo_names.clone(),
             data: self,
         }
     }
@@ -271,6 +300,13 @@ impl PropManagerEditor {
         &mut self.data.prefab_indices
     }
 
+    /// Returns mutable PropInfo names in original prefab-table order.
+    /// The number and order of entries are fixed; changed strings use
+    /// canonical DataSerializer encoding and can resize the manager body.
+    pub fn prefab_names_mut(&mut self) -> &mut [Option<String>] {
+        &mut self.data.prefab_names
+    }
+
     /// Returns mutable signed X coordinates in active-prop order.
     pub fn position_x_mut(&mut self) -> &mut [i16] {
         &mut self.data.position_x
@@ -292,10 +328,24 @@ impl PropManagerEditor {
         &mut self.data.race_logo_indices
     }
 
+    /// Returns mutable race-team logo names in original prefab-table order.
+    /// The number and order of entries are fixed; changed strings use
+    /// canonical DataSerializer encoding and can resize the manager body.
+    pub fn race_logo_names_mut(&mut self) -> &mut [Option<String>] {
+        &mut self.data.race_logo_names
+    }
+
     /// Returns mutable event logo assignments in PropInstance flag order.
     /// The slice is empty when the version-121026 logo tables are absent.
     pub fn event_logo_indices_mut(&mut self) -> &mut [u16] {
         &mut self.data.event_logo_indices
+    }
+
+    /// Returns mutable event logo names in original prefab-table order.
+    /// The number and order of entries are fixed; changed strings use
+    /// canonical DataSerializer encoding and can resize the manager body.
+    pub fn event_logo_names_mut(&mut self) -> &mut [Option<String>] {
+        &mut self.data.event_logo_names
     }
 
     /// Writes edited columns while retaining all unedited source bytes.
@@ -309,11 +359,17 @@ impl PropManagerEditor {
             || self.data.position_x.len() != count
             || self.data.position_z.len() != count
             || self.data.angles.len() != count
+            || self.data.prefab_names.len() != self.original_prefab_names.len()
+            || self.data.prefab_names.len() != self.data.prefab_name_ranges.len()
             || self.original_position_x.len() != count
             || self.original_position_z.len() != count
             || self.original_angles.len() != count
             || self.data.race_logo_indices.len() != self.original_race_logo_indices.len()
+            || self.data.race_logo_names.len() != self.original_race_logo_names.len()
+            || self.data.race_logo_names.len() != self.data.race_logo_name_ranges.len()
             || self.data.event_logo_indices.len() != self.original_event_logo_indices.len()
+            || self.data.event_logo_names.len() != self.original_event_logo_names.len()
+            || self.data.event_logo_names.len() != self.data.event_logo_name_ranges.len()
         {
             return Err(invalid_prop_manager(
                 0,
@@ -339,6 +395,13 @@ impl PropManagerEditor {
                 "prefab indexes",
             )?);
         }
+        replacements.extend(encode_name_replacements(
+            &bytes,
+            &self.original_prefab_names,
+            &self.data.prefab_names,
+            &self.data.prefab_name_ranges,
+            "PropInfo names",
+        )?);
         if self.data.position_x != self.original_position_x {
             let values = self
                 .data
@@ -389,6 +452,13 @@ impl PropManagerEditor {
                 "race-team logo indexes",
             )?);
         }
+        replacements.extend(encode_name_replacements(
+            &bytes,
+            &self.original_race_logo_names,
+            &self.data.race_logo_names,
+            &self.data.race_logo_name_ranges,
+            "race-team logo names",
+        )?);
         if self.data.event_logo_indices != self.original_event_logo_indices {
             let range = self.data.event_logo_indices_range.as_ref().ok_or_else(|| {
                 invalid_prop_manager(0, "event logo assignments are unavailable in this version")
@@ -400,6 +470,13 @@ impl PropManagerEditor {
                 "event logo indexes",
             )?);
         }
+        replacements.extend(encode_name_replacements(
+            &bytes,
+            &self.original_event_logo_names,
+            &self.data.event_logo_names,
+            &self.data.event_logo_name_ranges,
+            "event logo names",
+        )?);
 
         replacements.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
         let mut previous_start = bytes.len();
@@ -454,6 +531,38 @@ fn validate_range(
     Ok(())
 }
 
+fn encode_name_replacements(
+    source: &[u8],
+    original: &[Option<String>],
+    edited: &[Option<String>],
+    ranges: &[Range<usize>],
+    field: &str,
+) -> Result<Vec<(Range<usize>, Vec<u8>)>, CrpError> {
+    if original.len() != edited.len() || original.len() != ranges.len() {
+        return Err(invalid_prop_manager(
+            0,
+            format!("{field} entry counts do not match the source"),
+        ));
+    }
+
+    let mut replacements = Vec::new();
+    for (index, ((before, after), range)) in original.iter().zip(edited).zip(ranges).enumerate() {
+        if before == after {
+            continue;
+        }
+        if range.start > range.end || range.end > source.len() {
+            return Err(invalid_prop_manager(
+                range.start,
+                format!("{field} entry {index} byte range is invalid"),
+            ));
+        }
+        let mut encoded = Vec::new();
+        write_nullable_unique_string(&mut encoded, after.as_deref())?;
+        replacements.push((range.clone(), encoded));
+    }
+    Ok(replacements)
+}
+
 fn invalid_prop_manager(offset: usize, reason: impl Into<String>) -> CrpError {
     CrpError::InvalidAssetPayload {
         name: "PropManager+Data".to_owned(),
@@ -462,13 +571,18 @@ fn invalid_prop_manager(offset: usize, reason: impl Into<String>) -> CrpError {
     }
 }
 
-fn read_prefab_names(reader: &mut Reader<'_>) -> Result<Vec<Option<String>>, CrpError> {
+fn read_prefab_names(
+    reader: &mut Reader<'_>,
+) -> Result<(Vec<Option<String>>, Vec<Range<usize>>), CrpError> {
     let count = usize::from(reader.read_u16_be()?);
     let mut names = Vec::with_capacity(count);
+    let mut ranges = Vec::with_capacity(count);
     for _ in 0..count {
+        let start = reader.offset();
         names.push(reader.read_unique_string()?);
+        ranges.push(start..reader.offset());
     }
-    Ok(names)
+    Ok((names, ranges))
 }
 
 #[cfg(test)]
@@ -491,6 +605,44 @@ mod tests {
         if version >= 121_026 {
             bytes.extend_from_slice(&[0, 0, 0, 0]); // race and event name counts
         }
+        bytes
+    }
+
+    fn named_legacy_prefix() -> Vec<u8> {
+        let mut flags = vec![0_u16; PROP_INSTANCE_COUNT];
+        flags[0] = 1;
+        let mut bytes = Vec::new();
+        write_encoded_ushort_array(&mut bytes, &flags);
+        write_encoded_ushort_array(&mut bytes, &[9]);
+        bytes.extend_from_slice(&[0, 2]); // Two PropInfo names.
+        bytes.extend_from_slice(&[0x80, 0, 1, 0xd0]); // Compact "P".
+        bytes.push(0xff); // Null name.
+        write_encoded_ushort_array(&mut bytes, &[0]);
+        write_encoded_ushort_array(&mut bytes, &[0]);
+        write_encoded_ushort_array(&mut bytes, &[0]);
+        bytes
+    }
+
+    fn named_logo_prefix() -> Vec<u8> {
+        let mut flags = vec![0_u16; PROP_INSTANCE_COUNT];
+        flags[0] = 0x0100;
+        flags[1] = 0x0200;
+        let mut bytes = Vec::new();
+        write_encoded_ushort_array(&mut bytes, &flags);
+        write_encoded_ushort_array(&mut bytes, &[1, 2]);
+        bytes.extend_from_slice(&[0, 2]); // PropInfo names.
+        bytes.extend_from_slice(&[0, 0, 1, 0xff, 0xd0]); // Wide "P".
+        bytes.push(0xff); // Null name.
+        write_encoded_ushort_array(&mut bytes, &[3, 4]);
+        write_encoded_ushort_array(&mut bytes, &[5, 6]);
+        write_encoded_ushort_array(&mut bytes, &[7, 8]);
+        write_encoded_ushort_array(&mut bytes, &[11]); // Race logo index.
+        bytes.extend_from_slice(&[0, 2]); // Race logo names.
+        bytes.extend_from_slice(&[0x80, 0, 1, 0xd2]); // Compact "R".
+        bytes.push(0xff); // Null name.
+        write_encoded_ushort_array(&mut bytes, &[12]); // Event logo index.
+        bytes.extend_from_slice(&[0, 1]); // Event logo names.
+        bytes.extend_from_slice(&[0x80, 0, 1, 0xc5]); // Compact "E".
         bytes
     }
 
@@ -545,6 +697,78 @@ mod tests {
         assert_eq!(new.race_logo_names(), &[]);
         assert_eq!(new.event_logo_names(), &[]);
         assert_eq!(new.encode(), current);
+    }
+
+    #[test]
+    fn prop_manager_editor_changes_legacy_names_and_preserves_other_bytes() {
+        let bytes = named_legacy_prefix();
+        let (props, consumed) = PropManagerDataPrefix::decode_prefix(121_025, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(props.prefab_names(), &[Some("P".to_owned()), None]);
+        let name_ranges = props.prefab_name_ranges.clone();
+        let mut editor = props.into_editor();
+        editor.prefab_names_mut()[0] = Some("AB".to_owned());
+        editor.prefab_names_mut()[1] = Some("A".to_owned());
+
+        let mut expected = bytes.clone();
+        expected.splice(name_ranges[1].clone(), [0x80, 0, 1, 0xc1]);
+        expected.splice(name_ranges[0].clone(), [0x80, 0, 2, 0xc1, 1]);
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+
+        let (updated, consumed) = PropManagerDataPrefix::decode_prefix(121_025, &encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(
+            updated.prefab_names(),
+            &[Some("AB".to_owned()), Some("A".to_owned())]
+        );
+    }
+
+    #[test]
+    fn prop_manager_editor_changes_names_in_all_modern_scopes() {
+        let bytes = named_logo_prefix();
+        let (props, consumed) = PropManagerDataPrefix::decode_prefix(121_026, &bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(props.prefab_names(), &[Some("P".to_owned()), None]);
+        assert_eq!(props.race_logo_names(), &[Some("R".to_owned()), None]);
+        assert_eq!(props.event_logo_names(), &[Some("E".to_owned())]);
+
+        let mut expected_replacements = vec![
+            (props.prefab_name_ranges[0].clone(), vec![0xff]),
+            (
+                props.prefab_name_ranges[1].clone(),
+                vec![0x80, 0, 2, 0xc1, 1],
+            ),
+            (props.race_logo_name_ranges[0].clone(), vec![0xff]),
+            (
+                props.race_logo_name_ranges[1].clone(),
+                vec![0x80, 0, 2, 0xc1, 1],
+            ),
+            (
+                props.event_logo_name_ranges[0].clone(),
+                vec![0, 0, 1, 0x03, 0x3b],
+            ),
+        ];
+        expected_replacements.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        let mut expected = bytes.clone();
+        for (range, replacement) in expected_replacements {
+            expected.splice(range, replacement);
+        }
+
+        let mut editor = props.into_editor();
+        editor.prefab_names_mut()[0] = None;
+        editor.prefab_names_mut()[1] = Some("AB".to_owned());
+        editor.race_logo_names_mut()[0] = None;
+        editor.race_logo_names_mut()[1] = Some("AB".to_owned());
+        editor.event_logo_names_mut()[0] = Some("λ".to_owned());
+        let encoded = editor.encode().unwrap();
+        assert_eq!(encoded, expected);
+
+        let (updated, consumed) = PropManagerDataPrefix::decode_prefix(121_026, &encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(updated.prefab_names(), &[None, Some("AB".to_owned())]);
+        assert_eq!(updated.race_logo_names(), &[None, Some("AB".to_owned())]);
+        assert_eq!(updated.event_logo_names(), &[Some("λ".to_owned())]);
     }
 
     #[test]
