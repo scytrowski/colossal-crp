@@ -48,8 +48,8 @@ pub use audio_manager_data::{
 pub use building_manager_data::{
     BuildingBufferFieldsPrefix, BuildingByteStatePrefix, BuildingEconomicFieldsEditor,
     BuildingEconomicFieldsPrefix, BuildingEffectValue, BuildingFacultyBonusesEditor,
-    BuildingFacultyBonusesPrefix, BuildingFlag, BuildingFlagsPrefix, BuildingInstanceRecord,
-    BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
+    BuildingFacultyBonusesPrefix, BuildingFlag, BuildingFlagsEditor, BuildingFlagsPrefix,
+    BuildingInstanceRecord, BuildingInstanceRecordsEditor, BuildingInstanceRecordsPrefix,
     BuildingManagerObjectHeadersPrefix, BuildingMonumentEffectsEditor,
     BuildingMonumentEffectsPrefix, BuildingPopulationEditor, BuildingPopulationPrefix,
     BuildingPrefabPrefix, BuildingProblemEditor, BuildingProblemPrefix, BuildingProblemWords,

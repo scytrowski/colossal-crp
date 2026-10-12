@@ -3,10 +3,11 @@ use crate::data_serializer::{Reader, write_unique_string};
 use crate::encoded_array::{
     read_encoded_byte_array, read_encoded_int_array, read_encoded_uint_array,
     read_encoded_ulong_array, read_encoded_ushort_array, write_encoded_byte_array,
-    write_encoded_int_array, write_encoded_uint_array, write_encoded_ulong_array,
-    write_encoded_ushort_array,
+    write_encoded_int_array, write_encoded_uint_array, write_encoded_uint_array_runs,
+    write_encoded_ulong_array, write_encoded_ushort_array,
 };
 use crate::net_manager_data::{NetObjectHeader, read_net_object_header};
+use std::ops::Range;
 
 const BUILDING_COUNT: usize = 49_152;
 const LEGACY_BUILDING_COUNT: usize = 32_768;
@@ -38,7 +39,21 @@ pub struct BuildingFlag {
 pub struct BuildingFlagsPrefix {
     format_version: u32,
     building_flags: Vec<BuildingFlag>,
+    primary_flags_range: Range<usize>,
+    secondary_flags_range: Option<Range<usize>>,
     serialized_prefix: Vec<u8>,
+}
+
+/// Editor for raw primary and secondary BuildingManager flag values.
+///
+/// Primary flags preserve each building slot's zero/nonzero activity state.
+/// Secondary flags are available from inner version 112030 and do not select
+/// active building records. Changed arrays are canonically re-encoded and can
+/// resize the prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildingFlagsEditor {
+    original: BuildingFlagsPrefix,
+    building_flags: Vec<BuildingFlag>,
 }
 
 /// Prefab index tables and names immediately after the BuildingManager counts.
@@ -2657,6 +2672,57 @@ mod tests {
         BuildingTimerGeometryEditor, fixed_object_header_count, timer_fields_for_version,
     };
 
+    #[test]
+    fn building_flag_editor_preserves_activity_and_respects_version_gates() {
+        let mut legacy_values = vec![0_u32; 32_767];
+        legacy_values[32_766] = 1;
+        let mut legacy_bytes = Vec::new();
+        crate::encoded_array::write_encoded_uint_array(&mut legacy_bytes, &legacy_values);
+        let (legacy, consumed) = BuildingFlagsPrefix::decode_prefix(164, &legacy_bytes)
+            .expect("legacy primary flags decode");
+        assert_eq!(consumed, legacy_bytes.len());
+        let mut editor = legacy.into_editor();
+        assert!(editor.set_primary_flag_bits(32_766, 0).is_err());
+        assert!(editor.set_primary_flag_bits(32_767, 1).is_err());
+        assert!(editor.set_secondary_flag_bits(0, 1).is_err());
+        editor.set_primary_flag_bits(32_766, 3).unwrap();
+
+        let mut expected = vec![0xff; 255]; // 32,640 repeated zero values.
+        expected.extend_from_slice(&[0xfd, 0, 0, 0, 0, 3]); // 126 zeros, then one literal value.
+        assert_eq!(editor.encode().unwrap(), expected);
+        let (updated, _) =
+            BuildingFlagsPrefix::decode_prefix(164, &expected).expect("edited legacy flags decode");
+        assert_eq!(updated.building_flags()[32_766].flags, 3);
+        assert_eq!(updated.building_flags()[32_767].flags, 0);
+
+        let mut modern_primary = vec![0_u32; 49_151];
+        modern_primary[49_150] = 1;
+        let mut modern_bytes = Vec::new();
+        crate::encoded_array::write_encoded_uint_array(&mut modern_bytes, &modern_primary);
+        crate::encoded_array::write_encoded_uint_array_runs(&mut modern_bytes, &vec![0; 49_151]);
+        let (modern, consumed) = BuildingFlagsPrefix::decode_prefix(112_030, &modern_bytes)
+            .expect("version-112030 flag arrays decode");
+        assert_eq!(consumed, modern_bytes.len());
+        let mut editor = modern.into_editor();
+        editor.set_primary_flag_bits(49_150, 5).unwrap();
+        editor.set_secondary_flag_bits(0, 7).unwrap();
+        let encoded = editor.encode().unwrap();
+        let (updated, consumed) = BuildingFlagsPrefix::decode_prefix(112_030, &encoded)
+            .expect("edited secondary flags decode");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(updated.building_flags()[49_150].flags, 5);
+        assert_eq!(updated.building_flags()[0].flags2, 7);
+
+        let mut before_secondary_gate = Vec::new();
+        crate::encoded_array::write_encoded_uint_array_runs(
+            &mut before_secondary_gate,
+            &vec![0; 49_151],
+        );
+        let (legacy, _) = BuildingFlagsPrefix::decode_prefix(112_029, &before_secondary_gate)
+            .expect("pre-secondary flags decode");
+        assert!(legacy.into_editor().set_secondary_flag_bits(0, 1).is_err());
+    }
+
     fn expected_effect_table_bytes() -> Vec<u8> {
         let mut bytes = Vec::with_capacity(512);
         for index in 0..32_i32 {
@@ -2734,6 +2800,8 @@ mod tests {
                     flags2: 0,
                 },
             ],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
             serialized_prefix: Vec::new(),
         };
         let (prefix, used) =
@@ -2752,6 +2820,8 @@ mod tests {
         let legacy_flags = BuildingFlagsPrefix {
             format_version: 120_001,
             building_flags: flags.building_flags.clone(),
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
             serialized_prefix: Vec::new(),
         };
         let (legacy, used) =
@@ -2787,6 +2857,8 @@ mod tests {
                     flags2: 0,
                 },
             ],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
             serialized_prefix: Vec::new(),
         };
         let (unassigned, _) =
@@ -2859,6 +2931,8 @@ mod tests {
                     flags2: 0,
                 },
             ],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
             serialized_prefix: Vec::new(),
         };
         let bytes = [
@@ -2898,6 +2972,8 @@ mod tests {
                 flags: 1,
                 flags2: 0,
             }],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
             serialized_prefix: Vec::new(),
         };
         assert!(BuildingInstanceRecordsPrefix::decode_prefix(164, &flags, &[0; 23]).is_err());
@@ -3006,6 +3082,8 @@ mod tests {
                     flags2: 0,
                 },
             ],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
             serialized_prefix: Vec::new(),
         };
         // Nine one-value literal columns: education x3, age groups x4,
@@ -3042,6 +3120,8 @@ mod tests {
                 flags: 1,
                 flags2: 0,
             }],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
             serialized_prefix: Vec::new(),
         };
         // Ten one-value literal columns, with children between education
@@ -3082,6 +3162,8 @@ mod tests {
                 flags: 1,
                 flags2: 0,
             }],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
             serialized_prefix: Vec::new(),
         };
         let encoded = [
@@ -3126,6 +3208,8 @@ mod tests {
                 flags: 1,
                 flags2: 0,
             }],
+            primary_flags_range: 0..0,
+            secondary_flags_range: None,
             serialized_prefix: Vec::new(),
         };
         let encoded = [
@@ -3295,12 +3379,16 @@ impl BuildingFlagsPrefix {
         } else {
             BUILDING_COUNT - 1
         };
+        let primary_start = reader.offset();
         let primary = read_encoded_uint_array(&mut reader, primary_count)?;
+        let primary_flags_range = primary_start..reader.offset();
+        let secondary_start = reader.offset();
         let secondary = if format_version >= SECONDARY_BUILDING_FLAGS_VERSION {
             Some(read_encoded_uint_array(&mut reader, BUILDING_COUNT - 1)?)
         } else {
             None
         };
+        let secondary_flags_range = secondary.as_ref().map(|_| secondary_start..reader.offset());
         let mut building_flags = Vec::with_capacity(BUILDING_COUNT - 1);
         for index in 0..BUILDING_COUNT - 1 {
             building_flags.push(BuildingFlag {
@@ -3319,6 +3407,8 @@ impl BuildingFlagsPrefix {
             Self {
                 format_version,
                 building_flags,
+                primary_flags_range,
+                secondary_flags_range,
                 serialized_prefix: bytes[..consumed].to_vec(),
             },
             consumed,
@@ -3335,8 +3425,172 @@ impl BuildingFlagsPrefix {
         &self.building_flags
     }
 
+    /// Creates an editor for raw primary and version-112030 secondary flags.
+    pub fn into_editor(self) -> BuildingFlagsEditor {
+        BuildingFlagsEditor {
+            building_flags: self.building_flags.clone(),
+            original: self,
+        }
+    }
+
     /// Writes the original encoded arrays exactly.
     pub fn encode(&self) -> Vec<u8> {
         self.serialized_prefix.clone()
+    }
+}
+
+impl BuildingFlagsEditor {
+    /// Returns the inner DataSerializer version.
+    pub fn format_version(&self) -> u32 {
+        self.original.format_version
+    }
+
+    /// Returns decoded entries in ascending slot order; each entry has a
+    /// one-based buffer index.
+    pub fn building_flags(&self) -> &[BuildingFlag] {
+        &self.building_flags
+    }
+
+    /// Replaces primary flag bits for one serialized building slot.
+    ///
+    /// The zero/nonzero state must remain unchanged because it selects the
+    /// number and ordering of following active-building fields. Slots omitted
+    /// by the pre-version-222 layout return an error.
+    pub fn set_primary_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        let serialized_count = if self.original.format_version < FULL_BUILDING_COUNT_VERSION {
+            LEGACY_BUILDING_COUNT - 1
+        } else {
+            BUILDING_COUNT - 1
+        };
+        if index >= serialized_count {
+            return Err(invalid_building_flags(
+                index,
+                "primary flag slot is not serialized by this inner version",
+            ));
+        }
+        let flag = self
+            .building_flags
+            .get_mut(index)
+            .ok_or_else(|| invalid_building_flags(index, "primary flag index is out of range"))?;
+        if (flag.flags == 0) != (value == 0) {
+            return Err(invalid_building_flags(
+                index,
+                "primary flag edits must preserve the slot's active state",
+            ));
+        }
+        flag.flags = value;
+        Ok(())
+    }
+
+    /// Replaces secondary flag bits for one slot from inner version 112030.
+    ///
+    /// Secondary flags do not determine the active-building count. Earlier
+    /// versions return an error because this array is absent from their bytes.
+    pub fn set_secondary_flag_bits(&mut self, index: usize, value: u32) -> Result<(), CrpError> {
+        if self.original.format_version < SECONDARY_BUILDING_FLAGS_VERSION {
+            return Err(invalid_building_flags(
+                index,
+                "secondary flag array is absent before inner version 112030",
+            ));
+        }
+        let flag = self
+            .building_flags
+            .get_mut(index)
+            .ok_or_else(|| invalid_building_flags(index, "secondary flag index is out of range"))?;
+        flag.flags2 = value;
+        Ok(())
+    }
+
+    /// Re-encodes changed flag arrays and preserves all other source bytes.
+    ///
+    /// Changed arrays use the canonical repeat-delta encoding and may resize
+    /// this prefix. Primary activity and all building slot indexes stay fixed.
+    pub fn encode(&self) -> Result<Vec<u8>, CrpError> {
+        if self.building_flags.len() != self.original.building_flags.len() {
+            return Err(invalid_building_flags(0, "building flag count changed"));
+        }
+        let primary_count = if self.original.format_version < FULL_BUILDING_COUNT_VERSION {
+            LEGACY_BUILDING_COUNT - 1
+        } else {
+            BUILDING_COUNT - 1
+        };
+        let mut primary = Vec::with_capacity(primary_count);
+        for (index, (edited, original)) in self
+            .building_flags
+            .iter()
+            .zip(&self.original.building_flags)
+            .enumerate()
+        {
+            if edited.index != original.index {
+                return Err(invalid_building_flags(
+                    index,
+                    "building buffer index changed",
+                ));
+            }
+            if (edited.flags == 0) != (original.flags == 0) {
+                return Err(invalid_building_flags(
+                    index,
+                    "primary flag edits must preserve the slot's active state",
+                ));
+            }
+            if index < primary_count {
+                primary.push(edited.flags);
+            } else if edited.flags != 0 {
+                return Err(invalid_building_flags(
+                    index,
+                    "primary flag slot is not serialized by this inner version",
+                ));
+            }
+            if self.original.secondary_flags_range.is_none() && edited.flags2 != 0 {
+                return Err(invalid_building_flags(
+                    index,
+                    "secondary flag array is absent before inner version 112030",
+                ));
+            }
+        }
+
+        let mut bytes = self.original.serialized_prefix.clone();
+        let original_primary = self
+            .original
+            .building_flags
+            .iter()
+            .take(primary_count)
+            .map(|flag| flag.flags);
+        if let Some(range) = &self.original.secondary_flags_range {
+            let secondary: Vec<_> = self.building_flags.iter().map(|flag| flag.flags2).collect();
+            let original_secondary = self.original.building_flags.iter().map(|flag| flag.flags2);
+            if !secondary.iter().copied().eq(original_secondary) {
+                validate_building_flag_range(&bytes, range)?;
+                let mut encoded = Vec::new();
+                write_encoded_uint_array_runs(&mut encoded, &secondary);
+                bytes.splice(range.clone(), encoded);
+            }
+        }
+
+        if !primary.iter().copied().eq(original_primary) {
+            validate_building_flag_range(&bytes, &self.original.primary_flags_range)?;
+            let mut encoded = Vec::new();
+            write_encoded_uint_array_runs(&mut encoded, &primary);
+            bytes.splice(self.original.primary_flags_range.clone(), encoded);
+        }
+        Ok(bytes)
+    }
+}
+
+fn validate_building_flag_range(bytes: &[u8], range: &Range<usize>) -> Result<(), CrpError> {
+    if range.start > range.end || range.end > bytes.len() {
+        return Err(invalid_building_flags(
+            range.start,
+            "encoded flag range exceeds the original prefix",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_building_flags(offset: usize, reason: impl Into<String>) -> CrpError {
+    CrpError::InvalidAssetPayload {
+        name: "BuildingManager+Data flags".to_owned(),
+        offset,
+        reason: reason.into(),
     }
 }
