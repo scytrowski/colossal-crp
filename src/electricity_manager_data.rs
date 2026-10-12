@@ -231,7 +231,7 @@ impl ElectricityManagerData {
         let scalar_fields_offset = reader.offset();
         let processed_cell_count = reader.read_i32_be()?;
         let conductive_cell_count = reader.read_i32_be()?;
-        let can_continue = reader.read_u8()? != 0;
+        let can_continue = reader.read_u8()? == 1;
         if reader.remaining() != END_PROFILER_REFERENCE_LEN {
             return Err(reader.invalid(format!(
                 "ElectricityManager fields leave {} bytes before the next manager; expected the two-byte closing profiler reference",
@@ -2041,12 +2041,15 @@ mod tests {
         body[continuation_offset] = 2;
 
         let mut data = ElectricityManagerData::decode(117_000, &body).unwrap();
-        assert!(data.can_continue());
+        assert!(!data.can_continue());
         assert_eq!(data.encode().unwrap(), body);
 
         data.set_can_continue(false);
+        assert_eq!(data.encode().unwrap(), body);
+
+        data.set_can_continue(true);
         let encoded = data.encode().unwrap();
-        assert_eq!(encoded[continuation_offset], 0);
+        assert_eq!(encoded[continuation_offset], 1);
         assert_eq!(
             &encoded[..continuation_offset],
             &body[..continuation_offset]

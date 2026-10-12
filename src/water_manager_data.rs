@@ -481,7 +481,7 @@ impl WaterManagerData {
         let scalar_fields_offset = reader.offset();
         let processed_cell_count = reader.read_i32_be()?;
         let conductive_cell_count = reader.read_i32_be()?;
-        let can_continue = reader.read_u8()? != 0;
+        let can_continue = reader.read_u8()? == 1;
         let guide_references = read_guide_references(&mut reader, format_version)?;
         read_end_profiler_reference(&mut reader)?;
         if reader.remaining() != 0 {
@@ -4237,12 +4237,15 @@ mod tests {
         body[continuation_offset] = 2;
 
         let mut data = WaterManagerData::decode(265, &body).unwrap();
-        assert!(data.can_continue());
+        assert!(!data.can_continue());
         assert_eq!(data.encode().unwrap(), body);
 
         data.set_can_continue(false);
+        assert_eq!(data.encode().unwrap(), body);
+
+        data.set_can_continue(true);
         let encoded = data.encode().unwrap();
-        assert_eq!(encoded[continuation_offset], 0);
+        assert_eq!(encoded[continuation_offset], 1);
         assert_eq!(
             &encoded[..continuation_offset],
             &body[..continuation_offset]

@@ -20074,7 +20074,7 @@ mod manager_boundary_tests {
         let original_graph = manager.serialized_object_graph.clone();
 
         let editor = manager.decode_electricity_manager_data().unwrap();
-        assert!(editor.can_continue());
+        assert!(!editor.can_continue());
         manager.replace_electricity_manager_data(&editor).unwrap();
 
         assert_eq!(manager.serialized_object_graph, original_graph);
@@ -20233,7 +20233,7 @@ mod manager_boundary_tests {
         let original_graph = manager.serialized_object_graph.clone();
 
         let editor = manager.decode_water_manager_data().unwrap();
-        assert!(editor.can_continue());
+        assert!(!editor.can_continue());
         manager.replace_water_manager_data(&editor).unwrap();
 
         assert_eq!(manager.serialized_object_graph, original_graph);
